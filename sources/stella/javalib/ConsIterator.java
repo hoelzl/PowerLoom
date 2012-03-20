@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: ConsIterator.java,v 1.5 2003/04/18 21:16:06 hans Exp
+// Version: ConsIterator.java,v 1.8 2006/05/11 07:06:46 hans Exp
 
 package edu.isi.stella.javalib;
 
@@ -65,7 +65,7 @@ public class ConsIterator implements java.util.Iterator {
 
   /** Tests if more elements are available.
    *
-   * @returns true if at least one more element is available.
+   * @return true if at least one more element is available.
    */
   public boolean hasNext () {
     return cons.nonEmptyP();
@@ -73,7 +73,7 @@ public class ConsIterator implements java.util.Iterator {
 
   /** Returns the next Stella_Object contained in the Cons.
    *
-   * @returns the next Stella_Object in the Cons.
+   * @return the next Stella_Object in the Cons.
    */
   public Object next () {
     if (cons.emptyP()) {

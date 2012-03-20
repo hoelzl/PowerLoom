@@ -1,0 +1,1597 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: partial-match.ste,v 1.53 2006/05/11 07:05:26 hans Exp
+
+;;; Partial match routines
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+;; possible modes: :BASIC, :NN, :PLANNING, :PROBABILISTIC, :WHYNOT
+(defglobal *Partial-Match-Mode* KEYWORD :BASIC)
+
+;; Do you want to use the greedy heuristic to prune the NN partial
+;; match search?
+(defglobal *Greedy-Network-Pruning* BOOLEAN TRUE)
+
+
+(defun set-partial-match-mode ((k KEYWORD))
+  :command? TRUE  :public? TRUE
+  (setq *Partial-Match-Mode* k))
+
+;; possible combinations: :MAX, :NOISY-OR
+(defglobal *Rule-Combination* KEYWORD :MAX)
+
+(defglobal *planning-mode* BOOLEAN false)
+
+(defglobal *Planable-Predicates* CONS nil)
+
+(defclass PARTIAL-MATCH-FRAME (STANDARD-OBJECT)
+  :documentation "Abstract class acting as placeholder for system and
+user-defined partial match implementations."
+  :abstract? TRUE
+  :slots 
+  ((kind :type KEYWORD :required? TRUE)
+   (control-frame :type CONTROL-FRAME :required? TRUE)
+   ;; pointers to parent/child partial-match-frames (used for dynamic cutoffs)
+   (parent :type PARTIAL-MATCH-FRAME)
+   (child :type PARTIAL-MATCH-FRAME) ;; eliminate, use justifications instead - hc
+   ;; scores:
+   (positive-score :type PARTIAL-MATCH-SCORE :initially NULL)
+   (negative-score :type PARTIAL-MATCH-SCORE :initially NULL)
+   (dynamic-cutoff :type FLOAT)
+   (argument-scores :type (CONS OF FLOAT-WRAPPER) :initially NIL)
+   (argument-weights :type (CONS OF FLOAT-WRAPPER) :initially NIL)
+   (unbound-vars :type CONS :initially NIL)  ;; keeps missed bindings
+   (success? :type BOOLEAN :initially FALSE) ;; almost obsolete - hc
+   ))
+
+(defglobal *fail-unbound-clauses?* BOOLEAN FALSE) 
+
+(defglobal *minimum-score-cutoff* PARTIAL-MATCH-SCORE 0.0
+  :documentation "Positive scores below *minimum-score-cutoff* get trimmed
+to 0.0 during partial match operations.")
+
+(defglobal *maximum-score-cutoff* PARTIAL-MATCH-SCORE 0.0
+  :documentation "Positive scores above *maximum-score-cutoff* get trimmed
+to 1.0 during partial match operations.")
+
+
+(defun set-rule-combination ((k keyword))
+  :command? TRUE
+  (setq *Rule-Combination* k))
+
+(defun set-greedy-network-pruning ((b boolean))
+  :command? TRUE  :public? TRUE
+  (setq *greedy-network-pruning* b))
+
+(defun set-maximum-score-cutoff ((c float))
+  :command? TRUE :public? TRUE
+  (setq *maximum-score-cutoff* c))
+
+(defun set-minimum-score-cutoff ((c float))
+  :command? TRUE  :public? TRUE
+  (setq *maximum-score-cutoff* c))
+
+;; This variable is to notify an AND node that we missed an important binding
+(defglobal *AND-MISSED-A-BINDING* BOOLEAN FALSE)
+
+(defun link-to-parent-partial-match-frame ((self PARTIAL-MATCH-FRAME))
+  ;; Create link and backlink to `self's parent partial match frame.
+  (let ((controlFrame (up (control-frame self))))
+    (while (and (defined? controlFrame)
+                (null? (partial-match-frame controlFrame)))
+      (setq controlFrame (up controlFrame)))
+    (when (defined? controlFrame)
+      (setf (parent self) (partial-match-frame controlFrame))
+      (setf (child (partial-match-frame controlFrame)) self))))
+
+
+  ;;
+;;;;;; Default and abstract methods for partial match implementations
+  ;;
+
+;;; These methods comprise the "NEW" scheme to control partial match inference.
+;;; The main change is that the various `continue-XXX-proof' methods are now fully
+;;; wrapped (or advised) by `continue-partial-XXX-proof' methods for more modular
+;;; implementation and better control.  The new scheme is currently only implemented
+;;; for :BASIC partial match and its descendants.  We still chain through the old
+;;; scheme (with its various `old-interpret-XXX-scores' methods) for the :NN
+;;; partial matcher.  Tons of cleanup happened on the way.
+
+(defmethod (create-partial-match-frame PARTIAL-MATCH-FRAME)
+           ((self PARTIAL-MATCH-FRAME) (frame CONTROL-FRAME) (kind KEYWORD))
+  ;; Create an NAIVE-PARTIAL-MATCH, link it to 'frame', and
+  ;;    initialize selected slots.
+  (ignore frame kind)
+  (error "Missing concrete method named 'create-partial-match-frame' on the" EOL
+         "   class " (primary-type self)) )
+
+(defmethod (compute-dynamic-cutoff PARTIAL-MATCH-SCORE)
+    ((self PARTIAL-MATCH-FRAME))
+  ;; Compute a dynamic cutoff for the partial goal represented by `self'.
+  (return NULL))
+
+(defmethod set-dynamic-cutoff ((self PARTIAL-MATCH-FRAME))
+  ;; Set the dynamic cutoff for the partial goal represented by `self'.
+  (let ((cutoff (compute-dynamic-cutoff self)))
+    (when (defined? cutoff)
+      (when (or (< cutoff -100)
+                (> cutoff +100))
+        (warn "*** fishy dynamic cutoff=" cutoff " computed, resetting to 0.0")
+        (setq cutoff 0.0))
+      (setf (dynamic-cutoff self) cutoff))))
+
+(defmethod (cutoff-partial-match? BOOLEAN) ((self PARTIAL-MATCH-FRAME)
+                                            (trace? BOOLEAN))
+  ;; Assume the goal represented by `self' just completed.
+  ;; Return TRUE if the goal's computed score fails to clear the minimally
+  ;;    required cutoff score for `self'.
+  ;; Trace the search cutoff to standard output if `trace?' is true.
+  (let ((score (positive-score self))
+        (cutoff (dynamic-cutoff self))
+        (cutoff? FALSE))
+    (cond ((or (null? score)  ;; shouldn't happen
+               (null? cutoff) ;; can happen with frames that timeout, etc.
+               (= cutoff 0.0))
+           (setq cutoff? FALSE))
+          ((< cutoff 0.0)
+           (setq cutoff? (> score cutoff)))
+          (otherwise
+           (setq cutoff? (< score cutoff))))
+    ;; this is wrong (wrong interpretation of `*minimum-score-cutoff*), it
+    ;; is left in here as a reminder so we won't try to enable it again:
+    ;(unless cutoff?
+    ;  (setq cutoff? (<= (abs score) *minimum-score-cutoff*)))
+    (when (and cutoff? trace?)
+      (print "*** Cutting off search, cutoff=" cutoff EOL))
+    (return cutoff?)))
+
+(defmethod (proposition-weight FLOAT) ((self PARTIAL-MATCH-FRAME)
+                                       (proposition PROPOSITION))
+  ;; Compute the weight of `proposition' relative to its controlling
+  ;;    partial match frame `self'.
+  ;; Different partial match strategies might make different default
+  ;;    assumptions about weights of propositions based on their type.
+  (if (defined? proposition)
+      (let ((weight (weight proposition)))
+        (if (null? weight)
+            (return 1.0)
+          (return weight)))
+    ;; can happen in depth cutoff cases:
+    (return 1.0)))
+
+(defmethod clear-frame-partial-truth ((self PARTIAL-MATCH-FRAME))
+  ;; Reset the partial truth indicators of `self' to their initial values.
+  (setf (positive-score self) NULL)
+  (setf (negative-score self) NULL))
+
+(defmethod (defined-frame-partial-truth? BOOLEAN) ((self CONTROL-FRAME))
+  ;; Return TRUE if the partial truth of `self' is completely defined.
+  :globally-inline? TRUE
+  (return (and (defined? (partial-match-frame self))
+               (defined-frame-partial-truth? (partial-match-frame self)))))
+
+(defmethod (defined-frame-partial-truth? BOOLEAN) ((self PARTIAL-MATCH-FRAME))
+  ;; Return TRUE if the partial truth of `self' is completely defined.
+  :globally-inline? TRUE
+  (return (or (defined? (positive-score self))
+              (defined? (negative-score self)))))
+
+(defmethod set-frame-partial-truth ((self PARTIAL-MATCH-FRAME)
+                                    (truthValue TRUTH-VALUE)
+                                    (posScore PARTIAL-MATCH-SCORE)
+                                    (negScore PARTIAL-MATCH-SCORE)
+                                    (ignorePolarity? BOOLEAN))
+  ;; Set the truth-value of `frame' to the partial truth indicated by
+  ;;    `posScore' and `negScore' (currently ignored), or its inverse if
+  ;;    `frame' is a reverse polarity frame and `ignorePolarity?' is FALSE.
+  ;; Use appropriate defaults from `truthValue' to fill in for null values.
+  ;; In the future, all these numbers might be attached directly to the
+  ;;    truth value.
+  ;; IMPORTANT: For propagation of partial truth values between frames use
+  ;;    `propagate-frame-partial-truth', since it handles polarity flips.
+  ;; THIS IS STILL HIGHLY EXPERIMENTAL!
+  (let ((flipPolarity?
+         (and (reverse-polarity? (control-frame self))
+              (not ignorePolarity?))))
+    (when (and (null? posScore)
+               (defined? truthValue))
+      (setq posScore (positive-score truthValue)))
+    (when (and (null? negScore)
+               (defined? truthValue))
+      (setq negScore (positive-score (invert-truth-value truthValue))))
+    (when flipPolarity?
+      (let ((aux posScore))
+        ;; not yet:
+        ;(setq posScore negScore)
+        (setq posScore (- posScore))
+        (setq negScore aux)))
+    (setf (positive-score self) posScore)
+    (setf (negative-score self) negScore)
+ ;;; REMOVE, ONCE WE ARE DONE WITH CONVERSION ;;;
+ (setf (latest-positive-score *queryIterator*) posScore)
+    ))
+
+(defmethod propagate-frame-partial-truth ((source PARTIAL-MATCH-FRAME)
+                                          (target CONTROL-FRAME))
+  ;; Propagate the partial truth of `source' to `target' and invert it if
+  ;;    they have opposite polarity.
+  ;; THIS IS STILL HIGHLY EXPERIMENTAL!
+  (let ((targetPmf (partial-match-frame target))
+        (flipPolarity?
+         (not (eql? (reverse-polarity? (control-frame source))
+                    (reverse-polarity? target)))))
+    (when (null? targetPmf)
+      (cond (flipPolarity?
+             ;; need to allocate a new frame:
+             (setq targetPmf
+               (create-object (primary-type source)
+                              :control-frame target :kind (state target)))
+             (setf (parent targetPmf) (parent source))
+             (setf (child targetPmf) source))
+            (otherwise
+             ;; simply reuse the frame:
+             (setq targetPmf source)))
+      (setf (partial-match-frame target) targetPmf))
+    (cond (flipPolarity?
+           ;; not yet:
+           ;(setf (positive-score targetPmf) (negative-score source))
+           (setf (positive-score targetPmf) (- (positive-score source)))
+           (setf (negative-score targetPmf) (positive-score source)))
+          (otherwise
+           (setf (positive-score targetPmf) (positive-score source))
+           (setf (negative-score targetPmf) (negative-score source))))
+ ;;; REMOVE, ONCE WE ARE DONE WITH CONVERSION ;;;
+ (setf (latest-positive-score *queryIterator*) (positive-score targetPmf))
+   ))
+
+(defmethod trace-frame-partial-truth ((self PARTIAL-MATCH-FRAME)
+                                      (lastMove KEYWORD)
+                                      (stream OUTPUT-STREAM))
+  ;; Annotate the partial truth of `self' onto `stream' relative to `lastMove'.
+  (let ((weight (proposition-weight self (proposition (control-frame self)))))
+    (case lastMove
+      (:DOWN
+       ;; We need to compute the cutoff here, since it won't get initialized
+       ;;    until the :DOWN move is actually executed - ugly:
+       ;; BUG: THIS GETS RUN TOO LATE, SINCE THE PARTIAL MATCH FRAMES DON'T
+       ;;    GET INITIALIZED UNTIL THE :DOWN MOVE IS ACTUALLY EXECUTED.
+       (let ((cutoff (compute-dynamic-cutoff self)))
+         (when (defined? cutoff)
+           (print-stream stream "cutoff=" cutoff))))
+      ((:UP-TRUE :UP-FAIL)
+       (let ((score (positive-score self)))
+         (print-stream stream "score=" score)
+         (when (and (defined? weight)
+                    (not (= weight 1.0)))
+           (print-stream stream " weight=" weight))))
+      (otherwise NULL))))
+
+(defmethod set-cache-partial-truth ((self CONTROL-FRAME)
+                                    (cache ATOMIC-GOAL-CACHE))
+  ;; Record the partial truth of `self' in `cache'.
+  (let ((pmf (partial-match-frame self)))
+    (when (defined? pmf)
+      (set-cache-partial-truth pmf cache))))
+
+(defmethod set-cache-partial-truth ((self PARTIAL-MATCH-FRAME)
+                                    (cache ATOMIC-GOAL-CACHE))
+  ;; Record the partial truth of `self' in `cache'.
+  (setf (positive-score cache) (positive-score self))
+  (setf (negative-score cache) (negative-score self)))
+
+(defmethod set-justification-partial-truth ((self CONTROL-FRAME)
+                                            (justification JUSTIFICATION))
+  ;; Record the partial truth of `self' in `justification'.
+  (let ((pmf (partial-match-frame self)))
+    (when (defined? pmf)
+      (set-justification-partial-truth pmf justification))))
+
+(defmethod set-justification-partial-truth ((self PARTIAL-MATCH-FRAME)
+                                            (justification JUSTIFICATION))
+  ;; Record the partial truth of `self' in `justification'.
+  (setf (positive-score justification) (positive-score self))
+  (setf (negative-score justification) (negative-score self)))
+
+(defmethod (allow-unbound-variables? BOOLEAN) ((self PARTIAL-MATCH-FRAME))
+  ;; Return TRUE if compound clauses such as AND/OR are allowed to succeed
+  ;;    even if some of their variables remain unbound.
+  (return FALSE))
+
+(defmethod (compute-AND-score PARTIAL-MATCH-SCORE) ((self PARTIAL-MATCH-FRAME))
+  ;; Compute the current score of the partial match AND frame `self'.
+  (return NULL))
+
+(defmethod (continue-partial-AND-proof KEYWORD) ((self PARTIAL-MATCH-FRAME)
+                                                 (frame CONTROL-FRAME)
+                                                 (lastMove KEYWORD))
+  ;; Control partial :AND proofs.
+  ;; Chain through the old method in case the new one doesn't exist yet.
+  (setq lastMove (old-interpret-AND-scores frame lastMove))
+  (return (continue-and-proof frame lastMove)))
+
+(defmethod (compute-OR-score PARTIAL-MATCH-SCORE) ((self PARTIAL-MATCH-FRAME))
+  ;; Compute the current score of the partial match OR frame `self'.
+  (return NULL))
+
+(defmethod (continue-partial-OR-proof KEYWORD) ((self PARTIAL-MATCH-FRAME)
+                                                (lastMove KEYWORD))
+  ;; Control partial :OR proofs.
+  ;; Chain through the old method in case the new one doesn't exist yet.
+  (setq lastMove (old-interpret-OR-scores (control-frame self) lastMove))
+  (return (continue-OR-proof (control-frame self) lastMove)))
+
+(defmethod (compute-NOT-score PARTIAL-MATCH-SCORE) ((self PARTIAL-MATCH-FRAME))
+  ;; Compute the current score of the partial match NOT frame `self'.
+  (return NULL) )
+
+(defmethod (continue-partial-NOT-proof KEYWORD) ((self PARTIAL-MATCH-FRAME)
+                                                 (lastMove KEYWORD))
+  ;; Control partial :NOT proofs.
+  ;; This method is only in the new scheme and does nothing special otherwise.
+  (return (continue-NOT-proof (control-frame self) lastMove)))
+
+(defmethod (continue-partial-FAIL-proof KEYWORD) ((self PARTIAL-MATCH-FRAME)
+                                                  (lastMove KEYWORD))
+  ;; Control partial :FAIL proofs.
+  ;; Chain through the old method in case the new one doesn't exist yet.
+  (setq lastMove (old-interpret-FAIL-score (control-frame self) lastMove))
+  (return (continue-FAIL-proof (control-frame self) lastMove)))
+
+(defmethod (compute-GOAL-score PARTIAL-MATCH-SCORE) ((self PARTIAL-MATCH-FRAME))
+  ;; Compute the current score of the atomic goal partial match frame `self'.
+  (return NULL))
+
+(defmethod (continue-partial-strategies-proofs KEYWORD)
+    ((self PARTIAL-MATCH-FRAME) (lastMove KEYWORD))
+  ;; Called instead of `continue-strategies-proofs' if we are in partial match
+  ;;    mode to compute partial match scores and success or failure.
+  ;; Chain through the old method in case the new one doesn't exist yet.
+  (return (old-interpret-GOAL-scores (control-frame self) lastMove)))
+
+(defmethod (continue-partial-antecedents-proof KEYWORD)
+    ((self PARTIAL-MATCH-FRAME) (lastMove KEYWORD))
+  ;; Control partial :ANTECEDENTS strategy proofs.
+  ;; This method is only in the new scheme and does nothing special otherwise.
+  (return (continue-antecedents-proof (control-frame self) lastMove)))
+
+
+;;; Old top-level methods (should become obsolete once we've converted
+;;     the :NN matcher to the new control scheme):
+
+(defmethod set-base-partial-match-truth ((self PARTIAL-MATCH-FRAME)	
+					 (prop PROPOSITION)
+					 (truth KEYWORD))
+  (ignore prop)
+  (case truth
+    (:TRUE
+     (setf (latest-positive-score *queryiterator*) 1.0))
+    (:FAIL
+     (setf (latest-positive-score *queryiterator*) 0.0))))
+
+(defmethod record-partial-match-score ((self PARTIAL-MATCH-FRAME)
+                                       (score PARTIAL-MATCH-SCORE)
+                                       (weight FLOAT))
+  ;; Record scoring information into the partial match frame 'self'.
+  (ignore score weight)
+  NULL)
+
+(defmethod pop-partial-match-score ((self PARTIAL-MATCH-FRAME))
+  NULL)
+
+(defmethod (early-partial-match-AND-failure? BOOLEAN) ((self PARTIAL-MATCH-FRAME))
+  (return NULL))
+
+(defmethod (early-partial-match-OR-success? BOOLEAN) ((self PARTIAL-MATCH-FRAME))
+  (return NULL))
+
+
+  ;;
+;;;;;; :BASIC incremental partial match mode
+  ;;
+
+(defclass INCREMENTAL-PARTIAL-MATCH (PARTIAL-MATCH-FRAME)
+  :slots
+  ((parent :type INCREMENTAL-PARTIAL-MATCH) ;; redundant, I think - hc
+   (child :type INCREMENTAL-PARTIAL-MATCH)  ;; eliminate, use justifications - hc
+   (accumulated-score :type PARTIAL-MATCH-SCORE :initially 0.0)
+   (accumulated-weight :type FLOAT :initially 0.0)
+   (total-weight :type FLOAT)
+   (maximum-score :type PARTIAL-MATCH-SCORE :initially 0.0))
+  :initializer initialize-incremental-partial-match)
+
+(defun initialize-incremental-partial-match ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Initialize an INCREMENTAL-PARTIAL-MATCH frame.
+  ;; If its control frame contains an :AND proposition, compute the total
+  ;;    possible weight for that proposition.
+  (let ((frame (control-frame self))
+        (kind (kind self)))
+    (case kind
+      (:AND
+       (let ((argumentWeight FLOAT NULL)
+             (totalWeight 0.0)
+             (nofWeightedArgs 0))
+         (foreach arg in (cast (arguments (proposition frame))
+                               (VECTOR OF PROPOSITION))
+             do (cond
+                 ((and (eql? (kind arg) :AND)
+                       (null? (weight arg)))
+                  ;; We have a clustered conjunction; scale the weight of the
+                  ;;    cluster relative to its number of weighted args:
+                  (setq nofWeightedArgs 0)
+                  (foreach subArg in (cast (arguments arg)
+                                           (VECTOR OF PROPOSITION))
+                      where (or (null? (proposition-weight self subArg))
+                                (> (proposition-weight self subArg) 0.0))
+                      do (++ nofWeightedArgs))
+                  (setq argumentWeight (* 1.0 nofWeightedArgs))
+                  (setf (weight arg) argumentWeight))
+                 (otherwise 
+                  (setq argumentWeight (proposition-weight self arg))))
+                (++ totalWeight argumentWeight))
+         (if (> totalWeight 0.0)
+             (setf (total-weight self) totalWeight)
+           (setf (total-weight self)
+             (length (arguments (proposition frame)))))))
+      (otherwise NULL))
+    ;; should these be done later in the `create-and-link' phase instead?
+    (link-to-parent-partial-match-frame self)))
+
+(defmethod (create-partial-match-frame PARTIAL-MATCH-FRAME)
+    ((self INCREMENTAL-PARTIAL-MATCH) (frame CONTROL-FRAME) (kind KEYWORD))
+  (return (new INCREMENTAL-PARTIAL-MATCH :control-frame frame :kind kind)))
+
+(defmethod (compute-dynamic-cutoff PARTIAL-MATCH-SCORE)
+    ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Compute the minimum score to satisfy the proposition of `self'.
+  ;; This score comes from the parent's cutoff and the siblings' scores.
+  ;; EXTRACTED FROM `set-' METHOD, SO WE CAN USE IT IN THE GOAL TRACE.
+  (let ((parent (parent self))
+        (cutoff 0.0))
+    (when (defined? parent)
+      (case (kind parent)
+        (:AND
+         ;; Suppose we have an AND with 5 clauses and are evaluating clause 3.
+         ;; Then the following inequality must hold:
+         ;;    pCutoff <= (w1*s1 + w2*s2 + weight*X + w4*s4 + w5*s5)/totWeight
+         ;; Solving for X by assuming the best possible outcome for s4 and s5
+         ;; (i.e., 1.0 each) gives us the desired cutoff score X.  We have
+         ;;    accScore = w1*s1 + w2*s2
+         ;;    accWeight = w1 + w2
+         ;;    maxOther = (w4*1.0 + w5*1.0) = totWeight - accWeight - weight
+         ;; Therefore:
+         ;;    pCutoff*totWeight <= accScore + weight*X + maxOther
+         ;;    (pCutoff*totWeight - accScore - maxOther)/weight <= X
+         ;;
+         (let ((pCutoff (dynamic-cutoff parent))
+               (totWeight (total-weight parent))
+               (propWeight
+                (proposition-weight self (proposition (control-frame self))))
+               (weight
+                (choose (null? propWeight)
+                        1.0
+                        ;; protect against anomalies from really small weights:
+                        (choose (< propWeight 0.1)
+                                0.1
+                                propWeight)))
+               (maxOther (- totWeight (accumulated-weight parent) weight))
+               (unscaledCutoff
+                (- (* pCutoff totWeight)
+                   (accumulated-score parent)
+                   maxOther)))
+           (setq cutoff (/ unscaledCutoff weight))))
+        (otherwise
+         (setq cutoff (dynamic-cutoff parent))))
+      (cond ((and (< cutoff 0.0)
+                  (not (reverse-polarity? (control-frame self))))
+             (setq cutoff 0.0))
+            ((and (> cutoff 0.0)
+                  (reverse-polarity? (control-frame self)))
+             (setq cutoff 0.0))
+            ((not (eql? (reverse-polarity? (control-frame self))
+                        (reverse-polarity? (control-frame parent))))
+             (setq cutoff (- cutoff)))))
+    (return cutoff)))
+
+(defmethod clear-frame-partial-truth ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Reset the partial truth indicators of `self' to their initial values.
+  (setf (positive-score self) NULL)
+  (setf (negative-score self) NULL)
+  (setf (maximum-score self) 0.0))
+
+(defmethod (proposition-weight FLOAT) ((self INCREMENTAL-PARTIAL-MATCH)
+                                       (proposition PROPOSITION))
+  ;; Compute the weight of `proposition' relative to its controlling
+  ;;    partial match frame `self'.
+  (cond ((null? proposition)
+         ;; can happen in depth cutoff cases:
+         (return 1.0))
+        ((variable-type? proposition) 
+         (return 0.0))
+        ((auxiliary-equivalence-proposition? proposition)
+         (return 0.0))
+        ((defined? (weight proposition))
+         (return (weight proposition)))
+        ((defined? (truth-value proposition))
+         (return (positive-score (truth-value proposition))))
+        (otherwise
+         (return 1.0))))
+
+(defmethod push-AND-partial-match-score ((self INCREMENTAL-PARTIAL-MATCH)
+                                         (score PARTIAL-MATCH-SCORE)
+                                         (weight FLOAT))
+  ;; Push a new argument `score' scaled by `weight' onto the partial match
+  ;;    AND frame `self'.
+  (when (null? weight)
+    (setq weight 1.0))
+  (pushf (argument-scores self) score)
+  (pushf (argument-weights self) weight)
+  (++ (accumulated-score self) (* score weight))
+  (++ (accumulated-weight self) weight))
+
+(defmethod pop-AND-partial-match-score ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Pop the most recently recorded argument score of the partial match
+  ;;    AND frame `self'.
+  (-- (accumulated-score self) (* (value (argument-scores self))
+                                  (value (argument-weights self))))
+  (-- (accumulated-weight self) (value (argument-weights self)))
+  (setf (argument-scores self) (rest (argument-scores self)))
+  (setf (argument-weights self) (rest (argument-weights self))))
+
+(defmethod (compute-AND-score PARTIAL-MATCH-SCORE) ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Compute the current score of the partial match AND frame `self'.
+  ;; TO DO: Maybe handle `*min/maximum-score-cutoff*' here.
+  (return (/ (accumulated-score self) (total-weight self))) )
+
+(defmethod (skip-AND-clause? BOOLEAN)
+    ((self INCREMENTAL-PARTIAL-MATCH)
+     (frame CONTROL-FRAME)
+     (forbiddenVars (CONS OF PATTERN-VARIABLE)))
+  ;; Return true if the current conjunct is either too unconstrained or has
+  ;;    an unbound variable mentioned in `forbiddenVars' and simulate its
+  ;;    failure by generating appropriate result frames and justifications.
+  (let ((forbiddenVars? (non-empty? forbiddenVars))
+        (failUnconstrainedClauses? *fail-unbound-clauses?*)
+        (conjunct (nth (arguments (proposition frame))
+                       (argument-cursor frame))))
+    (when (or (and forbiddenVars?
+                   ;; If unbound vars were left by a function call, pass over
+                   ;;    all propositions that refer to that variable:
+                   (exists var in (get-unbound-variables conjunct)
+                       where (member? forbiddenVars var)))
+              (and failUnconstrainedClauses?
+                   ;; If failUnconstrainedClauses?, then skip over any
+                   ;;    propositions with all unbound variables:
+                   (all-variables-unbound? conjunct)))
+      (let ((result (create-down-frame frame conjunct)))
+        (set-frame-truth-value result UNKNOWN-TRUTH-VALUE)
+        (when (null? (partial-match-frame result))
+          (create-and-link-partial-match-frame result NULL))
+        (set-frame-partial-truth
+         (partial-match-frame result) UNKNOWN-TRUTH-VALUE 0.0 NULL TRUE)
+        (record-goal-justification
+         result (new PRIMITIVE-STRATEGY
+                     :inference-rule :SKIPPED-CONJUNCT
+                     :strategy :FAILURE))
+        (setf (state result) :POPPED) ;; IMPORTANT!!
+        (setf (nth (arguments frame) (argument-cursor frame)) result)
+        (setf (result frame) result)
+        (when (trace-keyword? :GOAL-TREE)
+          (print "*** Skipping clause " conjunct EOL))
+        (return TRUE)))
+    (return FALSE)))
+
+(defmethod (continue-partial-AND-proof KEYWORD) ((self INCREMENTAL-PARTIAL-MATCH)
+                                                 (frame CONTROL-FRAME)
+                                                 (lastMove KEYWORD))
+  ;; Control partial AND proofs in :BASIC partial match mode.
+  (let ((forbiddenVars NIL))
+    (case lastMove
+      (:DOWN
+       (set-dynamic-cutoff self))
+      ((:UP-TRUE :UP-FAIL)
+       (let ((success? (eql? lastMove :UP-TRUE))
+             (andProposition (proposition frame))
+             (conjunctFrame (result frame))
+             (conjunct (proposition conjunctFrame))
+             (score (positive-score (partial-match-frame conjunctFrame)))
+             (weight (proposition-weight self conjunct)))
+         (setq lastMove :UP-TRUE) ;; we succeed by default
+         (push-AND-partial-match-score self score weight)
+         (cond
+          ((cutoff-partial-match? (partial-match-frame conjunctFrame)
+                                  (trace-keyword? :GOAL-TREE))
+           ;; we didn't get the minimum score required:
+           (setq lastMove :UP-FAIL))
+          ((and (false-truth-value? (truth-value conjunctFrame))
+                (strict-truth-value? (truth-value conjunctFrame)))
+           ;; we have a strict falsity, always fail - is this too drastic?:
+           (setq lastMove :UP-FAIL))
+          ((and (variable-type? conjunct)
+                (not success?))
+           ;; if we miss a variable type in an AND we always fail:
+           (setq lastMove :UP-FAIL))
+          (otherwise
+           (when (= (argument-cursor frame)
+                    (1- (length (arguments andProposition))))
+             ;; all conjuncts evaluated; compute/propagate final score:
+             (setq score (compute-AND-score self))
+             (if (or (<= score *minimum-score-cutoff*)
+                     (and (not (all-arguments-bound? andProposition))
+                          (not (allow-unbound-variables? self))))
+                 (setq lastMove :UP-FAIL)
+               (set-frame-partial-truth self NULL score NULL FALSE))))))))
+    ;; if we are failing, clean up the down frame, since trying to find
+    ;;    another solution on the current conjunct won't help:
+    (when (eql? lastMove :UP-FAIL)
+      (setf (down frame) NULL))
+    (let ((result (continue-and-proof frame lastMove)))
+      (case result
+        (:MOVE-DOWN
+         ;; Pop partial match scores and weights until the number of weights
+         ;;    agrees with the cursor position (in case we backtracked):
+         (foreach i in (interval (argument-cursor frame)
+                                 (1- (length (argument-scores self))))
+             do (ignore i)
+		(pop-AND-partial-match-score self))
+         ;; skip clauses that are too unconstrained - we do this after the
+         ;;    call to `continue-and-proof' to potentially skip the first
+         ;;    clause as well as take advantage of clause re-optimization:
+         (when (skip-AND-clause? self frame forbiddenVars)
+           (setq result (continue-partial-AND-proof self frame :UP-FAIL))))
+        (:FAILURE
+         ;; the AND failed completely, compute result score by looking at the
+         ;;    truth value to honor cases where we got a false result, i.e.,
+         ;;    we can either get 0.0 or -1.0 but no partial scores:
+         (set-frame-partial-truth self (truth-value frame) NULL NULL FALSE))
+        (otherwise NULL))
+      (return result))))
+
+(defmethod push-OR-partial-match-score ((self INCREMENTAL-PARTIAL-MATCH)
+                                        (score PARTIAL-MATCH-SCORE)
+                                        (weight FLOAT))
+  ;; Push a new argument `score' scaled by `weight' onto the partial match
+  ;;    OR frame `self'.
+  (when (null? weight)
+    (setq weight 1.0))
+  (push-AND-partial-match-score self score weight)
+  (setq score (* score weight))
+  (when (> score (maximum-score self))
+    (setf (maximum-score self) score)))
+
+(defmethod pop-OR-partial-match-score ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Pop the most recently recorded argument score of the partial match
+  ;;    OR frame `self'.
+  (let ((latestScore (* (value (argument-scores self))
+                        (value (argument-weights self))))
+        (maximumScore (maximum-score self)))
+    (pop-AND-partial-match-score self)
+    (when (= latestScore maximumScore)
+      ;; recompute the maximum - better would be to compute it dynamically:
+      (setq maximumScore 0.0)
+      (foreach score in (argument-scores self)
+          as weight in (argument-weights self)
+          do (when (> (* score weight) maximumScore)
+               (setq maximumScore (* score weight))))
+      (setf (maximum-score self) maximumScore))))
+
+(defmethod (compute-OR-score PARTIAL-MATCH-SCORE) ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Compute the current score of the partial match OR frame `self'.
+  ;; TO DO: Maybe handle `*min/maximum-score-cutoff*' here.
+  (return (maximum-score self)) )
+
+(defmethod (continue-partial-OR-proof KEYWORD) ((self INCREMENTAL-PARTIAL-MATCH)
+                                                (lastMove KEYWORD))
+  ;; Control partial OR proofs in :BASIC partial match mode.
+  (let ((frame (control-frame self))
+        (orProposition (proposition frame))
+        (result KEYWORD NULL))
+    (case lastMove
+      (:DOWN
+  ;;;;;; SHOULD WE USE THE MAXIMUM SCORE FOUND SO FAR AS THE DYNAMIC CUTOFF?
+       (set-dynamic-cutoff self))
+      ((:UP-TRUE :UP-FAIL)
+       (let ((sucess? (eql? lastMove :UP-TRUE))
+             (result (result frame))
+             (disjuncts (VECTOR OF PROPOSITION) (arguments orProposition))
+             (disjunct (nth disjuncts (argument-cursor frame)))
+             (score PARTIAL-MATCH-SCORE NULL))
+         (setq score (positive-score (partial-match-frame result)))
+         (push-OR-partial-match-score
+          self score (proposition-weight self disjunct))
+         (setq score (compute-OR-score self))
+         (set-frame-partial-truth self NULL score NULL FALSE)
+         (cond ((or (and (not (all-arguments-bound? disjunct))
+                         (not (allow-unbound-variables? self)))
+                    (cutoff-partial-match? self (trace-keyword? :GOAL-TREE))
+                    (and (not sucess?)
+                         (= (argument-cursor frame) (1- (length disjuncts)))))
+                (set-frame-partial-truth self UNKNOWN-TRUTH-VALUE 0.0 NULL TRUE)
+                (setq lastMove :UP-FAIL))
+               (otherwise
+                (setq lastMove :UP-TRUE))))))
+    (setq result (continue-OR-proof frame lastMove))
+    (case result
+      (:MOVE-DOWN
+       ;; Pop partial match scores and weights until the number of weights
+       ;;    agrees with the cursor position (in case we backtracked):
+       (foreach i in (interval (argument-cursor frame)
+                               (1- (length (argument-scores self))))
+           do (ignore i)
+	      (pop-OR-partial-match-score self)))
+      (:FAILURE
+       ;; the OR failed completely, compute final score:
+       (set-frame-partial-truth self NULL (compute-OR-score self) NULL FALSE))
+      (otherwise NULL))
+    (return result)))
+
+(defmethod (compute-NOT-score PARTIAL-MATCH-SCORE) ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Compute the current score of the partial match NOT frame `self'.
+  ;; TO DO: Maybe handle `*min/maximum-score-cutoff*' here.
+  (return (- 0.0 (/ (accumulated-score self) (total-weight self)))) )
+
+(defmethod (continue-partial-NOT-proof KEYWORD) ((self INCREMENTAL-PARTIAL-MATCH)
+                                                 (lastMove KEYWORD))
+  ;; Control partial :NOT proofs in :BASIC partial match mode.
+  (let ((frame (control-frame self)))
+    (case lastMove
+      (:DOWN
+       (set-dynamic-cutoff self))
+      ((:UP-TRUE :UP-FAIL)
+       (let ((result (result frame))
+             (resultPmf (partial-match-frame result)))
+         (setf (positive-score resultPmf)
+           (* (positive-score resultPmf)
+              (proposition-weight resultPmf (proposition result))))
+         (propagate-frame-partial-truth resultPmf frame))))
+    (return (continue-NOT-proof (control-frame self) lastMove))))
+
+(defmethod (compute-GOAL-score PARTIAL-MATCH-SCORE) ((self INCREMENTAL-PARTIAL-MATCH))
+  ;; Compute the current score of the atomic goal partial match frame `self'.
+  ;; TO DO: Maybe handle `*min/maximum-score-cutoff*' here.
+  (let ((score 0.0))
+    (case *rule-combination*
+      (:MAX
+       (setq score (maximum-score self)))
+      (:NOISY-OR
+       (setq score (probabilistic-sum-n (argument-scores self))))
+      (otherwise nil))
+    (return score)))
+
+(defmethod (continue-partial-strategies-proofs KEYWORD)
+    ((self INCREMENTAL-PARTIAL-MATCH) (lastMove KEYWORD))
+  ;; Control partial strategy proofs in :BASIC partial match mode.
+  (let ((frame (control-frame self))
+        (result KEYWORD NULL))
+    (case lastMove
+      (:DOWN
+       (set-dynamic-cutoff self))
+      (:UP-FAIL
+       ;; if we are failing, clean up the down frame:
+       (when (defined? (down frame))
+         (setf (down frame) NULL)))
+      (otherwise NULL))
+    (loop
+      (setq result (continue-strategies-proofs frame lastMove))
+      (case result
+        (:CONTINUING-SUCCESS
+         (if (cutoff-partial-match? self (trace-keyword? :GOAL-TREE))
+             ;; try next strategy to see whether we can get a better score:
+             (setq lastMove :DOWN)
+           (break)))
+        (otherwise
+         (break))))
+    (return result)))
+
+(defmethod (continue-partial-antecedents-proof KEYWORD)
+    ((self INCREMENTAL-PARTIAL-MATCH) (lastMove KEYWORD))
+  ;; Control partial :ANTECEDENTS strategy proofs in :BASIC partial match mode.
+  (let ((frame (control-frame self))
+        (goal (extract-subgoal-of-frame frame))
+        (score PARTIAL-MATCH-SCORE NULL)
+        (result KEYWORD NULL))
+    (case lastMove
+      (:DOWN
+       (set-dynamic-cutoff self))
+      ((:UP-TRUE :UP-FAIL)
+       (setq score (positive-score (partial-match-frame (result frame))))
+       ;; Since this is a subgoaling strategy, treat it like an OR:
+       (push-OR-partial-match-score
+        self score (proposition-weight self (antecedents-rule frame)))
+       (setq score (compute-GOAL-score self))
+       ;(setq lastMove :UP-TRUE)
+       (set-frame-partial-truth self NULL score NULL FALSE)
+       (when (or (and (not (all-arguments-bound? goal))
+                      (not (allow-unbound-variables? self)))
+                 (cutoff-partial-match? self (trace-keyword? :GOAL-TREE)))
+         (set-frame-partial-truth self UNKNOWN-TRUTH-VALUE 0.0 NULL TRUE)
+         (setq lastMove :UP-FAIL))))
+    ;; if we are failing, clean up the down frame:
+    (when (and (eql? lastMove :UP-FAIL)
+               (defined? (down frame)))
+      (setf (down frame) NULL))
+    (setq result (continue-antecedents-proof frame lastMove))
+    (when (and (eql? lastMove :UP-TRUE)
+               (null? (truth-value frame)))
+      ;; indicate that we did already compute a truth value:
+      (setf (truth-value frame) UNKNOWN-TRUTH-VALUE))
+    (return result)))
+
+(defmethod (continue-partial-FAIL-proof KEYWORD)
+    ((self INCREMENTAL-PARTIAL-MATCH) (lastMove KEYWORD))
+  ;; Control partial :FAIL proofs in :BASIC partial match mode.
+  ;; Note about score computation: if the goal succeeded
+  ;;    (score=1.0) it didn't fail (therefore FAIL score=-1.0).
+  ;;    If the goal partially succeeded (e.g., score=0.4)
+  ;;    it did not fail with that score, therefore the FAIL
+  ;;    goal is false by that amount, therefore score=-0.4.
+  ;;    What this motivates is that we always invert the
+  ;;    score of the subgoal to compute the score of the
+  ;;    FAIL goal.
+  (let ((frame (control-frame self)))
+    (case lastMove
+      (:DOWN
+       (set-dynamic-cutoff self))
+      (:UP-TRUE
+       (let ((result (result frame))
+             (resultPmf (partial-match-frame result)))
+         (setf (positive-score resultPmf)
+           (* (positive-score resultPmf)
+              (proposition-weight resultPmf (proposition result))
+              -1.0))
+         (propagate-frame-partial-truth resultPmf frame)))
+      (:UP-FAIL
+       (let ((result (result frame))
+             (resultPmf (partial-match-frame result)))
+         (setf (positive-score resultPmf)
+           (choose (defined? (inference-cutoff-reason frame))
+                   0.0
+                   (* (positive-score resultPmf)
+                      (proposition-weight resultPmf (proposition result))
+                      -1.0)))
+         (propagate-frame-partial-truth resultPmf frame))))
+    (return (continue-FAIL-proof (control-frame self) lastMove))))
+
+
+  ;;
+;;;;;; Learning partial matcher (3 layer NN version)
+  ;;
+
+(defclass NN-PARTIAL-MATCH (PARTIAL-MATCH-FRAME)
+  :slots
+  ((parent :type NN-PARTIAL-MATCH) ;; redundant, I think - hc
+   (child :type NN-PARTIAL-MATCH)  ;; eliminate, use justifications instead - hc
+   (accumulated-score :type PARTIAL-MATCH-SCORE :initially 0.0)
+   (maximum-score :type PARTIAL-MATCH-SCORE :initially 0.0)
+   ;; used for strategies frame:
+   (rules :type (CONS of PROPOSITION) :initially NIL)
+   (arity :type INTEGER)) ;; number of args in proposition - not very useful
+  :initializer initialize-nn-partial-match)
+
+(defmethod initialize-nn-partial-match ((self NN-PARTIAL-MATCH))
+  ;; Initialize an NN-PARTIAL-MATCH frame.
+  ;; If its control-frame contains an :AND proposition, compute the total
+  ;;    possible weight for that proposition.
+  (let ((prop (proposition (control-frame self))))
+    (setf (arity self) (length (arguments prop)))
+    (case (kind self)
+      ((:AND :OR)
+       (when (null? (neural-network prop))
+	 (setf (neural-network prop) (create-neural-network prop))))
+      (otherwise NULL))
+    (link-to-parent-partial-match-frame self)
+    ;; potentially eliminate once we adjust to new scheme (see :BASIC mode):
+    (set-dynamic-cutoff self)))
+
+(defmethod (create-partial-match-frame PARTIAL-MATCH-FRAME)
+    ((self NN-PARTIAL-MATCH) (frame CONTROL-FRAME) (kind KEYWORD))
+  ;; Create an NN-PARTIAL-MATCH and initialize selected slots.
+  ;; If 'frame' contains an :AND proposition, compute the total
+  ;;    possible weight for that proposition.
+  (return (new NN-PARTIAL-MATCH :control-frame frame :kind kind)))
+
+(defmethod (compute-dynamic-cutoff PARTIAL-MATCH-SCORE)
+    ((self NN-PARTIAL-MATCH))
+  ;; For the NN partial matcher, we use a greedy cutoff strategy,
+  ;; where we only return activations of more input units.  That is,
+  ;; if a network is going to be activated with less input units than
+  ;; previously activated, we prune it.  This is not foolproof, but
+  ;; should be a good heuristic pruning strategy.
+  (when (defined? (parent self))
+    (case (kind self)
+      (:ATOMIC-GOAL
+       (return (dynamic-cutoff (parent self))))
+      ((:AND :OR)
+       (let ((parent (parent self))
+             (net (neural-network (proposition (control-frame self))))
+             (active -1.0)) ;; don't count the bias unit.
+         ;; if the p-cutoff is > 0, then this is not the first time down
+         (when (> (dynamic-cutoff parent) 0.1)
+           ;; count the number of active units
+           (foreach input in (input net)
+               do (setq active (+ active input)))
+           (return active))))
+      (otherwise NULL)))
+  (return 0.0))
+
+(defmethod (proposition-weight FLOAT) ((self NN-PARTIAL-MATCH)
+                                       (proposition PROPOSITION))
+  ;; Compute the weight of `proposition' relative to its controlling
+  ;;    partial match frame `self'.
+  ;; Different partial match strategies might make different default
+  ;;    assumptions about weights of propositions based on their type.
+  (when (null? proposition)
+    ;; can happen in depth cutoff cases:
+    (return 1.0))
+ ;;;;;; RETHINK THIS ;;;;;;;
+  (when (variable-type? proposition) 
+    (setf (weight proposition) 0.0))
+  (when (defined? (truth-value proposition))
+    (setf (weight proposition) (positive-score (truth-value proposition))))
+  (when (null? (weight proposition))
+    (setf (weight proposition) 1.0))
+  (return (weight proposition)))
+
+(defmethod set-base-partial-match-truth ((self NN-PARTIAL-MATCH)
+					 (prop PROPOSITION)
+					 (truth KEYWORD))
+  (case truth
+    (:TRUE
+     (if (defined? prop)
+	 (progn
+	   (if (defined? (weight prop))
+	       (setf (match-score prop) (weight prop))
+	     (setf (match-score prop) 1.0))
+	   (setf (latest-positive-score *queryiterator*) (match-score prop)))
+       (setf (latest-positive-score *queryiterator*) 1.0)))
+    (:FAIL 
+     (when (defined? prop)
+       (setf (match-score prop) 0.0))
+     (setf (latest-positive-score *queryiterator*) 0.0))))
+
+(defmethod set-cache-partial-truth ((self NN-PARTIAL-MATCH)
+                                    (cache ATOMIC-GOAL-CACHE))
+  ;; Record the partial truth of `self' in `cache'.
+  ;; ELIMINATE, ONCE WE HAVE COMPLETELY CONVERTED TO NEW SCHEME.
+  (setf (positive-score cache) (latest-positive-score *queryIterator*)))
+
+(defmethod set-justification-partial-truth ((self NN-PARTIAL-MATCH)
+                                            (justification JUSTIFICATION))
+  ;; Record the partial truth of `self' in `justification'.
+  ;; ELIMINATE, ONCE WE HAVE COMPLETELY CONVERTED TO NEW SCHEME.
+  (setf (positive-score justification) (latest-positive-score *queryIterator*)))
+
+(defmethod record-partial-match-score ((self NN-PARTIAL-MATCH)
+                                       (score PARTIAL-MATCH-SCORE) 
+                                       (weight FLOAT))
+  (when (null? weight)
+    (setq weight 1.0))
+  ;; A new score has been computed for an argument to the current proposition.
+  ;; Record scoring information into the partial match frame 'self'.
+  (setf (argument-scores self) (cons score (argument-scores self)))
+  (setf (argument-weights self) (cons weight (argument-weights self)))
+  (setf (accumulated-score self)
+    (+ (accumulated-score self) (* score weight)))
+  (when (> score (maximum-score self))
+    (setf (maximum-score self) score))
+  
+  ;; If this is a :full-subquery strategies frame put the rule that was
+  ;; used in the partial match frame
+  (let ((frame (control-frame self)))
+    (when (and (eql? (kind self) :ATOMIC-GOAL)
+	       (eql? (current-strategy frame) :FULL-SUBQUERY))
+      (let ((r PROPOSITION
+               ;; IS THIS REWRITE OK??? -rmm
+	       (value (iterator frame)))
+	    (ante (proposition (cast (first (arguments r)) DESCRIPTION))))
+	(setf (rules self) (cons r (rules self)))
+	(setf (match-score ante) score) ;; attach score to rule antecedent
+	))))
+
+(defmethod pop-partial-match-score ((self NN-PARTIAL-MATCH))
+  ;; Currently, we need a way to reset the partial match scores when the 
+  ;; search backtracks.  This is the method to pop a score off. 
+  (setf (accumulated-score self) (- (accumulated-score self) 
+				    (* (value (argument-scores self))
+				       (value (argument-weights self)))))
+  (setf (argument-scores self) (rest (argument-scores self)))
+  (setf (argument-weights self) (rest (argument-weights self))))
+
+(defmethod (compute-AND-score PARTIAL-MATCH-SCORE)
+    ((self NN-PARTIAL-MATCH))
+  (let ((net (neural-network (proposition (control-frame self)))))
+    ;; reset proposition activations in case they were overwritten by
+    ;; a recursive call
+    (foreach score in (reverse (copy-cons-list (argument-scores self) ))
+	as arg in (arguments (proposition (control-frame self))) do
+	  (setf (match-score (cast arg proposition)) score))
+    (when (defined? net)
+      (return (activate-propositional-neural-network net)))
+    (return 0.0)))
+
+(defmethod (compute-OR-score PARTIAL-MATCH-SCORE)
+           ((self NN-PARTIAL-MATCH))
+  (let ((net (neural-network (proposition (control-frame self)))))
+    ;; reset proposition activations in case they were overwritten by
+    ;; a recursive call
+    (foreach score in (reverse (copy-cons-list (argument-scores self) ))
+	as arg in (arguments (proposition (control-frame self))) do
+	  (setf (match-score (cast arg proposition)) score))
+    (when (defined? net)
+      (return (activate-propositional-neural-network net)))
+    (return 0.0)))
+
+(defmethod (compute-NOT-score PARTIAL-MATCH-SCORE)
+           ((self NN-PARTIAL-MATCH))
+  (return 0.0)) ;; this never gets called
+
+(defmethod (compute-GOAL-score PARTIAL-MATCH-SCORE)
+    ((self NN-PARTIAL-MATCH))
+  (let ((score 0.0))
+    (case *rule-combination*
+      (:MAX
+       (setq score (maximum-score self)))
+      (:NOISY-OR
+       (setq score (probabilistic-sum-n (argument-scores self))))
+      (otherwise nil))
+    (return score)))
+
+(defun (probabilistic-sum-n float) ((form (cons of float-wrapper)))
+  (case (length form)
+    (0 (return 0.0))
+    (1 (return (first form)))
+    (otherwise
+     (let ((sum (probabilistic-sum-n (rest form))))
+       (return
+	 (+ (first form) sum (- (* (first form) sum))))))))
+
+(defun (probabilistic-sum float) ((x float) (y float))
+  (return (+ x y (- (* x y)))))
+
+(defmethod (early-partial-match-AND-failure? BOOLEAN) 
+    ((self NN-PARTIAL-MATCH))
+  (return (prune-nn-search? self)))
+
+(defmethod (early-partial-match-OR-success? BOOLEAN)
+    ((self NN-PARTIAL-MATCH))
+  (return (prune-nn-search? self)))
+
+(defun (prune-nn-search? BOOLEAN) ((self NN-PARTIAL-MATCH))
+  (let ((max-possible-active (+ (accumulated-score self) 
+				(- (arity self) 
+				   (length (argument-scores self))))))
+    (if (and *GREEDY-NETWORK-PRUNING*
+	     (not (eql? *Rule-Combination* :NOISY-OR))
+	     (< max-possible-active (dynamic-cutoff self)))
+	(progn
+	  (when (trace-keyword? :GOAL-TREE)
+	    (print "*** Cutting off search, cutoff: " (dynamic-cutoff self)
+		   "+, Max possible score: " max-possible-active EOL))
+	  (return TRUE))
+    (return FALSE))))
+
+
+  ;;
+;;;;;; Partial match routines called by the query machine
+  ;;
+
+(defun (make-partial-match-frame PARTIAL-MATCH-FRAME)
+    ((query QUERY-ITERATOR))
+  ;; Create a partial match frame adequate to be used as the top-level
+  ;;    partial match frame of `query'.
+  ;; If `query's :MATCH-MODE option is NULL, use the value of
+  ;;    `*partial-match-mode*'.
+  (let ((matchMode GENERALIZED-SYMBOL (lookup (options query) :MATCH-MODE))
+        (frame (base-control-frame query))
+        (kind (state frame)))
+    (when (null? matchMode)
+      (setq matchMode *partial-match-mode*))
+    (case matchMode
+      ((:BASIC :INCREMENTAL)
+       (return
+         (new INCREMENTAL-PARTIAL-MATCH
+              :control-frame frame :kind kind)))
+      ((:NN :NEURAL-NETWORK)
+       (return (new NN-PARTIAL-MATCH
+                    :control-frame frame :kind kind)))
+      (otherwise
+       ;; Look for a class with name `<matchMode>-PARTIAL-MATCH':
+       (let ((class OBJECT NULL)
+             (className (concatenate (symbol-name matchMode) "-PARTIAL-MATCH"))
+             ;; pull this out here to work around a STELLA VRLET problem:
+             (module (first-defined (home-module matchMode) *module*)))
+         (within-module module
+           (setq class (lookup-class className))
+           (when (null? class)
+             (setq class (get-object className NULL))))
+         (if (and (defined? class)
+                  (isa? class @CLASS))
+             (return (create-object (class-type (cast class CLASS))
+                                    :control-frame frame :kind kind))
+           (signal-parsing-error "Unknown partial match mode: " matchMode)))))))
+
+(defun initialize-partial-query ((query QUERY-ITERATOR))
+  ;; Initialize partial-match-related slots of `query'.
+  (let ((partialMatchFrame (partial-match-strategy query)))
+    (when (null? partialMatchFrame)
+      (setq partialMatchFrame (make-partial-match-frame query))
+      (setf (partial-match-strategy query) partialMatchFrame))
+    (initialize-partial-match-strategy partialMatchFrame query)))
+
+(defmethod initialize-partial-match-strategy ((self PARTIAL-MATCH-FRAME)
+                                              (query QUERY-ITERATOR))
+  ;; Initialize the partial match strategy `self' of `query'.
+  ;; This method can be specialized by different strategies.
+  (let ((minimumScore FLOAT-WRAPPER (lookup (options query) :MINIMUM-SCORE))
+        (epsilon 0.001))
+    (setf (partial-match-strategy query) self)
+    (setf (dynamic-cutoff self)
+      (choose (defined? minimumScore) minimumScore epsilon))
+    (setf (latest-positive-score query) 0.0)))
+
+(defun create-and-link-partial-match-frame
+       ((frame CONTROL-FRAME) (kind KEYWORD))
+  ;; Create a partial match frame of type matching the type of
+  ;;    '(partial-match-strategy *queryIterator*)', initialize
+  ;;    it, and link it to 'frame'.
+  (let ((strategy (partial-match-strategy *queryIterator*))
+        (partialMatchFrame (create-partial-match-frame strategy frame kind)))
+    (setf (kind partialMatchFrame) kind)
+    (setf (partial-match-frame frame) partialMatchFrame)
+    (setf (control-frame partialMatchFrame) frame)
+    ))
+
+(defun (get-unbound-variables CONS) ((prop PROPOSITION))
+  ;; Return a cons of the unbound variables in a proposition.
+  (let ((result nil))
+    (foreach arg in (arguments prop)
+	do (let ((bind (argument-bound-to arg)))
+	     (when (null? bind)
+	       (setq result (cons arg result)))))
+    (return result)))
+
+(defun (all-variables-unbound? BOOLEAN) ((prop PROPOSITION))
+  (if (exists var in (arguments prop) 
+	  where (defined? (argument-bound-to var)))
+      (return false)
+    (return true)))
+
+(defun (unbound-variables-in-frame? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; returns true if there are unbound variables in a control frame
+  (return (not (empty? (get-unbound-variables (proposition frame))))))
+
+(defun record-latest-partial-match-score ((frame CONTROL-FRAME))
+  ;; Extract information from 'frame' needed by 'record-partial-match-score'
+  ;;    methods, and call a method.
+  (let ((prop PROPOSITION NULL)
+	(score (latest-positive-score *queryIterator*))
+	(pframe (partial-match-frame frame)))
+
+    (case (state frame)
+      ((:AND :OR)
+       (setq prop (nth (arguments (proposition frame)) (argument-cursor frame))))
+      (otherwise
+       (setq prop (proposition frame))))
+    
+    ;; When you miss an IN in an AND you should always fail, because
+    ;; you missed a binding. 
+    (when (and (eql? (kind pframe) :AND)
+	       (variable-type? prop) 
+	       (not (success? pframe)))
+      (setq *AND-MISSED-A-BINDING* TRUE))
+
+    ;; Same thing when a function fails with unbound variables
+    (when (and (eql? (kind pframe) :AND)
+	       (= score 0.0)
+	       (eql? (kind prop) :FUNCTION)
+	       (and (isa? (last (arguments prop)) @PATTERN-VARIABLE)
+		    (null? (argument-bound-to (last (arguments prop))))))
+      (setf (unbound-vars pframe) 
+	(cons (cast (last (arguments prop)) PATTERN-VARIABLE)
+	      (unbound-vars pframe))))
+    (record-partial-match-score pframe (latest-positive-score *queryIterator*)
+				(proposition-weight pframe prop))))
+
+(defun (compute-partial-match-AND-failure? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; Return TRUE if early determination of partial match failure can be
+  ;;    computed.
+  (return (early-partial-match-AND-failure? (partial-match-frame frame))))
+
+(defun (compute-partial-match-OR-success? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; Return TRUE if early determination of partial match failure can be
+  ;;    computed.
+  (return (early-partial-match-OR-success? (partial-match-frame frame))) )
+
+(defun (compute-partial-match-score? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; Compute a partial match score for an operator of type 'kind'.
+  ;; Store the result in '(latest-positive-score *queryIterator*)'.
+  (let ((partialMatchFrame (partial-match-frame frame))
+;;	(truth-value (new TRUTH-VALUE))
+        (score PARTIAL-MATCH-SCORE NULL))
+    (case (kind partialMatchFrame)
+      (:AND 
+       (setq score (compute-AND-score partialMatchFrame)))
+      (:OR (setq score (compute-OR-score partialMatchFrame)))
+      (:ATOMIC-GOAL (setq score (compute-GOAL-score partialMatchFrame)))
+      (otherwise nil))
+    (setf (latest-positive-score *queryIterator*) score)
+    (setf (positive-score partialMatchFrame) score)
+    (setf (match-score (proposition frame)) score)
+    ;; if you have unbound variables, then fail:
+    (if (unbound-variables-in-frame? frame) 
+        (return false)
+      (return (> score *minimum-score-cutoff*)))))
+
+(defun (retrieve-partial QUERY-ITERATOR) (&rest (tree PARSE-TREE))
+  :documentation
+  "Partial-match version of `retrieve' (which see) that generates scored
+partial solutions based on the current partial match strategy.  By supplying
+`BEST' instead of `ALL', or by adding the option `:SORT-BY :SCORE', the generated
+solutions will be sorted so that solutions with higher scores come first.
+Use the `:MATCH-MODE' option to override the global default setting established
+by `set-partial-match-mode', e.g., use `:MATCH-MODE :NN' to use the neural
+net partial match mode.  The `:MINIMUM-SCORE' option can be used to only
+retrieve solutions that have at least the specified minimum match score.
+By default, `retrieve-partial' does not maximize the match scores of its returned
+bindings.  To only get maximal scores use `:MAXIMIZE-SCORE? TRUE' (this is not
+yet implemented - you can use `ask-partial' to maximize scores for individual
+solutions by hand)."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (exception-case
+      (return (setq *most-recent-query*
+                (call-retrieve-partial (coerce-&rest-to-cons tree))))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return (setq *most-recent-query* NULL)))))
+
+(defun (call-retrieve-partial QUERY-ITERATOR) ((query OBJECT))
+  :documentation
+  "Callable version of `retrieve-partial' (which see).  Accepts queries
+specified by a query iterator, or specified as a CONS-list of arguments as they
+would be supplied to `retrieve-partial'.  Raises LOGIC-EXCEPTIONs in case of
+illegal queries and logical expressions."
+  :public? TRUE
+  (let ((theQuery (create-retrieve-query query)))
+    (initialize-partial-query theQuery)
+    (retrieve-partial-solutions (partial-match-strategy theQuery) theQuery)
+    (when (eql? (lookup-query-option theQuery :SORT-BY) :SCORE)
+      (sort-solutions-by-score theQuery))
+    (return theQuery)))
+
+(defmethod (retrieve-partial-solutions QUERY-ITERATOR)
+    ((self PARTIAL-MATCH-FRAME) (query QUERY-ITERATOR))
+  ;; Retrieve partial solutions for `query' using the partial match mode
+  ;;    indicated by `self'.
+  (ignore query)
+  (error "Don't know how to retrieve partial solutions for " self))
+
+(defmethod (retrieve-partial-solutions QUERY-ITERATOR)
+    ((self INCREMENTAL-PARTIAL-MATCH) (query QUERY-ITERATOR))
+  ;; Retrieve partial solutions for `query' using :BASIC partial match mode.
+  (let ((maximizeScore? BOOLEAN-WRAPPER
+                        (lookup-query-option query :MAXIMIZE-SCORE?)))
+    (when (eql? maximizeScore? TRUE-WRAPPER)
+      (warn ":MAXIMIZE-SCORE? option not yet implemented for partial "
+            "retrieval in incremental partial match mode - ignoring it."))
+    (special ((*queryIterator* query)
+              ;; initialize these for the sake of recursive queries:
+              (*reversePolarity?* FALSE)
+              (*generate-all-proofs?* FALSE)
+              (*inferenceLevel* (current-inference-level)))
+      (foreach i in (interval 1 (lookup-how-many-solutions query))
+          as solution in query
+          do (ignore solution i))
+      (return query))))
+
+(defun sort-solutions-by-score ((query QUERY-ITERATOR))
+  ;; Sort the solutions collected in `query' to list those with highest
+  ;;    match scores first.
+  (sort (solutions query) (the-code :function solution-score-greater-than?)))
+
+(defun (solution-score-greater-than? BOOLEAN) ((s1 QUERY-SOLUTION)
+                                               (s2 QUERY-SOLUTION))
+  ;; Return true if the match score of s1 is greater than the score of s2.
+  (return (> (match-score s1) (match-score s2))))
+
+(defun (ask-partial FLOAT) (&rest (proposition&options PARSE-TREE))
+  :documentation
+  "Similar to `ask' (which see), but return the highest partial match score
+for the supplied proposition instead of a truth value.  If the option
+:MAXIMIZE-SCORE? is set to FALSE, return after the first partial match score
+has been generated."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  ;; Enable the recording of the top-level query for the benefit of `why':
+  (setq *most-recent-query* NULL)
+  (exception-case      
+      (return (call-ask-partial (coerce-&rest-to-cons proposition&options)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (setq *most-recent-query* NULL)
+      (return NULL))))
+
+(defun (return-partial-truth FLOAT) ((query QUERY-ITERATOR) (top? Boolean))
+  ;; DEPRECATED.  Use `call-ask-partial' or `compute-partial-truth' instead.
+  (unless top?
+    (insert-at (options query) :MAXIMIZE-SCORE? top?))
+  (return (call-ask-partial query)))
+
+(defun (call-ask-partial FLOAT) ((query OBJECT))
+  ;; return-partial-truth returns a partial match from a bound proposition.
+  (let ((theQuery (create-ask-query query)))
+    (initialize-partial-query theQuery)
+    (when (null? *most-recent-query*)
+      ;; only the top-level query commands handle nullification and use:
+      (setq *most-recent-query* theQuery))
+    (return (compute-partial-truth (partial-match-strategy theQuery) theQuery))))
+
+(defmethod (compute-partial-truth FLOAT) ((self PARTIAL-MATCH-FRAME)
+                                          (query QUERY-ITERATOR))
+  ;; Compute the partial truth of the ground proposition in `query' using
+  ;;    the partial match mode indicated by `self'.
+  (ignore query)
+  (error "Don't know how to compute partial truth for " self))
+  
+(defmethod (compute-partial-truth FLOAT) ((self INCREMENTAL-PARTIAL-MATCH)
+                                          (query QUERY-ITERATOR))
+  ;; Compute the partial truth of `query' using the :BASIC partial match mode.
+  (let ((baseFrame (base-control-frame query))
+	(partialMatchFrame (partial-match-strategy query))
+        (minimumScore FLOAT-WRAPPER (lookup (options query) :MINIMUM-SCORE))
+        (maximizeScore?
+         (not (eql? (lookup (options query) :MAXIMIZE-SCORE?) FALSE-WRAPPER)))
+        (epsilon 0.001)
+        (latestScore 0.0)
+        (highestScore 0.0)
+        (bestJustification JUSTIFICATION NULL))
+    (when (null? partialMatchFrame)
+      (setq partialMatchFrame self)
+      (setf (partial-match-strategy query) self))
+    (setf (dynamic-cutoff partialMatchFrame)
+      (choose (defined? minimumScore) minimumScore epsilon))
+    (special ((*queryIterator* query)
+              (*generate-all-proofs?* TRUE)
+              (*inferenceLevel* (current-inference-level))
+              (*reversePolarity?* FALSE))
+      (loop
+	;(emit-thinking-dot :PARTIAL-MATCH)
+	(unless (next? query)
+          (break)) 
+	(setq latestScore (positive-score partialMatchFrame))
+        ;; If the score couldn't be improved, terminate (note that we set the
+        ;;    cutoff after every iteration to be epsilon higher than the latest
+        ;;    score to get strictly increasing scores):
+        (when (<= latestScore highestScore)
+          (break))
+        (setq bestJustification (justification baseFrame))
+        (setq highestScore latestScore)
+        (setf (dynamic-cutoff partialMatchFrame) (+ highestScore epsilon))
+        (when (or (not maximizeScore?)
+                  (not (unknown-truth-value? (truth-value baseFrame))))
+          (break))))
+    ;; Attach justification of the best proof found (might be NULL):
+    (setf (justification baseFrame) bestJustification)
+    (return highestScore)))
+
+(defmethod (compute-partial-truth FLOAT) ((self NN-PARTIAL-MATCH)
+                                          (query QUERY-ITERATOR))
+  ;; Compute the partial truth of `query' using the :NN partial match mode.
+  ;; NOTE: It is not clear to me (hc) why the termination logic for :NN mode
+  ;;    is different than for :BASIC mode.  It could be that this is historic
+  ;;    when we still used the uncached neural network mechanims to perform
+  ;;    learning (i.e., one query per training cycle).
+  (let ((proposition (proposition (base-control-frame query)))
+        (partialMatchFrame (partial-match-strategy query))
+        (minimumScore FLOAT-WRAPPER (lookup (options query) :MINIMUM-SCORE))
+        (maximizeScore?
+         (not (eql? (lookup (options query) :MAXIMIZE-SCORE?) FALSE-WRAPPER)))
+        (epsilon 0.001)
+        (latestScore 0.0)
+        (highestScore 0.0)
+        (scoreList (new (LIST OF FLOAT-WRAPPER)))
+        (weight 0.0)
+	(netList (LIST OF PROPOSITION-NEURAL-NETWORK) NULL)
+	(activationList (LIST OF (LIST OF FLOAT-WRAPPER)) NULL)
+	(support (CONS OF PARTIAL-SUPPORT) NULL))
+    (when (null? partialMatchFrame)
+      (setq partialMatchFrame self)
+      (setf (partial-match-strategy query) self))
+    (setf (dynamic-cutoff partialMatchFrame)
+      (choose (defined? minimumScore) minimumScore epsilon))
+    (setq *Activated-Networks* (new LIST))
+    (special ((*queryIterator* query))
+      (loop
+        (setf (latest-positive-score query) 0.0)
+	;(emit-thinking-dot :PARTIAL-MATCH)
+	(unless (next? query)
+          (break))
+	(setq latestScore (latest-positive-score query))
+        ;; If we receive a duplicate score, terminate (hc: not sure what this
+        ;;    was supposed to do in the context of NN learning/matching):
+        (when (member? scoreList latestScore)
+          (break))
+        ;; If we get a new high score, save the proposition match scores:
+        (when (> latestScore highestScore)
+          (setq support (support proposition))
+          (setq activationList (new LIST))
+          (setq netList *Activated-Networks*)
+          (foreach net in *Activated-Networks*
+              do (let ((propScores (new (LIST OF FLOAT-WRAPPER))))
+                   (foreach prop in (arguments (proposition net)) 
+                      collect (match-score (cast prop PROPOSITION))
+                      into propScores)
+                  (push activationList propScores)))
+          (setq activationList (reverse activationList)))
+        ;; Support for weighted propositions matched from top-level direct
+        ;;    lookups (hc: can this really change during iterations?):
+        (setq weight (weight proposition))
+        (when (defined? weight)
+          (setq latestScore (* latestScore weight)))
+        (when (> latestScore highestScore)
+          (setq highestScore latestScore))
+        (setf (dynamic-cutoff partialMatchFrame) (+ highestScore epsilon))
+        (when (or (not maximizeScore?)
+                  (= highestScore 1.0)) ;; hc: what if `weight > 1.0'?
+          (break))
+        (push scoreList latestScore)))
+    ;; Restore the highest scoring activation:
+    (when (defined? support)
+      (setf (support proposition) support)
+      (foreach net in (reverse netList)
+          as scoreList in (reverse activationList)
+          do (foreach prop in (arguments (proposition net))
+                 as k in scoreList
+                 do (setf (match-score (cast prop PROPOSITION)) k))))
+    (return highestScore)))
+
+
+  ;;
+;;;;;; "Partial" Propositions
+  ;;
+
+;;; Experimental support to lookup "partial" propositions that contain
+;;; one or more NULL arguments.  This is useful for EELD matching so we
+;;; can assert partial match results from a layered run that contain
+;;; some unbound variables.  E.g., such an assertion could be made via
+;;;
+;;;      (assert (about (foo a NULL c) :score 0.5)
+;;;
+;;; which during a partial proof would match `(foo a b c)'.
+
+(startup-time-progn
+  ;;; KLUDGE: Create the NULL-instance by hand (instead of via a definition in
+  ;;; `pl-kernel-kb.ste', so we won't shadow STELLA/NULL which is referenced
+  ;;; in various PL-KERNEL-KB code files.  Those will eventually move to other
+  ;;; modules, but until then we need to do this this way:
+  (within-module *pl-kernel-module*
+    (create-logic-instance PL-KERNEL/@NULL null)))
+
+(defun (null-instance? BOOLEAN) ((x OBJECT))
+  ;; Return true if `x' is the NULL object.
+  ;; NULL is defined in `pl-kernel-kb.ste'.  Remove its definition if
+  ;;    we ever decide to scrap this "Partial" propositions business.
+  (return (eql? (object-surrogate x) PL-KERNEL/@NULL)))
+
+(defun (get-null-instance LOGIC-OBJECT) ()
+  ;; Return the NULL instance used in partial propositions.
+  (return (surrogate-value PL-KERNEL/@NULL)))
+
+(defun (null-instance-propositions-exist? BOOLEAN) ()
+  ;; Return TRUE if there are some NULL-instance propositions in the system.
+  ;; Used for optimization so we won't do lots of rescans of the assertion
+  ;; base if we don't have to.
+  (let ((index (get-backlinks-index (get-null-instance))))
+    (return (or (defined? (predicate-propositions-table index))
+                (not (empty? (dependent-propositions-list index)))))))
+
+(defun (all-matching-partial-propositions (ITERATOR OF PROPOSITION))
+    ((self PROPOSITION))
+  ;; Return an iterator generating all partial propositions with the
+  ;;    same operator as `self' (or a specialization thereof).
+  ;; Unfortunately, we can't restrict the set by exploiting some of the
+  ;;    bindings of `self', since for something like `(foo ?x a)' we
+  ;;    still want to find `(foo b NULL)' as a match (which wouldn't be
+  ;;    found if we looked via backlinks from `a').
+  (let ((pattern (make-relation-pattern (operator self) (get-null-instance))))
+    (return
+      (new SPECIALIZING-PROPOSITIONS-ITERATOR
+           :selection-pattern pattern
+           :proposition-cursor
+           (allocate-iterator (select-propositions pattern))))))
+
+(defun (partial-arguments-unify-with-arguments? BOOLEAN)
+       ((subProposition PROPOSITION) (referenceProposition PROPOSITION))
+  ;; Partial-match version of `arguments-unify-with-arguments?' (which see)
+  ;;    that understands how to unify NULL arguments.
+  (let ((patternRecord (current-pattern-record *queryIterator*))
+        (ubStackOffset (top-unbinding-stack-offset 
+                        patternRecord))
+        (success? FALSE))
+    (setq success?
+      (and (forall superArg in (arguments referenceProposition)
+               as subArg in (arguments subProposition)
+               always (or (null-instance? subArg)
+                          (null-instance? superArg)
+                          (bind-argument-to-value?
+                           superArg (value-of subArg) FALSE)))
+           ;; kludge to fix BUG in STELLA:
+           (eql? (length (arguments referenceProposition))
+                 (length (arguments subProposition)))))
+    (when (not success?)
+      (unbind-variables-beginning-at patternRecord (1+ ubStackOffset)))
+    (return success?)) )
+
+(defun (try-scan-partial-propositions-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Partial-match version of `try-scan-propositions-proof' (which see)
+  ;;    that only picks up partial propositions that have at least one
+  ;;    NULL argument.
+  (let ((proposition (proposition frame))
+        (iterator (iterator frame))
+        (result :FAILURE))
+    (when (null? iterator) ;; first time?
+      ;; allocate specializing partial propositions iterator:
+      (setq iterator (all-matching-partial-propositions proposition))
+      (setf (iterator frame) iterator))
+    (when (defined? iterator)
+      (while (next? iterator)
+        (when (partial-arguments-unify-with-arguments?
+               (value iterator) proposition)
+          (setq result :CONTINUING-SUCCESS)
+          (break))))
+    (when (not (eql? result :FAILURE))
+      (let ((truthValue
+             (propositions-iterator-truth-value iterator))
+            (weight (weight (cast (value iterator) PROPOSITION))))
+        (setf (truth-value frame) UNKNOWN-TRUTH-VALUE)
+        (when (null? weight)
+          (setq weight 1.0))
+        (set-frame-partial-truth
+         (partial-match-frame frame)
+         UNKNOWN-TRUTH-VALUE ;; must be unknown, even though it was asserted
+         ;; the weight of the instantiating proposition scales the score of
+         ;;    its truth value (could be achieved with a custom truth value):
+         (* (positive-score truthValue) weight)
+         NULL TRUE)))
+    (return result)))

@@ -1,0 +1,1809 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: neural-network.ste,v 1.28 2006/05/11 07:05:23 hans Exp
+
+;;; Code for the neural networks attached to propositions
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+;; :BACKPROP, :QUICKPROP
+(defglobal *Neural-Network-Training-Method* Keyword :BACKPROP) 
+
+;;                   BACKPROP    QUICKPROP
+;;  learning-rate      0.1          1.75
+;;  momentum-term      0.9          0
+;;  weight-range       0.05         2.0
+
+(defglobal *Learning-Rate* Float 0.1)
+(defglobal *Momentum-Term* Float 0.9)
+(defglobal *Weight-Range* Float 0.05)
+(defglobal *Error-Cutoff* Float 0.0)
+
+(defglobal *Error-Print-Cycle* Integer 25) ;; how often is the error printed?
+(defglobal *Save-Network-Cycle* Integer 10000) ;; how often are networks saved?
+(defglobal *Save-Network-File* STRING NULL)    ;; what files are they saved to
+
+(defglobal *Trace-Neural-Network-Training* BOOLEAN false)
+
+(defglobal *Train-Cached-Networks?* BOOLEAN TRUE)
+
+;; Parameters for Quickprop algorithm
+(defglobal *Max-Movement* Float 1.75)
+(defglobal *Mode-Switch* Float 0.0)
+(defglobal *Shrink-Factor* Float (/ *Max-Movement* (+ 1.0 *Max-Movement*)))
+(defglobal *Weight-Decay* Float -0.0001)
+(defglobal *Sigmoid-Prime-Offset* Float 0.1)
+
+(deftype WEIGHT-VECTOR (VECTOR of FLOAT-WRAPPER))
+(deftype 2-D-WEIGHT-ARRAY (2-D-Array of FLOAT-WRAPPER))
+
+;;(deftype WEIGHT-VECTOR FLOAT-VECTOR)
+;;(deftype 2-D-WEIGHT-ARRAY 2-D-FLOAT-Array)
+
+(defclass PROPOSITION-NEURAL-NETWORK (Standard-Object)
+  :slots
+  ((proposition :type PROPOSITION)
+   (input :type WEIGHT-VECTOR)
+   (hidden :type WEIGHT-VECTOR)
+   (output :type Float)
+   (input-error :type WEIGHT-VECTOR)
+   (hidden-error :type WEIGHT-VECTOR)
+   (ih :type 2-D-WEIGHT-ARRAY)
+   (ih-delta :type 2-D-WEIGHT-ARRAY)
+   (ho :type WEIGHT-VECTOR)
+   (ho-delta :type WEIGHT-VECTOR)
+   ;; slots used by quickprop
+   (ih-slope :type 2-D-WEIGHT-ARRAY)
+   (ih-prev-slope :type 2-D-WEIGHT-ARRAY)
+   (ho-slope :type WEIGHT-VECTOR)
+   (ho-prev-slope :type WEIGHT-VECTOR)))
+
+;; Holds pointers to all neural networks that have been created
+(defglobal *Master-Neural-Network-List* (List of Proposition-Neural-Network)
+	   (new list))
+
+;; Pointers to any neural network activated in a given query
+(defglobal *Activated-Networks* (List of Proposition-Neural-Network)
+	   (new list))
+
+(defglobal *saved-net* Proposition-Neural-Network null)
+
+;; Here are some commands to set global variables in the PowerLoom listener
+(defun set-trace-neural-network-training ((b BOOLEAN))
+  :command? TRUE  :public? TRUE
+  (setq *trace-neural-network-training* b))
+
+(defun set-save-network-cycle ((i integer))
+  :documentation "Set number of cycles between which networks are saved to the
+file established by the last call to `save-all-neural-networks'.  A number <= 0
+or a NULL number turns off periodic saving."
+  :command? TRUE  :public? TRUE
+  (when (null? i)
+    (setq i 0))
+  (setq *Save-Network-Cycle* i)) ;; how often are networks saved?
+
+(defun set-error-cutoff ((f float))
+  :command? TRUE  :public? TRUE
+  (setq *Error-Cutoff* f))
+
+(defun set-train-cached-neural-networks ((b BOOLEAN))
+  :command? TRUE  :public? TRUE
+  (setq *train-cached-networks?* b))
+
+(defun set-learning-rate ((rate FLOAT))
+  :command? TRUE  :public? TRUE
+  (setq *Learning-Rate* rate))
+
+(defun set-momentum-term ((m FLOAT))
+  :command? TRUE  :public? TRUE
+  (setq *Momentum-Term* m))
+
+(defun set-weight-range ((w FLOAT))
+  :command? TRUE  :public? TRUE
+  (setq *Weight-Range* w))
+
+(defun set-neural-network-training-method ((m KEYWORD))
+  :command? TRUE  :public? TRUE
+  (setq *Neural-Network-Training-Method* m))
+
+(defun set-error-print-cycle ((i integer))
+  :documentation "Set number of cycles between which error rates are saved to
+the file established by the last call to `save-all-neural-networks' appended
+with extension `.err'.  A number <= 0 (or NULL) turns off periodic saving."
+  :command? TRUE  :public? TRUE
+  (when (null? i)
+    (setq i 0))
+  (setq *Error-Print-Cycle* i))
+
+(defun delete-all-neural-networks ()
+  :command? TRUE  :public? TRUE
+  (setq *master-neural-network-list* (new list)))
+
+(defun check-master-network-list ()
+  :command? TRUE  :public? TRUE
+  (foreach net in *master-neural-network-list* 
+      as i in (interval 0 null) do
+	(print "Net " i ": " (length (input net)) " inputs, " 
+	       (length (hidden net)) " outputs." EOL)))
+
+
+
+(defun clear-all-neural-networks ()
+  ;; randomize weights in all neural networks
+  :command? TRUE  :public? TRUE
+  (foreach net in *master-neural-network-list* do
+	(randomize-neural-network net)))
+
+(defun clear-all-slopes ()
+  ;; reset errors and slopes of all networks
+  (foreach net in *master-neural-network-list* do
+	(clear-slopes net)))
+
+(defun clear-slopes ((net Proposition-Neural-Network))
+  ;; resets the errors of all hidden and output units and copies
+  ;; current slopes to prev-slopes.
+  (foreach h in (interval 0 (- (length (hidden net)) 1)) do
+	(foreach i in (interval 0 (- (length (input net)) 1)) do
+	      (setf (2-d-element (ih-prev-slope net) i h)
+		(2-d-element (ih-slope net) i h))
+	      (setf (2-d-element (ih-slope net) i h) 
+		   (* (2-d-element (ih net) i h) *Weight-Decay*)))
+	(setf (nth (ho-prev-slope net) h) (nth (ho-slope net) h))
+	(setf (nth (ho-slope net) h) 
+	  (* (nth (ho net) h) *Weight-Decay*))))
+					
+					
+(defun randomize-neural-network ((net Proposition-Neural-Network))
+  ;; randomize the weights in a neural network
+  (let ((num-in (length (input net)))
+	(num-hidden (length (hidden net))))
+    ;; clear all delta values
+    (foreach h in (interval 0 (- num-hidden 1)) do
+	  (setf (nth (ho-delta net) h) 0.0)
+	  (foreach i in (interval 0 (- num-in 1))
+	      do (setf (2-d-element (ih-delta net) i h) 0.0)))
+
+    (foreach i in (interval 0 (- num-hidden 1))
+	do (foreach j in (interval 0 (- num-in 1))
+	       do (setf (2-d-element (ih net) j i) ;; randomize input to hidden
+		    (random-weight *Weight-Range*)))          ;; weights
+	   (setf (nth (ho net) i) 
+	     (random-weight *Weight-Range*)))));; randomize hidden to output wt
+
+(defun (create-neural-network PROPOSITION-NEURAL-NETWORK) ((prop PROPOSITION))
+  ;; create-neural-network builds a two-layer neural network for a given
+  ;; proposition.  The arguments are the input nodes and the proposition
+  ;; is the output node.  
+  (let ((net proposition-neural-network NULL)
+	(num-in (+ (length (arguments prop)) 1))
+	(num-hidden (min (+ num-in 0) 20)))
+    (when (> num-in 100) ;; for really big input layers
+      (setq num-hidden (+ (floor (/ num-in 10)) 10))) 
+    (setq net (allocate-neural-network num-in num-hidden))
+    (push *master-neural-network-list* net)
+    (setf (proposition net) prop)
+    ;; set default behavior for network
+    (case (kind prop)
+      ((:AND :OR)
+       (randomize-neural-network net))
+        ;;(set-default-neural-network-weights net (kind prop))
+      (otherwise 
+       (randomize-neural-network net)))
+    (return net)))
+
+
+(defun (gnp PROPOSITION) ((name SYMBOL))
+  :command? true :evaluate-arguments? false  :public? TRUE
+  (return (surrogate-value (lookup-surrogate (symbol-name name)))))
+
+
+(defun (defnetwork proposition-neural-network) (&rest (args PARSE-TREE))
+    :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+    (return (define-neural-network-from-parse-tree (coerce-&rest-to-cons args))))
+
+(defun (define-neural-network-from-parse-tree proposition-neural-network)
+    ((tree CONS))
+  (let ((prop (build-proposition (first tree)))
+        (net (create-neural-network prop))
+	(ih (cons of float-wrapper) (second tree))
+	(ho (cons of float-wrapper) (third tree))
+	(k 0))
+    (foreach i in (interval 0 (1- (length (input net)))) do
+       (foreach h in (interval 0 (1- (length (hidden net)))) do
+	  (setf (2-d-element (ih net) i h)  (nth ih k))
+	  (++ k)))
+    (foreach h in (interval 0 (1- (length (hidden net))))
+	as num in ho do
+	  (setf (nth (ho net) h) num))
+    (return net)))
+
+
+(defun (allocate-neural-network PROPOSITION-NEURAL-NETWORK) 
+    ((num-in Integer) (num-hidden Integer))
+  ;; allocates space for a neural network with given number of 
+  ;; input and hidden units.
+  (let ((net (new PROPOSITION-NEURAL-NETWORK)))
+    (setf (input net) (new WEIGHT-VECTOR :array-size num-in))
+    (setf (hidden net) (new WEIGHT-VECTOR 
+			    :array-size num-hidden))
+    (setf (ih net) (new 2-D-WEIGHT-ARRAY 
+			:nof-rows num-in :nof-columns num-hidden))
+    (setf (ih-delta net) (new 2-D-WEIGHT-ARRAY 
+			      :nof-rows num-in :nof-columns num-hidden))
+    (setf (input-error net) (new WEIGHT-VECTOR :array-size num-in))
+    (setf (hidden-error net) (new WEIGHT-VECTOR :array-size num-hidden))    
+    (setf (ho net) (new WEIGHT-VECTOR :array-size num-hidden))
+    (setf (ho-delta net) (new WEIGHT-VECTOR 
+			      :array-size num-hidden))
+    ;; If using quickprop, allocate memory
+    (when (eql? *Neural-Network-Training-Method* :QUICKPROP)
+      (setf (ih-slope net) (new 2-D-WEIGHT-ARRAY 
+				:nof-rows num-in 
+				:nof-columns num-hidden))
+      (setf (ih-prev-slope net) (new 2-D-WEIGHT-ARRAY 
+				     :nof-rows num-in 
+				     :nof-columns num-hidden))
+      (setf (ho-slope net) (new WEIGHT-VECTOR 
+				:array-size num-hidden))
+      (setf (ho-prev-slope net) (new WEIGHT-VECTOR 
+				     :array-size num-hidden)))
+    (return net)))
+
+
+(defun (activate-propositional-neural-network FLOAT)
+    ((net proposition-neural-network))
+  ;; propagates an activation through the network
+  (let ((num-in (length (input net)))
+	(num-hidden (length (hidden net)))
+	(arguments (vector of PROPOSITION) (arguments (proposition net)))
+	(stop (- num-in 1))
+	(input (input net))
+	(hidden (hidden net))
+	(ih (ih net))
+	(ho (ho net))
+	(score float 0.0)
+	(sum float 0.0))
+
+    (push *Activated-Networks* net)
+
+    (setf (nth (input net) 0) 1.0)
+    (foreach i in (interval 1 stop) do
+	  (if (defined? (match-score (nth arguments (- i 1))))
+	      (setf (nth input i) (match-score (nth arguments (- i 1))))
+	    (setf (nth input i) 0.0)))
+    ;; activate hidden units
+    (foreach i in (interval 0 (- num-hidden 1)) do
+	  (foreach j in (interval 0 stop) do
+		(setq sum (+ sum (* (nth input j) 
+				    (2-d-element ih j i)))))
+	  (setf (nth hidden i) 
+	    (/ 1.0 (+ 1.0 (exp (- sum)))))
+	  ;;pass hidden activation to the output unit
+	  (setq score (+ score (* (nth hidden  i)
+				  (nth ho i)))))
+    ;; compute output activation
+    (when (= (+ 1.0 (exp (- score))) 0.0)
+      (print "Sum is " score EOL))
+    (setf (output net) (/ 1.0 (+ 1.0 (exp (- score)))))
+    (setf (match-score (proposition net)) (output net))
+    (return (output net))))
+
+(defun (make-net-input-string STRING) ((input WEIGHT-VECTOR))
+  (return (stringify input)))
+
+
+;;
+;; NN learning functions
+;;
+
+(defun train-neural-network ((cycles Integer) (num-training Integer))
+  ;; The main training function.  
+  :command? TRUE  :public? TRUE
+  (if *Train-Cached-Networks?*
+      (train-cached-neural-networks cycles num-training)
+    (train-uncached-neural-networks cycles num-training)))
+
+
+(defun train-uncached-neural-networks ((cycles Integer) (num-training Integer))
+  ;; This function will invoke the learning algorithm.  Queries will
+  ;; be generated from the first num-training examples in
+  ;; *training-examples*.  The algorithm is iterated for the specified
+  ;; number of cycles.  Note: this is much slower than
+  ;; train-cached-neural-networks, because it reevaluates the training
+  ;; example query each time the network is activated.  This function
+  ;; is only here for historical and testing purposes.
+  (let ((mse float 0.0)
+	(num-ex (length *training-examples*))
+	(look-ptr OUTPUT-STREAM NULL)
+	(examples (Vector of TRAINING-EXAMPLE) 
+		  (new (vector of TRAINING-EXAMPLE)
+		       :array-size num-training)))
+    (when (> num-training num-ex)
+      (print-stream STANDARD-ERROR "Error: There are only " num-ex " training examples")
+      (return)) 
+    (shuffle-list *training-examples*)
+    (foreach i in (interval 0 (- num-training 1)) do
+      (setf (nth examples i) (nth *training-examples* i)))  
+    (foreach cycle in (interval 0 (- cycles 1)) do
+      (setq mse 0.0)
+      ;; some algorithm specific initializations
+      (case *Neural-Network-Training-Method*
+	((:BACKPROP :BACKPROPAGATION)
+	 (shuffle-vector examples))
+	(:QUICKPROP
+	 (clear-all-slopes)))
+	
+      (foreach example in examples
+	  as k in (interval 0 NULL) do
+	    ;; Run the partial matcher on the example, collect the error,
+	    ;; and call backprop to adjust the weights
+	    (when *Trace-Neural-Network-Training*
+	      (print "Example " k ": " (query example) "  " (score example) EOL))
+	    (when (not (null? (module example)))
+	      (change-module (module example)))
+	    (let ((form (copy-cons-tree (query example)))
+		  (target (score example))
+		  (query (make-query NIL (coerce-to-tree form) NIL NIL))
+		  (prop (proposition (base-control-frame query)))
+		  (output (return-partial-truth query TRUE))
+		  (error (compute-error target output)))
+	      (when *Trace-Neural-Network-Training*
+		(print "   Output: " output EOL))
+	      (setq mse (+ mse (* error error)))
+	      (setq *partial-support-cache* (new list)) ;; should this be free?
+	      (case *Neural-Network-Training-Method*
+		((:BACKPROPAGATION :BACKPROP)
+		 (backpropagate-error prop error))
+		(:QUICKPROP
+		 (quickpropagate-error prop error)))))
+      (when (eql? *Neural-Network-Training-Method* :QUICKPROP)
+	(modify-weights)) ;; batch mode, modify weights late
+      (when (and (> *save-network-cycle* 0)
+                 (= (rem cycle *save-network-cycle*) 0))
+      	(save-all-neural-networks *Save-Network-File*))
+      (when (and (> *error-print-cycle* 0)
+                 (= (rem cycle *error-print-cycle*) 0))
+        (when (defined? *Save-Network-File*)
+          (when (null? look-ptr)
+            (setq look-ptr
+              (new OUTPUT-FILE-STREAM
+                   :filename (concatenate *Save-Network-File* ".err"))))
+          (print-stream look-ptr "Cycle " cycle " Error: " 
+                        (/ mse num-training) EOL))
+	(print "Cycle " cycle " Error: " (/ mse num-training) EOL)))
+    (when (defined? look-ptr)
+      (free look-ptr))))
+
+
+;; this variable holds the support id's that were already used during 
+;; a depth first search.  It is used to detect loops.
+(defglobal *partial-support-cache* (list of Integer-Wrapper) (new list))
+
+
+(defun backpropagate-error ((prop PROPOSITION) (error FLOAT))
+  ;; This is the main learning routine for the uncached networks.  It
+  ;; follows the normal backpropagation algorithm to assign credit and
+  ;; blame to units in the neural network.  The cached network's have 
+  ;; their own backprop function called cached-backpropagate-error.
+  (let ((net (neural-network prop))
+	(output (match-score prop))
+	(num-hidden 0)
+	(delta 0.0)
+	(saved-input WEIGHT-VECTOR null)
+	(saved-hidden WEIGHT-VECTOR null)
+	(hidden-error WEIGHT-VECTOR null)
+	(input-error WEIGHT-VECTOR null)
+	(num-in 0)
+	(recursive-conflict FALSE)  ;; is there another call to this net?
+	(full-error error))
+    
+    ;; update the weights in the neural network if it exists
+    (when (defined? net)
+      (setq num-in (length (input net)))
+      (setq num-hidden (length (hidden net)))
+      (setq saved-input (input net))
+      (setq saved-hidden (hidden net))
+      (setf (nth (input net) 0) 1.0)
+
+      ;; check and see if input disagrees with proposition match scores.
+      ;; if it does, you were overwritten by a recursive call.  Reset the
+      ;; scores and reactivate the neural network.
+      (foreach i in (interval 1 (1- num-in)) do
+	    (let ((value FLOAT (nth (input net) i)))
+	      (when (not (= value
+			    (match-score (cast (nth (arguments prop) (- i 1)) 
+					       proposition))))
+		(setq recursive-conflict TRUE)
+		(break))))
+      (when recursive-conflict
+	;; reset to original input 
+	(foreach i in (interval 1 (- num-in 1)) do
+	      (setf (nth (input net) i) 
+		(match-score (cast (nth (arguments prop) (- i 1)) proposition))))
+	;; re-activate because hidden activations may have changed by
+	;; a recursive call
+	(activate-propositional-neural-network net))
+      
+      ;; squash the error by multiplying by the sigmoid derivative
+      (setq error (* error output (- 1.0 output)))
+      
+      ;; if there is a recursive call, save input and hidden activations
+      (when recursive-conflict
+	(setq saved-input (new WEIGHT-VECTOR :array-size num-in))
+	(setq saved-hidden (new WEIGHT-VECTOR 
+				:array-size num-hidden))
+	(foreach i in (interval 0 (- num-in 1)) do
+	      (setf (nth saved-input i) (nth (input net) i)))
+	(foreach i in (interval 0 (- num-hidden 1)) do
+	      (setf (nth saved-hidden i) (nth (hidden net) i))))	
+	
+      (setq hidden-error (new WEIGHT-VECTOR 
+			      :array-size num-hidden))
+      (setq input-error (new WEIGHT-VECTOR 
+			     :array-size num-in))
+      
+      ;; collect hidden errors
+      (foreach h in (interval 0 (- num-hidden 1))
+	  do (setf (nth hidden-error h) (* error (nth (ho net) h)))
+	     ;; squash hidden error before passing to input 
+	     (setf (nth hidden-error h) 
+	       (* (nth hidden-error h) (nth (hidden net) h) 
+		  (- 1.0 (nth (hidden net) h)))))
+      ;; collect input layer errors
+      (foreach i in (interval 0 (- num-in 1))
+	  do (setf (nth input-error i) 0.0)
+	     (foreach h in (interval 0 (- num-hidden 1)) do 
+		   (setf (nth input-error i) (+ (nth input-error i)
+						(* (nth hidden-error h)
+						   (2-d-element (ih net) i h)))))))
+
+    ;; If you have child nodes, pass the error backwards
+    (case (kind prop)
+      ((:AND :OR) ;; AND/OR propositions pass their errors to each argument
+       (foreach child in (cast (arguments prop) (VECTOR of PROPOSITION))
+	   as i in (interval 1 (- num-in 1))
+	   do (backpropagate-error child (nth input-error i)))
+
+       ;; Now, do the weight modification on the network.  We do this
+       ;; after calls to the children so the recursive children see
+       ;; the original weights of the NN (not the modified weights).
+
+       ;; modify hidden to output weights
+       (foreach h in (interval 0 (- num-hidden 1)) do
+	     (setq delta (+ (* *momentum-term* (nth (ho-delta net) h))
+			    (* *learning-rate* 
+			       error (nth saved-hidden h))))
+	     (setf (nth (ho net) h) (+ (nth (ho net) h) delta))
+	     (setf (nth (ho-delta net) h) delta))
+       ;; modify input to hidden weights
+       (foreach i in (interval 0 (- num-in 1)) do      
+	     (foreach h in (interval 0 (- num-hidden 1)) do 
+		   (setq delta (+ (* *momentum-term* (2-d-element (ih-delta net) i h))
+				  (* *learning-rate* (nth hidden-error h)
+				     (nth saved-input i))))
+		   (setf (2-d-element (ih net) i h) (+ (2-d-element (ih net) i h) 
+						       delta))
+		   (setf (2-d-element (ih-delta net) i h) delta))))
+
+      (otherwise
+       ;; If you have support and you are not currently backchaining on that 
+       ;; support, then pass the error to the antecedent proposition.
+       (when (not (empty? (support prop)))
+	 (let ((proofs (support prop))
+	       (guilty (cons of partial-support) nil))
+	   (case *rule-combination*
+	     (:MAX
+	      (setq guilty (cons-list (first proofs)))
+	      ;; Cycle through to find the guilty rule
+	      (foreach proof in (rest proofs)
+		  do (when (eql? (score proof) output)
+		       (setq guilty (cons-list proof)))))
+	     (:NOISY-OR  ;; all rules are guilty
+	      (setq guilty proofs)))
+	   (foreach proof in guilty  ;; no looping!
+	       where (not (member? *partial-support-cache* (id proof))) 
+	       do (let ((fact (fact proof)))
+		    ;; It is necessary to restore the match scores because
+		    ;; they may have been overwritten.
+		    (if (= (length (argument-scores proof)) 1)
+		      (setf (match-score fact) (first (argument-scores proof)))
+		      (foreach score in (argument-scores proof)
+			  as arg in (arguments fact) do
+			    (setf (match-score (cast arg proposition)) score)))
+		    ;; pass the error backwards
+		    (push *partial-support-cache* (id proof))
+		    (backpropagate-error (fact proof) 
+					 (* full-error (score proof)))
+		    (pop *partial-support-cache*)
+		    ))))))
+    ))
+
+
+(defun quickpropagate-error ((prop PROPOSITION) (error FLOAT))
+  ;; An experimental implementation of quickprop for the error propagation
+  ;; in the uncached neural networks.  This seems to work on the simple
+  ;; xor example, but I've had little luck in other problems. 
+  (let ((net (neural-network prop))
+	(output (match-score prop))
+	(full-error error)
+	(temp FLOAT 0.0)
+	(num-in 0)
+	(num-hidden 0)
+	(input-error WEIGHT-VECTOR null))
+    
+    ;; update the weights in the neural network if it exists
+    (when (defined? net)
+      (setq num-in (length (input net)))
+      (setq num-hidden (length (hidden net)))
+      ;; reset to original input 
+      (setf (nth (input net) 0) 1.0)
+      (foreach i in (interval 1 (- num-in 1)) do
+	    (setf (nth (input net) i) 
+	      (match-score (cast (nth (arguments prop) (- i 1)) proposition))))
+      ;; re-activate because hidden activations may have changed by
+      ;; a recursive call
+      (activate-propositional-neural-network net)
+      
+      ;; squash the error by multiplying by the sigmoid derivative
+      (setq error (* error (+ *Sigmoid-Prime-Offset* 
+			      (* output (- 1.0 output)))))
+
+      (setq input-error	(new WEIGHT-VECTOR :array-size num-in))
+      (zero-vector input-error) ;; zero out all members of the input vector
+      
+      ;; propagate error backwards
+      (foreach h in (interval 0 (- num-hidden 1)) do
+	    ;; compute gradient for hidden to output weight
+	    (setf (nth (ho-slope net) h)
+	      (+ (nth (ho-slope net) h) (* error (nth (hidden net) h))))
+	    ;; compute error in hidden units
+	    (setq temp 
+	      (* error (nth (ho net) h) (+ *Sigmoid-Prime-Offset*
+					   (* (nth (hidden net) h) 
+					      (- 1.0 (nth (hidden net) h))))))
+						  
+	    ;; pass error to input units
+	    (foreach i in (interval 0 (- num-in 1)) do
+		  ;; gradient for weights
+		  (setf (2-d-element (ih-slope net) i h)
+		    (+ (2-d-element (ih-slope net) i h) 
+		       (* temp (nth (input net) i))))
+		  ;; error in input units
+		  (setf (nth input-error i) 
+		    (+ (nth input-error i)
+		       (* temp (2-d-element (ih net) i h)))))))
+
+    ;; If you have child nodes, pass the error backwards
+    (case (kind prop)
+      ((:AND :OR) ;; AND/OR propositions pass their errors to each argument
+       (foreach child in (cast (arguments prop) (VECTOR of PROPOSITION))
+	   as i in (interval 1 (- num-in 1))
+	   do (quickpropagate-error child (nth input-error i))))
+      (otherwise
+       ;; If you have support and you are not currently backchaining on that 
+       ;; support, then pass the error to the antecedent proposition.
+       (when (not (empty? (support prop)))
+	 (let ((proofs (support prop))
+	       (guilty (cons of partial-support) nil))
+	   (case *rule-combination*
+	     (:MAX
+	      (setq guilty (cons-list (first proofs)))
+	      ;; Cycle through to find the guilty rule
+	      (foreach proof in (rest proofs)
+		  do (when (eql? (score proof) output)
+		       (setq guilty (cons-list proof)))))
+	     (:NOISY-OR  ;; all rules are guilty
+	      (setq guilty proofs)))
+	   (foreach proof in guilty  ;; no looping!
+	       where (not (member? *partial-support-cache* (id proof)))
+	       do (let ((fact (fact proof)))
+		    ;; It is necessary to restore the match scores because
+		    ;; they may have been overwritten.
+		    (if (= (length (argument-scores proof)) 1)
+		      (setf (match-score fact) (first (argument-scores proof)))
+		      (foreach score in (argument-scores proof)
+			  as arg in (arguments fact) do
+			    (setf (match-score (cast arg proposition)) score)))			;; pass the error backwards
+		    (push *partial-support-cache* (id proof))
+		    (quickpropagate-error (fact proof) 
+					  (* full-error (score proof)))
+		    (pop *partial-support-cache*)
+		    ))))))
+    ))
+
+
+(defun (compute-error FLOAT) ((training FLOAT) (output FLOAT))
+  (cond
+   ((eq? training 1.0)
+    (when (> output 0.9)
+      (return 0.0)))
+   ((eq? training 0.0)
+    (when (< output 0.1)
+      (return 0.0)))
+   (otherwise
+    nil))
+  (return (- training output)))
+    
+
+(defun (compute-delta FLOAT) ((slope FLOAT) (prev-slope FLOAT) (prev-delta FLOAT))
+  (ignore prev-slope)
+  (return (+ (* *Learning-Rate* slope)
+	     (* *Momentum-Term* prev-delta))))
+
+
+(defun (compute-qp-delta FLOAT) ((slope FLOAT) (prev-slope FLOAT)
+				 (prev-delta FLOAT))
+  (let ((delta FLOAT 0.0))
+    (cond
+     ((> prev-delta *Mode-Switch*)
+      (when (> slope 0.0)
+	(setq delta (* *Learning-Rate* slope)))
+      ;; if slope is close to previous slope, take max step
+      (if (> slope (* *shrink-factor* prev-slope))
+	  (setq delta (+ delta (* *max-movement* prev-delta)))
+	(setq delta (+ delta (* (/ slope (- prev-slope slope))
+				prev-delta)))))
+     ((< prev-delta (- 0.0 *Mode-Switch*))
+      (when (< slope 0.0)
+	(setq delta (* *Learning-Rate* slope)))
+      (if (< slope (* *shrink-factor* prev-slope))
+	  (setq delta (+ delta (* *max-movement* prev-delta)))
+	(setq delta (+ delta (* (/ slope (- prev-slope slope))
+				prev-delta)))))
+     (otherwise
+      (setq delta (+ (* *Learning-Rate* slope)
+		     (* *Momentum-Term* prev-delta)))))
+    (return delta)))
+
+
+(defun modify-weights ()
+  ;; Modify the weights according to the computed slopes.  This is used
+  ;; for batch mode NN training.
+  (let ((delta FLOAT 0.0)
+	(num-in Integer 0)
+	(num-hidden Integer 0))
+    (foreach net in *master-neural-network-list* do
+       (setq num-in (length (input net)))
+       (setq num-hidden (length (hidden net)))
+       ;; modify hidden to output weights
+       (foreach h in (interval 0 (- num-hidden 1)) do
+	  (setq delta (compute-qp-delta (nth (ho-slope net) h)
+				     (nth (ho-prev-slope net) h)
+				     (nth (ho-delta net) h)))
+	  (setf (nth (ho net) h) (+ (nth (ho net) h) delta))
+	  (setf (nth (ho-delta net) h) delta))
+
+       ;; modify input to hidden weights
+       (foreach i in (interval 0 (- num-in 1)) do      
+	  (foreach h in (interval 0 (- num-hidden 1)) do 
+	     (setq delta (compute-qp-delta (2-d-element (ih-slope net) i h)
+					(2-d-element (ih-prev-slope net) i h)
+					(2-d-element (ih-delta net) i h)))
+	     (setf (2-d-element (ih net) i h) 
+	       (+ (2-d-element (ih net) i h) delta))
+	     (setf (2-d-element (ih-delta net) i h) delta))))))
+
+
+(defun (test-over-training-examples FLOAT) ()
+  :command? TRUE  :public? TRUE
+  (let ((mse float 0.0)
+	(error 0.0)
+	(output float 0.0)
+	(form nil)
+	(query QUERY-ITERATOR NULL))
+    (foreach example in *training-examples* 
+	as i in (interval 0 NULL) do
+       (when (not (null? (module example)))
+	 (change-module (module example)))
+       (setq form (copy-cons-tree (query example)))
+       (setq query (make-query NIL (coerce-to-tree form) NIL NIL))
+       (setq output (return-partial-truth query TRUE))
+       (print "Example " i ": " (second (query example)) ", " output 
+	      "  Target: " (score example) EOL)
+	      
+       (setq error (- (score example) output))
+       (setq mse (+ mse (* error error))))
+    (return mse)))
+
+(defun (train-and-test-neural-network FLOAT) ((cycles Integer) 
+					      (num-training Integer)
+					      (num-testing Integer))
+  :command? TRUE  :public? TRUE
+  ;; train-and-test-neural-network will train the networks on num-training
+  ;; examples in *training-examples* and then test the network over num-testing
+  ;; different examples.
+  (train-neural-network cycles num-training)
+  (let ((mse float 0.0)
+	(testing-examples (Vector of TRAINING-EXAMPLE) 
+			  (new (vector of TRAINING-EXAMPLE)
+			       :array-size num-testing)))
+    (foreach i in (interval num-training (+ num-training (- num-testing 1)))
+	do (setf (nth testing-examples (- i num-training)) 
+		      (nth *training-examples* i)))
+    (foreach example in testing-examples do
+       (when (not (null? (module example)))
+	 (change-module (module example)))	  
+       (let ((form (copy-cons-tree (query example)))
+	     (query (make-query NIL (coerce-to-tree form) NIL NIL))
+	     (output (return-partial-truth query TRUE))
+	     (error (- (score example) output)))
+	 (setq mse (+ mse (* error error)))))
+    (setq mse (/ mse num-testing))
+    (return mse)))
+  
+
+(defun (test-neural-network FLOAT) ()
+  :command? TRUE  :public? TRUE
+  ;; Runs the partial matcher on all examples in *testing-examples*
+  (let ((error-sum float 0.0)
+	(num-testing (length *testing-examples*)))
+    (foreach example in *testing-examples* do
+	  (when (not (null? (module example)))
+	      (change-module (module example)))
+	  (let ((form (copy-cons-tree (query example)))
+		(query (make-query NIL (coerce-to-tree form) NIL NIL))
+		(output (return-partial-truth query TRUE))
+		(error (- (score example) output)))
+	    (setq error-sum (+ error-sum (abs error)))))
+    (setq error-sum (/ error-sum num-testing))
+    (return error-sum)))
+	
+	
+(defun (multiple-network-training-runs FLOAT) ((runs Integer)
+					       (cycles Integer)
+					       (num-training Integer))
+  :command? TRUE  :public? TRUE
+  ;; This is used to run multiple experiments with the learning algorithm.
+  (let ((errors (new WEIGHT-VECTOR :array-size runs))
+	(sum 0.0))
+    (foreach i in (interval 0 (- runs 1)) do
+	  (clear-all-neural-networks)
+	  (train-neural-network cycles num-training)
+	  (setf (nth errors i) (test-neural-network))
+	  (setq sum (+ sum (nth errors i)))
+	  (print "** Run " i ": " (nth errors i) EOL))
+    (print EOL "*** Report" EOL)
+    (foreach i in (interval 0 (- runs 1)) do
+	  (print "** Run " i ": " (nth errors i) EOL))
+    (return (/ sum runs))))
+
+
+;;
+;; New training and activation routines based on cached network records.
+;;
+
+(defun train-cached-neural-networks ((cycles Integer) (num-training Integer))
+  ;; train cached neural networks builds a network tree structure for
+  ;; each query in the training examples.  It then performs backprop
+  ;; (or quickprop) over that tree for the desired number of epochs.
+  ;; This is much faster because PowerLoom only is invoked once for
+  ;; each query.  Once the network trees (cached networks) are built,
+  ;; training is very quick.
+  (let ((mse float 0.0)
+	(abs-error float 0.0)
+	(error 0.0)
+	(target 0.0)
+	(output 0.0)
+	(num-ex (length *training-examples*))
+	(index (new (VECTOR of INTEGER-WRAPPER) :array-size num-training))
+	(look-ptr OUTPUT-STREAM NULL)
+	(examples (Vector of TRAINING-EXAMPLE) 
+		  (new (vector of TRAINING-EXAMPLE)
+		       :array-size num-training))
+	(net-records (Vector of CONS) (new (vector of cons) 
+					  :array-size num-training)))
+    (when (> num-training num-ex)
+      (print "Error: There are only " num-ex " training examples")
+      (return)) 
+
+    (foreach i in (interval 0 (- num-training 1)) 
+	as example in *training-examples* do
+	  (setf (nth examples i) example)
+	  (setf (nth index i) i))
+    
+    ;; Build the network tree records for each training example.
+;;    (print "Building Cached Networks" EOL)
+    (foreach i in (interval 0 (1- num-training)) do 
+       (let ((example (nth examples i))
+	     (timestamp (get-now-timestamp)))
+	 ;; First, check and see if you've already built a tree network
+	 ;; and no assertions have been made
+	 (if (and (not (null? (cached-solution example)))
+		   (eql? timestamp (timestamp example)))
+	      (setf (nth net-records i) (cached-solution example))
+	    (let ((current-module *module*))
+	      (when (not (null? (module example)))
+		(change-module (module example)))
+;;	      (print "  Building network for " (query example) EOL)
+	      (setf (nth net-records i) 
+		    (create-cached-network (query example)))
+	      (setf (cached-solution example) (nth net-records i))
+	      (setf (timestamp example) timestamp)
+	      (change-module current-module)))))
+
+    (print "Training Networks" EOL)
+    (foreach cycle in (interval 0 (- cycles 1)) do
+      (setq mse 0.0)
+      (setq abs-error 0.0)
+      ;; some algorithm specific initializations
+      (case *Neural-Network-Training-Method*
+	((:BACKPROP :BACKPROPAGATION) (shuffle-vector index))
+	(:QUICKPROP (clear-all-slopes)))
+	
+      (foreach k in (interval 0 (1- num-training)) do
+	 (when *Trace-Neural-Network-Training*
+	   (print "Example " k ": " (query (nth examples (nth index k))) "  " (score (nth examples (nth index k))) EOL))
+	 (setq target (score (nth examples (nth index k))))
+	 (setq output (activate-cached-network 
+			(nth net-records (nth index k))))
+	 (setq error (compute-error target output))
+	 (when *Trace-Neural-Network-Training*
+	   (print "   Output: " output EOL))
+	 (setq abs-error (+ abs-error (abs error)))
+	 (setq mse (+ mse (* error error)))
+	 (case *Neural-Network-Training-Method*
+	   ((:BACKPROPAGATION :BACKPROP)
+	    ;;	(print "Training on " (query (nth examples (nth index k))) EOL)
+	    (cached-backpropagate-error (nth net-records (nth index k))
+					    error))
+	   (:QUICKPROP
+	    (cached-quickpropagate-error (nth net-records (nth index k))
+					    error))))
+      (when (eql? *Neural-Network-Training-Method* :QUICKPROP)
+	(modify-weights)) ;; batch mode, modify weights late
+      (when (and (> *save-network-cycle* 0)
+                 (= (rem cycle *save-network-cycle*) 0))
+	(print "Saving networks" EOL)
+	(save-all-neural-networks *Save-Network-File*))
+      (when (and (> *error-print-cycle* 0)
+                 (= (rem cycle *error-print-cycle*) 0))
+        (when (defined? *Save-Network-File*)
+          (when (null? look-ptr)
+            (setq look-ptr
+              (new OUTPUT-FILE-STREAM
+                   :filename (concatenate *Save-Network-File* ".err"))))
+          (print-stream look-ptr "Cycle " cycle " Error: " 
+                        (/ abs-error num-training) EOL))
+;;	(setf (nth *learning-curve* cycle)
+;;	  (+ (nth *learning-curve* cycle) abs-error))
+;;	(print cycle " " (/ abs-error num-training) EOL))
+	(print "Cycle " cycle " Error: " (/ abs-error num-training) EOL))
+      (when (< (/ mse num-training) *Error-Cutoff*)
+	(break)))
+    (when (defined? look-ptr)
+      (free look-ptr))))
+
+(defglobal *learning-curve* (VECTOR of FLOAT-WRAPPER) NULL)
+
+(defun cached-backpropagate-error ((tree CONS) (error FLOAT))
+  (let ((net PROPOSITION-NEURAL-NETWORK null)
+	(temp 0.0)
+	(delta 0.0)
+	(input WEIGHT-VECTOR null)
+	(hidden WEIGHT-VECTOR null)
+	(hidden-error WEIGHT-VECTOR null)
+	(input-error WEIGHT-VECTOR null)
+	(recursive-conflict? FALSE))  ;; is there another call to this net?
+    
+    ;; if you have multiple networks divide blame between them based on
+    ;; score
+    (when (isa? (first tree) @CONS)
+      (case *rule-combination*
+	(:MAX 
+	 (let ((max 0.0)
+	       (guilty nil))
+	   (foreach net-def in tree do
+	      (setq net (first (cast net-def CONS)))
+	      (when (> (output net) max)
+		(setq max (output net))
+		(setq guilty net-def)))
+	   (cached-backpropagate-error guilty error)))
+	(:NOISY-OR
+	 (foreach net-def in tree do
+	    (cached-backpropagate-error 
+	     net-def (* error (output (cast (first (cast net-def CONS))
+					    PROPOSITION-NEURAL-NETWORK)))))))
+      (return))
+
+    ;; otherwise backpropagate within that network
+    (setq net (cast (first tree) PROPOSITION-NEURAL-NETWORK))
+    (setq input (input net))
+    (setq hidden (hidden net))
+    (setq input-error (input-error net))
+    (setq hidden-error (hidden-error net))
+
+    ;; squash the error by multiplying by the sigmoid derivative
+    (setq error (* error (output net) (- 1.0 (output net))))
+
+    ;; check and see if network input disagrees with the cached input
+    ;; if it does, you were overwritten by a recursive call.  Reset the
+    ;; scores and reactivate the neural network.
+    (foreach i in (interval 1 (1- (length (input net))))
+	as ele in (rest tree) do
+	  (typecase ele
+	    (CONS
+	     (if (eql? (length ele) 1)
+		 (setq temp (output (cast (first (cast (first ele) CONS))
+					  PROPOSITION-NEURAL-NETWORK)))
+	       (case *rule-combination*
+		 (:MAX 
+		  (setq temp 0.0)
+		  (foreach net-def in ele do
+		     (when (> (output (cast (first (cast net-def CONS))
+					    PROPOSITION-NEURAL-NETWORK))
+			      temp)
+		       (setq temp (output net)))))
+		 (:NOISY-OR
+		  (let ((scores (CONS of FLOAT-WRAPPER) nil))
+		    (foreach net-def in ele 
+			collect (output (cast (first (cast net-def CONS))
+					      PROPOSITION-NEURAL-NETWORK))
+			into scores)
+		    (setq temp (probabilistic-sum-n scores)))))))
+	    (FLOAT-WRAPPER (setq temp ele)))
+	  (let ((value FLOAT (nth (input net) i)))
+	    (when (not (eql? value temp))
+	      (setq recursive-conflict? TRUE)
+	      (break))))
+    (when recursive-conflict?
+      (activate-cached-network (cons-list tree))
+      ;; have to keep your own copies of these because someone else is
+      ;; using the same network data structure
+      (setq hidden (new WEIGHT-VECTOR :array-size (length (hidden net))))
+      (setq hidden-error (new WEIGHT-VECTOR :array-size (length (hidden net))))
+      (setq input (new WEIGHT-VECTOR :array-size (length (input net))))
+      (foreach i in (interval 0 (1- (length input))) do
+	    (setf (nth input i) (nth (input net) i)))
+      (foreach h in (interval 0 (1- (length hidden))) do
+	    (setf (nth hidden h) (nth (hidden net) h))))
+    
+    ;; calculate hidden errors
+    (foreach h in (interval 0 (1- (length hidden))) do
+       (setf (nth hidden-error h) (* error (nth (ho net) h)))
+       ;; squash hidden error before passing to input 
+       (setf (nth hidden-error h) 
+	 (* (nth hidden-error h) (nth hidden h) (- 1.0 (nth hidden h)))))
+		    
+    ;; collect input layer errors
+    (foreach i in (interval 0 (1- (length input))) do  
+       (setf (nth input-error i) 0.0)
+       (foreach h in (interval 0 (1- (length hidden))) do
+	  (setf (nth input-error i) 
+	       (+ (nth input-error i) (* (nth hidden-error h)
+					 (2-d-element (ih net) i h))))))
+
+    ;; pass error back to any networks that are in input
+    (foreach input in (rest tree)
+	as i in (interval 1 NULL)
+	where (isa? input @CONS) do
+	  (cached-backpropagate-error input (nth input-error i)))
+
+    ;; Now, do the weight modifications
+    (foreach h in (interval 0 (1- (length hidden))) do
+       (setq delta (+ (* *momentum-term* (nth (ho-delta net) h))
+		      (* *learning-rate* error (nth hidden h))))
+       (setf (nth (ho net) h) (+ (nth (ho net) h) delta))
+       (setf (nth (ho-delta net) h) delta)
+       (foreach i in (interval 0 (1- (length input))) do
+	  ;; modify input to hidden weights
+          (setq delta (+ (* *momentum-term* (2-d-element (ih-delta net) i h))
+			 (* *learning-rate* (nth hidden-error h)
+			    (nth input i))))
+	  (setf (2-d-element (ih net) i h) (+ (2-d-element (ih net) i h) 
+					      delta))
+	  (setf (2-d-element (ih-delta net) i h) delta)))
+    ))
+
+
+(defun cached-quickpropagate-error ((tree CONS) (error FLOAT))
+  (let ((net PROPOSITION-NEURAL-NETWORK null)
+	(temp 0.0)
+	(input WEIGHT-VECTOR null)
+	(hidden WEIGHT-VECTOR null)
+	(input-error WEIGHT-VECTOR null)
+	(recursive-conflict? FALSE))  ;; is there another call to this net?
+    
+    ;; if you have multiple networks divide blame between them based on
+    ;; score
+    (when (isa? (first tree) @CONS)
+      (case *rule-combination*
+	(:MAX 
+	 (let ((max 0.0)
+	       (guilty nil))
+	   (foreach net-def in tree do
+	      (setq net (first (cast net-def CONS)))
+	      (when (> (output net) max)
+		(setq max (output net))
+		(setq guilty net-def)))
+	   (cached-quickpropagate-error guilty error)))
+	(:NOISY-OR
+	 (foreach net-def in tree do
+	    (cached-quickpropagate-error 
+	     net-def (* error (output (cast (first (cast net-def CONS))
+					    PROPOSITION-NEURAL-NETWORK)))))))
+      (return))
+
+    ;; otherwise quickpropagate within that network
+    (setq net (cast (first tree) PROPOSITION-NEURAL-NETWORK))
+    (setq input (input net))
+    (setq hidden (hidden net))
+    (setq input-error (input-error net))
+
+    ;; squash the error by multiplying by the sigmoid derivative
+    (setq error (* error (+ *Sigmoid-Prime-Offset*
+			    (* (output net) (- 1.0 (output net))))))
+
+    ;; check and see if network input disagrees with the cached input
+    ;; if it does, you were overwritten by a recursive call.  Reset the
+    ;; scores and reactivate the neural network.
+    (foreach i in (interval 1 (1- (length (input net))))
+	as ele in (rest tree) do
+	  (typecase ele
+	    (CONS
+	     (if (eql? (length ele) 1)
+		 (setq temp (output (cast (first (cast (first ele) CONS))
+					  PROPOSITION-NEURAL-NETWORK)))
+	       (case *rule-combination*
+		 (:MAX 
+		  (setq temp 0.0)
+		  (foreach net-def in ele do
+		     (when (> (output (cast (first (cast net-def CONS))
+					    PROPOSITION-NEURAL-NETWORK))
+			      temp)
+		       (setq temp (output net)))))
+		 (:NOISY-OR
+		  (let ((scores (CONS of FLOAT-WRAPPER) nil))
+		    (foreach net-def in ele 
+			collect (output (cast (first (cast net-def CONS))
+					      PROPOSITION-NEURAL-NETWORK))
+			into scores)
+		    (setq temp (probabilistic-sum-n scores)))))))
+	    (FLOAT-WRAPPER (setq temp ele)))
+	  (let ((value FLOAT (nth (input net) i)))
+	    (when (not (eql? value temp))
+	      (setq recursive-conflict? TRUE)
+	      (break))))
+    (when recursive-conflict?
+      (activate-cached-network (cons-list tree)))
+
+    (zero-vector input-error)
+    
+    ;; propagate error backwards
+    (foreach h in (interval 0 (1- (length hidden))) do
+       ;; compute gradient for hidden to output weight
+       (setf (nth (ho-slope net) h)
+	 (+ (nth (ho-slope net) h) (* error (nth hidden h))))
+       ;; compute error in hidden units
+       (setq temp 
+	 (* error (nth (ho net) h) (+ *Sigmoid-Prime-Offset*
+				      (* (nth hidden h) 
+					 (- 1.0 (nth hidden h))))))
+       ;; pass error to input units
+       (foreach i in (interval 0 (1- (length input))) do
+	  ;; gradient for weights
+	  (setf (2-d-element (ih-slope net) i h) 
+	        (+ (2-d-element (ih-slope net) i h) (* temp (nth input i))))
+	  ;; error in input units
+	  (setf (nth input-error i) 
+	    (+ (nth input-error i) (* temp (2-d-element (ih net) i h))))))
+
+    ;; pass error back to any networks that are in input
+    (foreach input in (rest tree)
+	as i in (interval 1 NULL)
+	where (isa? input @CONS) do
+	  (cached-quickpropagate-error input (nth input-error i)))))
+
+
+(defun (create-cached-network CONS) ((cons-query CONS))
+  (let ((query (make-query
+                NIL (coerce-to-tree (copy-cons-tree cons-query)) NIL NIL))
+        ;; need to run this query for side-effect:
+	(score (return-partial-truth query TRUE))
+	(tree 
+	 (build-network-tree (proposition (base-control-frame query)) nil)))
+    (ignore score)
+    (when (isa? tree @CONS)
+      (return tree))
+    (return nil)))
+
+(defun (build-network-tree PARSE-TREE) ((prop proposition) (prop-list (cons of  proposition)))
+  ;; This function builds a tree representation of a network and its
+  ;; inputs.  The information is sufficient to replicate the neural
+  ;; network activation using activate-network-tree.
+  (when (member? prop-list prop)
+    (return (match-score prop)))
+  (cond
+   ((not (empty? (support prop)))
+    (let ((proofs (support prop))
+	  (tree nil))
+      (foreach proof in proofs do
+	 (let ((fact (fact proof))
+	       (proof-tree nil))
+	   (foreach arg in (arguments fact) 
+	       as score in (argument-scores proof) 
+	       where (isa? arg @PROPOSITION) 
+	       do (setf (match-score (cast arg proposition)) score)
+	       collect (build-network-tree arg (cons prop prop-list)) 
+	       into proof-tree)
+	   ;; put network at front of tree
+	   (if (defined? (neural-network fact))
+	       (setq tree (cons (cons (neural-network fact) proof-tree) tree))
+	     (setq tree (cons (match-score prop) tree)))))
+      (if (and (empty? (rest tree))
+               (not (cons? (first tree))))
+          ;; KLUDGE (hc): Atomize singleton `(score)' lists, since they are taken
+          ;;    for full-fledged subnetworks by `activate-cached-network'.
+          (return (first tree))
+        (return tree))))
+   ((defined? (neural-network prop))
+    (let ((tree nil))
+      (foreach arg in (arguments prop) 
+	  as i in (interval 1 NULL) 
+	  do (setf (match-score (cast arg PROPOSITION)) 
+	           (nth (input (neural-network prop)) i))
+	  collect (build-network-tree arg (cons prop prop-list)) into tree)
+      (setq tree (cons (neural-network prop) tree))
+      (return (cons-list tree))))
+   (otherwise
+    (return (match-score prop)))))
+
+
+(defun (activate-cached-network FLOAT) ((tree (CONS of CONS)))
+  ;; This function activates a saved network tree.  Since the
+  ;; structure of the network and all of the inputs are cached with
+  ;; the tree, it does not require the PowerLoom backward chainer.
+  (let ((scores (new WEIGHT-VECTOR :array-size (length tree)))
+	(score 0.0)
+	(sum 0.0))
+    (foreach cached-net in tree 
+	as k in (interval 0 NULL) do
+       (let ((net PROPOSITION-NEURAL-NETWORK (first cached-net)))
+         (setq sum 0.0)
+	 (setq score 0.0)
+	 ;; Set up input layer
+	 (setf (nth (input net) 0) 1.0)
+	 (foreach i in (interval 1 (1- (length (input net)))) 
+	     as input in (rest cached-net) do
+	       (if (isa? input @CONS)
+		   (setf (nth (input net) i) (activate-cached-network input))
+		 (setf (nth (input net) i) input)))
+
+	 ;; Activate hidden units
+	 (foreach i in (interval 0 (1- (length (hidden net)))) do
+	    (foreach j in (interval 0 (1- (length (input net)))) do
+               (setq sum (+ sum (* (nth (input net) j) 
+				   (2-d-element (ih net) j i)))))
+	    (setf (nth (hidden net) i) 
+	      (/ 1.0 (+ 1.0 (exp (- sum)))))
+	      
+	    ;;pass hidden activation to the output unit
+	    (setq score (+ score (* (nth (hidden net) i) (nth (ho net) i)))))
+				    
+	 ;; compute output activation
+	 (setf (output net) (/ 1.0 (+ 1.0 (exp (- score)))))
+	 (setf (nth scores k) (output net))))
+    (case *rule-combination*
+      (:MAX
+       (let ((max (nth scores 0)))
+	 (foreach i in (interval 0 (1- (length scores))) do
+	       (when (> (nth scores i) max)
+		 (setq max (nth scores i))))
+	 (return max)))
+      (:NOISY-OR
+       (case (length scores)
+	 (0 (return 0.0))
+	 (1 (return (nth scores 0)))
+	 (2 (return (probabilistic-sum (nth scores 0) (nth scores 1))))
+	 (otherwise (let ((cons-scores nil))
+		      (foreach ele in scores
+			  collect ele into cons-scores)
+		      (return (probabilistic-sum-n cons-scores)))))))))
+
+
+;; The next two functions are experimental.
+
+;(defun assert-background-facts ((data Data-Case) (base-module MODULE))
+;  (setf (training-module data)
+;    ;; create a new module for each data case
+;    (find-or-create-module (concatenate (module-full-name base-module)
+;					"/T" (stringify (id data)))))
+;  (clear-context (training-module data))
+;  (change-module (training-module data))
+;  (foreach fact in (background data) do
+;	(evaluate-logic-command fact false))
+;  (change-module base-module))
+  
+;(defun learn-data-cases ((cycles Integer))
+;  :documentation "The main learning routine for the partial matcher."
+;  (let ((mse float 0.0)
+;	(num-ex 0)
+;	(form CONS nil)
+;	(target float 0.0)
+;	(query QUERY-ITERATOR null)
+;	(prop PROPOSITION null)
+;	(base-module *module*)
+;	(output float 0.0)
+;	(error float 0.0))
+;    ;; assert background facts in each data case module
+;    (print "Asserting background knowledge." EOL)
+;    (foreach data-case in *data-cases* do
+;	  (assert-background-facts data-case base-module))
+;    (print "Beginning learning loop. " EOL)
+;    (foreach cycle in (interval 0 (- cycles 1)) do
+;      (setq mse 0.0)
+;      (setq num-ex 0)  
+;      (shuffle-list *data-cases*)
+;      (foreach data-case in *data-cases* do 
+;	 (change-module (training-module data-case))
+;;;	 (print "Data case " (id data-case) EOL)   
+;	 (shuffle-list *training-examples*)
+;	 (foreach example in (training-examples data-case) do
+;	    ;; Run the partial matcher on the example, collect the error,
+;	    ;; and call backprop to adjust the weights
+;	    (setq form (copy-cons-tree (query example)))
+;	    (setq target (score example))
+;	    (setq query (make-query NIL (coerce-to-tree form) NIL NIL))
+;	    (setq prop (proposition (base-control-frame query)))
+;	    (setq output (return-partial-truth query TRUE))
+;	    (setq error (- target output))
+;	    (++ num-ex)
+;	    (setq mse (+ mse (* error error)))
+;	    (setq *partial-support-cache* (new list)) ;; should this be free?
+;	    (backpropagate-error prop error)))
+;      (when (= (rem cycle 1) 0)
+;	(print "Cycle " cycle " Error: " (/ mse num-ex) EOL)))))
+    
+
+(defun (random-weight FLOAT) ((n FLOAT))
+  ;; generates a random weight between -n and n
+  (when (= (random 2) 1)
+    (return (random-float n)))
+  (return (- 0.0 (random-float n))))
+
+(defun (random-float FLOAT) ((n FLOAT))
+  :public? TRUE
+  :documentation "Generate a random integer in the interval [0..n-1].
+'n' must be <= 2^15."
+  (when (> n 32768)
+    ;; This is a C++ restricition:
+    (error "random: Can only generate random numbers between 0 and (2^15)-1."))
+  (return (* n (/ (random 32768) 32767.0))))
+
+(defun (cons-to-vector VECTOR) ((form CONS))
+  (let ((size (length form))
+	(vect (new vector :array-size size)))
+    (foreach i in (interval 0 (- size 1))
+	do (setf (nth vect i) (nth form i)))
+    (return vect)))
+
+
+(defun (create-vector VECTOR) (&rest (values OBJECT))
+  :documentation "Return a vector containing 'values', in order."
+  :public? TRUE
+  (let ((vector (new VECTOR :array-size (length values))))
+    (foreach v in values
+        as i in (interval 0 NULL)
+        do (setf (nth vector i) v))
+    (return vector)))
+
+(defun zero-vector ((v WEIGHT-VECTOR))
+  (foreach i in (interval 0 (- (length v) 1)) do
+	(setf (nth v i) 0.0)))
+
+
+(defun structured-neural-network-regression  ((class-name SYMBOL) 
+					     (slot-name SYMBOL) 
+					     (cycles INTEGER))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  (setq slot-name (permanentify slot-name))
+  (setq class-name (permanentify class-name))
+  (print "Generating training examples" EOL)
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(slot (surrogate-value-inverse (get-description slot-name)))
+	(ilist (listify (all-class-instances class)))
+	(instances (new (VECTOR of LOGIC-OBJECT) :array-size (length ilist))))
+    (when (not (float-function? slot))
+      (print "ERROR " slot-name " is not a function of type float or integer" EOL)
+      (return))
+
+    (foreach i in (interval 0 (1- (length ilist))) 
+	as instance in ilist do
+	  (setf (nth instances i) instance))
+    (clear-cases)
+    (generate-regression-rule-wo-slot instances slot-name class-name TRUE)
+    (let ((num (generate-regression-training-examples instances slot)))
+	(print "Training regression networks" EOL)
+	(train-cached-neural-networks cycles num))))
+
+
+(defun (get-nn-nearest-neighbors (LIST of TRAINING-EXAMPLE))
+    ((probe TRAINING-EXAMPLE) 
+     (cases (List of TRAINING-EXAMPLE))
+     (k INTEGER))
+  ;; uses the neural network hidden layer as a feature vector to compare
+  ;; a probe example with different examples in the cases
+  (let ((result (new (LIST of TRAINING-EXAMPLE)))
+	(current-module *module*) ;; save current module
+	(neighbors (new (VECTOR of TRAINING-EXAMPLE) :array-size k))
+	(farthest 0)
+	(distance FLOAT 0.0)
+	(distances (new (VECTOR of FLOAT-WRAPPER) :array-size k)))
+    (shuffle-list cases)
+    (foreach i in (interval 0 (1- k)) do ;; initialize distances
+	(setf (nth distances i) 999999.0))
+    (setf (nn-hidden probe) (create-hidden-signature (query probe)))
+;;    (print "signature: " (nn-hidden probe) EOL)
+    ;; fill out nn-hidden signatures for each training example
+    ;; TODO: Look at time stamp to decide if you need to recreate
+    ;; hidden signature
+    (foreach case in cases do
+	(when (null? (nn-hidden case)) 
+	  (when (defined? (module case))
+	    (change-module (module case)))
+	  (when (null? (nn-hidden case))
+	    (setf (nn-hidden case) (create-hidden-signature (query case))))
+	  (change-module current-module))
+	(setq distance (+ (euclidean-distance (nn-hidden probe) (nn-hidden case))
+			  0.0))
+	(when *Print-Case-Distances*
+	  (print "  Distance from " (last (query case)) ": " distance EOL))
+	(setf (temp case) distance)
+	(when (< distance (nth distances farthest))
+	  (setf (nth distances farthest) distance)
+	  (setf (nth neighbors farthest) case)
+          ;; recalculate farthest
+	  (setq farthest 0)
+	  (foreach j in (interval 1 (1- k)) do
+		(when (> (nth distances j) (nth distances farthest))
+		  (setq farthest j)))))
+    (foreach i in (interval 0 (1- k))
+	where (defined? (nth neighbors i))
+	collect (nth neighbors i) into result)
+    (return result)))
+  
+
+
+;;
+;; Saving and loading networks support
+;;
+
+(defun swap-in-new-networks ((old-nets (list of proposition-neural-network))
+			     (new-nets (list of proposition-neural-network)))
+  :command? TRUE  :public? TRUE
+  ;; This command is used for loading in saved neural networks.  It is
+  ;; fairly brittle, in that the networks must have been created in the
+  ;; same way.
+  (foreach old-net in old-nets
+      as new-net in new-nets do
+	(setf (neural-network (proposition old-net)) new-net)
+	(setf (proposition new-net) (proposition old-net)))
+  (setq *master-neural-network-list* new-nets))
+
+(defun swap-in-network-file ((file string))
+  :command? TRUE  :public? TRUE
+  (let ((new-nets (load-neural-network-file file)))
+    ;; check and see if they match up
+    (foreach old-net in *master-neural-network-list* 
+	as new-net in new-nets do
+	  (when (or (not (eql? (length (input old-net))
+			       (length (input new-net))))
+		    (not (eql? (length (hidden old-net))
+			       (length (hidden new-net)))))
+	    (print "Error: network file does not match master list" EOL)
+	    (return)))
+    (swap-in-new-networks *master-neural-network-list* new-nets)))
+
+(defun (load-neural-network-file (LIST of PROPOSITION-NEURAL-NETWORK))
+    ((file STRING))
+  :command? TRUE  :public? TRUE
+  (let ((nets (new (LIST of PROPOSITION-NEURAL-NETWORK)))
+	(stream (new INPUT-FILE-STREAM :filename file))
+	(num-hidden INTEGER 0)
+	(prop CONS nil)
+	(temp OBJECT NULL)
+	(num-in INTEGER 0)
+	(net PROPOSITION-NEURAL-NETWORK null))
+    (loop
+      (when (not (eql? (read-s-expression stream) (quote defnetwork)))
+	(return (reverse nets)))
+      (setq prop (read-s-expression stream))
+      (setq num-in (read-s-expression stream))
+      (setq num-hidden (read-s-expression stream))
+      (setq net (allocate-neural-network num-in num-hidden))
+      (foreach i in (interval 0 (1- num-in))
+	  do (foreach h in (interval 0 (1- num-hidden))
+		 do (setq temp (read-s-expression stream))
+		    ;; stella reads 0 as an integer - I want read-float!
+		    (when (eql? temp zero-wrapper)
+		      (setq temp 0.0))
+		    (setf (2-d-element (ih net) i h) temp)))
+      (foreach h in (interval 0 (1- num-hidden))
+	  do (setf (nth (ho net) h) (read-s-expression stream)))
+      (push nets net))))
+
+(defun save-all-neural-networks ((file string))
+  :documentation "Save all neural networks to `file' (if `file' is non-NULL).
+If networks are saved periodically (see `set-save-network-cycle') this file
+name will be used to perform periodic saves."
+  :command? TRUE  :public? TRUE
+  (setq *Save-Network-File* file)
+  (when (defined? file)
+    (print "Saving networks" EOL)
+    (let ((fptr (new OUTPUT-FILE-STREAM :filename file)))
+      (foreach net in *master-neural-network-list* do
+            (print-neural-network net fptr)
+            (print-stream fptr EOL))
+      (free fptr))))
+
+(defun save-neural-network ((net proposition-neural-network)
+				 (file string))
+  :command? TRUE  :public? TRUE
+  ;; save's a neural network from a named rule into a file
+  (let ((fptr (new OUTPUT-FILE-STREAM :filename file)))
+    (print-neural-network net fptr)
+    (free fptr)))
+
+(defun print-neural-network ((net proposition-neural-network)
+			     (stream OUTPUT-STREAM))
+    (print-stream stream "defnetwork " EOL)
+    (print-proposition (proposition net) stream FALSE)
+    (print-stream stream EOL)
+    (print-stream stream (length (input net)) " " (length (hidden net)) EOL)
+    (foreach i in (interval 0 (1- (length (input net)))) do
+	  (foreach j in (interval 0 (1- (length (hidden net)))) do
+		(let ((value FLOAT (2-d-element (ih net) i j)))
+		  (print-stream stream " " value))))
+					
+    (print-stream stream EOL)
+    (foreach num in (ho net) do
+	  (let ((value FLOAT num))
+	    (print-stream stream " " value)))
+    (print-stream stream EOL))
+
+(defun (create-hidden-signature WEIGHT-VECTOR) ((cons-query CONS))
+  ;; create-hidden-signature generates a propositional hidden vector
+  ;; for a particular query.  This works by calling the partial
+  ;; matcher and then recording the hidden layer activations of the
+  ;; neural network associated with the antecedent of the first rule
+  ;; backchained on.
+  (let ((query (make-query nil (copy-cons-tree cons-query) nil nil))
+	(pmf NN-PARTIAL-MATCH NULL)
+	(net PROPOSITION-NEURAL-NETWORK NULL)
+	(result WEIGHT-VECTOR NULL))
+    (insert-at (options query) :MATCH-MODE :NN)
+    (insert-at (options query) :MAXIMIZE-SCORE? TRUE-WRAPPER)
+    (call-ask-partial query)
+    ;; THIS IS UGLY AND VERY FRAGILE (hc):
+    ;; first pmf is :pattern, second :strategies, third :and
+    (setq pmf (child (child (partial-match-frame (base-control-frame query)))))
+    (setq net (neural-network (proposition (control-frame pmf))))
+    (setq result (new WEIGHT-VECTOR :array-size (length (hidden net))))
+    (foreach i in (interval 0 (1- (length (hidden net)))) do
+	  (setf (nth result i) (nth (hidden net) i)))
+    (return result)))
+
+
+;; 2 dimensional array support
+
+  ;;
+;;;;;; Two-dimensional arrays
+  ;;
+
+(defclass MULTI-DIMENSIONAL-ARRAY (ABSTRACT-COLLECTION))
+
+(defclass 2-D-ARRAY (MULTI-DIMENSIONAL-ARRAY)
+  :documentation "Two-dimensional arrays with elements of type OBJECT."
+  :parameters ((any-value :type OBJECT))
+  :slots ((nof-rows :type INTEGER :required? TRUE)
+          (nof-columns :type INTEGER :required? TRUE)
+          (the-array :type (NATIVE-VECTOR OF (LIKE (any-value self)))))
+  :initializer initialize-2-D-array
+  :print-form (print-array self stream))
+
+(defun initialize-2-D-array ((self 2-D-ARRAY))
+  (let ((vector
+         (new VECTOR :array-size (* (nof-rows self) (nof-columns self)))))
+    (setf (the-array self) (the-array vector))
+    (setf (the-array vector) NULL)))
+
+(defmethod (2-D-element (LIKE (any-value self)))
+    ((array 2-D-ARRAY) (row INTEGER) (column INTEGER))
+  :documentation "Return the element of `array' at position [`row', `column']."
+  :globally-inline? TRUE :public? TRUE
+  (return (nth (the-array array) (+ (* row (nof-columns array)) column))))
+
+(defmethod (2-D-element-setter (LIKE (any-value self)))
+    ((array 2-D-ARRAY) (value OBJECT) (row INTEGER) (column INTEGER))
+  :documentation "Set the element of `array' at position [`row', `column']
+to `value' and return the result."
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (setf (nth (the-array array) (+ (* row (nof-columns array)) column))
+      value)))
+
+(defun (create-2-D-array 2-D-ARRAY)
+    ((nof-rows INTEGER) (nof-columns INTEGER) &rest (values OBJECT))
+  :documentation "Create a two-dimensional array with `nof-rows' rows and
+`nof-columns' columns, and initialize it in row-major-order from `values'.
+Missing values will be padded with NULL, extraneous values will be ignored."
+  :public? TRUE
+  (let ((array (new 2-D-ARRAY :nof-rows nof-rows :nof-columns nof-columns))
+        (nativeArray (the-array array)))
+    (foreach i in (interval 0 (1- (* nof-rows nof-columns)))
+        as value in values
+        do (setf (nth nativeArray i) value))
+    (return array)))
+
+(defmethod fill-array ((self 2-D-ARRAY) &rest (values OBJECT))
+  :documentation "Fill the two-dimensional array `self' in row-major-order
+from `values'.  Missing values will retain their old values, extraneous values
+will be ignored."
+  :public? TRUE
+  (let ((nativeArray (the-array self)))
+    (foreach i in (interval 0 (1- (* (nof-rows self) (nof-columns self))))
+        as value in values
+        do (setf (nth nativeArray i) value))))
+
+(defmethod print-array ((self 2-D-ARRAY) (stream NATIVE-OUTPUT-STREAM))
+  :documentation "Print the array `self' to `stream'."
+  (let ((nof-rows (nof-rows self))
+        (nof-columns (nof-columns self))
+        (limit 9))
+    (print-native-stream stream "|i|[")
+    (foreach row in (interval 0 (1- nof-rows))
+        do (print-native-stream stream "[")
+           (foreach column in (interval 0 (1- nof-columns))
+               do (print-native-stream stream (2-D-element self row column))
+                  (cond ((> column limit)
+                         (print-native-stream stream " ...]")
+                         (break))
+                        ((< column (1- nof-columns))
+                         (print-native-stream stream " "))
+                        (otherwise
+                         (print-native-stream stream "]"))))
+           (cond ((> row limit)
+                  (print-native-stream stream " ...]")
+                  (break))
+                 ((< row (1- nof-rows))
+                  (print-native-stream stream " "))
+                 (otherwise
+                  (print-native-stream stream "]"))))))
+
+;;; Temporary kludges for float vectors and arrays:
+
+
+(defclass FLOAT-VECTOR (ABSTRACT-COLLECTION SEQUENCE-MIXIN)
+  :parameters ((any-value :type FLOAT))
+  :public-slots ((array-size :type INTEGER :required? TRUE))
+  :slots ((the-array :type (NATIVE-VECTOR OF FLOAT-WRAPPER)))
+  :print-form (print-vector self stream)
+  :initializer initialize-float-vector)
+
+(defun initialize-float-vector ((self FLOAT-VECTOR))
+  (let ((vector (new VECTOR :array-size (array-size self))))
+    (foreach i in (interval 0 (1- (length vector)))
+        do (setf (nth vector i) (new FLOAT-WRAPPER :wrapper-value NULL)))
+    (setf (the-array self)
+      (safe-cast (the-array vector) (NATIVE-VECTOR OF FLOAT-WRAPPER)))
+    (setf (the-array vector) NULL)))
+
+(defun (create-float-vector FLOAT-VECTOR) (&rest (values FLOAT))
+  :documentation "Return a vector containing 'values', in order."
+  :public? TRUE
+  (let ((vector (new FLOAT-VECTOR :array-size (length values))))
+    (foreach v in values
+        as i in (interval 0 NULL)
+        do (setf (nth vector i) v))
+    (return vector)))
+
+(defmethod print-vector ((self FLOAT-VECTOR) (stream NATIVE-OUTPUT-STREAM))
+  (if (eq? (length self) 0)
+      (print-native-stream stream "|i|[]")
+    (let ((i 0)
+          (limit 9))
+      (print-native-stream stream "|i|[")
+      (foreach element in self
+               do
+               (print-native-stream stream element)
+               (++ i)
+               (when (> i limit) (break))
+               (when (< i (length self))
+                 (print-native-stream stream " ")))
+      (if (or (<= i limit)
+              (eq? i (length self)))
+          (print-native-stream stream "]")
+        (print-native-stream stream " ...]")))))
+
+(defmethod (empty? BOOLEAN) ((self FLOAT-VECTOR))
+  :documentation "Return TRUE if 'self' has length 0."
+  :globally-inline? TRUE
+  (return (eql? (array-size self) 0)))
+
+(defmethod (non-empty? BOOLEAN) ((self FLOAT-VECTOR))
+  :documentation "Return TRUE if 'self' has length > 0."
+  :globally-inline? TRUE
+  (return (> (array-size self) 0)) )
+
+(defmethod (nth FLOAT) ((self FLOAT-VECTOR) (position INTEGER))
+  :globally-inline? TRUE
+  (return (safe-cast (nth (the-array self) position) FLOAT-WRAPPER)))
+
+(defmethod (nth-setter FLOAT)
+    ((self FLOAT-VECTOR) (value FLOAT) (position INTEGER))
+  :globally-inline? TRUE
+  (return
+    (setf (wrapper-value
+           (safe-cast (nth (the-array self) position) FLOAT-WRAPPER))
+      value)))
+
+(defmethod (length INTEGER) ((self FLOAT-VECTOR))
+  :globally-inline? TRUE
+  (return (array-size self)))
+
+(defmethod (member? BOOLEAN) ((self FLOAT-VECTOR) (object FLOAT))
+  (let ((array (the-array self)))
+    (foreach i in (interval 0 (1- (length self)))
+             where (= (wrapper-value (safe-cast (nth array i) FLOAT-WRAPPER))
+                      object)
+             do (return TRUE))
+    (return FALSE) ))
+
+(defclass 2-D-FLOAT-ARRAY (MULTI-DIMENSIONAL-ARRAY)
+  :documentation "Two-dimensional arrays with elements of type FLOAT."
+  :parameters ((any-value :type FLOAT))
+  :slots ((nof-rows :type INTEGER :required? TRUE)
+          (nof-columns :type INTEGER :required? TRUE)
+          (the-array :type (NATIVE-VECTOR OF FLOAT-WRAPPER)))
+  :initializer initialize-2-D-float-array
+  :print-form (print-array self stream))
+
+(defun initialize-2-D-float-array ((self 2-D-FLOAT-ARRAY))
+  (let ((vector
+         (new VECTOR :array-size (* (nof-rows self) (nof-columns self)))))
+    (foreach i in (interval 0 (1- (length vector)))
+        do (setf (nth vector i) (new FLOAT-WRAPPER :wrapper-value NULL)))
+    (setf (the-array self)
+      (safe-cast (the-array vector) (NATIVE-VECTOR OF FLOAT-WRAPPER)))
+    (setf (the-array vector) NULL)))
+
+(defmethod (2-D-element FLOAT)
+    ((array 2-D-FLOAT-ARRAY) (row INTEGER) (column INTEGER))
+  :documentation "Return the element of `array' at position [`row', `column']."
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (safe-cast (nth (the-array array) (+ (* row (nof-columns array)) column))
+               FLOAT-WRAPPER)))
+
+(defmethod (2-d-element-setter (LIKE (any-value self)))
+    ((array 2-D-FLOAT-ARRAY) (value FLOAT) (row INTEGER) (column INTEGER))
+  :documentation "Set the element of `array' at position [`row', `column']
+to `value' and return the result."
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (setf (wrapper-value
+           (safe-cast
+            (nth (the-array array) (+ (* row (nof-columns array)) column))
+            FLOAT-WRAPPER))
+      value)))
+
+(defun (create-2-D-float-array 2-D-FLOAT-ARRAY)
+    ((nof-rows INTEGER) (nof-columns INTEGER) &rest (values FLOAT))
+  :documentation "Create a two-dimensional array with `nof-rows' rows and
+`nof-columns' columns, and initialize it in row-major-order from `values'.
+Missing values will be padded with NULL, extraneous values will be ignored."
+  :public? TRUE
+  (let ((array (new 2-D-FLOAT-ARRAY :nof-rows nof-rows :nof-columns nof-columns))
+        (nativeArray (the-array array)))
+    (foreach i in (interval 0 (1- (* nof-rows nof-columns)))
+        as value in values
+        do (setf (wrapper-value (safe-cast (nth nativeArray i) FLOAT-WRAPPER))
+             value))
+    (return array)))
+
+(defmethod fill-array ((self 2-D-FLOAT-ARRAY) &rest (values FLOAT))
+  :documentation "Fill the two-dimensional array `self' in row-major-order
+from `values'.  Missing values will retain their old values, extraneous values
+will be ignored."
+  :public? TRUE
+  (let ((nativeArray (the-array self)))
+    (foreach i in (interval 0 (1- (* (nof-rows self) (nof-columns self))))
+        as value in values
+        do (setf (wrapper-value (safe-cast (nth nativeArray i) FLOAT-WRAPPER))
+             value))))
+
+(defmethod print-array ((self 2-D-FLOAT-ARRAY) (stream NATIVE-OUTPUT-STREAM))
+  :documentation "Print the array `self' to `stream'."
+  (let ((nof-rows (nof-rows self))
+        (nof-columns (nof-columns self))
+        (limit 9))
+    (print-native-stream stream "|i|[")
+    (foreach row in (interval 0 (1- nof-rows))
+        do (print-native-stream stream "[")
+           (foreach column in (interval 0 (1- nof-columns))
+               do (print-native-stream stream (2-d-element self row column))
+                  (cond ((> column limit)
+                         (print-native-stream stream " ...]")
+                         (break))
+                        ((< column (1- nof-columns))
+                         (print-native-stream stream " "))
+                        (otherwise
+                         (print-native-stream stream "]"))))
+           (cond ((> row limit)
+                  (print-native-stream stream " ...]")
+                  (break))
+                 ((< row (1- nof-rows))
+                  (print-native-stream stream " "))
+                 (otherwise
+                  (print-native-stream stream "]"))))))
+
+
+;;; Example:
+#|
+(eval
+ (let ((array (create-2-D-float-array 2 2 1.0 2.0 3.0 4.0)))
+   ;; read elements with `2-D-element':
+   (print (+ (2-D-element array 1 1) 0.2) EOL)
+   ;; write elements with `setf':
+   (setf (2-D-element array 1 1) 1.3)
+   (print array EOL)))
+|#
+
+
+
+;;;
+;;;  Default neural network weights.  
+;;;
+
+;; These vectors hold the weights of neural networks of a given arity
+;; (number of inputs) that compute specific functions like averaging
+;; or maxing their inputs.
+;;
+;; Weights are encoded in the following manner:
+;;
+;;   h0-bias h0-i0-weight h0-i1-weight h1-bias h1-i0-weight h1-i1-weight
+;;   O-h0-weight O-h1-weight
+
+;; 2 layer networks that compute the average of their input activations

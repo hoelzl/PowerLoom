@@ -1,0 +1,1129 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: rules.ste,v 1.48 2006/05/11 07:05:35 hans Exp
+
+;;; Routines that manipulate implication rules.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Skolem functions
+  ;;
+
+;; PROBABLY A WRONG IDEA:
+
+;(defclass SKOLEM-FUNCTION-RECORD (STANDARD-OBJECT)
+;  :documentation "Attached to a variable, allows the variable to be
+;manipulated as a skolem function."
+;  :slots
+;  ((skolemized-propositions :type (LIST OF PROPOSITION)
+;                            :allocation :embedded)
+;   (total? :type BOOLEAN)) )
+;
+;(defun (total-proposition? BOOLEAN) ((proposition PROPOSITION))
+;  (case (kind proposition)
+;    (:FUNCTION
+;     ;; BUG: FIX THIS TO LOOK FOR NEGATION OF 'total' PREDICATE, AFTER WE
+;     ;;    INVENT ONE:
+;     (return TRUE))
+;    (:PREDICATE
+;     (return FALSE)
+;;     (return (test-property?
+;;              (surrogate-value (relationRef proposition)) PL-KERNEL/@TOTAL))
+;     )
+;    (otherwise (return FALSE))) )
+
+;(defun help-compute-skolem-functions 
+;       ((variable PATTERN-VARIABLE) (proposition PROPOSITION))
+;  ;; Search 'proposition' or propositions nested within it for
+;  ;;    ones that 'define' the existential variable 'variable'.
+;  ;; Put each such function into the skolem function record for 'variable'.
+;  (let ((arguments (arguments proposition)))
+;    (case (kind proposition)
+;      (:AND (foreach arg in arguments
+;                     do (help-compute-skolem-functions variable arg)))
+;      ((:ISA :PREDICATE :FUNCTION)
+;       (when (exists arg in arguments where (eql? arg variable))
+;         ;; add 'proposition' to the list of skolemized propositions:
+;         (when (null? (skolem-function-record variable))
+;           (setf (skolem-function-record variable) (new SKOLEM-FUNCTION-RECORD)))
+;         (insert (skolemized-propositions (skolem-function-record variable))
+;                 proposition)))
+;      (:EXISTS (safety 3 FALSE "Exists where none should be."))
+;      (otherwise NULL)) ))
+
+;(defun compute-skolem-functions 
+;       ((existsProposition PROPOSITION) (total? BOOLEAN))
+;  ;; Compute a skolem function record for each existentially-quantified
+;  ;;    variable in 'existsProposition'
+;  (foreach v in (io-variables existsProposition)
+;           where (null? (skolem-function-record v))
+;           do
+;           (help-compute-skolem-functions v (first (arguments existsProposition)))
+;           (let ((sfRecord (skolem-function-record v)))
+;           ;; determine whether or not the skolem function is total:
+;           (when (and (defined? sfRecord)
+;                      (or total?
+;                          (forall p in (skolemized-propositions sfRecord)
+;                                  always
+;                                  (and (total-proposition? p)
+;                                       (eql? v (last-argument p))))))
+;             (setf (total? sfRecord) TRUE)))) )
+
+
+  ;;
+;;;;;; Support routines for finding heads and tails of IMPLIES rules
+  ;;
+
+(defun (find-matchable-goals (LIST OF PROPOSITION))
+       ((forallProp PROPOSITION) (headOrTail KEYWORD))
+  ;; Scan either the head or tail of 'forallProp' looking for goals that
+  ;;    can serve as a matchable rule head or tail.  Return all goals found.
+  ;; Called by 'derive-satellite-rules'.
+  (let ((index (choose (eql? headOrTail :HEAD) 1 0))
+        (proposition PROPOSITION (nth (arguments forallProp) index))
+        (variables NIL)
+        (resultList (new LIST)))
+    (foreach v in (io-variables forallProp) do (pushq variables v))
+    (when (> (length variables) 1)
+      (case headOrTail
+        (:TAIL
+         (case (kind proposition)
+           (:AND
+            (foreach g in (arguments proposition)
+                     do (collect-matching-rule-goals g variables :TAIL resultList))
+            (return resultList))
+           (:EXISTS
+            (let ((existsBody PROPOSITION (first (arguments proposition))))
+              (when (eql? (kind existsBody) :AND)
+                (foreach g in (arguments existsBody)
+                         do (collect-matching-rule-goals g variables :TAIL resultList))))
+            (return resultList))
+           (otherwise NULL)))
+        (otherwise NULL)))
+    (collect-matching-rule-goals proposition variables headOrTail resultList)
+    (return resultList) ))
+
+(defun collect-matching-rule-goals
+       ((proposition PROPOSITION) (topLevelVars CONS)
+        (headOrTail KEYWORD) (collection (LIST OF PROPOSITION)))
+  ;; Helping function for 'find-matchable-goals'.
+  ;; If 'goal' can be matched to a named description and if its
+  ;;    variables belong to 'topLevelVars', push it onto 'collection'.
+  ;; Searches AND, OR, and EXISTS for nested goals.
+  (case (kind proposition)
+    ((:AND :OR)
+     (case headOrTail
+       (:HEAD
+        (foreach arg in (arguments proposition)
+                 do (collect-matching-rule-goals arg topLevelVars headOrTail collection)))
+       (:TAIL
+        (let ((goalCount (length collection)))
+          ;; if there are any goals collectable other than a goal representing
+          ;;    a variable type, collect only those other goals:
+          (foreach arg in (arguments proposition)
+                   do 
+                   (collect-matching-rule-goals arg topLevelVars headOrTail collection))
+          (when (eql? goalCount (length collection))    ; no other goals collected?
+            (foreach arg in (arguments proposition)
+                     do 
+                     (collect-matching-rule-goals
+                      arg topLevelVars headOrTail collection)))))))
+    (:EXISTS
+     (case headOrTail
+       (:HEAD
+        ;; NOT SURE IF WE SHOULD ADD EXISTENTIALLY-QUANTIFIED VARIABLES
+        ;;   TO 'topLevelVars' FOR BWD CHAINING (BUT WE NEED IT FOR FORWARD):
+        (collect-matching-rule-goals
+         (first (arguments proposition)) topLevelVars headOrTail collection))
+       (:TAIL
+        ;; add to list of top level variables:
+        (foreach v in (io-variables proposition) do (pushq topLevelVars v))
+        (collect-matching-rule-goals
+         (first (arguments proposition)) topLevelVars headOrTail collection))))
+    (:FORALL
+     (case headOrTail
+       (:HEAD 
+        ;; add to list of top level variables:
+        (foreach v in (io-variables proposition) do (pushq topLevelVars v))
+        (collect-matching-rule-goals
+         (second (arguments proposition)) topLevelVars headOrTail collection))
+       (:TAIL
+       ;; THIS APPEARS TO BE A DISASTER (TOO MANY FORWARD GOALS):
+;        ;; add to list of top level variables:
+;        (foreach v in (io-variables proposition) do (pushq topLevelVars v))
+;        (collect-matching-rule-goals
+;         (first (arguments proposition)) topLevelVars headOrTail collection)
+        )))
+    ((:ISA :PREDICATE :FUNCTION :NOT :IMPLIES)
+     (when (and (forall a in (extract-goal-arguments proposition)
+                        always (or (member? topLevelVars a)
+                                   (not (isa? a @PATTERN-VARIABLE))))
+                (defined? (extract-goal-description proposition headOrTail))
+                (not (eql? (operator proposition) PL-KERNEL/@HOLDS)))
+       (insert collection proposition)))
+    (otherwise NULL)) )
+
+(defun (atomic-forall-argument? BOOLEAN)
+    ((forallProp PROPOSITION) (headOrTail KEYWORD))
+  ;; Return TRUE if the relevant argument of 'forallProp' is atomic, and if it
+  ;;    can be used as the goal of a forward or backward chaining operation.
+  (return
+    (atomic-goal-proposition?
+     (choose (eql? headOrTail :HEAD)
+             (nth (arguments forallProp) 1)
+             (nth (arguments forallProp) 0)))))
+
+(defun (atomic-goal-proposition? BOOLEAN) ((proposition PROPOSITION))
+  ;; Return TRUE if `proposition' is atomic for the purpose of being
+  ;;    used as the goal of a forward or backward chaining operation.
+  (case (kind proposition)
+    ((:ISA :PREDICATE :FUNCTION :IMPLIES)
+     (return (defined? (extract-goal-description proposition NULL))))
+    (:NOT
+     ;; Separate case to avoid forcing the generation of a complement
+     ;;    description if we are just testing:
+     (return
+       (defined? (extract-goal-description 
+                  (first (arguments proposition)) NULL))))
+    (:AND
+     (let ((count 0))
+       (foreach conjunct in (safe-cast (arguments proposition)
+                                       (VECTOR OF PROPOSITION))
+           do (if (and (not (eql? (kind conjunct) :AND))
+                       (atomic-goal-proposition? conjunct))
+                  (++ count)
+                (return FALSE)))
+       (return (eql? count 1))))
+    (otherwise
+     (return FALSE))))
+
+(defun (atomic-goal-description? BOOLEAN) ((description DESCRIPTION))
+  ;; Return TRUE if `description' is (or can be) an atomic head or tail
+  ;;    of an IMPLIES rule.
+  (when (named-description? description)
+    (return TRUE))
+  (let ((complement (relative-complement description)))
+    (if (and (defined? complement)
+             (named-description? complement))
+      (return TRUE)
+      (return (atomic-goal-proposition? (proposition description))))))
+
+(defun (variable-arity-goal-proposition? BOOLEAN) ((proposition PROPOSITION))
+  ;; Return TRUE if 'proposition' is a variable arity :PREDICATE or :FUNCTION
+  (case (kind proposition)
+    ((:PREDICATE :FUNCTION)
+     (let ((description (extract-goal-description proposition NULL)))
+       (return (and (defined? description)
+                    (variable-arity? description)))))
+    (otherwise NULL))
+  (return FALSE) )
+
+
+  ;;
+;;;;;; Making IMPLIES propositions from FORALL propositions
+  ;; 
+
+;; TO DO: INVENT AN ANNOTATION ATTACHED TO SLOTS THAT MEANS DON'T CHAIN
+;;    ON THIS SLOT (OR FIGURE OUT SOMETHING BETTER THAT ACCOMODATES 
+;;    CHAINING ON ONLY A FIXED SET OF RULES):
+(defun (chainable-relation? BOOLEAN)
+       ((description NAMED-DESCRIPTION) (headOrTail KEYWORD))
+  ;; Return TRUE if 'slot' can be used as the head or tail of an 
+  ;;    IMPLIES rule.
+  (when (null? headOrTail)
+    (return TRUE))
+  (let ((nonPermittedPredicates CONS NULL))
+    (case headOrTail
+      (:TAIL
+       (setq nonPermittedPredicates
+             (quote (PL-KERNEL/@HOLDS
+                     PL-KERNEL/@MEMBER-OF
+                     PL-KERNEL/@INSTANCE-OF
+                     PL-KERNEL/@SUBSET-OF
+                     @NUMBER-WRAPPER.PLUS @NUMBER-WRAPPER.MINUS
+                     @NUMBER-WRAPPER.TIMES @NUMBER-WRAPPER.DIVIDE
+                     ))))
+      (:HEAD
+       (setq nonPermittedPredicates
+             (quote (@NUMBER-WRAPPER.PLUS @NUMBER-WRAPPER.MINUS
+                     @NUMBER-WRAPPER.TIMES @NUMBER-WRAPPER.DIVIDE
+                     )))))
+    (return (not (member? nonPermittedPredicates
+                          (surrogate-value-inverse description)))) ))
+
+(defun (extract-goal-description DESCRIPTION) ((goal PROPOSITION) (headOrTail KEYWORD))
+  ;; Return a description corresponding to the relation referenced in 'goal'.
+  ;; If 'goal' is a :NOT, then return the complement of its argument.
+  ;; A NULL return value indicates that 'goal' does not map to a named
+  ;;    description or the complement of one.
+  ;; Certain predicates are disallowed as goal descriptions.  'direction'
+  ;;    determines whether we disallow more or fewer, or none if it's NULL.
+  (let ((arguments (arguments goal)))
+    (case (kind goal)
+      ((:ISA :PREDICATE :FUNCTION :IMPLIES)
+       ;; Check for surrogate operator, so we won't break on undefined
+       ;;    functions during normalization:
+       (when (isa? (operator goal) @SURROGATE)
+         (let ((description (get-description (relationRef goal))))
+           (when (null? description)
+             (signal-proposition-error "Can't finalize relations because relation "
+                   (symbol-name (relationRef goal)) " is undefined."))
+           (when (chainable-relation? description headOrTail)
+             (return description)))))
+      (:NOT
+       (let ((argumentDescription
+              (extract-goal-description (first arguments) headOrTail)))
+         (when (defined? argumentDescription)
+           (return (get-complement-of-goal-description argumentDescription)))))
+      (otherwise NULL))
+    (return NULL) ))
+
+(defun (extract-goal-arguments CONS) ((goal PROPOSITION))
+  ;; Return a list of arguments (variables and constants) found in 'goal',
+  ;;    which is either an :ISA, :PREDICATE, :FUNCTION, :NOT, or :IMPLIES.
+  (let ((arguments (arguments goal)))
+    (case (kind goal)
+      ((:ISA :PREDICATE :FUNCTION :IMPLIES)
+       (let ((result NIL))
+         (foreach arg in arguments collect arg into result)
+         (return result)))
+      (:NOT (return (extract-goal-arguments (first arguments))))
+      (otherwise (return NIL))) ))
+
+(defun (substitute-proposition PROPOSITION) 
+       ((proposition PROPOSITION) (outProp PROPOSITION) (inProp PROPOSITION))
+  ;; Replace all argument references to 'outProp' in 'proposition' with
+  ;;    'inProp'.
+  ;; If 'outProp' equals 'proposition', return 'inProp' else return 'proposition'.
+  (when (eql? proposition outProp)
+    (return inProp))
+  (foreach arg in (arguments proposition)
+      as i in (interval 0 NULL)
+      do (cond
+	  ((eql? arg outProp)
+	   (setf (nth (arguments proposition) i) inProp))
+	  ((isa? arg @PROPOSITION)
+	   (substitute-proposition arg outProp inProp))))
+  (return proposition) )
+
+(defun (extract-inverted-goal PROPOSITION)
+    ((proposition PROPOSITION) (goal PROPOSITION))
+  ;; Find the inversion of `goal' in `proposition' and return it.
+  ;; At call-time `proposition' is an inverted head or tail and
+  ;;    goal is the goal proposition saved before the inversion.
+  ;;    However, the inversion might have already destructively
+  ;;    modified it.
+  ;; THIS IS A KLUDGE: It tries to deal with the fact that
+  ;;    `invert-proposition' is only sometimes destructive.
+  ;; TO DO: WE MIGHT HAVE TO RECORD WHETHER THE ORIGINAL GOAL WAS
+  ;;    ACTUALLY NEGATED OR NOT BEFORE THE INVERSION IS DONE TO
+  ;;    FIND ITS NEGATION CORRECTLY IN ALL CASES.
+  (when (eql? (kind goal) :NOT)
+    (return (extract-inverted-goal proposition (first (arguments goal)))))
+  (case (kind proposition)
+    (:NOT (if (equivalent-propositions?
+               (first (arguments proposition)) goal NULL)
+              (return proposition)
+            (return
+              (extract-inverted-goal (first (arguments proposition)) goal))))
+    ((:AND :OR)
+     (let ((result PROPOSITION NULL))
+       (foreach arg in (arguments proposition)
+           do (setq result (extract-inverted-goal arg goal))
+              (when (defined? result)
+                (return result)))))
+    (otherwise
+     (when (equivalent-propositions? proposition goal NULL)
+       (return proposition))))
+  (return NULL))
+
+(defun (invert-forall-around-goal PROPOSITION)
+       ((forallProp PROPOSITION) (goal PROPOSITION)
+        (headOrTail KEYWORD) (contrapositive? BOOLEAN))
+  ;; 'goal' exists within 'headOrTail' of 'forallProp'.
+  ;; If 'contrapositive?', convert 'forallProp' into the contrapositive
+  ;;    and negate 'goal'.
+  ;; For 'headOrTail' = :HEAD, make a copy of 'forallProp', construct
+  ;;    a new tail as:
+  ;;    (not (or (not <tail>) <headPrime>))
+  ;;   where '<headPrime>' is the original head with 'goal' replaced
+  ;;   by FALSE.
+  ;; Otherwise, the new head is
+  ;;   (or (not <tailPrime>) <head>)
+  ;;   where '<tailPrime>' is the original tail with 'goal' replaced by TRUE.
+  ;; Make (a copy of) 'goal' the head of the new FORALL proposition.
+  ;; Make (a copy of) the arguments of 'goal' the universally quantified
+  ;;    variables of the result.
+  ;; Tricky: If a constant C appears in the position of a universal variable,
+  ;;    it is replaced by a new variable V42, and the proposition
+  ;;    '(= V42 C)' is conjoined to the tail or its negation is disjoined to the
+  ;;    head.
+  (let ((mapping (new ENTITY-MAPPING))
+        (invertedForall (copy-proposition forallProp mapping))
+        (oldHead (second (arguments invertedForall)))
+        (oldTail (first (arguments invertedForall)))
+        (newGoal PROPOSITION (lookup mapping goal))
+        (newGoalArguments (extract-goal-arguments newGoal))
+        (headPrime PROPOSITION NULL)
+        (tailPrime PROPOSITION NULL)
+        (newHead PROPOSITION NULL)
+        (newTail PROPOSITION NULL))
+    (when contrapositive?
+      (setq oldHead (invert-proposition oldHead))
+      (setq oldTail (invert-proposition oldTail))
+      (setq newGoal
+        (extract-inverted-goal
+         (choose (eql? headOrTail :HEAD) oldHead oldTail)
+         newGoal))
+   (when (null? newGoal)                ; zzz
+     (inform "Unable to generate contrapositive rule for goal " goal EOL "in " forallProp)
+     (return NULL))
+      (safety 3 (defined? newGoal)
+              "INTERNAL ERROR: Failed to extract inverted goal")
+      (setf (first (arguments invertedForall)) oldHead)
+      (setf (second (arguments invertedForall)) oldTail)
+      (setq oldHead oldTail)
+      (setq oldTail (first (arguments invertedForall)))
+      (setq headOrTail
+        (choose (eql? headOrTail :HEAD) :TAIL :HEAD)))
+    ;; check for quick exit:
+    (when (and (eql? newGoal (choose (eql? headOrTail :HEAD) oldHead oldTail))
+               (forall arg in newGoalArguments
+                       as v in (io-variables invertedForall)
+                       always (eql? arg v))
+               ;; correct for bug in STELLA 'forall':
+               (eql? (length newGoalArguments)
+                     (length (io-variables invertedForall))))
+      (return invertedForall))
+    (case headOrTail
+      (:HEAD
+       ;; replace 'newGoal' by FALSE everywhere its referenced:
+       (setq headPrime (substitute-proposition oldHead newGoal FALSE-PROPOSITION))
+       ;; normalize 'headPrime', possibly converting the entire head to FALSE:
+       (normalize-proposition headPrime)
+       (if (eql? (operator headPrime) @FALSE)
+         (setq newTail oldTail)
+         (progn
+           (setq oldTail (invert-proposition oldTail))
+           (setq newTail (disjoin-propositions (cons-list oldTail headPrime)))
+           (setq newTail (invert-proposition newTail))
+           (normalize-proposition newTail)))
+       (setf (nth (arguments invertedForall) 0) newTail)
+       (setf (nth (arguments invertedForall) 1) newGoal))
+      (:TAIL
+       ;; replace 'newGoal' by TRUE everywhere its referenced:
+       (setq tailPrime (substitute-proposition oldTail newGoal TRUE-PROPOSITION))
+       ;; normalize 'tailPrime', possibly converting the entire tail to TRUE:
+       (normalize-proposition tailPrime)
+       (if (eql? (operator tailPrime) @TRUE)
+         (setq newHead oldHead)
+         (let ((residueVariables NIL))
+           (setq tailPrime (invert-proposition tailPrime))
+           (setq newHead (disjoin-propositions (cons-list tailPrime oldHead)))
+           ;; tricky: if there are universal variables that don't appear in the
+           ;;    goal, we need to wrap a forall around the new head:
+           (foreach vbl in (io-variables invertedForall)
+	       where (not (member? newGoalArguments vbl))
+	       collect vbl into residueVariables)
+           (when (non-empty? residueVariables)
+             (let ((nestedForall (create-proposition (quote FORALL) 2)))
+               (setf (io-variables nestedForall)
+                     (copy-cons-list-to-variables-vector residueVariables))
+               (setf (nth (arguments nestedForall) 0) TRUE-PROPOSITION)
+               (setf (nth (arguments nestedForall) 1) newHead)
+               (setq newhead nestedForall)))
+           (normalize-proposition newHead)))
+       (setf (nth (arguments invertedForall) 0) newGoal)
+       (setf (nth (arguments invertedForall) 1) newHead)))
+    ;; compute new universal variables for 'invertedForall':
+    (let ((newVariables (extract-goal-arguments newGoal)))
+      ;; tricky: each constant in 'newVariables' is replaced by a variable, and
+      ;;    an equivalence is conjoined to 'newTail' or 'newHead':
+      (foreach v in newVariables
+	  as i in (interval 0 NULL)
+	  where (not (isa? v @PATTERN-VARIABLE))
+	  do
+	    (let ((constantVbl (create-variable NULL NULL FALSE)))
+	      (update-skolem-type constantVbl (logical-type v))
+	      (setf (nth newVariables i) constantVbl)
+	      (case headOrTail
+		(:HEAD
+		 (setf (nth (arguments invertedForall) 0)
+		   (conjoin-two-propositions 
+		    (create-equivalence-proposition constantVbl v)
+		    (nth (arguments invertedForall) 0))))
+		(:TAIL
+		 (let ((negatedEquivalence 
+			(create-equivalence-proposition constantVbl v)))
+		   (invert-proposition negatedEquivalence)
+		   (setf (nth (arguments invertedForall) 1)
+		     (disjoin-propositions
+		      (cons-list
+		       negatedEquivalence (nth (arguments invertedForall) 1)))))))
+	      (normalize-proposition (nth (arguments invertedForall) 0))))
+      (setf (io-variables invertedForall)
+            (copy-cons-list-to-variables-vector newVariables)))
+    (recursively-fasten-down-propositions invertedForall FALSE)
+    (return invertedForall) ))
+
+(defun (construct-description-from-forall-proposition OBJECT)
+       ((forallProp PROPOSITION) (headOrTail KEYWORD))
+  ;; Called by 'derive-one-satellite-rule' to construct a description
+  ;;    from either the head or tail of 'forallProp'.
+  ;; '(io-variables forallProp)' become io-variables of the new description.
+  ;; NOTE: 'forallProp' is trashed during this operation.
+  (let ((description (new DESCRIPTION)))
+    ;; insert goal proposition into 'description':
+    (setf (proposition description)
+      (nth (arguments forallProp) (choose (eql? headOrTail :HEAD) 1 0)))
+    ;; copy universal variables into kappa variables:
+    (setf (io-variables description) (copy (io-variables forallProp)))
+    (special ((*evaluationMode* :DESCRIPTION))
+       (return (finish-building-description description TRUE))) ))
+
+(defun mark-as-forward-rule ((impliesProp PROPOSITION))
+  ;; Mark 'impliesProp' as a forward rule unless its head is equivalent
+  ;;    to a named relation.
+  (let ((head DESCRIPTION (second (arguments impliesProp))))
+    (when (and (not (named-description? head))
+               (null? (relative-complement head)))
+      (setf (forward-only? impliesProp) TRUE)) ))
+
+(defun derive-one-satellite-rule
+       ((masterForall PROPOSITION) (goal PROPOSITION)
+        (headOrTail KEYWORD) (contrapositive? BOOLEAN))
+  ;; Create a satellite IMPLIES proposition.
+  ;; Create the contrapositive if `contrapositive?' is true.
+  (let ((invertedForall PROPOSITION NULL)
+        (head DESCRIPTION NULL)
+        (tail DESCRIPTION NULL)
+        (overrideForwardOnly? FALSE))
+    (when (and (eql? headOrTail :TAIL)
+               (or (not (atomic-goal-proposition? (first (arguments masterForall))))
+                   (variable-arity-goal-proposition? (first (arguments masterForall))))
+               ;; TO DO: POSSIBLY REMOVE THIS RESTRICTION:
+               (not contrapositive?))
+      (derive-complex-forward-rule goal masterForall)
+      (return))
+    (special ((*evaluationMode* :DESCRIPTION))
+      (setq invertedForall
+        (invert-forall-around-goal
+         masterForall goal headOrTail contrapositive?)))
+    (when (null? invertedForAll)        ; zzz
+      (return))
+    (when contrapositive?
+      (case headOrTail
+        (:HEAD (setq headOrTail :TAIL))
+        (:TAIL (setq headOrTail :HEAD))))
+    (case headOrTail
+      (:HEAD
+       (setq head (extract-goal-description
+                   (second (arguments invertedForall)) NULL))
+       (setq tail (construct-description-from-forall-proposition
+                   invertedForall :TAIL)))
+      (:TAIL
+       (setq tail (extract-goal-description
+                   (first (arguments invertedForall)) NULL))
+       (setq head (construct-description-from-forall-proposition
+                   invertedForall :HEAD))))
+    (when (and (forward-only? masterForall)
+               (eql? headOrTail :HEAD))
+      ;; consider overriding the 'forward-only?' directive:
+      ;; the only rules that override are subrelation rules:
+      (setq overrideForwardOnly? (and (named-description? head)
+                                      (named-description? tail)
+                                      (eql? (arity head)
+                                            (arity tail))))
+      (when (not overrideForwardOnly?)
+        (return)))
+    ;; created the head and tail; now stick them together:
+    (let ((impliesProp (create-implies-proposition tail head)))
+      ;; note: 'updateMode' = :ASSERT-TRUE:
+      ;; check for duplicate here, so that we can reliably install
+      ;;    a master/satellite link:
+      (special ((*evaluationMode* :EXTENSIONAL-ASSERTION))
+       (let ((duplicate
+              (recursively-fasten-down-propositions impliesProp FALSE)))
+         (cond
+          ((not (eql? duplicate impliesProp))   ; found duplicate rule?
+           (setq impliesProp duplicate))
+          ((eql? headOrTail :TAIL)
+           ;; tricky: if rule is new (no duplicate found), we mark rule
+           ;;    as forward-only? (we assume a duplicate would either
+           ;;    already be marked, or is deliberately not marked):
+           (mark-as-forward-rule impliesProp)))))
+      (when (empty? (satellite-propositions masterForall))
+        (setf (satellite-propositions masterForall) (new LIST)))
+      ;; doubly-link satellite and master:
+      ;; tricky: duplicate 'impliesProp' may or may not be linked already:
+      (insert-new (satellite-propositions masterForall) impliesProp)
+      (setf (master-proposition impliesProp) masterForall)
+      ;; copy fwd/bwd markings:
+      (when (and (forward-only? masterForall)
+                 (not overrideForwardOnly?))
+        (if contrapositive?
+          (setf (backward-only? impliesProp) TRUE)
+          (setf (forward-only? impliesProp) TRUE)))
+      (when (backward-only? masterForall)
+        (if contrapositive?
+          (setf (forward-only? impliesProp) TRUE)
+          (setf (backward-only? impliesProp) TRUE)))
+      (when (dont-optimize? masterForall)
+        (setf (dont-optimize? impliesProp) TRUE)
+        (setq tail (first (arguments impliesProp)))
+        (when (null? (native-relation tail))
+          (setf (dont-optimize? tail) TRUE))
+        (setq head (second (arguments impliesProp)))
+        (when (null? (native-relation head))
+          (setf (dont-optimize? head) TRUE))))))
+
+;; This should be a feature settable on a per-module basis (btw, should
+;;    there be a separate `set-module-feature' command?).
+;; TO DO: If it becomes a feature, we need a mechanism to force the generation
+;;    of all deferred satellites when it is switched to FALSE.
+(defglobal *lazy-satellite-rules?* BOOLEAN FALSE
+  :documentation "If true, inversion of forall propositions happens lazily.
+I.e., satellite rules are generated on-demand during inference only if they
+are actually needed."
+  :public? TRUE)
+
+(defun (derive-satellite-rules-for-goal? BOOLEAN)
+    ((forallProp PROPOSITION) (goalDescription DESCRIPTION)
+     (direction KEYWORD) (lazySatellites? BOOLEAN))
+  ;; Derive zero or more :IMPLIES propositions from `forallProp'.
+  ;; Return TRUE if any satellite were created (or deferred).
+  ;; This is the main workhorse for various satellite-rule creation
+  ;;    entry points which explains the multitude of parameters.
+  ;; If `goalDescription' is non-null, only satellite rules with it
+  ;;    in their head or tail will be generated.  Otherwise, satellite
+  ;;    rules for all matchable goals of `forallProp' are generated.
+  ;; If `direction' is :POSITIVE, only positive rules are generated.
+  ;;    If it is `:CONTRAPOSITIVE', only contrapositive rules are generated.
+  ;;    Otherwise, rules in both directions are generated.
+  ;; NOTE: Currently, contrapositives are only built for rules with
+  ;;    either a complex head or tail, since simple rules can be inverted
+  ;;    with reverse polarity.  If we decide to rip out the reverse
+  ;;    polarity mechanism, this needs to change.
+  ;; If `lazySatellites?' is true, satellite rules won't be built right
+  ;;    away; instead, `forallProp' will be indexed on `goalDescription'
+  ;;    (or all its matchable goals), and the generation of satellites
+  ;;    will be triggered on demand by inference.
+  (finalize-objects)
+  (let ((createdSatellites? FALSE)
+        (goalDesc DESCRIPTION NULL)
+        (positiveOnly? (eql? direction :POSITIVE))
+        (contrapositiveOnly? (eql? direction :CONTRAPOSITIVE)))
+    (within-context
+     (home-context forallProp)
+     ;; Generate backward satellites ('derive-one-satellite-rule'
+     ;;    chooses not to generate most rules marked 'forward-only?'):
+     (foreach goal in (find-matchable-goals forallProp :HEAD)
+	 where (or (null? goalDescription)
+		   (eql? goalDescription (extract-goal-description goal :HEAD)))
+	 do (setq createdSatellites? TRUE)
+	    ;; Positive backward satellites:
+	    (cond (lazySatellites?
+		   (if (null? goalDescription)
+		     (setq goalDesc (extract-goal-description goal :HEAD))
+		     (setq goalDesc goalDescription))
+		   (safety 3 (defined? goalDesc)
+			   "INTERNAL ERROR: Failed to extract goal "
+			   "description for " goal " in " forallProp)
+		   (when (null? (rules-with-deferred-satellites goalDesc))
+		     (setf (rules-with-deferred-satellites goalDesc)
+		       ;; PROBLEM: WE DON'T KNOW HOW TO REGENERATE THESE:
+		       (create-sequence-index :NON-PAGING NIL)))
+		   (insert (rules-with-deferred-satellites goalDesc)
+			   forallProp))
+		  ((not contrapositiveOnly?)
+		   (derive-one-satellite-rule forallProp goal :HEAD FALSE)))
+	    ;; Contrapositive backward satellites:
+	    (when (and (not positiveOnly?)
+		       (not (backward-only? forallProp))
+		       ;; reverse polarity can handle simple tails:
+		       (not (atomic-forall-argument? forallProp :TAIL)))
+	      (cond (lazySatellites?
+		     (setf (deferred-contrapositives? goalDesc) TRUE))
+		    (otherwise
+		     (derive-one-satellite-rule
+		      forallProp goal :HEAD TRUE)))))
+     ;; Generate forward satellites:
+     (when (and (not (backward-only? forallProp))
+                ;; generate forward rule if the tail is simple or the head
+                ;;    is complex:
+                ;; subtle: rule like '(=> (r ?x ?y) (c ?y))' has simple head
+                ;;    and simple tail, but two distinct rules get generated.
+                (or (atomic-forall-argument? forallProp :TAIL)
+                    (not (atomic-forall-argument? forallProp :HEAD))
+                    (forward-only? forallProp)))
+       (foreach goal in (find-matchable-goals forallProp :TAIL)
+	   where (or (null? goalDescription)
+		     (eql? goalDescription (extract-goal-description goal :TAIL)))
+	   do (setq createdSatellites? TRUE)
+	      ;; Positive forward satellites:
+	      (cond (lazySatellites?
+		     (if (null? goalDescription)
+		       (setq goalDesc (extract-goal-description goal :TAIL))
+		       (setq goalDesc goalDescription))
+		     (safety 3 (defined? goalDesc)
+			     "INTERNAL ERROR: Failed to extract goal "
+			     "description for " goal " in " forallProp)
+		     (when (null? (rules-with-deferred-satellites goalDesc))
+		       (setf (rules-with-deferred-satellites goalDesc)
+			 ;; PROBLEM: WE DON'T KNOW HOW TO REGENERATE THESE:
+			 (create-sequence-index :NON-PAGING NIL)))
+		     (insert (rules-with-deferred-satellites goalDesc)
+			     forallProp))
+		    ((not contrapositiveOnly?)
+		     (derive-one-satellite-rule forallProp goal :TAIL FALSE)))
+	      ;; Contrapositive forward satellites:
+	      (when (and (not positiveOnly?)
+			 (not (forward-only? forallProp))
+			 ;; reverse polarity can handle simple heads:
+			 (not (atomic-forall-argument? forallProp :HEAD)))
+		(cond (lazySatellites?
+		       (setf (deferred-contrapositives? goalDesc) TRUE))
+		      (otherwise
+		       (derive-one-satellite-rule
+			forallProp goal :TAIL TRUE))))))
+     
+     (when (and createdSatellites?
+                (defined? (truth-value forallProp)))
+       ;; This might do a little bit too much work if it reassigns
+       ;;    truth values to satellites created by other `goalDescriptions':
+       (within-context (home-context forallProp)
+        (special ((*invisibleAssertion?* TRUE))
+         (foreach satellite in (satellite-propositions forallProp)
+                  ;; BUG: DOESN'T COPY CONTEXT SENSITIVE TRUTH VALUES INTO SATELLITE:
+                  do (assign-truth-value satellite (truth-value forallProp))))))
+     (return createdSatellites?))))
+
+(defun derive-satellite-rules ((forallProp PROPOSITION))
+  ;; Called by 'run-goes-true-demons'.
+  ;; Derive zero or more :IMPLIES propositions from 'forallProp'.
+  ;; If `*lazy-satellite-rules?*' is true, only index `forallProp' on
+  ;;    its goal descriptions, but defer the creation of satellites
+  ;;    until inference actually needs them.
+  (safety 3 (not (description-mode?)) "BUG: Deriving rules inside of a description")
+  (when (not (derive-satellite-rules-for-goal?
+              forallProp NULL (choose (natural-deduction-mode?)
+                                      :POSITIVE
+                                      :POSITIVE-AND-CONTRAPOSITIVE)
+              *lazy-satellite-rules?*))
+    (when-cyc-kludges-enabled
+     (when (and (isa? (second (arguments forallProp)) @PROPOSITION)
+                (eql? (kind (cast (second (arguments forallProp))
+                                  PROPOSITION))
+                      :EXISTS))
+       ;; we know that we can't yet normalize existentials in the consequent:
+       (return)))
+    (warn "PowerLoom can't index the rule:" EOL "   " forallProp EOL)))
+
+(defspecial *derive-deferred-satellite-rules-invocations*
+    (LIST OF DESCRIPTION) NULL)
+
+(defun derive-deferred-satellite-rules ((self DESCRIPTION))
+  ;; Derive all deferred satellite rules for `self'.
+  ;; Defer any contrapositives unless `self' already has a complement.
+  ;; If the complement already exists, also derive its deferred rules.
+  ;; NOTE: This means that once the complement exists, the derivation
+  ;;    of satellite rules for it is always done in lockstep with
+  ;;    the derivation of satellites for `self'.  This scheme mandates
+  ;;    a special "catch-up" operation when the complement is first
+  ;;    created which is handled by
+  ;;    `derive-deferred-contrapositive-satellite-rules'.
+  (when *lazy-satellite-rules?*
+    (special ((*derive-deferred-satellite-rules-invocations*
+               (choose (null? *derive-deferred-satellite-rules-invocations*)
+                       (new LIST)
+                       *derive-deferred-satellite-rules-invocations*)))
+      ;; since this might trigger recursive calls, make sure we don't loop:
+      (when (memb? *derive-deferred-satellite-rules-invocations* self)
+        (return))
+      (insert *derive-deferred-satellite-rules-invocations* self)
+    (when (and (null? (rules-with-deferred-satellites self))
+               (null? (relative-complement self)))
+      (return))                         ; quick exit
+    (let ((queuedRules (rules-with-deferred-satellites self))
+          (complement (relative-complement self)))
+      (when (defined? queuedRules)
+        (foreach forallProp in queuedRules
+            do (derive-satellite-rules-for-goal?
+                forallProp self
+                (choose (null? complement)
+                        :POSITIVE
+                        :POSITIVE-AND-CONTRAPOSITIVE)
+                FALSE))
+        (when (defined? complement)
+          (setf (deferred-contrapositives? self) NULL))
+        (setf (rules-with-deferred-satellites self) NULL))
+      (when (and (defined? complement)
+                 (defined? (rules-with-deferred-satellites complement)))
+        (derive-deferred-satellite-rules complement))))))
+
+(defun derive-deferred-contrapositive-satellite-rules ((self DESCRIPTION))
+  ;; Derive any deferred contrapositive satellite rules for `self' (since
+  ;;    they are contrapositives, they are indexed on `self's complement).
+  ;; It will only generate contrapositives for those rules whose `self'
+  ;;    satellites have already been derived.  Newly queued rules on
+  ;;    `self' will not be considered.  Instead, those will be processed
+  ;;    by subsequent calls to `derive-deferred-satellite-rules'.
+  ;; Called by `get-complement-of-goal-description' to catch up to the
+  ;;    current satellite-rule state of `self'.
+  (when *lazy-satellite-rules?*
+    (when (deferred-contrapositives? self)
+      (let ((masterProposition PROPOSITION NULL)
+            (queuedRules (new (LIST OF PROPOSITION))))
+        (foreach prop in (unfiltered-dependent-implies-propositions self)
+	    where (eql? (kind prop) :IMPLIES)
+	    do (setq masterProposition (master-proposition prop))
+	       (when (and (defined? masterProposition)
+			  (not (deleted? masterProposition)))
+		 (insert-new queuedRules masterProposition)))
+        (foreach forallProp in queuedRules
+            do (derive-satellite-rules-for-goal?
+                forallProp self :CONTRAPOSITIVE FALSE))))))
+
+(defun (get-inferable-complement-description DESCRIPTION) ((self DESCRIPTION))
+  ;; Return the complement of `self' or NULL if it does not exist
+  ;;    and is not inferable.
+  ;; Create the complement if it can be infered by deferred rules and
+  ;;    derive any deferred satellite rules pointing at it.
+  (let ((complement (relative-complement self)))
+    (when *lazy-satellite-rules?*
+      (when (and (null? complement)
+                 (deferred-contrapositives? self))
+        ;; This will trigger the generation of deferred contrapositives
+        ;;    from previously derived satellites of `self':
+        (setq complement (get-complement-of-goal-description self)))
+      (when (deferred-contrapositives? self)
+        ;; Derive any deferred satellites for `self' to make sure to
+        ;;    take advantage of their contrapositives:
+        (derive-deferred-satellite-rules self)
+        (setf (deferred-contrapositives? self) NULL)))
+    (return complement)))
+
+(defun (derive-implies-from-forall PROPOSITION) ((forallProp PROPOSITION))
+  ;; Called by 'normalize-FORALL-proposition'.
+  ;; If 'forallProp' can be converted to an equivalent IMPLIES proposition
+  ;;    having a simple head or tail, then return the IMPLIES proposition.
+  ;; Tricky: 'create-implies-proposition' trashes 'forallProp', but then
+  ;;    it gets overlayed by 'normalize-FORALL-proposition', so all is well.
+  (let ((heads (find-matchable-goals forallProp :HEAD))
+        (tails (find-matchable-goals forallProp :TAIL))
+        (headGoal (first heads))
+        (tailGoal (first tails))
+        (headProposition PROPOSITION (second (arguments forallProp)))
+        (tailProposition PROPOSITION (first (arguments forallProp))))
+    (if (and (eql? (length heads) 1)
+             (eql? (length tails) 1)
+             (forall hv in (arguments headGoal)
+                     as tv in (arguments tailGoal)
+                     always (and (eql? hv tv)
+                                 (isa? hv @PATTERN-VARIABLE)))
+             ;; correct for bug in STELLA 'forall':
+             (eql? (length (arguments headGoal)) (length (arguments tailGoal)))
+             (eql? (first heads) headProposition)
+             (or (eql? (first tails) tailProposition)
+                 (and (eql? (kind tailProposition) :AND)
+                      (forall arg in (arguments tailProposition)
+                              always
+                              (or (eql? arg tailGoal))))))
+      (return (create-implies-proposition
+               (extract-goal-description tailGoal NULL)
+               (extract-goal-description headGoal NULL)))
+      (return NULL)) ))
+
+
+  ;;
+;;;;;;  Forward chaining indices
+  ;;
+
+(defun (deconstruct-forall-tree CONS OBJECT CONS) ((forallTree CONS))
+  ;; Helping function for 'create-forward-chaining-index'.
+  ;; Return three values, a list of universally-quantified variables,
+  ;;    and antecedent tree, and a consequent tree.
+  ;; 'forallTree' has the form
+  ;;      (forall (?x1 ... ?xn) (=> <antecedent> <consequent>)).
+  ;; IMPORTANT: This assumes that `forallTree' contains a forward arrow
+  ;;    and does not describe a backward-only rule (should be a safe
+  ;;    assumption for the creation of forward chaining indices).
+  (safety 3 (null? (fourth forallTree)) "Bug in deconstruct.")
+  (let ((antecedent CONS (third forallTree))
+        (ifClause (second antecedent)))
+    (when (eql? ifClause (quote TRUE))
+      ;; tricky: convert 'TRUE' to '(and)' because we need a query body
+      ;;    of type CONS:
+      (setq ifClause (quote (and))))
+    (return (second forallTree) ifClause (third antecedent)) ))
+
+(defun (create-forward-chaining-index FORWARD-CHAINING-INDEX)
+    ((goal PROPOSITION) (masterForall PROPOSITION))
+  ;; Create a forward chaining index for goal 'goal' on the forward
+  ;;    rule 'masterForall'.
+  (let ((index (new FORWARD-CHAINING-INDEX))
+        (mapping (new ENTITY-MAPPING))
+        (forallCopy (copy-proposition masterForall mapping))
+        (goalCopy (lookup mapping goal)))
+    ;; tricky: clip 'goalCopy' out of 'forallCopy', resulting in a slightly
+    ;;    more efficient query:
+    (setq forallCopy (substitute-proposition forallCopy goalCopy TRUE-PROPOSITION))
+    (let ((ioVariableNames CONS NULL)
+          (goalVariableList (list))
+          (goalVariableNames NIL)
+          (existVariableNames NIL)
+          (queryBody CONS NULL)
+          (consequentTree CONS NULL))
+      (mv-setq (ioVariableNames queryBody consequentTree)
+        ;; going via `generate-proposition' here is a bit odd (or lazy):
+	(deconstruct-forall-tree (generate-proposition forallCopy)))
+      ;; we might get negated goals here, so simply checking arguments is not enough:
+      (collect-free-variables goal goalVariableList (list) (list))
+      (setq goalVariableNames
+        (collect (skolem-name (cast arg PATTERN-VARIABLE))
+                 foreach arg in goalVariableList))
+      ;; if a variable occurs only in the antecedent, transform it from
+      ;;    universally quantified to existentially quantified:
+      (foreach v in ioVariableNames
+	  where (not (search-cons-tree? consequentTree v))
+          collect v into existVariableNames)
+      (setq ioVariableNames (subtract ioVariableNames existVariableNames))
+      ;; generate consequent description from actually unbound io-variables:
+      (setf (consequent index)
+	(value-of			; in case a surrogate comes back
+	 (conceive-term 
+	  (bquote
+           (KAPPA & (copy-cons-tree ioVariableNames) & consequentTree)))))
+      (setq existVariableNames (subtract existVariableNames goalVariableNames))
+      ;; now add goal variables back to io-variables to handle initial bindings:
+      (when (non-empty? existVariableNames)
+        (setq queryBody
+          (bquote (EXISTS & existVariableNames & queryBody))))
+      ;; goal variables need to be in front to correspond to initial bindings
+      ;;    (this might duplicate some variables which is ok, since bound ones
+      ;;    will not be returned by the associated cached query):
+      (setq ioVariableNames (concatenate goalVariableNames ioVariableNames))
+      (setf (io-variables index) ioVariableNames)
+      (setf (query-body index) queryBody)
+      (setf (input-bindings index)
+        (collect NULL foreach v in ioVariableNames where (defined? v))))
+    (setf (forward-goal index) goal)
+    (setf (master-rule index) masterForall)
+    (setf (cache-id index) (gensym "FWD-QUERY"))
+    (return index) ))
+
+(defun derive-complex-forward-rule ((goal PROPOSITION) (masterForall PROPOSITION))
+  ;; Create a forward chaining index for goal 'goal' on the forward
+  ;;    rule 'masterForall' and attach it to the description for 'goal'.
+  ;; Replace duplicate index if one exists.
+  ;; Note: No IMPLIES rule gets created; instead, we work directly with
+  ;;    FORALL proposition.
+  (let ((goalDescription
+         (choose (eql? (kind goal) :NOT)
+                 (get-complement-of-goal-description
+                  (surrogate-to-description 
+                   (relationRef (cast (first (arguments goal)) PROPOSITION))))
+                 (surrogate-to-description (relationRef goal))))
+        (duplicate FORWARD-CHAINING-INDEX NULL))
+    (foreach idx in (forward-chaining-indices goalDescription)
+             where (eql? goal (forward-goal idx))
+             do (setq duplicate idx))
+    (when (defined? duplicate)
+      (remove (forward-chaining-indices goalDescription) duplicate))
+    (when (eql? (forward-chaining-indices goalDescription) NIL-LIST)
+      (setf (forward-chaining-indices goalDescription) (list)))
+    (insert (forward-chaining-indices goalDescription)
+            (create-forward-chaining-index goal masterForall)) ))
+
+
+  ;;
+;;;;;;  Finding and manipulating rules
+  ;;
+
+(defun (help-get-forward-chaining-rules (CONS OF PROPOSITION))
+    ((description DESCRIPTION))
+  ;; Helping function for 'call-get-rules'.
+  ;; Collect forward-indexed rules on 'description' and return the result
+  ;;    (note that these rules are not IMPLIES rules but FORALL's which is
+  ;;    why this is not used by `applicable-rules-of-description').
+  (let ((rules NIL))
+    (foreach idx in (forward-chaining-indices description)
+        where (not (deleted? (master-rule idx)))
+        collect (master-rule idx) into rules)
+    (return rules)))
+
+(defun (call-get-rules (CONS OF PROPOSITION)) ((relationRef OBJECT))
+  (let ((description LOGIC-OBJECT (get-description relationRef))
+        (rules NIL))
+    (when (null? description)
+      (signal NO-SUCH-OBJECT-EXCEPTION  "Can't find a relation named " relationRef))
+    (typecase description
+      (NAMED-DESCRIPTION
+       (setq rules
+         ;; these are disjoint sets, so concatenation is ok:
+         (concatenate
+           (applicable-rules-of-description description :FORWARD FALSE)
+           (applicable-rules-of-description description :BACKWARD FALSE)
+           (help-get-forward-chaining-rules description)))
+       (let ((complement (relative-complement description)))
+         (when (defined? complement)
+           (setq rules
+             (concatenate
+               rules
+               (applicable-rules-of-description complement :FORWARD FALSE)
+               (applicable-rules-of-description complement :BACKWARD FALSE)
+               (help-get-forward-chaining-rules complement))))))
+      (otherwise NULL))
+    (return rules)))
+
+(defun (get-rules (CONS OF PROPOSITION)) ((relation NAME))
+  :documentation "Return the list of rules associated with `relation'."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (return (call-get-rules relation)))
+
+(defun delete-rules ((relation NAME))
+  :documentation "Delete the list of rules associated with `relation'.
+This function is included mainly for debugging purposes, when
+a user wants to verify the behavior of different sets of rules."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (foreach r in (call-get-rules relation)
+      do (destroy-proposition r)))
+
+(defun print-rules ((relation OBJECT))
+  :documentation "Print the list of true rules associated with `relation'."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  ;; TO DO:
+  ;; - :true-only? could become an option that is false by default;
+  ;;   in that case we should probably annotate truth.
+  (within-context (get-query-context)
+    (foreach rule in (call-get-rules relation)
+        where (true-proposition? rule)
+        do (pretty-print-logical-form rule STANDARD-OUTPUT)
+           (print EOL EOL))))
+
+(defun print-satellites ((forallProp PROPOSITION))
+  (foreach rule in (satellite-propositions forallProp)
+      do (print rule EOL)) )
+
+
+  ;;
+;;;;;; 'get-rule' and 'find-rule'
+  ;;
+
+
+;; TO DO: CONSIDER CALLING 'conceive' ON INPUTS OF TYPE CONS:
+(defun (get-rule PROPOSITION) ((ruleName NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? TRUE
+   (let ((object (get-instance ruleName)))
+    (when (or (null? object)
+              (not (isa? object @PROPOSITION)))
+      (inform "Can't find a rule named " ruleName EOL)
+      (return NULL))
+    (return object) ))
+
+(defun (find-rule PROPOSITION) ((ruleName NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation "Search for a rule named 'ruleName'.  Like 'get-rule',
+but 'find-rule' implicity quotes its input argument."
+  (return (get-rule ruleName)) )
+
+(defun (assert-rule PROPOSITION) ((ruleName NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation "Set the truth value of the rule named 'ruleName' to 
+TRUE.  The proposition having the name 'ruleName' may be
+any arbitrary proposition, although we expect that it is probably
+a material implication.  (See `retract-rule')."
+  (let ((proposition (get-rule ruleName)))
+    (when (null? proposition)
+      (return NULL))
+    (update-proposition-truth-value proposition :ASSERT-TRUE)
+    (return proposition) ))
+
+(defun (retract-rule PROPOSITION) ((ruleName NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation "If it is currently TRUE, set the truth value 
+of the rule named 'ruleName' to UNKNOWN  This
+command may be used alternately with `assert-rule' to
+observe the effects of querying with or without a particular (named) rule
+being asserted within the current context. The proposition having the name
+'ruleName' may be any arbitrary proposition, although we expect that it is
+probably a material implication."
+  (let ((proposition (get-rule ruleName)))
+    (when (null? proposition)
+      (return NULL))
+    (update-proposition-truth-value proposition :RETRACT-TRUE)
+    (return proposition) ))
+
+
+  ;;
+;;;;; Deleting query optimizer caches
+  ;;
+
+(defun delete-rule-caches-on-relation ((relation RELATION))
+  ;; Delete all patterns placed on 'relation' by the query optimizer.
+  (foreach rule in (call-get-rules relation)
+      do (foreach arg in (arguments rule)
+             where (defined? (query-patterns (cast arg DESCRIPTION)))
+             do (foreach it on (query-patterns (cast arg DESCRIPTION))
+                    do (setf (value it) NULL)))) )
+    
+(defun reset-query-caches ()
+  :documentation "Zero out all caches managed by the query optimizer,
+so that it will reoptimize subgoal queries upon next invocation."
+  ;  :command? TRUE :public? TRUE
+  ;; zero out slot caches:
+  (foreach slot in (all-slots NULL TRUE)
+           where (defined? (description slot))
+           do (delete-rule-caches-on-relation slot))
+  (foreach description in (all-named-descriptions NULL TRUE)
+           do
+           (when (defined? (query-patterns description))
+             (foreach it on (query-patterns description)
+                      do (setf (value it) NULL)))) )
+
+
+                 

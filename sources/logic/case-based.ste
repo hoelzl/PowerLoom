@@ -1,0 +1,1052 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Code for case-based reasoning
+
+;;; Version: case-based.ste,v 1.27 2006/05/11 07:05:06 hans Exp
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(defglobal *Log-Match-Rules* BOOLEAN FALSE) ;; print rule as it is defined?
+(defglobal *Log-Antecedent-Construction* BOOLEAN FALSE)
+
+(defglobal *Num-Neighbors* Integer 3) ;; number of neighbors to infer solution
+
+;; how to combine the answers:  :weighted-vote, :weighted-average, :average
+(defglobal *Case-Solution-Combination* KEYWORD :WEIGHTED-VOTE)
+
+;; list of case instances
+(defglobal *case-rule-names* (LIST of SYMBOL) (new (LIST of SYMBOL)))
+
+(defglobal *Num-Cases* Integer 0)
+
+(defglobal *Num-Training-Per-Case* INTEGER 12)
+
+(defglobal *Case-Variable-Counter* INTEGER 0)
+(defglobal *Base-Counter* INTEGER 0) ;; first variable number for current case
+
+
+;; Visited instances prevents looping during a all-facts-of search.
+;; It contains a list of all instances that have been traversed for a
+;; given all-facts-of search.  
+
+(defglobal *Visited-Instances* (LIST of SYMBOL) (new (LIST of SYMBOL)))
+
+(defglobal *Only-Variablize-Visited-Instances* BOOLEAN FALSE)
+
+;; prevent redundant propositions
+(defglobal *Visited-Propositions* (LIST of PROPOSITION) (new (LIST of PROPOSITION)))
+
+;; *Seen-Instances* contains a list of all instances that have been
+;; seen, but not necessarily traversed.
+(defglobal *Seen-Instances* (LIST of SYMBOL) null)
+
+;; *Deleted-Case-Variables*  contains the variable names who have been 
+;; removed from filtering.  
+(defglobal *Deleted-Case-Variables* (LIST of SYMBOL) null)
+
+;; Hash table to map symbol names to their variablized names
+(defglobal *Symbol-Variable-Hash-Table* (HASH-TABLE of SYMBOL SYMBOL) null)
+
+;; *Case-Antecedent-Table* and *Case-Types-Table* are hash tables that
+;; map from a rule name into the current antecedent and type
+;; definition of the large case rule.  
+
+(defglobal *Case-Antecedent-Table* (STRING-HASH-TABLE of STRING (LIST of CONS))
+	   (new (STRING-HASH-TABLE of STRING (LIST of CONS))))
+(defglobal *Case-Types-Table* (STRING-HASH-TABLE of STRING (LIST of SYMBOL))
+	   (new (STRING-HASH-TABLE of STRING (LIST of SYMBOL))))
+
+
+;; maintain the case names (instances) for each case type
+(defglobal *Case-Name-Table* (HASH-TABLE OF SYMBOL (LIST OF SYMBOL))
+	   (new (HASH-TABLE of SYMBOL (LIST OF SYMBOL))))
+
+;; general case-match predicate
+;;(defrelation case-match ((?x thing) (?y thing)))
+
+(defun set-num-neighbors ((d INTEGER))
+  :command? TRUE  :public? TRUE
+  :documentation "Sets the number of nearest neighbors to predict from."
+  (setq *Num-Neighbors* d))
+
+(defun set-case-solution-combination ((k KEYWORD))
+  :command? TRUE  :public? TRUE
+  (setq *Case-Solution-Combination* k))
+
+(defun set-num-training-per-case ((d INTEGER))
+  :command? TRUE  :public? TRUE
+  :documentation "Sets the number of training examples for each case in the training set."
+  (setq *Num-Training-Per-Case* d))
+
+(defun clear-cases ()
+  :command? TRUE  :public? TRUE
+  ;; This function will clear all case information
+  (foreach name in *case-rule-names* do
+	(smart-update-proposition name :RETRACT-TRUE))
+  (setq *Num-Cases* 0)
+  (setq *Seen-instances* (new (list of symbol)))
+  (setq *Visited-Propositions* (new list))  
+  (setq *visited-instances* (new (list of symbol)))
+  (setq *case-rule-names* (new (LIST of SYMBOL)))
+  (setq *Case-Antecedent-Table* (new (STRING-HASH-TABLE of STRING (LIST of CONS))))
+  (setq *Case-Types-Table* (new (STRING-HASH-TABLE of STRING (LIST of SYMBOL))))
+  (setq *Case-Name-Table* (new (HASH-TABLE of SYMBOL (LIST OF SYMBOL))))
+  (setq *Case-Variable-Counter* 0))
+
+(defun add-all-class-instances-to-case-rule ((kind SURROGATE))
+  (foreach instance in (all-class-instances kind)
+      do (build-case-from-instance instance kind))
+  (build-case-rule kind))
+
+(defun finalize-cases ((kind SYMBOL))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  ;; command that calls build-case-rule
+  (let ((class (surrogate-value-inverse (get-description kind))))
+    (build-case-rule class)))
+
+(defun build-case-rule ((kind SURROGATE))
+  ;; Build the case rule from the cons version
+  (let ((rule-name (concatenate (symbol-name kind) "-match"))
+	(rule-name-symbol (intern-symbol rule-name))
+	(rule-antecedent (lookup *Case-Antecedent-Table* rule-name))
+	(rule-types (lookup *Case-Types-Table* rule-name))
+	(rule nil))
+    (setq rule (bquote 
+		(defrule & rule-name
+		  (forall & rule-types
+		    (=> (and && (consify rule-antecedent))
+			(case-match /logic/?X /logic/?Y))))))
+;;		  :dont-optimize? TRUE)))
+    (when (not (member? *case-rule-names* rule-name-symbol))
+      (push *case-rule-names* rule-name-symbol))
+    (when *Log-Match-Rules*
+      (print rule EOL))
+    (when (not (empty? rule-antecedent))
+      (evaluate-logic-command rule false))))
+
+
+(defun add-case ((inst SYMBOL) (kind SYMBOL))
+  ;; Add case information to global case-match rule
+  ;;   - Following relation links to depth, *Max-Structure-Depth*
+  ;;   - Collect all relations and instances along the path
+  ;;   - Variablize the instances
+  ;;   - Place variablized propositions in the rule antecedent
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  (setq inst (permanentify inst))
+  (setq kind (permanentify kind))
+  (build-case-from-instance (get-instance inst)
+			    (surrogate-value-inverse (get-description kind))))
+
+(defun build-case-from-instance ((inst LOGIC-OBJECT) (kind SURROGATE))
+  (setq *Seen-Instances* (new list))
+  (setq *Deleted-Case-Variables* (new list))
+  (++ *Num-Cases*)
+  (setq *Base-Counter* *Case-Variable-Counter*)
+  (let ((name (object-name inst))
+        (antecedent (get-assertion-structure name 1))
+	(class (surrogate-value kind))
+	(class-symbol (object-name class))
+	(rule-name (concatenate (object-name-string class) "-match"))
+	(rule-antecedent (lookup *Case-Antecedent-Table* rule-name))
+	(rule-types (lookup *Case-Types-Table* rule-name))
+	(case-list (lookup *Case-Name-Table* class-symbol))
+	(type-defs (list of symbol) null))
+    (if (null? case-list)
+	(insert-at *Case-Name-Table* class-symbol (list name))
+      (progn
+	(push case-list name)
+        (insert-at *Case-Name-Table* class-symbol case-list)))
+
+    (when (null? rule-antecedent)
+      (setq rule-antecedent (new (LIST of CONS))))
+    (when (null? rule-types)
+      (setq rule-types (new (LIST of SYMBOL))))
+
+    (setq *Symbol-Variable-Hash-Table* (new (HASH-TABLE of SYMBOL SYMBOL)))
+
+    ;; Do we turn all instances into variables or just visited instances?
+    (if *Only-Variablize-Visited-Instances*
+	(setq antecedent (variablize-instances antecedent *visited-instances*))
+      (setq antecedent (variablize-cons-propositions antecedent)))
+    (foreach clause in antecedent do
+       (substitute-cons-tree clause (quote /logic/?Y)
+			     (lookup *Symbol-Variable-Hash-Table* name)))
+    (insert-at *Symbol-Variable-Hash-Table* name (quote /logic/?Y))
+    ;; remove redundant clauses
+    (filter-antecedent antecedent rule-name)
+;;    (when (> (length antecedent) 0)
+;;      (print "Adding " (length antecedent) " clauses from " inst EOL))
+    (setq type-defs (build-type-defs *Seen-Instances*))
+    
+    ;; add new antecedent clauses to rule antecedent
+    (setq rule-antecedent (concatenate rule-antecedent antecedent))
+    (setq rule-types (concatenate rule-types type-defs))
+    (insert-at *Case-Antecedent-Table* rule-name rule-antecedent)
+    (insert-at *Case-Types-Table* rule-name rule-types)))
+
+
+
+(defun (create-case-instance-vector VECTOR) ((class SURROGATE))
+  ;; creates a vector of all of the instances in the given class
+  (let ((iterator (all-class-instances class))
+	(num (length iterator))
+	(instances (new (VECTOR of OBJECT) :array-size num)))
+    (foreach i in (interval 0 (- num 1))
+	as inst in iterator do
+	  (setf (nth instances i) inst))
+    (return instances)))
+
+(defun (match-instances FLOAT-WRAPPER) ((x LOGIC-OBJECT) (y LOGIC-OBJECT))
+  (let ((prop (bquote (PL-KERNEL/case-match & x & y))))
+    (return (return-partial-truth
+             (make-query NIL (coerce-to-tree prop) NIL NIL) 
+             TRUE))))
+
+(defun (create-case-value-vector VECTOR) ((instances (LIST of LOGIC-OBJECT))
+					  (slot SURROGATE))
+  ;; creates a vector of slot values for each instance in instances vector
+  (let ((slot-values (new VECTOR :array-size (length instances))))
+    (foreach i in (interval 0 (- (length instances) 1)) 
+	as inst in instances do
+       (setf (nth slot-values i) (get-slot-value inst slot)))
+    (return slot-values)))
+	
+
+(defun (guess OBJECT) ((inst-name SYMBOL) (slot-name SYMBOL))
+  ;; guess is the main query engine for the the case based reasoner.
+  ;; Given a particular instance and a slot name, it will look for the most
+  ;; similar instance and return its slot value.
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  (setq inst-name (permanentify inst-name))
+  (setq slot-name (permanentify slot-name))
+  (let ((probe (get-instance inst-name))
+	(class (surrogate-value-inverse 
+		(cast (last (get-most-specific-classes probe))
+		      LOGIC-OBJECT)))
+	(rule-name (concatenate (symbol-name class) "-match"))
+	(rule-name-symbol (intern-symbol rule-name))
+	(instances (listify (all-class-instances class)))
+	(slot (surrogate-value-inverse (get-description slot-name))))
+    ;; if no case match rule has been built, build it
+    (when (not (member? *Case-Rule-Names* rule-name-symbol))
+      (print "Building match rule." EOL)
+      (add-all-class-instances-to-case-rule class))
+    (print "Generating answer" EOL)
+    (return (generate-case-based-answer probe slot instances))))
+
+(defun (generate-case-based-answer OBJECT) ((probe LOGIC-OBJECT)
+					    (slot SURROGATE)
+					    (cases LIST))
+  (let ((num (length cases))
+	(slot-vector (create-case-value-vector cases slot))
+	(match-scores (new (VECTOR OF FLOAT-WRAPPER) :array-size num))
+	(farthest 0)
+	(nearest-neighbors (new (VECTOR of INTEGER-WRAPPER) 
+			      :array-size *Num-Neighbors*))
+	(max 0.0))
+
+    (foreach i in (interval 0 (1- *Num-Neighbors*)) do
+	  (setf (nth nearest-neighbors i) 0))
+    (foreach i in (interval 0 (1- num)) do
+	  (setf (nth match-scores i) 1.0))
+    ;; find nearest neigbors (neighbors with highest match score
+    (foreach i in (interval 0 (- num 1))
+	as case in cases
+       where (not (eql? probe case)) do
+       (let ((score (match-instances probe case)))
+	 (setf (nth match-scores i) score)
+	 (when (> score max)
+	   (setq max i))
+	 (when (> score (nth match-scores (nth nearest-neighbors farthest)))
+	   (setf (nth nearest-neighbors farthest) i)
+	   (setq farthest 0)
+	   (foreach j in (interval 1 (1- *Num-Neighbors*)) do
+	      (when (< (nth match-scores (nth nearest-neighbors j))
+		       (nth match-scores (nth nearest-neighbors farthest)))
+		(setq farthest j))))))
+    
+    (return (combine-case-answers nearest-neighbors match-scores slot-vector))))
+
+
+(defun (combine-case-answers OBJECT) ((closest (VECTOR of INTEGER-WRAPPER))
+				      (scores (VECTOR OF FLOAT-WRAPPER))
+				      (slots (VECTOR of OBJECT)))
+
+  ;; Combines the solutions of the nearest neighbors.  Combination is 
+  ;; dictated by the variable *Case-Solution-Combination*.
+;;  (foreach close in closest do
+;;	(print close " matches " (nth scores close) " with answer " 
+;;	       (nth slots close)  EOL))
+  (ignore scores)
+  (case *Case-Solution-Combination*
+    (:WEIGHTED-VOTE
+     (let ((answer-table (new (PROPERTY-LIST of OBJECT INTEGER-WRAPPER)))
+	   (keys (new (list of object))))
+       (foreach neighbor in closest do
+	     (let ((answer (nth slots neighbor))
+		   (votes (lookup answer-table answer)))
+	       (if (null? votes)
+		   (progn
+		     (push keys answer)
+		     (insert-at answer-table answer 1))
+		 (insert-at answer-table answer (+ votes 1)))))
+       (let ((max 0)
+	     (answer OBJECT null))
+	 (foreach key in keys do
+	       (let ((votes (lookup answer-table key)))
+		 (when (> votes max)
+		   (setq max votes)
+		   (setq answer key))))
+	 (return answer))))
+    (:WEIGHTED-AVERAGE
+     (if (or (isa? (nth slots 0) @FLOAT-WRAPPER)
+	     (isa? (nth slots 0) @INTEGER-WRAPPER))
+	 (print "Weighted average not implemented yet" EOL)
+       (print "Warning:  Slot type not number.  Cannot average" EOL)))
+    (:AVERAGE
+     (typecase (nth slots 0)
+       (FLOAT-WRAPPER
+	(let ((sum FLOAT-WRAPPER (cast (nth slots (nth closest 0)) 
+				       FLOAT-WRAPPER)))
+	   (foreach i in (interval 1 (1- *Num-Neighbors*)) do
+		 (setq sum (+ sum (cast (nth slots (nth closest i))
+					FLOAT-WRAPPER))))
+	   (return (/ sum *Num-Neighbors*))))
+       (INTEGER-WRAPPER
+	(let ((sum INTEGER-WRAPPER (cast (nth slots (nth closest 0)) 
+				       INTEGER-WRAPPER)))
+	   (foreach i in (interval 1 (1- *Num-Neighbors*)) do
+		 (setq sum (+ sum (cast (nth slots (nth closest i))
+					INTEGER-WRAPPER))))
+	   (return (/ sum *Num-Neighbors*))))
+       (otherwise
+	(print "Warning:  Slot type not number.  Cannot average" EOL))))
+    (otherwise nil))
+  ;; If all else fails, just return the answer of the first match
+  (return (nth slots (nth closest 0))))
+  
+
+(defun train-case-matcher ((class-name SYMBOL) (slot-name SYMBOL) 
+			   (cycles INTEGER))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  (setq slot-name (permanentify slot-name))
+  (setq class-name (permanentify class-name))
+  (print "Generating training examples" EOL)
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(slot (surrogate-value-inverse (get-description slot-name)))
+	(ilist (listify (all-class-instances class)))
+	(instances (new (VECTOR of LOGIC-OBJECT) :array-size (length ilist))))
+
+    (foreach i in (interval 0 (1- (length ilist))) 
+	as instance in ilist do
+	  (setf (nth instances i) instance))
+    (generate-case-rule-wo-slot instances class-name slot-name)
+    (let ((num (generate-case-training-examples instances slot)))
+	(print "Training case match network" EOL)
+	(train-cached-neural-networks cycles (* num *Num-Training-Per-Case*)))))
+
+
+(defun generate-case-rule-wo-slot ((cases (VECTOR of LOGIC-OBJECT))
+				   (class-name SYMBOL)
+				   (slot-name SYMBOL))
+  ;; this function will build a case match rule from the given cases
+  ;; excluding the slot that ou are trying to predict
+  (let ((num-cases (length cases))
+	(kind (surrogate-value-inverse (get-description class-name)))
+	(case-names (new (LIST OF SYMBOL)))
+	(slot (surrogate-value-inverse (get-description slot-name)))
+	(slot-values (new (VECTOR of OBJECT) :array-size num-cases)))
+    (clear-cases)
+    (foreach case in cases
+	collect (object-name case) into case-names)
+
+    (foreach case in cases 
+	as case-name in case-names
+	as i in (interval 0 NULL) do
+	  (let ((val (get-slot-value case slot)))
+	    (setf (nth slot-values i) val)
+            ;; don't build cases with slot you are trying to predict
+	    (smart-update-proposition 
+	     (bquote (& slot-name & case-name & val)) :retract-true)))
+	     
+    (let ((fptr (new OUTPUT-FILE-STREAM :filename "current-cases.ste")))
+      (print-stream fptr "(in-package \"STELLA\")" EOL)
+      (foreach i in (interval 0 (1- num-cases))
+	  as case-name in case-names do
+	      (build-case-from-instance (nth cases i) kind)
+	      (print-stream fptr "(add-case " case-name ")" EOL)))
+
+    (build-case-rule kind)
+
+    ;; put slot value back
+    (foreach val in slot-values
+	as case-name in case-names do
+	  (smart-update-proposition 
+	   (bquote (& slot-name & case-name & val)) :assert-true))))
+
+(defun (train-and-test-case-matcher FLOAT) 
+    ((class-name SYMBOL) (slot-name SYMBOL) 
+     (num-train INTEGER) (num-test INTEGER) (cycles INTEGER)) 
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  ;; build a case-match rule for num-train cases of type class-name and 
+  ;; train neural network to score them.  Test neural network on num-test
+  ;; cases not in the original training set.
+  (setq class-name (permanentify class-name))
+  (setq slot-name (permanentify slot-name))
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(cases (listify (all-class-instances class)))
+	(instances (new (VECTOR of LOGIC-OBJECT) :array-size num-train))
+	(slot (surrogate-value-inverse (get-description slot-name)))
+	(slot-values (new (VECTOR of OBJECT) :array-size (length cases)))
+	(num-correct 0))
+    (shuffle-list cases)
+    ;; training instances are random subset of cases
+    (foreach case in cases
+	as i in (interval 0 (1- num-train)) do
+	  (setf (nth instances i) case))
+    ;; create case match rule
+    (generate-case-rule-wo-slot instances class-name slot-name)
+    
+    ;; ask a single query to create the neural networks
+    (return-partial-truth 
+     (make-query NIL (coerce-to-tree 
+                      (bquote (case-match & (object-name (first cases))
+                                          (object-name (second cases)))))
+                 NIL NIL)
+     TRUE)
+    (save-all-neural-networks *Save-Network-File*)  ;; save networks to a file
+    
+    (print "Training case matcher" EOL)
+    (let ((num-instances (generate-case-training-examples instances slot)))
+      (train-neural-network cycles (* num-instances *Num-Training-Per-Case*)))
+    ;; test the case matcher
+    (let ((training-cases (new list)))
+      (foreach i in (interval 0 (1- num-train))
+	  collect (nth instances i) into training-cases)
+      (foreach i in (interval num-train (1- (+ num-train num-test))) do
+	 (let ((probe (nth cases i))
+	       (correct-answer (nth slot-values i))
+	       (answer (generate-case-based-answer probe slot training-cases)))
+	   (print probe "  Predicted: " answer ", Correct: " correct-answer EOL)
+	   (when (eql? answer correct-answer)
+	     (++ num-correct)))))
+    (return (/ num-correct num-test))))
+
+(defun (test-case-based-reasoner FLOAT) ((class-name SYMBOL) (slot-name SYMBOL) (num-train INTEGER) (num-test INTEGER))
+  ;; generates data for creating a learning curve using the case-based
+  ;; reasoner.  This does not generate curves for the nn learner.
+  :command? TRUE :evaluate-arguments? FALSE :public? TRUE
+  (setq class-name (permanentify class-name))
+  (setq slot-name (permanentify slot-name))
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(case-list (listify (all-class-instances class)))
+	(num-cases (length case-list))
+	(slot (surrogate-value-inverse (get-description slot-name)))
+	(fptr (new OUTPUT-FILE-STREAM :filename "cbr-test-output.txt"))
+	(training-cases (new list))
+	(case-vector (new (vector of logic-object) :array-size num-cases))
+	(num-correct 0))
+    (shuffle-list case-list)
+    (when (> (+ num-train num-test) num-cases)
+      (print "Error:  training and test instances out number total instances" 
+	     EOL)
+      (return 0.0))
+    (foreach i in (interval 0 (1- num-cases)) 
+	as case in case-list 
+	do (setf (nth case-vector i) case))
+    ;; fill out training case list
+    (foreach i in (interval 1  num-train)
+	as case in case-list
+	collect case into training-cases)
+    (foreach i in (interval num-train (1- (+ num-train num-test)))
+	do (let ((probe (nth case-vector i))
+		 (case-name (object-name probe))
+		 (correct-answer (get-slot-value probe slot))
+		 (answer (generate-case-based-answer probe slot training-cases)))
+	     (when (eql? answer correct-answer)
+	       (++ num-correct))
+	     (print-stream fptr 
+			   "Case " case-name " predicted: " answer " correct: " 
+			   correct-answer)
+	     (print "Case " case-name " predicted: " answer " correct: " 
+		    correct-answer)
+	     (print-stream fptr "  Summary: " num-correct " out of " num-test 
+			   EOL)
+	     (print "  Summary: " num-correct " out of " num-test EOL)))
+    (return (/ num-correct num-test))))
+		
+	 
+(defun (test-case-matcher FLOAT) ((class-name SYMBOL) (slot-name SYMBOL))
+  :command? TRUE :evaluate-arguments? FALSE :public? TRUE
+  (setq class-name (permanentify class-name))
+  (setq slot-name (permanentify slot-name))
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(cases (listify (all-class-instances class)))
+	(slot (surrogate-value-inverse (get-description slot-name)))
+	(fptr (new OUTPUT-FILE-STREAM :filename "test-output.txt"))
+	(training-case-names (lookup *Case-Name-Table* class-name))
+	(training-cases (new list))
+	(case-names (new (LIST of SYMBOL)))
+	(total 0)
+	(num-correct 0))
+    (foreach case in cases
+	collect (object-name case) into case-names)
+    (foreach case in cases
+	as case-name in case-names
+	where (member? training-case-names case-name)
+	collect case into training-cases)
+    (foreach case in cases 
+	as probe in cases
+	as case-name in case-names 
+	where (not (member? training-case-names case-name))
+	do
+	  (let ((correct-answer (get-slot-value case slot))
+		(answer (generate-case-based-answer probe slot cases)))
+	    (print-stream fptr 
+			  "Case " case-name " predicted: " answer " correct: " 
+			  correct-answer)
+	    (print "Case " case-name " predicted: " answer " correct: " 
+		   correct-answer)
+	    (++ total)
+	    (when (eql? answer correct-answer)
+	      (++ num-correct))
+	    (print-stream fptr "  Summary: " num-correct " out of " total EOL)
+    	    (print "  Summary: " num-correct " out of " total EOL)))
+    (return (/ num-correct total))))
+	    
+
+(defun (generate-case-training-examples INTEGER) 
+    ((instances (VECTOR of LOGIC-OBJECT)) (slot SURROGATE))
+
+  ;; Generates a set of training examples for training the case
+  ;; matcher.  The input is the name of the class the instances
+  ;; (cases) are drawn from and the slot that is to be predicted.  The
+  ;; function generates all instances of that class and queries the
+  ;; value of slot-name.  Training examples are created for two
+  ;; instances of the following form: 
+  ;; (add-training-example (PL-KERNEL/case-match i1 i2) diff) 
+  ;; where i1 and i2 are the two instances and diff is the difference 
+  ;; between them computed from their respective slot-name values.
+  
+  (let ((num-instances (length instances))
+	(slot-values (new (VECTOR of OBJECT) :array-size num-instances))
+	(k 0)
+	(l 0)
+	(index (new (VECTOR of INTEGER-WRAPPER) ;; index of matching case
+		    :array-size (* num-instances 
+				   *Num-Training-Per-Case*)))
+	(match-scores (new (VECTOR OF FLOAT-WRAPPER) ;; distance between case
+			   :array-size (* num-instances 
+					  *Num-Training-Per-Case*))))
+							      
+    ;; Set up instance and value vector.  Get slot value for each instance
+    (foreach i in (interval 0 (- num-instances 1)) 
+	as inst in instances 
+	do (setf (nth slot-values i) (get-slot-value inst slot)))
+
+    (foreach i in (interval 0 (- num-instances 1))
+	do (foreach j in (interval 1 *Num-Training-Per-Case*)
+	       do (ignore j)
+	       (setq l (random num-instances))
+	       (while (= i l)
+		 (setq l (random num-instances)))
+	       (setf (nth index k) l)
+	       (setf (nth match-scores k) 
+		 (calculate-case-match (nth slot-values i)
+				       (nth slot-values l)))
+	       (++ k)))
+
+    (setq k 0)
+    (normalize-numbers match-scores)
+    ;; scores should be matches not distances, so take 1 - score.
+    (foreach i in (interval 0 (1- (length match-scores))) do
+	  (setf (nth match-scores i) (- 1.0 (nth match-scores i))))
+    
+    (foreach i in (interval 0 (- num-instances 1))
+	do (foreach j in (interval 1 *Num-Training-Per-Case*) 
+	       do (ignore j)
+		  (let ((example (new TRAINING-EXAMPLE)))
+		    (setf (query example) 
+		      (bquote 
+		       (PL-KERNEL/case-match
+			& (logic-symbol (nth instances i))
+			& (logic-symbol (nth instances (nth index k))))))
+		    (setf (score example) (nth match-scores k))
+		    (push *Training-Examples* example))
+		  (++ k)))
+    (return num-instances)))
+
+
+(defun normalize-numbers ((vect (VECTOR OF FLOAT-WRAPPER)))
+  ;; Normalizes a vector of numbers to be between 0 and 1
+  (let ((num (length vect))
+	(max -99999.0)
+	(min 99999.0)
+	(range 0.0))
+    (foreach i in (interval 0 (- num 1)) do
+       (setf (nth vect i) (* 1.0 (nth vect i)))
+       (when (> (nth vect i) max)
+	 (setq max (nth vect i)))
+       (when (< (nth vect i) min)
+	 (setq min (nth vect i))))
+    (setq range (- max min))
+    (foreach i in (interval 0 (- num 1)) do
+	  (setf (nth vect i) (/ (- (nth vect i) min) range)))))
+
+(defun clear-slot-from-class ((class-name SYMBOL) (slot-name SYMBOL))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  ;; removes the slot value from each member of a class
+  (setq class-name (permanentify class-name))
+  (setq slot-name (permanentify slot-name))
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(cases (listify (all-class-instances class)))
+	(slot (surrogate-value-inverse (get-description slot-name))))
+    (foreach case in cases do
+	  (smart-update-proposition
+	   (bquote (& slot-name & case & (get-slot-value case slot)))
+	   :RETRACT-TRUE))))
+	
+	
+
+(defun (logic-symbol OBJECT) ((obj OBJECT))
+  ;; Returns the symbol name of the logic object
+  (typecase obj
+    (DESCRIPTION 
+     (return obj))
+    ((PATTERN-VARIABLE SKOLEM)
+     (return (intern-symbol (get-skolem-print-name obj))))
+    (LOGIC-OBJECT
+     (return (intern-symbol (symbol-name (surrogate-value-inverse obj)))))
+    (otherwise
+     (return obj))))
+
+(defun (calculate-case-match FLOAT) ((x OBJECT) (y OBJECT))
+  ;; Calculate distances between two objects based on what types
+  ;; of objects they are.
+  (typecase x
+    (FLOAT-WRAPPER
+     (return (abs (- (cast x FLOAT-WRAPPER) (cast y FLOAT-WRAPPER)))))
+    (INTEGER-WRAPPER
+     (return (abs (- (cast x INTEGER-WRAPPER) (cast y INTEGER-WRAPPER)))))
+    (SYMBOL
+     (if (eql? x y)
+	 (return 1.0)
+       (return 0.0)))
+    (otherwise
+     (return 0))))
+  
+
+(defun (get-most-specific-classes CONS) ((instance LOGIC-OBJECT))
+;; This function will return the most specific classes for a given instance
+;; e.g.: 
+;; STELLA(143): (get-most-specific-classes (get "hyp-mgb-wa"))
+;; |i|(|C|BUILD-MGB)
+;; STELLA(144):
+  (let ((types (all-direct-types instance)))
+    (when (empty? types)
+      (return (all-asserted-types instance)))
+    (return types)))
+
+(defun (find-unique-variable-names list) ((tree CONS) (names (list of symbol)))
+  ;; Given a cons proposition, it finds unique variable names and adds 
+  ;; them to 'names'.
+  (foreach arg in (rest tree) do
+     (typecase arg
+       (CONS 
+	(find-unique-variable-names arg names))
+       (SYMBOL 
+	(when (not (member? names arg))
+	  (push names arg)))
+       (otherwise nil)))
+  (return names))
+				  
+(defun (variablize-cons-propositions (LIST of CONS)) 
+    ((antecedent (LIST of CONS)))
+  ;; Variablize all instances in a cons proposition
+  (let ((var-list (new (list of symbol))))
+    ;; collect symbol to variable pairings
+    (foreach prop in antecedent do
+	  (find-unique-variable-names prop var-list))
+    (return (variablize-instances antecedent var-list))))
+
+
+(defun (variablize-instances (LIST of CONS)) ((form (LIST of CONS))
+				    (instances (LIST of OBJECT)))
+  ;; For each instance in instances substitute a unique variable in form
+  (foreach bind in instances do
+       (let ((var (intern-logic-symbol (concatenate "?X" (stringify *Case-Variable-Counter*)))))
+	 (++ *Case-Variable-Counter*)
+	 (insert-at *Symbol-Variable-Hash-Table* bind var)
+	 (push *Seen-Instances* bind)
+	 (foreach clause in form do
+	       (substitute-cons-tree clause var bind))))
+    (return form))
+
+(defun (string-argument? BOOLEAN) ((clause CONS))
+  (foreach ele in clause do
+	(typecase ele
+	  (CONS
+	   (when (string-argument? ele)
+	     (return TRUE)))
+	  (STRING
+	   (return TRUE))
+	  (otherwise nil)))
+  (return false))
+	   
+
+(defun filter-antecedent ((antecedent (LIST of CONS)) 
+			  (rule-name STRING)) 
+
+  ;; Take out any clauses with string types in them
+  (foreach clause on antecedent
+      where (string-argument? (value clause))
+      do (setf (value clause) NULL))
+  (remove antecedent NULL)
+  
+  ;; remove clauses that are already in the rule antecedent.  If
+  ;; duplicate is found, adjust the names of all of its variables to
+  ;; coincide with the rule's variables.
+  (let ((rule-ant (lookup *Case-Antecedent-Table* rule-name))
+	(generated-variables (list (intern-logic-symbol "?Y")))
+	(index 0))
+    (when *Log-Antecedent-Construction*
+      (print "New clauses: " antecedent EOL))
+    ;;      (print "Current clauses: " rule-ant EOL))
+    (when (null? rule-ant)
+      (return))
+    (foreach i in (interval 1 (length antecedent))
+	do (ignore i)
+	   (let ((clause (nth antecedent index))
+		 (vars (CONS of CONS)
+		       (find-matching-case-vars clause rule-ant
+						generated-variables)))
+	     (if (non-empty? vars)
+	       (progn
+		 (setq antecedent (remove antecedent clause))
+		 (foreach sub in vars 
+		     where (symbol? (second sub)) do
+		       (push *Deleted-Case-Variables* (second sub))
+		       (when (not (eql? (first sub) (second sub)))
+			 (foreach ant in antecedent do
+			       (substitute-cons-tree ant (first sub) (second sub))))))
+	       (++ index)))) ;; else skip to next clause
+    (when *Log-Antecedent-Construction*
+      (print "Clauses added to antecedent: " antecedent EOL))
+    (return)))
+    
+
+(defun (find-matching-case-vars CONS) ((clause CONS) 
+				       (antecedent (LIST of CONS))
+				       (generated-variables LIST))
+  ;; find a clause in the antecedent that maches given clause.  For a
+  ;; match to be found, it must match the predicate and all
+  ;; generated variables must be aligned.  If a clause is found,
+  ;; return a series of variable substitutions that will unify the
+  ;; two clauses.  Otherwise return nil.
+;;  (when *Log-Antecedent-Construction*
+;;    (print "  Checking " clause EOL))
+  (let ((predicate (first clause))
+	(arity (length clause)))
+    (foreach ant in antecedent do  
+       (let ((real-ant ant))
+	 (when *Log-Antecedent-Construction*    
+	   (print "   Comparing " clause " to " real-ant EOL))
+	 (when (and (eql? (first real-ant) predicate)
+		     (parameters-aligned? clause real-ant generated-variables)
+		     (eql? (length real-ant) arity))
+	   (let ((subs nil))
+	     (foreach var1 in (rest clause)
+		 as var2 in (rest real-ant)
+		 do (push generated-variables var2)
+		 collect (cons-list var2 var1) into subs)
+	     (when *Log-Antecedent-Construction*    
+	       (print "   Found match: " subs EOL))
+	     (return subs)))))
+    (return nil)))
+
+(defun (parameters-aligned? BOOLEAN) ((clause1 CONS) (clause2 CONS)
+					       (vars list))
+  ;; checks to see if two clauses have all of their generated variables 
+  ;; in the same position.
+  (foreach var in vars do
+	(when (not (eql? (position clause1 var 0) (position clause2 var 0)))
+	  (return false)))
+  ;; checks to see if parameters match
+  (foreach p1 in (rest clause1)
+      as p2 in (rest clause2) do
+	(cond 
+	 ((cons? p1)
+	  (when (or (not (cons? p2))
+		    (not (parameters-aligned? p1 p2 vars)))
+	    (return false)))
+	 (otherwise
+	  (when (and (or (not (variable-arg? p1))
+			 (not (variable-arg? p2)))
+		     (not (eql? p1 p2)))
+	    (return false)))))
+  (return true))
+
+(defun (variable-arg? BOOLEAN) ((arg OBJECT))
+  (typecase arg
+    (SYMBOL
+     (if (eq? (nth (symbol-name arg) 0) #\?)
+	 (return true)
+       (return false)))
+    (otherwise 
+     (return false))))
+
+(defun (build-variable-constraints CONS) ((instances (LIST of SYMBOL)))
+  ;; returns the constraints that Xi = Yi for all variables.
+  (let ((constraints nil))
+    (foreach var in instances do
+       (let ((name (lookup *Symbol-Variable-Hash-Table* var)))
+	 (when (not (member? *Deleted-Case-Variables* name))
+	   (setq constraints 
+	     (cons (bquote (soft-eq & name & 
+				    (intern-logic-symbol 
+				     (concatenate 
+				       "X" 
+				       (subsequence (stringify name) 1 NULL)))))
+		   constraints)))))
+    (return constraints)))
+
+(defun (build-type-defs (LIST of SYMBOL)) ((instances (LIST of SYMBOL)))
+  ;; build type-defs: lookup variable name and class definition
+  (let ((type-defs (new (LIST OF SYMBOL)))
+	(name SYMBOL NULL))
+    (foreach var in instances do
+	(setq name (lookup *Symbol-Variable-Hash-Table* var))
+	(when (not (member? *Deleted-Case-Variables* name))
+	  (push type-defs name)))
+    (return type-defs)))
+
+
+;(defun (duplicate-antecedent-clauses CONS) ((antecedent (CONS of CONS))) 
+;  ;; creates a duplicate for every clause in the antecedent with able
+;  ;; names.  The new clause is connected to the old clause with either
+;  ;; = or <=> depending on the type of the first argument.
+;  (let ((new-clauses (copy-cons-tree antecedent))
+;	(result (CONS of CONS) nil))
+;    (foreach i in (interval 0 *Case-Variable-Counter*) do
+;       (let ((counter (stringify i)))
+;	 (substitute-cons-tree new-clauses 
+;			       (intern-logic-symbol (concatenate "?X" counter))
+;			       (intern-logic-symbol (concatenate "?V" counter)))))
+;    (substitute-cons-tree new-clauses (quote /logic/?X) (quote /logic/?Y))
+;    (foreach clause in antecedent 
+;	as new-clause in new-clauses 
+;;;        do (print "Creating " (second new-clause) " from " (second clause) EOL)
+;	collect (cons-list (first clause) (second new-clause) (second clause))
+;	into result)
+;    (return result)))
+
+
+;;
+;; Here are some useful utilites for doing basic structure matching
+;;
+
+       
+
+;(defun (match-structure FLOAT) ((name1 SYMBOL) (name2 SYMBOL))
+;  :command? TRUE :evaluate-arguments? FALSE :public? TRUE
+;  ;; does a naive structural match between two instances
+;  (setq name1 (permanentify name1))
+;  (setq name2 (permanentify name2))
+;  (return (return-structure-match-score name1 name2)))
+  
+;(defun (return-structure-match-score FLOAT) ((name1 SYMBOL) (name2 SYMBOL))
+;  (setq *Seen-Instances* (new list))
+;  (setq *Visited-Instances* (new list))
+;  (setq *Deleted-Case-Variables* (new list))  
+;  (setq *Visited-Propositions* (new list))
+;  (setq *Drop-Function-Values?* FALSE)
+;  (let ((antecedent (LIST of CONS) (get-assertion-structure name2 1))
+;	(temp nil)
+;	(vars nil)
+;	(var-restrictions nil)
+;	(type-defs nil))
+;    (setq *Symbol-Variable-Hash-Table* (new (HASH-TABLE of SYMBOL SYMBOL)))
+;    (setq antecedent (variablize-instances antecedent *visited-instances*))
+;    (substitute-cons-tree antecedent name1
+;			  (lookup *Symbol-Variable-Hash-Table* name2))
+;    (insert-at *Symbol-Variable-Hash-Table* name2 name1)
+;    (setq *Seen-Instances* (remove *Seen-Instances* name2))
+
+;    ;; create variable restrictions
+;    (foreach name in *Seen-Instances*
+;	collect (lookup *Symbol-Variable-Hash-Table* name) into vars)
+;    (foreach i in (interval 0 (1- (length vars))) do
+;	  (foreach j in (interval (+ i 1) (1- (length vars))) 
+;	      collect (bquote (not (= & (nth vars i) & (nth vars j))))
+;	      into var-restrictions))
+;    (setq temp (build-type-defs *Seen-Instances*))
+;    ;; get rid of extra type defs that are used for the one big rule approach
+;    (foreach type in temp
+;	as i in (interval 0 NULL)
+;	where (odd? i)
+;	collect type into type-defs)
+;    (foreach ant on antecedent do
+;	  (setf (value ant) (second (value ant))))
+;    (setq *Drop-Function-Values?* TRUE)
+;    (return (first (match-scores *most-recent-query*)))))
+
+
+;(defun (find-matching-instances	CONS) ((ilist1 (list of symbol))
+;				       (ilist2 (list of symbol)))
+;  :command? TRUE :public? TRUE
+;  (return (structure-match-instances ilist1 ilist2)))
+
+;(defglobal *ilist1* (list of symbol) (new (list of symbol)))
+;(defglobal *ilist2* (list of symbol) (new (list of symbol)))
+
+;; use (listify (all-named-instances *module* true)) to get list of instances
+;;
+;;STELLA(22): (eval (foreach inst in (all-named-instances *module* true)
+;;				  collect (object-name inst)
+;;		     into *ilist1*))
+;;CL:NIL
+;;STELLA(23): 
+
+
+;(defun (structure-match-instances CONS) ((ilist1 (list of symbol))
+;					 (ilist2 (list of symbol)))
+;  (let ((result nil)
+;	(high-score 0.0)
+;	(score 0.0)
+;	(matching-symbol symbol NULL))
+;    (foreach i1 in ilist1 do
+;	  (setq high-score -5.0)
+;	  (setq matching-symbol NULL)
+;	  (foreach i2 in ilist2 
+              ;; ONLY SKOLEMS HAVE root-typeS NOW.  REWRITE??:
+;;	      where (eql? (root-type (cast (get-instance (symbol-name i1))
+;					   LOGIC-OBJECT))
+;			  (root-type (cast (get-instance (symbol-name i2))
+;					   LOGIC-OBJECT)))
+;	      do
+;		(print "Testing " i1 " and " i2)
+;		(setq score (return-structure-match-score i1 i2))
+;		(setq score (+ score (return-structure-match-score i1 i2)))
+;		(print " " score EOL)
+;		(when (> score high-score)
+;		  (setq high-score score)
+;		  (setq matching-symbol i2)))
+;	  (print "*** Match " i1 " " matching-symbol " " high-score EOL)
+;	collect (cons-list i1 matching-symbol high-score) into result)
+;    (return result)))
+
+;; KNN stuff
+
+(defglobal *Print-Case-Distances* BOOLEAN FALSE)
+
+(defun set-print-case-distances ((b BOOLEAN))
+  :command? TRUE :public? TRUE
+  (setq *Print-Case-Distances* b))
+    
+(defun (get-nearest-neighbors (LIST of TRAINING-EXAMPLE))
+    ((probe TRAINING-EXAMPLE) 
+     (cases (List of TRAINING-EXAMPLE))
+     (k INTEGER))
+  (let ((result (new (LIST of TRAINING-EXAMPLE)))
+	(current-module *module*) ;; save current module
+	(neighbors (new (VECTOR of TRAINING-EXAMPLE) :array-size k))
+	(farthest 0)
+	(distance FLOAT 0.0)
+	(distances (new (VECTOR of FLOAT-WRAPPER) :array-size k)))
+    (foreach i in (interval 0 (1- k)) do
+	(setf (nth distances i) 999999.0))
+    (when (null? (input probe))
+      (setf (input probe) (create-input-signature (query probe))))
+    ;; fill out input signatures for each training example
+    ;; TODO: Look at time stamp to decide if you need to recreate
+    ;; input signature
+    (foreach case in cases do
+	(when (null? (input case)) 
+	  (when (not (null? (module case)))
+	    (change-module (module case)))
+	  (setf (input case) (create-input-signature (query case)))
+	  (change-module current-module))
+	(when (= (length (input probe)) 1)
+	  (setf (input probe) (create-input-signature (query probe))))
+	(setq distance (+ (hamming-distance (input probe) (input case))
+			  0.0))
+	(when *Print-Case-Distances*
+	  (print "  Distance from " (last (query case)) ": " distance EOL))
+	(setf (temp case) distance)
+	(when (< distance (nth distances farthest))
+	  (setf (nth distances farthest) distance)
+	  (setf (nth neighbors farthest) case)
+          ;; recalculate farthest
+	  (setq farthest 0)
+	  (foreach j in (interval 1 (1- k)) do
+		(when (> (nth distances j) (nth distances farthest))
+		  (setq farthest j)))))
+    (foreach i in (interval 0 (1- k))
+	collect (nth neighbors i) into result)
+    (return result)))
+
+
+(defun (euclidean-distance FLOAT) ((vec1 (VECTOR of FLOAT-WRAPPER)) (vec2 (VECTOR of FLOAT-WRAPPER)))
+  ;; Returns the euclidean distance between two vectors
+  (let ((result 0.0)
+	(diff 0.0))
+    (foreach i in (interval 0 (1- (length vec1))) do
+	  (setq diff (- (nth vec1 i) (nth vec2 i)))
+	  (setq result (+ result (* diff diff))))
+    (return (sqrt result))))
+
+(defun (hamming-distance INTEGER) ((vec1 (VECTOR of INTEGER-WRAPPER)) (vec2 (VECTOR of INTEGER-WRAPPER)))
+  ;; returns the hamming distance between two bit vectors
+  (let ((result 0))
+    (foreach i in (interval 0 (1- (length vec1))) do
+	  (when (not (= (nth vec1 i) (nth vec2 i)))
+	    (++ result)))
+    (return result)))
+
+
+(defun (intern-logic-symbol SYMBOL) ((name STRING))
+  (return (intern-symbol-in-module name (get-module "LOGIC") TRUE)))
+

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: java-output.ste,v 1.55 2003/10/23 16:58:41 tar Exp
+;;; Version: java-output.ste,v 1.60 2006/05/11 07:06:09 hans Exp
 
 ;;; Routines for outputing a formatted Java program.
 
@@ -684,6 +684,7 @@
   ;;   and method/function names.
   (let ((return? FALSE)
 	(escape? FALSE)
+        (eol-last? FALSE)
 	(inside-quote? FALSE)
 	(saved-stream *current-stream*)
 	(string-stream STRING-OUTPUT-STREAM NULL)
@@ -693,13 +694,21 @@
 	do (case char
 	     (#\Linefeed
 	      (unless return?
-		(print-stream *current-stream* EOL)
+                (if (and eol-last? javadoc-comment?)
+                  (print-stream *current-stream* "<p>" EOL)
+		  (print-stream *current-stream* EOL))
+                (setq eol-last? TRUE)
 		(java-indent)
-		(print-stream *current-stream* comment-continuation)))
+		(print-stream *current-stream* comment-continuation))
+              (setq escape? FALSE)
+              (setq return? FALSE))
 	     (#\Return
-	      (print-stream *current-stream* EOL)
+              (if (and eol-last? javadoc-comment?)
+                (print-stream *current-stream* "<p>" EOL)
+                (print-stream *current-stream* EOL))
 	      (java-indent)
 	      (print-stream *current-stream* comment-continuation)
+              (setq eol-last? TRUE)
 	      (setq return? TRUE)
 	      (setq escape? FALSE)
 	      (continue))
@@ -712,7 +721,10 @@
 		    (otherwise
 		     (setq string-stream (new STRING-OUTPUT-STREAM))
 		     (setq *current-stream* string-stream)
-		     (setq inside-quote? TRUE))))
+		     (setq inside-quote? TRUE)))
+              (setq escape? FALSE)
+              (setq return? FALSE)
+              (setq eol-last? FALSE))
 	     (#\'
 	      (cond (escape? 
 		     (print-stream *current-stream* char))
@@ -730,21 +742,31 @@
 		       (print-stream *current-stream* #\'))
 		     (setq inside-quote? FALSE))
 		    (otherwise
-		     (print-stream *current-stream* char))))
+		     (print-stream *current-stream* char)))
+              (setq escape? FALSE)
+              (setq return? FALSE)
+              (setq eol-last? FALSE))
 	     (#\\
 		 (if escape?
-		   (print-stream *current-stream* char)
 		   (progn
-		     (setq escape? TRUE)
-		     (setq return? FALSE)
-		     (continue))))
+                     (print-stream *current-stream* char)
+                     (setq escape? FALSE))
+                   (setq escape? TRUE))
+                 (setq return? FALSE)
+                 (setq eol-last? FALSE))
 	     (otherwise
 	      (if (or inside-quote? (not javadoc-comment?))
 		(print-stream *current-stream* char)
 		(write-html-character-quoting-special-characters 
 		 *current-stream* char))
 	      (setq return? FALSE)
-	      (setq escape? FALSE))))
+	      (setq escape? FALSE)
+              (setq eol-last? FALSE))))
+    (when inside-quote?
+      (warn "Comment ended while inside a ` form in comment " comment)
+      (setq *current-stream* saved-stream)
+      (print-stream *current-stream* #\`)
+      (print-stream *current-stream* (the-string string-stream)))
     (if (and (defined? comment-end)
 	     (not (eql? comment-end "")))
       (progn (java-indent)
@@ -1275,16 +1297,67 @@
 
 (defun java-output-foreach ((loop CONS))
   ;; Output a Java foreach statement.  "loop" has the form
-  ;;   (<continuationTest> <nextAssignments> <body>)
-  (let ((continuationTest (first loop))
-	(nextAssignments (second loop))
-	(body (third loop)))
-    (print-stream *current-stream* "while (")
-    (java-output-statement continuationTest)
-    (print-stream *current-stream* ") {" EOL)
+  ;;   (<variables>
+  ;;    <continuationTest>
+  ;;    <valueAssignments>
+  ;;    <nextAssignments>
+  ;;    <body>)
+  ;; All <variables> are already assumed to be declared in
+  ;;    a surrounding block.
+  (let (;(variables (CONS OF CONS) (first loop))
+        ;(nofVariables (length variables))
+        (continuationTest (second loop))
+        (valueAssignments CONS (third loop))
+	(nextAssignments CONS (fourth loop))
+        (nofNextAssignments (length nextAssignments))
+	(body CONS (fifth loop))
+        (eolSeparateExpressions?
+         (or (> nofNextAssignments 2)
+             (> *java-indent-chars* 35))))
+    
+    ;; For elegance, if there are no next assignments, we use
+    ;; a while loop instead of  for ( ; ... ; )
+    (when (= nofNextAssignments 0)
+      (print-stream *current-stream* "while (")
+      (java-output-statement continuationTest)
+      (print-stream *current-stream* ") {" EOL)
+      (java-bump-indent)
+      (java-output-statements
+       (concatenate valueAssignments body))
+      (java-unbump-indent)
+      (java-indent)
+      (print-stream *current-stream* "}" EOL)
+      (return))
+
+    ;; We need to do a full foreach statement...
+
+    (print-stream *current-stream* "for (;")
     (java-bump-indent)
-    (java-output-statements nextAssignments)
-    (java-output-statements body)
+    (java-bump-indent)
+    (java-bump-indent)
+    ;; in Java we can't just list the variables in the initializer (as in C++)
+    ;;    since those are not legal expression statements.  We could initialize
+    ;;    the variables there, but that makes the translation very verbose since
+    ;;    we have a declaration and a separate initialization for each variable.
+    (java-output-statement continuationTest)
+    (print-stream *current-stream* "; ")
+    (when (non-empty? nextAssignments)
+      (when eolSeparateExpressions?
+        (print-stream *current-stream* EOL))
+      (foreach next in nextAssignments
+          as i in (interval 1 NULL)
+          do (when eolSeparateExpressions?
+               (java-indent))
+             (java-output-statement next)
+             (unless (= i nofNextAssignments)
+               (if eolSeparateExpressions?
+                   (print-stream *current-stream* "," EOL)
+                 (print-stream *current-stream* ", ")))))
+    (print-stream *current-stream* ") {" EOL)
+    (java-unbump-indent)
+    (java-unbump-indent)
+    (java-output-statements
+     (concatenate valueAssignments body))
     (java-unbump-indent)
     (java-indent)
     (print-stream *current-stream* "}" EOL) ))

@@ -1,12 +1,12 @@
 ;;; fi-stella.el --- Stella extensions for the Allegro-CL fi-interface
 
-;;; COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 1996-2003
+;;; COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 1996-2006
 ;;; University of Southern California, Information Sciences Institute
 ;;; 4676 Admiralty Way, Marina Del Rey, California 90292
 
 ;;; Author: Hans Chalupsky <hans@isi.edu>
 ;;; Created: 1996
-;;; Version: fi-stella.el,v 1.26 2003/09/30 00:56:16 hans Exp
+;;; Version: fi-stella.el,v 1.28 2006/05/11 07:06:44 hans Exp
 
 ;;; This program is free software; you can redistribute it and/or modify
 ;;; it under the terms of the GNU General Public License as published by
@@ -246,6 +246,8 @@ to be evaluated or macroexpanded."
   (put 'while tag '(like when))
   (put 'verbatim tag '(like when))
   (put 'startup-time-progn tag '(like when))
+  (put 'with-input-file tag '(like let))
+  (put 'with-output-file tag '(like let))
   (put 'with-transient-objects tag '(like progn))
   (put 'with-permanent-objects tag '(like progn))
   (put 'within-context tag '(like let))

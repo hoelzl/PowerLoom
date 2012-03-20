@@ -1,0 +1,1143 @@
+; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: explanations.ste,v 1.10 2006/05/11 07:05:09 hans Exp
+
+;;; Support for generating explanations
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+;;; TO DO:
+
+;;; - Handle :DISJUNCTIVE-IMPLICATION-INTRODUCTION
+;;; - Handle :ITERATIVE-FORALL
+;;; - Handle subset queries that use :CONTAINED-BY, subsumption, or
+;;;   simple computation.
+;;; - Annotate named rules
+;;; - Explain normalization transformations
+;;; - Handle reference to a defined class for member/isa propositions that are
+;;;   derived from a `setof' definition of a class (e.g., COLOR).
+;;; - Make intensional function propositions like
+;;;   (= (FRIENDS BUCK) (FRIENDS BUCK)) invisible.
+;;; - `append' demo looks a bit funny (maybe related to intensional function
+;;;   propositions).
+;;; - Handle funniness introduced by function denesting, e.g., the resulting
+;;;   `and' in the example below looks weird:
+;;;       (and (= (AGE FRED) (AGE FRED))
+;;;            (> (AGE FRED) 30))
+;;; - Handle subsumption relationships that look like primitive assertions, e.g.,
+;;;   in recursion demo, `has-ancestor' subsumes `has-parent', hence, the
+;;;   explicit `has-parent' assertions are always recorded as `has-ancestor'
+;;;   assertions.
+;;; - Handle propositions derived via forward inference.  A first-cut solution
+;;;   would be to record the inference context and say
+;;;   "holds via forward inference" if the proposition holds in a strict
+;;;   inference cache of the query context.
+
+;;; Tom's suggestions:
+
+;;; - Mention rule in modus ponens as last antecedent.
+;;; - Use forward-implication by default.
+
+
+(defclass EXPLAIN-EXCEPTION (LOGIC-EXCEPTION))
+(defclass EXPLAIN-NO-QUERY-EXCEPTION (EXPLAIN-EXCEPTION))
+(defclass EXPLAIN-NO-SOLUTION-EXCEPTION (EXPLAIN-EXCEPTION))
+(defclass EXPLAIN-NO-MORE-SOLUTIONS-EXCEPTION (EXPLAIN-EXCEPTION))
+(defclass EXPLAIN-NOT-ENABLED-EXCEPTION (EXPLAIN-EXCEPTION))
+(defclass EXPLAIN-NO-SUCH-LABEL-EXCEPTION (EXPLAIN-EXCEPTION))
+(defclass EXPLAIN-QUERY-TRUE-EXCEPTION (EXPLAIN-EXCEPTION))
+
+(defspecial *explanation-format* KEYWORD :ASCII
+  :documentation "Keyword to control the explanation format.
+Valid values are :ASCII, :HTML and :XML")
+
+(defspecial *explanation-style* KEYWORD :BRIEF
+  :documentation "Keywords that controls how detailed explanations will be.
+Valid values are :VERBOSE and :BRIEF."
+  :public? TRUE)
+
+(defspecial *explanation-audience* KEYWORD :TECHNICAL
+  :documentation "Keywords that controls the language for justifications.
+Valid values are :TECHNICAL and :LAY"
+  :public? TRUE)
+
+(defglobal *default-explanation-depth* INTEGER 3
+  :documentation "Maximal explanation depth used if not otherwise specified."
+  :public? TRUE)
+
+(defglobal *explanation-tab-string* STRING "    ") 
+
+(defglobal *max-inline-label-length* INTEGER 10
+  :documentation "Maximum length of a label string for which the following
+proposition will be printed on the same line.")
+
+(defglobal *explanation-assertion-marker* STRING "!")
+(defglobal *explanation-failure-marker* STRING "?")
+(defglobal *explanation-cutoff-marker* STRING "x")
+(defglobal *explanation-inference-marker* STRING " ")
+
+(defun (explanation-truth-marker STRING) ((justification JUSTIFICATION))
+  ;; Annotate the truth of a reasoning step encoded in `justification'.
+  (let ((holdsBy KEYWORD NULL))
+    (cond ((mark-as-explicit-assertion? justification)
+           (setq holdsBy :ASSERTION))
+          ((mark-as-failed-goal? justification)
+           (setq holdsBy :FAILURE))
+          ((mark-as-cutoff-goal? justification)
+           (setq holdsBy :CUTOFF))
+          (otherwise
+           (setq holdsBy :INFERENCE)))
+    (case *explanation-format*
+      (:HTML
+       (let ((label "Fact:")
+             ;; color trans: (cl:format cl:nil "#~x~x~x" 60 179 113)
+             (green "#00ff00" #|green|#
+                    ;"#90ee90" #|light green|#
+                    )
+             (yellow "#ffd70" #|gold|#)
+             (red "#ff0000" #|red|#)
+             (color STRING NULL))
+         (case holdsBy
+           (:ASSERTION
+            (when (eql? (kind (proposition justification)) :IMPLIES)
+              (setq label "Rule:"))
+            (setq color green))
+           (:FAILURE
+            (setq color red)
+            (setq label "Unknown:"))
+           (:CUTOFF
+            (setq color red)
+            (setq label "Cutoff:"))
+           (:INFERENCE
+            (setq label "Inferred:")
+            (if (partially-follows? justification)
+                (setq color yellow)
+              (setq color green))))
+         (when (defined? color)
+           (setq label
+             (concatenate
+               "<font color=\"" color "\">" "<strong>" label "</strong>" "</font>")))
+         (return label)))
+      (otherwise
+       (case holdsBy
+         (:ASSERTION
+          (return *explanation-assertion-marker*))
+         (:FAILURE
+          (return *explanation-failure-marker*))
+         (:CUTOFF
+          (return *explanation-cutoff-marker*))
+         (:INFERENCE
+          (return *explanation-inference-marker*)))))))
+
+(deftype EXPLANATION-VOCABULARY (HASH-TABLE OF KEYWORD (CONS OF CONS)))
+
+(defspecial *explanation-vocabulary* EXPLANATION-VOCABULARY NULL
+  :documentation "The currently active vocabulary lookup table")
+
+(defglobal *explanation-vocabularies*
+    (KEY-VALUE-LIST OF KEYWORD EXPLANATION-VOCABULARY) (new KEY-VALUE-LIST)
+  :documentation "List of vocabularies with keyword keys")
+
+(defun define-explanation-phrase ((phraseKey KEYWORD)
+                                  (audience KEYWORD)
+                                  (phrase STRING)
+                                  &rest (modifiers KEYWORD))
+  ;; Define an explanation `phrase' for `phraseKey' and `audience'.
+  ;; `modifiers' such as :reverse, :partial or :amplification can be
+  ;;    used to define phrase variants for the same `phraseKey'.
+  ;; The main user extensible part of the explanation vocabulary is
+  ;;    for the <because> and <amplification> parts in the following
+  ;;    explanation sentence schema:
+  ;;
+  ;;        <label> (P ?x)
+  ;;           is [partly] true <because>
+  ;;           <amplification>
+  ;;           since <label> (Q ?x) ...
+  ;;           and   <label> ...
+  ;;           ...
+  ;;
+  ;;    The <because> for a particular inference rules should read
+  ;;    something like `by rule X' or `because of X'.  The <amplification>
+  ;;    part can be used to provide an even more detailed explanation
+  ;;    (actually, apart from a bit of formatting the <amplification>
+  ;;    option doesn't really buy us very much).
+  ;; Phrases for a particular justification object are looked up based
+  ;;    on its `inference-rule' (or `strategy' for primitive strategies).
+  (let ((vocabulary (lookup *explanation-vocabularies* audience))
+        (mods (coerce-&rest-to-cons modifiers))
+        (entry NIL))
+    (when (null? vocabulary)
+      (setq vocabulary (new EXPLANATION-VOCABULARY))
+      (insert-at *explanation-vocabularies* audience vocabulary))
+    (setq entry (lookup vocabulary phraseKey))
+    (when (null? entry)
+      (setq entry NIL))
+    (insert-at vocabulary phraseKey (cons (cons phrase mods) entry))))
+
+(defun (lookup-explanation-phrase STRING) ((phraseKey KEYWORD)
+                                           (modifiers (CONS OF KEYWORD))
+                                           (audience KEYWORD))
+  ;; Return the explanation phrase for `phraseKey' and `audience'
+  ;;    that has the most modifiers listed in `modifiers' but none
+  ;;    that aren't listed (i.e., we are looking for the phrase whose
+  ;;    modifiers form the largest subset of `modifiers').
+  ;; If `audience' is NULL, it defaults to the value of
+  ;;    `*explanation-audience*'.
+  ;; If `audience' has no vocabulary or doesn't define a phrase for
+  ;;    `phraseKey', we fall back on the :TECHNICAL vocabulary.
+  (let ((vocabulary
+         (lookup *explanation-vocabularies*
+                 (choose (defined? audience)
+                         audience
+                         *explanation-audience*)))
+        (entry (CONS OF CONS) NIL)
+        (bestPhrase STRING NULL)
+        (bestScore -1))
+    (when (null? vocabulary)
+      (setq vocabulary (lookup *explanation-vocabularies* :TECHNICAL)))
+    (setq entry (lookup vocabulary phraseKey))
+    (when (null? entry)
+      (setq vocabulary (lookup *explanation-vocabularies* :TECHNICAL))
+      (setq entry (lookup vocabulary phraseKey)))
+    (when (null? entry)
+      (return (lookup-explanation-phrase :UNKNOWN-RULE NIL audience)))
+    (foreach phrase in entry
+        do (when (and (forall mod in (rest phrase)
+                        always (memb? modifiers mod))
+                      (> (length (rest phrase)) bestScore))
+             (setq bestScore (length (rest phrase)))
+             (setq bestPhrase (first phrase))))
+    (return bestPhrase)))
+
+(startup-time-progn
+  (define-explanation-phrase :unknown-rule :technical
+    "because of an inference PowerLoom can't explain yet"))
+
+;;; Miscellaneous explanation phrases:
+(startup-time-progn
+  ;; introductory phrases for "X <follows> <because>...":
+  (define-explanation-phrase :follows :technical
+    "follows")
+  (define-explanation-phrase :follows :lay
+    "is true")
+  (define-explanation-phrase :follows :technical
+    "is partially true" :partial)
+  (define-explanation-phrase :follows :lay
+    "is true to some part" :partial)
+  (define-explanation-phrase :holds :technical
+    "holds")
+  (define-explanation-phrase :holds :lay
+    "is true")
+
+  ;; explanation phrases for definitions:
+  (define-explanation-phrase :definition :technical
+    "by the definition of")
+  (define-explanation-phrase :definition :lay
+    "by the definition of")
+
+  ;; introductory phrases for "X <failed> <because>...":
+  (define-explanation-phrase :failed :technical
+    "failed")
+  (define-explanation-phrase :failed :lay
+    "could not be proven")
+
+  ;; global phrases to annotate missing assertions or rules:
+  (define-explanation-phrase :not-asserted :technical
+    "is not asserted")
+  (define-explanation-phrase :not-asserted :lay
+    "is not asserted to be true")
+  (define-explanation-phrase :no-rules :technical
+    "no potential inference leading to the proposition could be found")
+  (define-explanation-phrase :no-rules :lay
+    "no rules for proving the proposition could be found"))
+
+
+;;; Explanation-infos and mappings are used to associate various information
+;;; necessary for the explanation of a proof with the justifications representing
+;;; the proof.  Since justifications are persistent and might be referenced in
+;;; multiple proofs (e.g., via caching), we cannot store this information right
+;;; inside them.
+
+(defclass EXPLANATION-INFO (STANDARD-OBJECT)
+  :slots ((label :type STRING)
+          (depth :type INTEGER)
+          (explained? :type BOOLEAN)))
+
+(deftype EXPLANATION-MAPPING (KEY-VALUE-LIST OF JUSTIFICATION EXPLANATION-INFO))
+
+(defun (register-justification EXPLANATION-INFO)
+    ((self JUSTIFICATION) (mapping EXPLANATION-MAPPING))
+  ;; Register the justification `self' in `mapping'.
+  (return (get-explanation-info self mapping TRUE)))
+  
+(defun (get-explanation-info EXPLANATION-INFO)
+    ((self JUSTIFICATION) (mapping EXPLANATION-MAPPING) (create? BOOLEAN))
+  ;; Return the explanation info for the justification `self' in `mapping'.
+  ;; If `create?' is TRUE, create one if it doesn't exist yet.
+  ;; This is slightly complicated by the fact, that different justifications
+  ;;    might represent the same proposition, since different patters can
+  ;;    be instantiated to the same ground proposition.
+  (let ((info (lookup mapping self)))
+    (unless (defined? info)
+      ;; try to find an equivalent registered justification:
+      (foreach (just info) in mapping
+          where (justification-eql? just self)
+          do (insert-at mapping self info)
+             (return info))
+      (when create?
+        (setq info (new EXPLANATION-INFO))
+        (insert-at mapping self info)))
+    (return info)))
+
+(defun (explanation-info EXPLANATION-INFO)
+    ((self JUSTIFICATION) (mapping EXPLANATION-MAPPING))
+  ;; Return the info for the justification `self' in `mapping',
+  ;;    or NULL if `self' has not been registered yet.
+  (return (get-explanation-info self mapping FALSE)))
+
+(defun (lookup-justification JUSTIFICATION)
+    ((mapping EXPLANATION-MAPPING) (label STRING))
+  ;; Look for a justification with `label' in `mapping' and return it
+  ;;    if it could be found.
+  (foreach (justification info) in mapping
+      where (eql? (label info) label)
+      do (return justification))
+  (return NULL))
+
+(defun reset-mapping-for-subexplanation ((mapping EXPLANATION-MAPPING))
+  ;; Reset `mapping' to a state where it can be reused for a follow-up
+  ;;    or sub-explanation.
+  (foreach (justification info) in mapping
+      do (ignore justification)
+	 (setf (explained? info) FALSE)))
+
+(defun (print-explanation EXPLANATION-MAPPING)
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM)
+     (mapping EXPLANATION-MAPPING) (maxDepth INTEGER) (audience KEYWORD))
+  ;; Print an explanation of the proof starting with `self' to `stream'
+  ;;    and return the generated (or modified) explanation `mapping'.
+  ;; Do not further explain any antecedents whose depth is greater
+  ;;    than `maxDepth'.  Depth corresponds to the number of levels of the
+  ;;    generated label, i.e., the top-level goal has depth 1, its antecedents
+  ;;    depth 2, etc.).  If `maxDepth' is NULL, explain to arbitrary depth.
+  ;; If `mapping' is supplied as non-NULL, it is assumed that `self' is
+  ;;    already registered in it and further explanation of it is sought.
+  ;;    In this case `maxDepth' is counted relative to the depth of `self'.
+  ;; 'Audience' is a keyword indicating the audience for the explanation.
+  ;;    It should be a keyword like :TECHNICAL or :LAY which describes a
+  ;;    registered explanation vocabulary.
+  (let ((unexplained (new (LIST OF JUSTIFICATION)))
+        (info EXPLANATION-INFO NULL))
+    (setq self (visible-justification self))
+    (cond
+     ((null? mapping)
+      (setq mapping (new EXPLANATION-MAPPING))
+      (setq info (register-justification self mapping))
+      (setf (label info) "1")
+      (setf (depth info) 1))
+     (otherwise
+      (setq info (explanation-info self mapping))
+      (when (null? info)
+        (error "Justification not found in supplied explanation mapping."))
+      (reset-mapping-for-subexplanation mapping)
+      (setq maxDepth (1- (+ (depth info) maxDepth)))))
+    (push unexplained self)
+    (special ((*explanation-audience* audience))
+      (while (non-empty? unexplained)
+        (setq self (pop unexplained))
+        (print-one-explanation self stream mapping maxDepth unexplained)))
+    ;; return the mapping, so we can use it in follow-up explanations:
+    (setq *most-recent-explanation-mapping* mapping)
+    (return mapping)))
+
+(defun print-explanation-support
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (mapping EXPLANATION-MAPPING)
+     (maxDepth INTEGER) (unexplained (LIST OF JUSTIFICATION)))
+  ;; Print the support part of the explanation.
+  (print-explanation-text self stream mapping)
+  (print-explanation-substitution self stream mapping)
+  (print-explanation-antecedents self stream mapping maxDepth unexplained))
+
+(defun print-one-explanation
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (mapping EXPLANATION-MAPPING)
+     (maxDepth INTEGER) (unexplained (LIST OF JUSTIFICATION)))
+  ;; Print an explanation for the single proof step represented by `self'
+  ;;    onto `stream'.
+  ;; Add any new antecedents to `unexplained' relative to `maxDepth'.
+  ;; NOTE: IN CASE EXPLANATIONS START TO VARY SIGNIFICANTLY DEPENDING ON
+  ;;    THE INFERENCE RULE, THIS COULD BECOME A METHOD DISPATCHING ON
+  ;;    DIFFERENT CLASSES OF JUSTIFICATIONS.
+  (case *explanation-format*
+    (:ASCII 
+     (print-explanation-header self stream mapping)
+     (print-explanation-support self stream mapping maxDepth unexplained)
+     (print-stream stream EOL))
+    (:XML   
+     (with-xml-tag ("inference" stream TRUE)
+       (print-stream stream EOL)
+       (print-explanation-header self stream mapping)
+       (with-xml-tag ("support" stream TRUE)
+	 (print-stream stream EOL)
+	 (print-explanation-support self stream mapping maxDepth unexplained))))
+    (:HTML
+     (with-html-tag ("TABLE" stream TRUE)
+       (with-html-tag ("TR" stream TRUE)
+         (print-stream stream EOL)
+         (print-explanation-header self stream mapping)
+         (print-explanation-support self stream mapping maxDepth unexplained)
+         (print-stream stream "</TD>"))))))
+
+;;; Support to print justification propositions containing variables
+;;;    as instantiated propositions:
+
+(defspecial *currentJustification* JUSTIFICATION NULL)
+
+(defun (printing-justification? BOOLEAN) ()
+  ;; Return TRUE if we are printing the proposition of a justification.
+  :globally-inline? TRUE
+  (return (defined? *currentJustification*)))
+
+(defun print-justification-proposition-for-format
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (indent INTEGER))
+  ;; Print the proposition justified by `self' onto `stream' with
+  ;;    continuation lines indented by `indent' spaces, with special
+  ;;    handling based on the format needed.
+  (case *explanation-format*
+    (:ASCII
+     (print-justification-proposition self stream indent))
+    (:HTML
+     (let ((string-stream (new STRING-OUTPUT-STREAM))
+           (quoteHtml? TRUE))
+       (print-justification-proposition self string-stream indent)
+       (when-cyc-kludges-enabled
+        ;; Kludge, until we can control HTML-quoting more elegantly:
+        (when (eql? *logic-dialect* :CYC-NL)
+          (setq quoteHtml? FALSE)))
+       (when (or (eql? *logic-dialect* :KIF-ONTOSAURUS)
+		 (eql? *logic-dialect* :JAVA-GUI-HTML))
+         (setq quoteHtml? FALSE))
+       (if quoteHtml?
+           (write-html-quoting-special-characters
+            stream (the-string string-stream))
+         (print-stream stream (the-string string-stream)))))
+    (:XML
+     (let ((proposition (proposition self))
+	   (string-stream (new STRING-OUTPUT-STREAM)))
+       (print-justification-proposition self string-stream 0)
+       (print-stream stream "<proposition type=\"")
+       (if (eql? (kind proposition) :IMPLIES)
+	 (print-stream stream "RULE")
+	 (print-stream stream "FACT"))
+       (print-stream stream "\" truthvalue=\""
+                     (choose (null? (truth-value self))
+                             UNKNOWN-TRUTH-VALUE
+                             (truth-value self)))
+       (print-stream stream "\">" EOL)
+       (write-html-quoting-special-characters stream (the-string string-stream))
+       (print-stream stream EOL "</proposition>") ))) )
+
+(defun print-justification-proposition
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (indent INTEGER))
+  ;; Print the proposition justified by `self' onto `stream' with
+  ;;    continuation lines indented by `indent' spaces.
+  (special ((*indentCounter* indent)
+            (*printMode* :REALISTIC))
+    (let ((proposition (proposition self)))
+      (when (reverse-polarity? self)
+        ;; Create dummy NOT proposition so we don't hardcode printing of NOT
+        ;;    and leave it up to the printers for the current dialect:
+        (setq proposition (create-proposition (quote PL-KERNEL/NOT) 1))
+        (setf (nth (arguments proposition) 0) (proposition self)))
+      (special ((*currentJustification* self))
+        (pretty-print-logical-form proposition stream)))))
+
+(defun print-explanation-label ((stream OUTPUT-STREAM) (label STRING) (head? BOOLEAN))
+  ;; Prints the Label on stream.  If head?, then this is in the header rather
+  ;;    than as a separate justification.
+  (ignore head?)
+  (case *explanation-format*
+    (:ASCII (print-stream stream label))
+    (:XML   (with-xml-tag ("label" stream TRUE)
+	      (print-stream stream label)))
+    (:HTML
+     (with-html-tag ("STRONG" stream FALSE)
+       (print-stream stream label "&nbsp;")))))
+
+(defun print-explanation-header
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (mapping EXPLANATION-MAPPING))
+  ;; Print the header with the label and proposition of `self' onto `stream'
+  ;;    relative to `mapping'.
+  (let ((info (explanation-info self mapping))
+        (label (label info))
+        (indent (1+ (length label))))
+    (case *explanation-format*
+      ((:XML :ASCII)
+       (print-explanation-label stream label TRUE))
+      (:HTML
+       (with-html-tag ("TD align=left valign=top" stream TRUE)
+         (print-explanation-label stream label TRUE))))
+    ;; this should be irrelevant to :XML and :HTML styles:
+    (cond
+     ((> (length label) *max-inline-label-length*)
+      (print-stream stream EOL *explanation-tab-string*)
+      (setq indent (length *explanation-tab-string*)))
+     (otherwise
+      (print-stream stream " ")))
+    (case *explanation-format*
+      ((:XML :ASCII) NULL)
+      (:HTML
+       (print-stream stream "<TD align=left valign=top>")))
+    (print-justification-proposition-for-format self stream indent)
+    (print-stream stream EOL)
+    (setf (explained? info) TRUE)))
+
+(defun print-explanation-text
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (mapping EXPLANATION-MAPPING))
+  ;; Print a textual explanation of the inference rule represented by `self'
+  ;;    onto `stream' relative to `mapping'.
+  (let ((introduction "")
+	(inference "")
+	(amplification "")
+        (modifiers NIL)
+        (modifiers+ (cons :amplification NIL)))
+    (when (reverse-polarity? self)
+      (pushq modifiers :reverse)
+      (pushq modifiers+ :reverse))
+    (when (partially-follows? self)
+      (pushq modifiers :partial)
+      (pushq modifiers+ :partial))
+    (if (failed-goal-justification? self)
+        ;; we have a cutoff (modifiers will be ignored):
+        (setq introduction (lookup-explanation-phrase :failed modifiers NULL))
+      (setq introduction (lookup-explanation-phrase :follows modifiers NULL)))
+    (case (inference-rule self)
+      (:PRIMITIVE-STRATEGY
+       ;; TO DO:  Is there a way to handle the case of assertions from
+       ;; Forward-chained rules?  The information available at this point
+       ;; in the processing doesn't seem to allow making that distinction.
+       (case (inference-strategy self)
+         (:SCAN-PROPOSITIONS
+          (when (defined? (master-proposition (proposition self)))
+            (setq introduction (lookup-explanation-phrase :holds NIL NULL))
+            (setq inference (make-rule-origin-explanation-phrase self))))
+         (otherwise NULL))
+       (when (null? inference)
+         (setq inference
+           (lookup-explanation-phrase
+            (inference-strategy self) modifiers NULL))))
+      (otherwise
+       (setq inference
+         (lookup-explanation-phrase (inference-rule self) modifiers NULL))
+       (setq amplification
+         (lookup-explanation-phrase (inference-rule self) modifiers+ NULL))))
+    (case *explanation-format*
+      (:ASCII
+       (print-stream stream *explanation-tab-string*)
+       (print-stream stream introduction " " inference)
+       (when (and (> (length amplification) 0)
+                  (not (eql? amplification inference)))
+         (print-stream stream " " amplification))
+       (print-stream stream EOL))
+      (:HTML
+       (print-stream stream "<BR>" EOL)
+       (print-stream stream introduction " " inference)
+       (when (and (> (length amplification) 0)
+                  (not (eql? amplification inference)))
+         (print-stream stream " " amplification))
+       (print-stream stream EOL))
+      (:XML
+       (print-stream stream "<method>" inference "</method>" EOL))) ))
+
+(defun (mark-as-explicit-assertion? BOOLEAN) ((self JUSTIFICATION))
+  ;; Return TRUE if `self' should be marked inline in an antecedent list
+  ;;    as an explicit assertion, instead of explaining it in a separate entry.
+  (when (eql? *explanation-style* :BRIEF)
+    (case (inference-rule self)
+      (:PRIMITIVE-STRATEGY
+       (case (strategy (cast self PRIMITIVE-STRATEGY))
+         ((:SCAN-COLLECTION :SCAN-PROPOSITIONS :LOOKUP-ASSERTIONS :EQUIVALENCE)
+          (return TRUE))
+         (otherwise NULL)))
+      (otherwise NULL)))
+  (return FALSE))
+
+(defun (mark-as-failed-goal? BOOLEAN) ((self JUSTIFICATION))
+  ;; Return TRUE if `self' should be marked inline in an antecedent list
+  ;;    as a failed goal, instead of explaining it in a separate entry.
+  (return (and (eql? *explanation-style* :BRIEF)
+               (eql? (inference-rule self) :PRIMITIVE-STRATEGY)
+               (failed-goal-justification? self))))
+
+(defun (mark-as-cutoff-goal? BOOLEAN) ((self JUSTIFICATION))
+  ;; Return TRUE if `self' should be marked as a cutoff goal (different
+  ;;    from the previous predicates, we might still need follow-up
+  ;;    explanation to indicate what kind of cutoff we had).
+  (return (cutoff-goal-justification? self)))
+
+(defun (partially-follows? BOOLEAN) ((self JUSTIFICATION))
+  ;; Return TRUE if only some of the direct antecedents of `self' hold.
+  (return (unknown-truth-value? (truth-value self))))
+
+(defun (make-rule-origin-explanation-phrase STRING) ((self JUSTIFICATION))
+  ;; Return an explanation string explaining the origin of the rule
+  ;;    contained in `self' if necessary.
+  ;; In particular, rules that were derived by parsing class or relation
+  ;;    definitions and/or by complex inversions should be further explained.
+  ;; TO DO: WRITE CODE THAT DETERMINES/EXPLAINS COMPLEX INVERSIONS.
+  (let ((satellite (proposition self))
+        (master (master-proposition satellite))
+        (head DESCRIPTION (second (arguments satellite)))
+        (tail DESCRIPTION (first (arguments satellite)))
+        (namedSource NAMED-DESCRIPTION NULL)
+        (source DESCRIPTION NULL))
+    (foreach i in (interval 1 4)
+        do (case i
+             (1 (setq source head))
+             (2 (setq source (relative-complement head)))
+             (3 (setq source tail))
+             (4 (setq source (relative-complement tail))))
+           (when (and (defined? source)
+                      (isa? source @NAMED-DESCRIPTION))
+             (when (member? (originated-propositions source) master)
+               (setq namedSource source)
+               (break))))
+    (if (defined? namedSource)
+        (return
+          (concatenate
+            (lookup-explanation-phrase :definition NIL NULL) " "
+            (name-object-metaclass namedSource) " "
+            (description-name namedSource)))
+      (return (lookup-explanation-phrase :lookup-assertions NIL NULL)))))
+
+(defun (get-explanation-substitution ENTITY-MAPPING) ((self JUSTIFICATION))
+  ;; `self' represents the result of a rule application.
+  ;; Collect the set of rule variable substitutions and return the result.
+  (let ((ruleJustification (first (antecedents self)))
+        (rule (proposition ruleJustification))
+        ;; the rule antecedent is a :PATTERN frame containing the relevant
+        ;;    variable substitutions:
+        (antecedentJustification (second (antecedents self)))
+        (antecedentSubstitution (substitution antecedentJustification)))
+    #|
+    ;; All we do below is sort the variables in `antecedentSubstitution'
+    ;;    so they occur in the same order as in the rule.  This is complicated
+    ;;    by the fact that the variables in the pattern frame are copied from
+    ;;    the optimal pattern and have to be compared by name:
+    (safety 1 (eql? (kind rule) :IMPLIES)
+            "INTERNAL ERROR: Unexpected rule format in justification")
+    (let ((substitution (new ENTITY-MAPPING))
+          (antecedent DESCRIPTION (first (arguments rule))))
+      (foreach var in (io-variables antecedent)
+          do (foreach (pVar value) in antecedentSubstitution
+                 where (eql? (skolem-name var)
+                             (skolem-name (cast pVar PATTERN-VARIABLE)))
+                 do (insert-at substitution var value)
+                    (break)))
+      (foreach var in (internal-variables antecedent)
+          do (foreach (pVar value) in antecedentSubstitution
+                 where (eql? (skolem-name var)
+                             (skolem-name (cast pVar PATTERN-VARIABLE)))
+                 do (insert-at substitution var value)
+                    (break)))
+      (return (reverse substitution)))
+      |#
+    ;; since we collect the bindings in the same order they are in the
+    ;;    pattern frame, the order should be ok even without sorting:
+    (return antecedentSubstitution)))
+
+(defun print-one-variable-substitution ((stream OUTPUT-STREAM) (var OBJECT) (value OBJECT))
+  ;; Prints one variable substitution in the appropriate format
+  ;;
+  ;; Test (eql? (value-of var) var):
+  ;; Don't print binding for variables that are bound to constants
+  ;;    within a rule, e.g., with a `(= ?x NIL)' clause, since
+  ;;    those are displayed already by `print-variable':
+  (case *explanation-format*
+    (:ASCII
+     (pretty-print-logical-form var stream)
+     (when (eql? (value-of var) var)
+       (print-stream stream "/")
+       (cond ((alternative-bindings-set? value)
+              (print-stream stream "{")
+              (foreach binding in (alternative-bindings value)
+                  do (pretty-print-logical-form binding stream)
+                     (print-stream stream ", "))
+              (print-stream stream "...}"))
+             (otherwise
+              (pretty-print-logical-form value stream)))))
+    (:HTML
+     (let ((string-stream (new STRING-OUTPUT-STREAM))
+           (quoteHtml? TRUE))
+       (when-cyc-kludges-enabled
+        ;; Kludge, until we can control HTML-quoting more elegantly:
+        (when (eql? *logic-dialect* :CYC-NL)
+          (setq quoteHtml? FALSE)))
+       (when (or (eql? *logic-dialect* :KIF-ONTOSAURUS)
+		 (eql? *logic-dialect* :JAVA-GUI-HTML))
+         (setq quoteHtml? FALSE))
+       (pretty-print-logical-form var string-stream)
+       (when (eql? (value-of var) var)
+	 (print-stream string-stream "/")
+	 (cond ((alternative-bindings-set? value)
+                (print-stream string-stream "{one of ")
+                (foreach binding in (alternative-bindings value)
+                    do (pretty-print-logical-form binding string-stream)
+                       (print-stream string-stream ", "))
+                (print-stream string-stream "etc.}"))
+               (otherwise
+                (pretty-print-logical-form value string-stream))))
+       (if quoteHtml?
+           (write-html-quoting-special-characters
+            stream (the-string string-stream))
+         (print-stream stream (the-string string-stream)))))
+    (:XML
+  ;;;;; TO DO: HANDLE ALTERNATIVE BINDING SETS ;;;;;
+     (let ((string-stream (new STRING-OUTPUT-STREAM)))
+       (with-xml-tag ("binding" stream TRUE)
+	 (pretty-print-logical-form var string-stream)
+	 (with-xml-tag ("variable" stream TRUE)
+	   (write-html-quoting-special-characters stream (the-string string-stream)))
+	 (when (eql? (value-of var) var)
+	   (setq string-stream (new STRING-OUTPUT-STREAM))
+	   (pretty-print-logical-form value string-stream)
+	   (with-xml-tag ("value" stream)
+	     (write-html-quoting-special-characters stream (the-string string-stream)))))))))
+ 
+(defun print-explanation-substitution
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (mapping EXPLANATION-MAPPING))
+  ;; If `self' represents the result of a rule application, print an
+  ;;    additional line with variable substitutions onto `stream'.
+  (ignore mapping)
+  (when (or (eql? (inference-rule self) :MODUS-PONENS)
+            (eql? (inference-rule self) :MODUS-TOLLENS))
+    (let ((substitution
+           (get-explanation-substitution self))
+          (nofVars INTEGER NULL))
+      (when (defined? substitution)
+        (setq nofVars (length substitution))
+	(case *explanation-format*
+	  (:ASCII
+	   (print-stream stream *explanation-tab-string* "with substitution {"))
+          (:HTML
+           (print-stream stream "<BR><TABLE><TR>" EOL)
+           (with-html-tag ("TD align=left valign=top" stream TRUE)
+             (print-stream stream "with&nbsp;substitution" EOL))
+           (print-stream stream "<TD>{"))
+	  (:XML
+	   (print-stream stream "<variables>")))
+        (foreach (var value) in substitution
+            as i in (interval 1 nofVars)
+            do (print-one-variable-substitution stream var value)
+               (when (and (< i nofVars)
+			  (or (eq? *explanation-format* :ASCII)
+			      (eq? *explanation-format* :HTML)))
+                 (print-stream stream ", ")
+                 (when-cyc-kludges-enabled
+                  ;; use multiple lines to make NL more readable:
+                  (when (or (eq? *explanation-format* :ASCII)
+                            (eq? *explanation-format* :HTML))
+                    (print-stream stream EOL
+                                  *explanation-tab-string*
+                                  "                   ")))))
+	(case *explanation-format*
+	  (:ASCII
+	   (print-stream stream "}" EOL))
+          (:HTML
+	   (print-stream stream "}</TD></TR></TABLE>" EOL ))
+	  (:XML
+	   (print-stream stream "</variables>" EOL)))))))
+
+(defun print-explanation-antecedents
+    ((self JUSTIFICATION) (stream OUTPUT-STREAM) (mapping EXPLANATION-MAPPING)
+     (maxDepth INTEGER) (unexplained (LIST OF JUSTIFICATION)))
+  ;; Print a list of visible antecedents of `self' onto `stream' relative
+  ;;    to `mapping' (following the textual explanation of `self').
+  ;; Push any antecedents that require further explanation and have a
+  ;;    depth <= `maxDepth' onto `unexplained'.
+  (let ((info (explanation-info self mapping))
+        (label (label info))
+        (depth (depth info))
+        (antecedents (visible-antecedents self))
+        (newAntecedents NIL)
+        (newAntecedentsIndex 0)
+        (maxLabelLength 0)
+        (haveMarkedAntecedent? FALSE)
+        (labelStartPosition (+ (length *explanation-tab-string*) 6))
+        (propositionStartPosition 0)
+        (indent 0))
+    ;; Label new antecedents and measure labels:
+    (foreach antecedent in antecedents
+        do (setq info (explanation-info antecedent mapping))
+           (when (null? info)
+             ;; A new justification, label it:
+             (setq info (register-justification antecedent mapping))
+             (setf (label info)
+               (concatenate
+                 label "." (integer-to-string (++ newAntecedentsIndex))))
+             (setf (depth info) (1+ depth)))
+           (setq maxLabelLength (max maxLabelLength (length (label info))))
+           (when (not haveMarkedAntecedent?)
+             (setq haveMarkedAntecedent?
+               (or (mark-as-explicit-assertion? antecedent)
+                   (mark-as-failed-goal? antecedent)))))
+
+    ;; Print antecedents and push new ones onto `unexplained':
+    (if (> maxLabelLength *max-inline-label-length*)
+        (setq propositionStartPosition labelStartPosition)
+      (setq propositionStartPosition (+ labelStartPosition maxLabelLength 1)))
+  ;;;;; TO DO: HTML GENERATION BELOW SHOULD BE STREAM-LINED A BIT ;;;;;
+    (case *explanation-format*
+      (:HTML
+       (print-stream stream "<TABLE>" EOL))
+      (otherwise NULL))
+    (foreach antecedent in antecedents
+        as i in (interval 1 NULL)
+        do (setq info (explanation-info antecedent mapping))
+           (setq label (label info))
+           (unless (or (explained? info)
+                       (mark-as-explicit-assertion? antecedent)
+                       (mark-as-failed-goal? antecedent)
+                       (and (defined? maxDepth)
+                            (> (depth info) maxDepth)))
+             (pushq newAntecedents antecedent))
+	   (case *explanation-format*
+	     (:ASCII
+	      (print-stream stream *explanation-tab-string*
+			    (choose (= i 1) "since " "and   "))
+	      (print-explanation-label stream label FALSE)
+	      (print-stream stream " ")
+	      (cond
+	       ((> maxLabelLength *max-inline-label-length*)
+		(print-stream stream EOL)
+		(setq indent propositionStartPosition))
+	       (otherwise
+		(setq indent
+		  (- propositionStartPosition
+		     (+ labelStartPosition (length label)) 1))))
+	      (print-spaces stream indent)
+	      (when haveMarkedAntecedent?
+                (print-stream
+                 stream (explanation-truth-marker antecedent) " ")))
+             (:HTML
+              (print-stream stream "<TR>" EOL)
+              (with-html-tag ("TD align=right valign=top" stream TRUE)
+                (print-stream stream (choose (= i 1) "since&nbsp;" "and&nbsp;"))
+                (print-explanation-label stream label FALSE)
+                (with-html-tag ("TD align=left valign=top" stream FALSE)
+                  (when haveMarkedAntecedent?
+                    (print-stream
+                     stream (explanation-truth-marker antecedent))))))
+	     (:XML
+	      (print-explanation-label stream label FALSE)))
+           (case *explanation-format*
+             (:HTML
+              (print-stream stream "<TD>" EOL))
+             (otherwise NULL))
+           (print-justification-proposition-for-format
+            antecedent stream
+            (choose haveMarkedAntecedent?
+                    (+ propositionStartPosition
+                       (1+ (length (explanation-truth-marker antecedent))))
+                    propositionStartPosition))
+           (print-stream stream EOL)
+           (case *explanation-format*
+             (:HTML
+              (print-stream stream "</TD></TR>" EOL))
+             (otherwise NULL)))
+    (case *explanation-format*
+      (:HTML
+       (print-stream stream "</TABLE>" EOL))
+      (otherwise NULL))
+    (foreach antecedent in newAntecedents
+        do (push unexplained antecedent))))
+
+(defun (visible-justification JUSTIFICATION) ((self JUSTIFICATION))
+  ;; If `self' is an invisible justification, return the next visible one.
+  ;; Otherwise, return `self'.
+  ;; This skips unintersting :DISPROOF (NOT) frames that only switch polarity
+  ;;    as well as :PATTERN frames that just record variable bindings.
+  (cond ((or (and (eql? (inference-rule self) :DISPROOF)
+                  (not (reverse-polarity? self)))
+             (and (eql? (inference-rule self) :PRIMITIVE-STRATEGY)
+                  (eql? (inference-strategy self) :GOAL-COMPLEMENT)))
+         (return (visible-justification (first (antecedents self)))))
+        ((eql? (inference-rule self) :PATTERN)
+         (return (visible-justification (first (antecedents self)))))
+        (otherwise
+         (return self))))
+
+(defun (visible-antecedents (LIST OF JUSTIFICATION)) ((self JUSTIFICATION))
+  ;; Return the visible antecedents of `self'.
+  ;; This skips uninteresting antecedents and possibly flattens conjunctions
+  ;;     depending on the current `*explanation-style*'.
+  (let ((visibleAntecedents (new (LIST OF JUSTIFICATION))))
+    (collect-visible-antecedents self visibleAntecedents)
+    (return (reverse visibleAntecedents))))
+
+(defun collect-visible-antecedents
+    ((self JUSTIFICATION) (visibleAntecedents (LIST OF JUSTIFICATION)))
+  (let ((antecedents (antecedents self)))
+    (foreach antecedent in antecedents
+        do (setq antecedent (visible-justification antecedent))
+           (case (inference-rule antecedent)
+             (:AND-INTRODUCTION
+              (if (eql? *explanation-style* :BRIEF)
+                  (foreach subAntecedent in (visible-antecedents antecedent)
+                      do (push visibleAntecedents subAntecedent))
+                (push visibleAntecedents antecedent)))
+             (:PRIMITIVE-STRATEGY
+              (case (strategy (cast antecedent PRIMITIVE-STRATEGY))
+                (:EQUIVALENCE
+                 (unless (auxiliary-equivalence-proposition?
+                          (proposition antecedent))
+                   (push visibleAntecedents antecedent)))
+                (otherwise
+                 (push visibleAntecedents antecedent))))
+             (otherwise
+              (push visibleAntecedents antecedent))))))
+
+
+  ;;
+;;;;;; Top level `why'
+  ;;
+
+;; Contains the mapping for the most recently explained query:
+(defspecial *most-recent-explanation-mapping* EXPLANATION-MAPPING NULL)
+
+(defun why (&rest (args OBJECT))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Print an explanation for the result of the most recent query.
+Without any arguments, `why' prints an explanation of the top level
+query proposition down to a maximum depth of 3.  `(why all)' prints
+an explanation to unlimited depth.  Alternatively, a particular depth
+can be specified, for example, `(why 5)' explains down to a depth of 5.
+A proof step that was not explained explicitly (e.g., due to a depth
+cutoff) can be explained by supplying the label of the step as the
+first argument to `why', for example, `(why 1.2.3 5)' prints an explanation
+starting at 1.2.3 down to a depth of 5 (which is counted relative to the
+depth of the starting point).  The keywords `brief' and `verbose' can be
+used to select a particular explanation style.  In brief mode, explicitly
+asserted propositions are not further explained and indicated with a
+`!' assertion marker.  Additionally, relatively uninteresting proof steps
+such as AND-introductions are skipped.  This explanation style option is
+sticky and will affect future calls to `why' until it gets changed again.
+The various options can be combined in any way, for example,
+`(why 1.2.3 brief 3)' explains starting from step 1.2.3 down to a depth
+of 3 in brief explanation mode."
+  (mv-bind (label style maxDepth summary?)
+      (parse-why-arguments (coerce-&rest-to-cons args))
+    (ignore summary?)
+    (explain-why label style maxDepth STANDARD-OUTPUT) ))
+
+(defun explain-why ((label STRING) (style KEYWORD) (maxDepth INTEGER) (stream OUTPUT-STREAM))
+  :public? true
+  :documentation "Programmer's interface to WHY function."
+  (exception-case
+      (let ((justification (get-why-justification label)))
+	(special ((*explanation-style* (choose (defined? style) style :BRIEF)))
+	  (print-explanation justification
+			     stream
+			     *most-recent-explanation-mapping*
+			     maxDepth
+			     *explanation-audience*)))
+    (EXPLAIN-EXCEPTION (ee)
+      (print-stream STANDARD-OUTPUT (exception-message ee)))))
+  
+(defun (get-why-justification JUSTIFICATION) ((label STRING))  
+  :public? true
+  :documentation "Returns the current WHY justification.  May also throw one of the
+following subtypes of EXPLAIN-EXCEPTION:
+   EXPLAIN-NO-QUERY-EXCEPTION
+   EXPLAIN-NO-SOLUTION-EXCEPTION
+   EXPLAIN-NO-MORE-SOLUTIONS-EXCEPTION
+   EXPLAIN-NOT-ENABLED-EXCEPTION
+   EXPLAIN-NO-SUCH-LABEL-EXCEPTION
+   EXPLAIN-QUERY-TRUE-EXCEPTION"
+  (let ((query *most-recent-query*)
+        (partialQuery? FALSE)
+        (justification JUSTIFICATION NULL))
+    (when (null? query)
+      (signal EXPLAIN-NO-QUERY-EXCEPTION "There is nothing to explain."))
+    (setq partialQuery? (defined? (partial-match-strategy *most-recent-query*)))
+    (setq justification (justification (base-control-frame query)))
+    (cond
+     ((null? justification)
+      (cond
+       ((non-empty? (solutions query))
+        (if (exhausted? query)
+	  (signal EXPLAIN-NO-SOLUTION-EXCEPTION
+		  "There were either no more solutions, or you used the `all' keyword." EOL
+		  "   The query must generate only a single answer for explanation" EOL
+		  "   to be possible, thus don't use the `all' keyword to `retrieve'.")
+          (signal EXPLAIN-NOT-ENABLED-EXCEPTION
+		  "No justifications available.  You have to enable justifications" EOL
+		  "   with `(set-feature justifications)' and rerun the query in" EOL
+		  "   order to enable the explanation of results.")))
+       ((exhausted? query)
+        (signal EXPLAIN-NO-SOLUTION-EXCEPTION "There was no solution."))
+       (otherwise
+        (signal EXPLAIN-NO-SOLUTION-EXCEPTION "There is no solution yet."))))
+     ((and (exhausted? query)
+           (not partialQuery?))
+      (signal EXPLAIN-NO-MORE-SOLUTIONS-EXCEPTION "There were no more solutions."))
+     (otherwise
+      (cond
+       ((defined? label)
+	(when (defined? *most-recent-explanation-mapping*)
+	  (setq justification
+	    (lookup-justification *most-recent-explanation-mapping* label)))
+	(when (null? justification)
+	  (signal EXPLAIN-NO-SUCH-LABEL-EXCEPTION
+		  "Label " label " does not exists in the current explanation.")))
+       (otherwise
+	(setq *most-recent-explanation-mapping* NULL)))
+      (return justification))) ))
+
+(defun (command-option-eql? BOOLEAN) ((arg OBJECT) (option STRING))
+  ;; Return TRUE if the command argument `arg' equals `option'.
+  ;; The comparison ignores module and case differences.
+  (typecase arg
+    (GENERALIZED-SYMBOL
+     (return (eql? (string-upcase (symbol-name arg)) option)))
+    (STRING-WRAPPER
+     (return (eql? (string-upcase arg) option)))
+    (otherwise
+     (return FALSE))))
+
+(defun (parse-why-arguments STRING KEYWORD INTEGER BOOLEAN) ((args (CONS OF OBJECT)))
+  ;; Parse the `args' passed to `why' and return the start label (or NULL),
+  ;;    the explanation style (or NULL), and the max-depth (or NULL).
+  (let ((label STRING NULL)
+        (depth *default-explanation-depth*)
+        (style KEYWORD NULL)
+	(summary? BOOLEAN FALSE)
+        (firstArg (first args)))
+    (when (defined? firstArg)
+      (typecase firstArg
+        (STRING-WRAPPER
+         (setq label firstArg)
+         (setq args (rest args)))
+        (INTEGER-WRAPPER
+         (when (eql? firstArg ONE-WRAPPER)
+           (setq label "1")
+           (setq args (rest args))))
+        (FLOAT-WRAPPER
+         (setq label (stringify firstArg))
+         (setq args (rest args)))
+        (SYMBOL
+         (when (digit-character? (nth (symbol-name firstArg) 0))
+           (setq label (symbol-name firstArg))
+           (setq args (rest args))))
+        (otherwise NULL))
+      (foreach arg in args
+          as i in (interval 0 NULL)
+          do (when (command-option-eql? arg "BRIEF")
+               (setq style :BRIEF))
+             (when (command-option-eql? arg "VERBOSE")
+               (setq style :VERBOSE))
+	     (when (command-option-eql? arg "SUMMARY")
+               (setq summary? TRUE))
+             (when (integer? arg)
+               (setq depth (cast arg INTEGER-WRAPPER)))
+             (when (eql? arg :DEPTH)
+               (when (null? (nth args (1+ i)))
+                 (setq depth NULL)))
+             (when (command-option-eql? arg "ALL")
+               (setq depth NULL))))
+    (return label style depth summary?)))
+
+
+  ;;
+;;;;;; Examples:
+  ;;
+
+#|
+(why 1.2.3 :style :brief :depth 2)
+(why 1.2.3 brief 2)
+|#
+
+#|
+1 (not (CIVILIAN JUDY))
+    follows by Modus Tollens (p => q, ~q |= ~p)
+    and substitution {?x/JUDY}
+    since 1.1 (forall ((?x CIVILIAN))
+                 (<= (and (PERSON ?x)
+                          (not (WARFIGHTER ?x)))
+                     (CIVILIAN ?x)))
+    and   1.2 (not (and (not (WARFIGHTER JUDY))
+                        (PERSON JUDY)))
+
+1.1 (forall ((?x CIVILIAN))
+       (<= (and (PERSON ?x)
+                (not (WARFIGHTER ?x)))
+           (CIVILIAN ?x)))
+    holds by definition of class CIVILIAN
+
+1.2 (not (and (not (WARFIGHTER JUDY))
+              (PERSON JUDY)))
+    follows by Not-And-Introduction (~p |= ~(p & q))
+    since 1.2.1 (not (not (WARFIGHTER JUDY)))
+
+1.2.1 (not (not (WARFIGHTER JUDY)))
+    follows by Double-Negation-Introduction
+    since 1.2.1.1 (WARFIGHTER JUDY)
+
+1.2.1.1 (WARFIGHTER JUDY)
+    holds by explicit assertion
+
+
+;;; Possible partial truth annotation:
+
+1 [32%] (Happy Joe)
+    follows by Modus Ponens
+    since 1.1 [50%]  (Person Joe)
+    and   1.2 [24%]  (= (age Joe) 10)
+    and   1.3 [23%]  (=< 10 25)
+    and   1.4 [100%] (forall (?x Person)
+                       (=> (=< (age ?x) 25)
+                           (Happy ?x)))
+|#

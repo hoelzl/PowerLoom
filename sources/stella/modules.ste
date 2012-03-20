@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: modules.ste,v 1.71 2003/10/23 17:01:31 tar Exp
+;;; Version: modules.ste,v 1.82 2006/05/09 20:30:47 hans Exp
 
 ;;; Contexts, Modules, and Worlds.
 
@@ -62,9 +62,12 @@
 ;;;;;; Qualified pathnames
   ;;
 
+;;; see also `qualified-stella-name?' in read.ste
+
 (defmethod (parent-contexts (ITERATOR OF CONTEXT)) ((self CONTEXT))
   ;; Dummy to make sure there is a method on the abstract class 'CONTEXT'.
-  (return NULL) )
+  ;:abstract? TRUE ;; C++ doesn't know how to handle those yet
+  (return NULL))
 
 (defmethod (parent-contexts (ITERATOR OF CONTEXT)) ((self MODULE))
   ;; Return an iterator over the parents of 'self'.
@@ -86,6 +89,10 @@
   ;; If 'symbolName?' is TRUE, 'pathName' is assumed to be a symbol
   ;;    and the last component will be ignored.  In this case the
   ;;    second return value indicates the start of the last component.
+  ;; NOTE: the pathname/symbol splitting logic of this function is somewhat
+  ;;    obsolete and superseded by `parse-stella-name'.  This means this
+  ;;    could be somewhat simplified and become a pure module name parser
+  ;;    and lookup function.
   (let ((context (choose (eql? (nth pathName 0) MODULE-SEPARATOR-CHARACTER)
                          *root-module*
                          NULL))
@@ -152,101 +159,21 @@
              always (eql? char (nth string i))))))
 
 (defun (compute-module-and-bare-name MODULE STRING) ((name STRING))
+  :documentation "Compute the module indicated by the STELLA name
+`name' and return it.  Return the bare symbol name as the second
+value.  `name' does not necessarily have to be qualified in which
+case the current module is returned.  `name' is assumed to be the
+printed representation of a STELLA symbol, surrogate or keyword."
   :public? TRUE
-  ;; 'name' contains one or more MODULE-SEPARATOR-CHARACTERs.
-  ;; Return two values, the module indicated by path of all but the 
-  ;;   last name, and the last name.
-  (mv-bind (module bareNameStart)
-      (compute-context-or-module-from-pathname name TRUE TRUE)
-    (return module
-            (choose (defined? bareNameStart)
-                    (subsequence name bareNameStart NULL)
-                    NULL))))
-
-(defun (qualified-name-module-name STRING) ((qualifiedName STRING))
-  ;; Return the portion of `qualifiedName' before the right-most
-  ;;    MODULE-SEPARATOR-CHARACTER, or NULL if it is not a qualified name.
-  ;; Note that for "/foo" this returns the empty string.
-  (let ((end (length qualifiedName)))
-    (foreach i in (interval 1 end)
-        where (eql? (nth qualifiedName (- end i)) MODULE-SEPARATOR-CHARACTER)
-        do (return (subsequence qualifiedName 0 (- end i))))
-    (return NULL)))
-
-(defun (qualified-name-bare-name STRING) ((qualifiedName STRING))
-  ;; Return the portion of `qualifiedName' after the right-most
-  ;;    MODULE-SEPARATOR-CHARACTER, or `qualifiedName' if it is not
-  ;;    a qualified name.
-  (let ((end (length qualifiedName)))
-    (foreach i in (interval 1 end)
-        where (eql? (nth qualifiedName (- end i)) MODULE-SEPARATOR-CHARACTER)
-        do (return (subsequence qualifiedName (1+ (- end i)) end)))
-    (return qualifiedName)))
-
-(defun (dwim-module-and-bare-name MODULE STRING) ((name STRING) (warn? BOOLEAN))
-  ;; Just like `compute-module-and-bare-name', but try to dwim a module for
-  ;;    cases where a module with the same name but different pathname exists.
-  ;; If `warn?' is TRUE, print a warning if the module had to be dwimmed
-  ;;    or couldn't be found at all.
-  (let ((module MODULE NULL)
-	(bareNameStart INTEGER NULL))
-    (exception-case
-	(mv-setq (module bareNameStart)
-	  (compute-context-or-module-from-pathname name TRUE TRUE))
-      (NO-SUCH-CONTEXT-EXCEPTION ()
-	(when (defined? bareNameStart)
-	  (let ((moduleName
-		 (qualified-name-bare-name (qualified-name-module-name name))))
-	    (exception-case
-		(setq module (get-stella-module moduleName FALSE))
-	      (NO-SUCH-CONTEXT-EXCEPTION ()
-		(setq module (get-stella-module (string-upcase moduleName) FALSE))))
-	    (when warn?
-	      (if (null? module)
-		(warn "Module " (subsequence name 0 (1- bareNameStart))
-		      " of symbol " name " does not exist.")
-		(warn "Module " (subsequence name 0 (1- bareNameStart))
-		      " of symbol " name " does not exist." EOL
-		      "    Assuming you mean " (module-full-name (cast module MODULE))
-		      ".")))))))
-    (return module
-            (choose (defined? bareNameStart)
-                    (subsequence name bareNameStart NULL)
-                    NULL))))
-
-(defun (intern-qualified-name GENERALIZED-SYMBOL) 
-    ((name STRING) (enable-case-conversion? BOOLEAN))
-  ;; 'name' contains one or more MODULE-SEPARATOR-CHARACTERs.
-  ;; 'enable-case-conversion?' will allow canonical upcasing in modules
-  ;;    that are not case-sensitive.
-  ;; Intern the unqualified portion of 'name' into the module indicated
-  ;;    by the previous module names.
-  (mv-bind (module bareName)
-      (dwim-module-and-bare-name name TRUE)
-    (when (null? module)                ; names non-existent module?
-      (if (or (null? bareName)
-              (surrogate-name? bareName))
-          (return @UNKNOWN-SURROGATE)
-        (return (quote UNKNOWN-SYMBOL))))
-    (when (string-eql? bareName "")
-      (if (or (eq? module *module*)
-              (eq? module *root-module*))
-        ;; special case the division '/' symbol;
-        ;; tricky: /foo// lands us in the root module:
-        (return
-         (intern-rigid-symbol-wrt-module "/" *stella-module* SYMBOL-SYM))
-        (progn
-          (warn "Empty symbol name encountered")
-          (return (quote UNKNOWN-SYMBOL)))))
-    (when (and enable-case-conversion?
-	       (not (case-sensitive? module)))
-      (setq bareName (string-upcase bareName)))
-    (if (surrogate-name? bareName)
-        (return (intern-rigid-symbol-wrt-module
-                 (subsequence bareName 1 NULL-INTEGER)
-                 module SURROGATE-SYM))
-      (return (intern-rigid-symbol-wrt-module
-               bareName module SYMBOL-SYM)))))
+  (let ((module *module*))
+    (mv-bind (bareName moduleName kind)
+        (parse-stella-name name FALSE)
+      (when (defined? moduleName)
+        (setq module (get-stella-module moduleName TRUE)))
+      (case kind
+        (:SYMBOL (return module bareName))
+        (:SURROGATE (return module (concatenate "@" bareName)))
+        (:KEYWORD (return module (concatenate ":" bareName)))))))
 
 
   ;;
@@ -255,7 +182,7 @@
 
 (defun (help-get-stella-context-or-module CONTEXT) ((pathName STRING) (module? BOOLEAN))
   ;; Helping function for `get-stella-context' and `get-stella-module'
-  (if (qualified-name? pathName)
+  (if (qualified-stella-name? pathName)
     (return 
       (compute-context-or-module-from-pathname pathName module? FALSE))
     (return (get-stella-context-slowly pathName))))
@@ -273,6 +200,26 @@ if no context is found, otherwise silently return `null'."
       (return NULL)))))
 
 (defun (get-stella-module MODULE) ((pathName STRING) (error? BOOLEAN))
+  :documentation "Return the module located at `pathName', or `null'
+if no such module exists.  The search looks at ancestors and top-most
+ (cardinal) modules.  If `error?' is `true', throw an exception if no
+ module is found."
+  :public? TRUE
+  (let ((wrappedPathName (make STRING-WRAPPER))
+        (module MODULE NULL))
+    ;; hand-generate wrapper for speed:
+    (setf (wrapper-value wrappedPathName) pathName)
+    (setq module
+      (memoize (wrappedPathName)
+               :timestamps :MODULE-UPDATE :max-values 100
+               (help-get-stella-module pathName FALSE)))
+    (when (and (null? module)
+               error?)
+      ;; recall it to generate exception:
+      (help-get-stella-module pathName TRUE))
+    (return module)))
+  
+(defun (help-get-stella-module MODULE) ((pathName STRING) (error? BOOLEAN))
   :documentation "Return the module located at `pathName', or `null'
 if no such module exists.  The search looks at ancestors and top-most
  (cardinal) modules.  If `error?' is `true', throw an exception if no
@@ -345,7 +292,7 @@ if no such module exists.  The search looks at ancestors and top-most
     (otherwise
      (let ((moduleName (coerce-to-module-name object warn?)))
        (when (defined? moduleName)
-         (when (qualified-name? moduleName)
+         (when (qualified-stella-name? moduleName)
            (return (get-stella-module moduleName warn?)))
          ;; Name is unqualified:
          (return (get-stella-module moduleName warn?)))
@@ -412,6 +359,11 @@ if no such module exists.  The search looks at ancestors and top-most
 ;;;;;; Finalizing a context or module
   ;;
 
+(defmethod (multiple-parents? BOOLEAN) ((self CONTEXT))
+  ;; Dummy to make sure there is a method on the abstract class 'CONTEXT'.
+  ;:abstract? TRUE ;; C++ doesn't know how to handle those yet
+  (return FALSE))
+
 (defmethod (multiple-parents? BOOLEAN) ((module MODULE))
   :documentation "Return TRUE if 'module' has more than one parent."
   (return (non-empty? (rest (parent-modules module)))) )
@@ -438,7 +390,20 @@ if no such module exists.  The search looks at ancestors and top-most
                     ;;    module super structure of each parent.
                     (remove parents otherSuperModule))))))
 
-(defun inherit-supercontexts ((module MODULE))
+
+(defmethod inherit-supercontexts ((context CONTEXT))
+  ;:abstract? TRUE ;; C++ doesn't know how to handle those yet
+  NULL)
+
+(defmethod inherit-supercontexts ((world WORLD))
+  (let ((parent (parent-context world)))
+    (if (defined? parent)
+      ;; structure share with parent list:
+      (setf (all-super-contexts world)
+            (cons parent (all-super-contexts parent)))
+      (setf (all-super-contexts world) NIL))))
+
+(defmethod inherit-supercontexts ((module MODULE))
   ;; Fill the slot 'all-super-contexts' with a list of all
   ;;    superContexts of 'module', ordered such that more specific
   ;;    contexts always precede more general ones.
@@ -472,9 +437,9 @@ if no such module exists.  The search looks at ancestors and top-most
     ;; unreverse parents:
     (reverse (parent-modules module))))
 
-(defun uninherit-supercontexts ((module MODULE))
+(defmethod uninherit-supercontexts ((context CONTEXT))
   ;; Clear 'all-super-contexts'.
-  (setf (all-super-contexts module) NIL))
+  (setf (all-super-contexts context) NIL))
 
 (defun inherit-used-modules ((module MODULE))
   ;; Compute the actual set of modules used by 'module'.
@@ -623,6 +588,7 @@ all contexts that inherit 'self'."
     (when (null? parentModule)
       (setq parentModule *stella-module*))
     (unfinalize-module self)
+    (bump-memoization-timestamp :MODULE-UPDATE)
     (when (eq? self *module*)
       (change-module parentModule))) )
 
@@ -688,7 +654,7 @@ all contexts that inherit 'self'."
   ;; If the name is qualified, also link 'module' to its parent.
   (let ((parentModule MODULE NULL)
         (bareName STRING NULL))
-    (if (qualified-name? name)
+    (if (qualified-stella-name? name)
       (progn
         (mv-setq (parentModule bareName) (compute-module-and-bare-name name))
         (when (null? parentModule)
@@ -749,9 +715,15 @@ all contexts that inherit 'self'."
 (defun (true-option? boolean) ((value OBJECT))
   ;; Helping function for option reading.  Returns TRUE if `value' is
   ;; either the symbol TRUE or the TRUE-BOOLEAN-WRAPPER.
+  ;; Tricky:  Since this could be read in any module*, there is no guarantee
+  ;;          that we would get the STELLA TRUE symbol, so we also test
+  ;;          for string equality.
+  ;; * See the comment in DEFINE-MODULE about parsing options.
   :globally-inline? TRUE
   (return (or (eql? value (quote TRUE))
-              (eql? value TRUE-WRAPPER))))
+              (eql? value TRUE-WRAPPER)
+	      (and (isa? value @SYMBOL) 
+		   (string-equal? (symbol-name (cast value SYMBOL)) "TRUE")))))
 
 (defun incorporate-module-options ((self MODULE) (options CONS))
   ;; Called by 'define-module'.  Incorporate each of the options into 'self'.
@@ -771,50 +743,51 @@ all contexts that inherit 'self'."
                   ;; prevents accidental wiping out of module:
                   :clearable?
                   ;; prevents cleared modules from wiping out
-                  ;;    surrogates embedded in code:
+                  ;;    surrogates and symbols embedded in code:
                   :protect-surrogates?
                   ;; prevents creation of KB objects where they don't belong:
-                  :code-only?)))))
-    (foreach 
-      (key value) in plist
-      do
-      (case (cast key KEYWORD)
-        (:includes (incorporate-includes-modules self value))
-        (:uses (incorporate-uses-modules self value))
-        (:shadow
-         ;; can't create surrogates before finalization; hold list
-         ;;    of symbols in special variable:
-         (setq *shadowedSurrogates* value))
-        (otherwise
-         (setq value (permanent-copy value))
-         (case (cast key KEYWORD)
-           (:documentation (setf (documentation self)
-                                 (wrapper-value (cast value STRING-WRAPPER))))
-	   (:case-sensitive?
-            (setf (case-sensitive? self) (true-option? value)))
-	   (:api? 
-            (setf (api? self) (true-option? value)))
-	   (:lisp-package (setf (module-lisp-package self)
-			        (wrapper-value (cast value STRING-WRAPPER))))
-	   (:cpp-package (setf (module-cpp-package self)
-			       (wrapper-value (cast value STRING-WRAPPER))))
-	   (:java-package (setf (java-package self)
-			        (wrapper-value (cast value STRING-WRAPPER))))
-	   (:java-catchall-class
-	    (setf (java-flotsam-class self)
-	      (wrapper-value (cast value STRING-WRAPPER))))
-           (:nickname
-            (when (null? (nicknames self))
-              (setf (nicknames self) (new LIST)))
-            (insert (nicknames self) (cast value STRING-WRAPPER)))
-           (:clearable? 
-            (setf (clearable? self) (true-option? value)))
-           (:protect-surrogates?
-            (setf (protect-surrogates? self) (true-option? value)))
-           (:code-only?
-            (setf (code-only? self) (true-option? value)))
-           (:requires (setf (requires self) value))
-           ))))
+                  :code-only?
+                  :namespace?)))))
+    (foreach (key value) in plist
+      do (case (cast key KEYWORD)
+	   (:includes (incorporate-includes-modules self value))
+	   (:uses (incorporate-uses-modules self value))
+	   (:shadow
+	    ;; can't create surrogates before finalization; hold list
+	    ;;    of symbols in special variable:
+	    (setq *shadowedSurrogates* value))
+	   (otherwise
+	    (setq value (permanent-copy value))
+	    (case (cast key KEYWORD)
+	      (:documentation 
+	       (setf (documentation self) (unwrap-string value)))
+	      (:case-sensitive?
+	       (setf (case-sensitive? self) (true-option? value)))
+	      (:api? 
+	       (setf (api? self) (true-option? value)))
+	      (:lisp-package 
+	       (setf (module-lisp-package self) (unwrap-string value)))
+	      (:cpp-package
+	       (setf (module-cpp-package self) (unwrap-string value)))
+	      (:java-package
+	       (setf (java-package self) (unwrap-string value)))
+	      (:java-catchall-class
+	       (setf (java-flotsam-class self) (unwrap-string value)))
+	      (:nickname
+	       (when (null? (nicknames self))
+		 (setf (nicknames self) (new LIST)))
+	       (insert (nicknames self) (cast value STRING-WRAPPER)))
+	      (:clearable? 
+	       (setf (clearable? self) (true-option? value)))
+	      (:protect-surrogates?
+	       (setf (protect-surrogates? self) (true-option? value)))
+	      (:code-only?
+	       (setf (code-only? self) (true-option? value)))
+	      (:namespace?
+	       (setf (namespace? self) (true-option? value)))
+	      (:requires 
+	       (setf (requires self) value))
+	      ))))
     (free plist) ))
 
 (defun undefine-module ((oldModule MODULE) (newModule MODULE))
@@ -847,16 +820,24 @@ all contexts that inherit 'self'."
         (the-cons-list (child-contexts oldModule)))
   (setf (the-cons-list (child-contexts oldModule)) NIL)
   (setf (surrogate-value-inverse oldModule) NULL)
+  (unfinalize-module oldModule)
   (free oldModule) )
 
 (defglobal *define-module-hooks* HOOK-LIST (new HOOK-LIST)
   :documentation "HOOK-LIST called by 'define-module', applied to a
 'module' argument.")
 
+;; NOTE:  Must use BQUOTE and not QUOTE here for bootstrap reasons:
+(defglobal *MODULE-NON-STRUCTURAL-OPTIONS* (CONS OF KEYWORD) (BQUOTE (:DOCUMENTATION))
+	   :public? FALSE
+	   :documentation "List of non-structural options for Module definitions.
+Used in testing for module changes and in updating non-structurally changed
+modules.")
+
 (defun (define-module MODULE) ((name STRING) (options CONS))
   :documentation "Define or redefine a module named 'name' having the
 options 'options'.  Return the new module."
-  :public? TRUE
+  :public? TRUE :constructor? TRUE
   (special ((*shadowedSurrogates* NIL))
     (let ((module MODULE NULL)
 	  (stringifiedOptions (stringify options))
@@ -864,8 +845,10 @@ options 'options'.  Return the new module."
       ;; check for old module definition:
       (setq oldModule (get-stella-module name FALSE))
       (when (and (defined? oldModule)
-                 (identical-module-signatures? oldModule NULL stringifiedOptions))
-        ;; no change -- don't redefine module:
+                 (identical-module-structure? oldModule NULL stringifiedOptions))
+        ;; no change -- don't redefine module, just update any
+	;; non-structural parts
+	(update-non-structural-module-options oldModule NULL stringifiedOptions)
         (return oldModule))
       (setq module (new MODULE))
       ;; tricky: because option values are strings (and lists of strings)
@@ -882,8 +865,10 @@ options 'options'.  Return the new module."
         ;;    `(defmodule "/A/B")' vs. `(defmodule "B" :includes ("A"))'.
         ;;    The latter case requires option processing to determine
         ;;    the full name of the module:
-        (when (identical-module-signatures? oldModule module NULL)
-          ;; no change -- don't redefine module:
+        (when (identical-module-structure? oldModule module NULL)
+          ;; no change -- don't redefine module, just update any 
+	  ;; non-structural parts
+	  (update-non-structural-module-options oldModule module NULL)
           (unfinalize-module module)
           (return oldModule))
         ;; Catch error condition:
@@ -894,16 +879,67 @@ options 'options'.  Return the new module."
           (return oldModule))
         (undefine-module oldModule module))
       (finalize-module module)
+      (when (defined? oldModule)	; A redefinition
+	;; And for redefinitions of existing modules with children,
+	;; we go through and re-finalize them as well.  This needs
+	;; to be done after the finalization of `module'.
+	(foreach c in (all-subcontexts module :topdown)
+	   ;; TO DO: Should these finalize-xyz calls be methods with a single name?
+	   do (typecase c
+		(MODULE 
+		 (when (empty? (uses c)) ; Restore empty list kludge
+		   (setf (uses c) (list c)))
+		 (finalize-module c))
+		(WORLD
+		 (finalize-world c)))))
+      (bump-memoization-timestamp :MODULE-UPDATE)
       (run-hooks *define-module-hooks* module)
       (return module) )))
 
-(defun (identical-module-signatures? BOOLEAN)
+(defun update-non-structural-module-options ((oldModule MODULE) (newModule MODULE)
+					     (newOptions STRING))
+  ;; Update the changed non-structural options of `oldModule' from `newModule'.
+  ;; Maybe change the stringified source.
+  ;; The newModule will be discarded shortly.
+  ;; See also function `identical-module-structure?'.
+  (when (null? newOptions)
+    (setq newOptions (stringified-options newModule)))
+  (let ((oldPlist (new PROPERTY-LIST :the-plist (unstringify (stringified-options oldModule))))
+	(newPlist (new PROPERTY-LIST :the-plist (unstringify newOptions)))
+	(oldValue OBJECT NULL)
+	(newValue OBJECT NULL)
+	(changed-values NIL))
+    ;; Tricky.  If the newValue from the lookup is NULL, then we copy the
+    ;;    default value out of the corresponding slot in "newModule", which
+    ;;    will have been initialized at creation time.
+    (foreach option in *MODULE-NON-STRUCTURAL-OPTIONS*
+       do (setq oldValue (lookup oldPlist option))
+          (setq newValue (lookup newPlist option))
+	  (unless (eql? oldValue newValue)
+	    (if (defined? newValue)
+		(pushq changed-values newValue)
+		(progn
+		  (when (null? newModule) (setq newModule (new MODULE)))
+		  (pushq changed-values 
+			 (read-slot-value newModule (lookup-slot-from-option-keyword
+						     (primary-type newModule) option)))))
+	    (pushq changed-values option)))
+    (when (non-empty? changed-values)
+      (inform "Updating module " oldModule)
+      (incorporate-module-options oldModule changed-values)
+      (setf (stringified-options oldModule) newOptions))))
+
+(defun (identical-module-structure? BOOLEAN)
     ((oldModule MODULE) (newModule MODULE) (newOptions STRING))
-  ;; Return TRUE if `oldModule' and `newModule' have identical signatures, i.e.,
-  ;;    they were defined with the same full name and options.
+  ;; Return TRUE if `oldModule' and `newModule' have identical structure, i.e.,
+  ;;    they were defined with the same full name and structural options.
+  ;; Currently structural options include all options except for :DOCUMENTATION
+  ;;    although this list should be expanded in the future.  See also
+  ;;    function `update-non-structural-module-options'
   ;; If `newModule' is NULL, the test is performed against the option string
   ;;    `newOptions' of a module about to be created, assuming that their
   ;;    full names will match.
+  ;; TO DO: EXPAND NON-STRUCTURAL-OPTIONS
   (when (and (defined? newModule)
              (not (eql? (module-full-name oldModule)
                         (module-full-name newModule))))
@@ -916,8 +952,9 @@ options 'options'.  Return the new module."
               (stringified-options newModule)))
     (when (null? newOptions)
       (return FALSE))
-    (when (eql? oldOptions newOptions)
+    (when (eql-except-in-whitespace? oldOptions newOptions)
       (return TRUE))
+    ;; Huh?
     (when (and (null? (string-search oldOptions ":INCLUDES" 0))
                (null? (string-search newOptions ":INCLUDES" 0)))
       (return FALSE))
@@ -929,17 +966,22 @@ options 'options'.  Return the new module."
             (newPlist (new PROPERTY-LIST :the-plist (unstringify newOptions))))
         (remove-at oldPlist :INCLUDES)
         (remove-at newPlist :INCLUDES)
-        (when (not (= (length oldPlist) (length newPlist)))
-          (return FALSE))
+	;; Run through each list separately to make sure we haven't added 
+	;; or removed a structural option.
         (foreach (key value) in oldPlist
-            where (not (equal-cons-trees? value (lookup newPlist key)))
-            do (return FALSE))
+    	    where (not (member? *MODULE-NON-STRUCTURAL-OPTIONS* key))
+	    do (unless (equal-cons-trees? value (lookup newPlist key))
+                 (return FALSE)))
+	(foreach (key value) in newPlist
+    	    where (not (member? *MODULE-NON-STRUCTURAL-OPTIONS* key))
+	    do (unless (equal-cons-trees? value (lookup oldPlist key))
+                 (return FALSE)))
         (return TRUE)))
     (return FALSE)))
 
 (defun (define-module-from-stringified-source MODULE) 
     ((name STRING) (stringifiedOptions STRING))
-  :public? TRUE
+  :public? TRUE :constructor? TRUE
   ;; Define a stella module given a stringified definition
   (return (define-module name (unstringify stringifiedOptions))))
 
@@ -1082,6 +1124,9 @@ Optionally, specify a name."
     (finalize-world world)
     (return world) ))
 
+(defmethod (multiple-parents? BOOLEAN) ((world WORLD))
+  :documentation "Return FALSE always, since worlds never have more than one parent."
+  (return FALSE) )
 
   ;;
 ;;;;;; Push and pop world
@@ -1111,40 +1156,62 @@ if there is no current world."
   ;;
 
 (defun (all-subcontexts (ALL-PURPOSE-ITERATOR OF CONTEXT)) ((context CONTEXT)
-                                                (traversal KEYWORD))
+                                                            (traversal KEYWORD))
   :documentation "Return an iterator that generates all subcontexts of
 'self' (not including 'self') in the order specified by 'traversal' (one
-of :preorder, :inorder, or :postorder)."
+of :preorder, :inorder, :postorder or :topdown)."
   (let ((contextsIterator (new ALL-PURPOSE-ITERATOR))
         (subContexts NIL))
     (foreach child in (child-contexts context)
-             collect child into subContexts)
+      collect child into subContexts)
     (when (eql? traversal :postorder)
       (setq subContexts (reverse subContexts)))
     (setf (iterator-cons-list contextsIterator) subContexts)
-    (setf (iterator-object contextsIterator) traversal)
-    (setf (iterator-next-code contextsIterator)
-          (the-code :function all-subcontexts-next?))
+    (if (eql? traversal :topdown)
+      (progn 
+        (setf (iterator-object contextsIterator) context)
+        (setf (iterator-next-code contextsIterator)
+              (the-code :function all-topdown-subcontexts-next?)))
+      (progn
+        (setf (iterator-object contextsIterator) traversal)
+        (setf (iterator-next-code contextsIterator)
+              (the-code :function all-subcontexts-next?))))
     (return contextsIterator) ))
+
+#|
+;; Test code:
+(eval (foreach k in (quote (:preorder :inorder :postorder :topdown))
+          do (print EOL K EOL)
+             (foreach sub in (all-subcontexts (get-stella-context "PL-KERNEL-KB" TRUE) k)
+               do (print "  " sub eol))))
+|#
 
 (defun (all-subcontexts-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
   ;; 'next?' function for the 'all-subcontexts' iterator.
   (let ((traversal KEYWORD (iterator-object self))
         (remainingContexts (iterator-cons-list self))
         (thisContext CONTEXT NULL)
-        (subContexts NIL))
+        (subContexts NIL)
+        (beenThere HASH-SET (iterator-second-object self)))
     (when (empty? remainingContexts)
       (setf (slot-value self value) NULL)
       (return FALSE))
+    (when (null? beenThere)
+      ;; first time around, initialize the `beenThere' list, don't do it in
+      ;;    `all-subcontexts' since `all-contexts' hacks the initialization:
+      (setq beenThere (new HASH-SET))
+      (setf (iterator-second-object self) beenThere)
+      (foreach ctxt in remainingContexts
+          do (insert beenThere ctxt)))
     (setq thisContext (first remainingContexts))
     (setq remainingContexts (rest remainingContexts))
     (foreach child in (child-contexts thisContext)
-             ;; Avoid duplicates due to multiple inheritance:
-             where (or (eql? (pop (parent-contexts child)) thisContext)
-                       (empty? (parent-contexts child)))
-             collect child into subContexts)
+        ;; Avoid duplicates due to multiple inheritance:
+        where (not (member? beenThere child))
+        do (insert beenThere child)
+        collect child into subContexts)
     (if (empty? subContexts)
-        (setf (iterator-cons-list self) remainingContexts)
+      (setf (iterator-cons-list self) remainingContexts)
       (case traversal
         (:preorder
          (setf (rest (last-cons subContexts)) remainingContexts)
@@ -1159,6 +1226,54 @@ of :preorder, :inorder, or :postorder)."
                (otherwise
                 (setf (rest (last-cons remainingContexts)) subContexts)
                 (setf (iterator-cons-list self) remainingContexts))))))
+    (setf (slot-value self value) thisContext)
+    (return TRUE)))
+
+(defun (all-topdown-subcontexts-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; alternate 'next?' function for the 'all-subcontexts' iterator.
+  (let ((remainingContexts (iterator-cons-list self))
+        (thisContext CONTEXT NULL)
+        (subContexts NIL)
+        (beenThere HASH-TABLE (iterator-second-object self)))
+    (when (empty? remainingContexts)
+      (setf (slot-value self value) NULL)
+      (return FALSE))
+    (when (null? beenThere)
+      ;; first time around, initialize the `beenThere' list, don't do it in
+      ;;    `all-subcontexts' since `all-contexts' hacks the initialization:
+      (setq beenThere (new HASH-TABLE))
+      (setf (iterator-second-object self) beenThere)
+      ;; For topdown traversal, we initially get the start context as
+      ;; the sole item in remainingContexts.  We initialize the visited
+      ;; table to FALSE-WRAPPER for all subs, and then make sure that 
+      ;; all parents of any context we return have either been visited
+      ;; (and have a TRUE-WRAPPER value) or they are outside the initial
+      ;; subtree (and have a NULL value).
+      (foreach sub in (all-subcontexts (iterator-object self) :preorder)
+        do (insert-at beenThere sub FALSE-WRAPPER)))
+    (while (non-empty? remainingContexts)
+      (setq thisContext (first remainingContexts))
+      ;; Tricky:  Test this before moving down the list so that
+      ;;    after we exit the loop, we can test for exhausted values
+      (when (forall p in (parent-contexts thisContext)
+                    always (not (eql? (lookup beenThere p) FALSE-WRAPPER)))
+        (break))
+      (setq remainingContexts (rest remainingContexts)))
+    (if (empty? remainingContexts)
+      (progn                            ; None found, so punt.
+        (setf (slot-value self value) NULL)
+        (return FALSE))
+      (setq remainingContexts (rest remainingContexts)))
+    (insert-at beenThere thisContext TRUE-WRAPPER)
+    (foreach child in (child-contexts thisContext)
+      collect child into subContexts)
+    (cond ((empty? remainingContexts)
+           (setf (iterator-cons-list self) subContexts))
+          ((empty? subContexts)
+           (setf (iterator-cons-list self) remainingContexts))
+          (otherwise
+           (setf (rest (last-cons remainingContexts)) subContexts)
+           (setf (iterator-cons-list self) remainingContexts)))
     (setf (slot-value self value) thisContext)
     (return TRUE)))
 
@@ -1190,6 +1305,16 @@ of :preorder, :inorder, or :postorder)."
           (the-code :function filter-module?))
     (return iterator)))
 
+(defun (list-modules (CONS OF MODULE)) ((kb-only? BOOLEAN))
+  :public? TRUE
+  :command? TRUE
+  :documentation "Returns a cons of all modules defined in PowerLoom.  If `kb-only?'
+is `true', then any modules which are code only or just namespaces are not returned."
+  (if kb-only?
+    (return (collect m in (all-modules) where (and (not (code-only? m))
+                                                   (not (namespace? m)))))
+    (return (collect m in (all-modules)))))
+
 (defun (all-included-modules (ITERATOR OF MODULE)) ((self MODULE))
   :public? TRUE
   :documentation "Generate a sequence of all modules included
@@ -1201,27 +1326,34 @@ down to 'self' (which is last)."
     (return
      (allocate-destructive-list-iterator (reverse copy))) ))
 
-(defun (visible-modules (ITERATOR OF MODULE)) ((from MODULE))
-  :public? TRUE
+(defun (visible-modules (CONS OF MODULE)) ((from MODULE))
   :documentation
-  "Return an iterator that generates all modules visible from module `from'.
-The generated modules are generated from most- to least-specific and 
-will start with the module `from'."
+  "Return a list of all modules visible from module `from' (or `*module*'
+if `from' is NULL.  The generated modules are generated from most to
+least-specific and will start with the module `from'."
+  :public? TRUE
+  (when (null? from)
+    (setq from *module*))
+  (return
+    ;; for top-level code modules the memoization doesn't buy us much:
+    (memoize (from)
+             :timestamps :MODULE-UPDATE :max-values 50
+             (help-memoize-visible-modules from))))
+
+(defun (help-memoize-visible-modules (CONS OF MODULE)) ((from MODULE))
+  ;; Helper function for `visible-modules' that does all the work.
   (let ((visibleModules (CONS OF MODULE) NIL))
-    (when (null? from)
-      (setq from *module*))
     (pushq visibleModules from)
     (foreach super in (all-super-contexts from)
-             do (pushq visibleModules super))
+        do (pushq visibleModules super))
     (foreach usee in (uses from)
-             do
-             (when (not (memb? visibleModules usee))
-               (pushq visibleModules usee))
-             (foreach useeSuper in (all-super-contexts usee)
-                      ;; Avoid duplicates (e.g., if siblings use each other):
-                      where (not (memb? visibleModules useeSuper))
-                      do (pushq visibleModules useeSuper)))
-    (return (allocate-destructive-list-iterator (reverse visibleModules))) ))
+        do (when (not (memb? visibleModules usee))
+             (pushq visibleModules usee))
+           (foreach useeSuper in (all-super-contexts usee)
+               ;; Avoid duplicates (e.g., if siblings use each other):
+               where (not (memb? visibleModules useeSuper))
+               do (pushq visibleModules useeSuper)))
+    (return (reverse visibleModules))))
 
 
   ;;
@@ -1270,19 +1402,17 @@ will start with the module `from'."
      (foreach class in (all-classes self TRUE)
          do (destroy-class class))
      (foreach surrogate in (all-surrogates self TRUE)
-         do
-         (if (protect-surrogates? self)
-           (setf (surrogate-value surrogate) NULL)
-           (unintern-surrogate surrogate)))
-     ;; if we are protecting surrogates, then we protect symbols
-     ;;    as well:
+         do (if (protect-surrogates? self)
+                (setf (surrogate-value surrogate) NULL)
+              (unintern-surrogate surrogate)))
+     ;; if we are protecting surrogates, then we protect symbols as well:
      (unless (protect-surrogates? self)
        (foreach symbol in (all-symbols self TRUE)
-                do (unintern-symbol symbol)))
+           do (unintern-symbol symbol)))
      (special ((*module* self))
        (foreach it on (shadowed-surrogates self)
-	   do (setf (value it)
-		(shadow-surrogate (symbol-name (value it)))))))
+	   do (setf (value it) (shadow-surrogate (symbol-name (value it))))))
+     (bump-memoization-timestamp :MODULE-UPDATE))
     (otherwise NULL)))
 
 (defun help-clear-context ((self CONTEXT))

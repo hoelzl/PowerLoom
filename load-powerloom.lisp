@@ -1,31 +1,46 @@
 ;;; -*- Mode: Lisp; Package: CL-USER; Syntax: COMMON-LISP; Base: 10 -*-
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;                                                                          ;
-;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 1997-2003              ; 
-;  University of Southern California, Information Sciences Institute       ;
-;  4676 Admiralty Way                                                      ;
-;  Marina Del Rey, California 90292                                        ;
-;                                                                          ;
-;  This software was developed under the terms and conditions of Contract  ;
-;  No. N00014-94-C-0245 between the Defense Advanced Research Projects     ;
-;  Agency and the University of Southern California, Information Sciences  ; 
-;  Institute.  Use and distribution of this software is further subject    ;
-;  to the provisions of that contract and any other agreements developed   ;
-;  between the user of the software and the University of Southern         ;
-;  California, Information Sciences Institute.  It is supplied "AS IS",    ;
-;  without any warranties of any kind.  It is furnished only on the basis  ;
-;  that any party who receives it indemnifies and holds harmless the       ;
-;  parties who furnish and originate it against any claims, demands, or    ;
-;  liabilities connected with using it, furnishing it to others or         ;
-;  providing it to a third party.  THIS NOTICE MUST NOT BE REMOVED FROM    ;
-;  THE SOFTWARE, AND IN THE EVENT THAT THE SOFTWARE IS DIVIDED, IT SHOULD  ;
-;  BE ATTACHED TO EVERY PART.                                              ;
-;                                                                          ;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-powerloom.lisp,v 1.9 2003/10/22 23:42:02 hans Exp
+;;; Version: load-powerloom.lisp,v 1.13 2006/05/15 18:08:38 tar Exp
 
 ;;; Load PowerLoom.
 
@@ -35,19 +50,18 @@
 ;; Set this to t to use structs instead of CLOS objects as the implementation
 ;; of STELLA classes.  Structs are significantly faster but can cause problems
 ;; when classes are redefined.  Use for production versions only.
-(defvar *load-cl-struct-stella?* nil)
+(defvar *load-cl-struct-stella?* t)
 
 (load (merge-pathnames "translations" *load-pathname*))
-(load (merge-pathnames "load-stella" *load-pathname*))
-(stella::make-system "logic" :common-lisp)
+(unless (find-package "STELLA")
+  (load (merge-pathnames "load-stella" *load-pathname*)))
+(unless (stella::system-loaded? "logic")
+  (stella::make-system "powerloom" :common-lisp))
 
 (defun powerloom ()
   (stella::powerloom))
 
-(format t "~&~a loaded.~
-           ~%Type `(powerloom)' to get started.~
-           ~%Type `(in-package \"STELLA\")' to run PowerLoom commands directly~
-           ~%   from the Lisp top level."
+(format t "~&~a loaded.~%Type `(powerloom)' to get started.~%Type `(in-package \"STELLA\")' to run PowerLoom commands directly~%   from the Lisp top level."
 	stella::*powerloom-version-string*)
 
 (stella::in-module "PL-USER")

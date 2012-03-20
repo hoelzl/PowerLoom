@@ -1,0 +1,876 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: goal-caches.ste,v 1.15 2006/05/11 07:05:12 hans Exp
+
+;;; Caching of backchaining goals.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Goal caches
+  ;;
+
+(defclass GOAL-CACHE (STANDARD-OBJECT)
+  :documentation "Cache of output bindings derived for a particular goal
+and set of input bindings."
+  :slots
+  ((cached-bindings :type (LIST OF GOAL-BINDINGS) :allocation :embedded)
+   ;; TO DO: CONSIDER MAKING THIS A VECTOR, TO HANDLE MULTI-THREADING:
+   ;; BUG: THIS MUST BE INDEXED BY GOAL BINDINGS, ELSE DIFFERENT GOALS
+   ;;    WITH THE SAME PREDICATE GET MIXED UP:
+   (timestamp :type TIMESTAMP)
+   (proposition :type PROPOSITION)      ; for debugging only
+   (reverse-polarity? :type BOOLEAN)    ; for debugging only
+   (cache-context :type CONTEXT)        ; for debugging only
+  ))
+
+(defun trace-goal-cache ((string STRING) (frame CONTROL-FRAME))
+  (let ((goal (proposition frame)))
+    (when (trace-keyword? :GOAL-CACHES)
+      (special ((*printInFrame* frame))
+               (print string)
+               (when *reversePolarity?*
+                 (print "not~"))
+               (print goal EOL))) ))
+
+(deftype GOAL-CACHE-TABLE (KEY-VALUE-LIST OF CONTEXT GOAL-CACHE))
+
+(defun remove-obsolete-goal-caches
+       ((table (KEY-VALUE-LIST OF CONTEXT GOAL-CACHE)))
+  ;; Remove all entries indexed on deleted contexts.
+  (foreach (k v) in table
+           where (deleted? k)
+           do (ignore v)
+	      (remove-at table k)
+	      (remove-obsolete-goal-caches table)
+	      (break)) )
+
+(defslot NAMED-DESCRIPTION goal-cache-table :type GOAL-CACHE-TABLE
+  :documentation "Allows attachment of goal caches to classes or slots.")
+
+(defslot NAMED-DESCRIPTION negated-goal-cache-table :type GOAL-CACHE-TABLE
+  :documentation "Allows attachment of goal caches to classes or slots.")
+
+;;; Tricky: When a goal cache is initially created, it is tied to the
+;;;    first frame (called the 'owner') that posted the corresponding goal.
+;;;    The owner frame is the only frame that can add to the set of cached
+;;;    bindings.
+
+(defun (yield-goal-bindings GOAL-BINDINGS) ((goal PROPOSITION))
+  ;; Return a cons list representing the current bindings of the arguments
+  ;;    of 'goal'.
+  (let ((result NIL))
+    (foreach arg in (arguments goal)
+             collect (argument-bound-to arg) into result)
+    (return result) ))
+
+(defun (find-goal-cache-table GOAL-CACHE-TABLE) ((goal PROPOSITION))
+  ;; Return a goal cache table for the class or slot associated with 'goal',
+  ;;    if one exists.
+  (case (kind goal)
+    ((:ISA :PREDICATE :FUNCTION)
+     (safety 3 (isa? (operator goal) @SURROGATE))
+     (let ((description (get-description (relationref goal))))
+       (if *reversePolarity?*
+         (return (negated-goal-cache-table description))
+         (return (goal-cache-table description)))))
+    (otherwise (return NULL))))
+
+(defun (create-goal-cache? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; Called by 'continue-cached-bindings-proof', 'handle-depth-violation'
+  ;;    and 'establish-goal-cache'.
+  ;; Create a goal cache corresponding to the current set of bindings
+  ;;    for 'goal'.  Return TRUE if a cache was created.
+  (let ((goal (proposition frame))
+        (table (find-goal-cache-table goal)))
+    (when (null? table)
+      (setq table (new GOAL-CACHE-TABLE))
+      (case (kind goal)
+        ((:ISA :PREDICATE :FUNCTION)
+         (if (eql? (primary-type (operator goal)) @SURROGATE)
+           (let ((goalDescription (get-description (relationRef goal))))
+             (if *reversePolarity?*
+                 (setf (negated-goal-cache-table goalDescription) table)
+                 (setf (goal-cache-table goalDescription) table)))
+           (return FALSE)))
+        (otherwise (return FALSE))))
+    (let ((goalCache (lookup-goal-cache table)))
+      ;; should always be null? (perhaps we allocated duplicate and hit depth
+      ;;    cut-off before checking the cache?):
+      (when (null? goalCache)
+ (trace-goal-cache "CREATING GOAL CACHE: " frame)
+        (setq goalCache (new GOAL-CACHE))
+        (remove-obsolete-goal-caches table)
+        (insert-at table *context* goalCache)
+        (setf (goal-cache frame) goalCache)
+        (setf (timestamp goalCache) (get-now-timestamp))
+        (setf (proposition goalCache) goal)     ; only for tracing
+        (setf (reverse-polarity? goalCache) *reversePolarity?*) ; only for tracing
+        (setf (cache-context goalCache) *context*)    ; only for tracing
+        (insert (active-goal-caches *queryIterator*) goalCache)
+        (when (top-level-query-context? *context*)
+          (setf (augmented-goal-cache? *queryIterator*) TRUE)))
+      (return TRUE)) ))
+  
+(defun (lookup-goal-cache GOAL-CACHE) ((table GOAL-CACHE-TABLE))
+  ;; TO DO: REPLACE LINEAR SEARCH BY HASH LOOKUP WHEN TABLE GROWS
+  ;;    TOO BIG.
+  ;; Return a goal cache indexed on the bindings of arguments in 'goal'.
+  (return (lookup table *context*)) )
+
+(defun (find-goal-cache GOAL-CACHE) ((frame CONTROL-FRAME))
+  ;; Called by 'continue-cached-bindings-proof' and 'handle-depth-violation'.
+  ;;    Return a goal cache, if one exists, corresponding to the current
+  ;;    set of bindings for 'goal'.
+  ;; Side-effect: If a goal table attached to 'goal' is out of date, purge
+  ;;    its goal bindings.
+  (let ((goal (proposition frame))
+        (table (find-goal-cache-table goal))
+        (goalCache GOAL-CACHE NULL))
+    (when (null? table)
+      (return NULL))
+    (setq goalCache (lookup-goal-cache table))
+    ;; PERFORMANCE BUG: ADVANCING THE TIME STAMP MAKES ALL CACHES
+    ;;    OUT-OF-DATE, NOT JUST THE ONES FOR CONTEXTS AT AND BELOW THE UPDATE
+    ;; REWRITE 'get-now-timestamp' TO BE INDEXED BY CONTEXT.
+    (when (and (defined? goalCache)
+               (< (timestamp goalCache) (get-now-timestamp)))
+      ;; purge out-of-date goal cache:
+      (clear (cached-bindings goalCache))
+      (setf (timestamp goalCache) (get-now-timestamp)))
+    (return goalCache) ))
+
+(defun update-goal-cache ((frame CONTROL-FRAME) (success? BOOLEAN))
+  ;; Called by 'move-up' upon return.
+  ;; If a goal cache is attached to the goal for 'frame', record the
+  ;;    bindings for that goal in the cache.
+  ;; Assumes a successful return.
+  (when (or (not (eql? *duplicate-subgoal-strategy* :DUPLICATE-GOALS-WITH-CACHING))
+            (not success?))
+    (return))
+  (let ((goalCache (find-goal-cache frame)))
+    (when (defined? goalCache)
+      (let ((cachedBindings (cached-bindings goalCache))
+            (bindings (yield-relative-goal-bindings frame)))
+        ;; check for duplicate:
+        (when (exists oldBindings in cachedBindings
+                      where (forall v1 in bindings
+                                    as v2 in oldBindings
+                                    always (eql? v1 v2)))
+          (return))
+        (trace-if :GOAL-CACHES "AUGMENT CACHE: " bindings "  " frame EOL)
+        (push cachedBindings bindings)
+        (setf (augmented-goal-cache? *queryIterator*) TRUE)))) )
+
+(defun (yield-relative-goal-bindings GOAL-BINDINGS) ((frame CONTROL-FRAME))
+  ;; Return a list representing the bindings of the arguments of 'goal'.
+  ;; Tricky: Temporarily reset '(current-pattern-record *queryIterator*)'
+  ;;    so that bindings can be extracted.
+  (let ((goal (proposition frame))
+        (result NIL)
+        (saveCurrentPR (current-pattern-record *queryIterator*)))
+    (setf (current-pattern-record *queryIterator*)
+          (operative-pattern-record frame))
+    (foreach arg in (arguments goal)
+             collect (argument-bound-to arg) into result)
+    (setf (current-pattern-record *queryIterator*) saveCurrentPR)
+    (return result) ))
+
+(defun (continue-cached-bindings-proof KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Find or create a goal cache for the goal in 'frame'.
+  ;; If found, bind the goal to the next bindings found in the cache.
+  (ignore lastMove)
+  (let ((goal (proposition frame))
+        (iterator (cached-bindings-iterator frame)))
+    (when (null? iterator)
+      ;; first time through -- retrieve cached bindings.  Use them directly
+      ;;    or set up an iterator.
+      (let ((goalCache (find-goal-cache frame))
+            (cachedBindings (LIST OF GOAL-BINDINGS) NULL))
+        (when (null? goalCache)
+          ;; situation: a duplicate goal was detected for the first time,
+          ;;    and the goal cache is just now being created.
+          ;; create an empty cache for later filling, and then exit
+          (create-goal-cache? frame)
+          (return :FAILURE))
+        (setq cachedBindings (cached-bindings goalCache))
+        (case (length cachedBindings)
+          (0
+ (trace-goal-cache "EMPTY CACHE: " frame)
+           (return :FAILURE))
+          (1
+ (trace-goal-cache "USED CACHED BINDING: " frame)
+           ;; bind arguments in 'goal':
+           (if (bind-vector-of-arguments-to-values?
+                (arguments goal) (first cachedBindings))
+             (return :FINAL-SUCCESS)
+             (return :FAILURE)))
+          (otherwise ;; overlay with cached bindings generator:
+ (trace-goal-cache "USED MANY CACHED BINDINGS: " frame)
+           ;; allocate an iterator that returns successive bindings:
+           (setq iterator (allocate-iterator (cached-bindings goalCache)))
+           (setf (cached-bindings-iterator frame) iterator)))))
+    ;; scan next cached bindings:
+    (create-choice-point frame)
+    (while (next? iterator)
+      (when (bind-vector-of-arguments-to-values?
+             (arguments (proposition frame)) (value iterator))
+        (if (empty? iterator)
+          (return :FINAL-SUCCESS)
+          (return :CONTINUING-SUCCESS))))
+    (return :FAILURE) ))
+
+(defun (top-level-query-context? BOOLEAN) ((self CONTEXT))
+  ;; Return TRUE if `self' is a top-level query context of the current
+  ;;    query (as opposed to a hypothetical world).
+  (let ((queryContext (query-context *queryIterator*)))
+    (return (or (eql? self queryContext)
+                (world-state? self)
+                (eql? (inference-cache-of (safe-cast self WORLD))
+                      queryContext)))))
+
+
+  ;;
+;;;;;; Alternative goal caches
+  ;;
+
+;;; The cache mechanism below is an alternative to the one above.  It uses a
+;;;    fixed-size, revolving cache that caches recently failed and succeeded
+;;;    goals using a hashing scheme.  Whenever a hash collision occurs, a
+;;;    previously cached result becomes obsolete and gets overwritten with
+;;;    a new cached goal.
+;;; The advantages of this mechanism are that it can handle failed open goals,
+;;;    that it uses a bounded amount of space, and that the cache data
+;;;    structure used is goal-centered which makes it easier to attach various
+;;;    information needed to, for example, accommodate the partial matcher or
+;;;    store justifications.
+;;; The disadvantage is that the cache can never be fully trusted, thus, even
+;;;    though bindings can be generated from the cache to answer an open query,
+;;;    in order to be sure to generate all bindings we always have to pursue
+;;;    all other available strategies after the cache is exhausted.
+
+;;; TO DO:
+;;; - Make timestamp mechanism more selective to preserve as many
+;;;   cached results as possible.
+;;; - See whether it pays to use a subcontext test instead of context
+;;;   equality for comparing a goal to a cached result in cases where
+;;;   this is warranted.
+;;; - Fix lazy satellite rule generation to not bump time stamps.
+;;; - Figure out whether in `(retrieve all ...)' queries we should turn
+;;;   off generation of cached bindings, since we always have to pursue
+;;;   all other proofs once caches are exhausted, and how this would
+;;;   interact with duplicate subgoals.
+;;;   Alternatively, we could in some cases determine that the caches
+;;;   are in fact complete (e.g., upon failure to generate another binding)
+;;;   and exploit that information (unless collisions invalidated something).
+;;; - Figure out interactions with duplicate subgoals, caching, and
+;;;   completeness of generated solutions.
+
+;;; Query caching:
+
+(defun (cache-query-results? BOOLEAN) ()
+  ;; Return TRUE if results of succeeded and/or failed backward
+  ;;    inference (sub)goals should be cached in a revolving cache.
+  :globally-inline? TRUE
+  (return (and (or *cache-succeeded-goals?*
+                   *cache-failed-goals?*)
+               (eql? *duplicate-subgoal-strategy* :DUPLICATE-GOALS)
+               ;; Until we fully understand how to do this correctly:
+               (not (partial-match-mode?)))))
+
+(defglobal *cache-succeeded-goals?* BOOLEAN TRUE)
+(defglobal *cache-failed-goals?* BOOLEAN TRUE)
+
+(defglobal *cache-goal-quantum* INTEGER 5
+  :documentation "Only goals whose success or failure took at least this
+number of query clock ticks will be cached.")
+
+(defun (toggle-goal-caching STRING) ()
+  (if *cache-succeeded-goals?*
+    (progn
+      (setq *cache-succeeded-goals?* FALSE)
+      (setq *cache-failed-goals?* FALSE)
+      (increment-now-timestamp)
+      (return "Disabled goal caching."))
+    (progn
+      (setq *cache-succeeded-goals?* TRUE)
+      (setq *cache-failed-goals?* TRUE)
+      (return "Enabled goal caching."))) )
+
+(defclass ATOMIC-GOAL-CACHE (STANDARD-OBJECT)
+  :documentation "Cache data structure to store the result of proving an atomic
+and possibly open `proposition' relative to a set of variable `bindings'."
+  :slots
+  ((goal-context :type CONTEXT)
+   (timestamp :type TIMESTAMP)
+   (truth-value :type TRUTH-VALUE)
+   (reverse-polarity? :type BOOLEAN)
+   (proposition :type PROPOSITION)
+   (bindings :type GOAL-BINDINGS)
+   (justification :type JUSTIFICATION)
+   ;; Partial-match information (fold into truth values):
+   (positive-score :type PARTIAL-MATCH-SCORE)
+   (negative-score :type PARTIAL-MATCH-SCORE)
+   ;; These are only needed for succeeded goals to handle open queries:
+   (previous :type ATOMIC-GOAL-CACHE)
+   (next :type ATOMIC-GOAL-CACHE))
+  :print-form (print-atomic-goal-cache self stream))
+
+(defun print-atomic-goal-cache
+    ((self ATOMIC-GOAL-CACHE) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print `self' to `stream' (useful for debugging).
+  (print-native-stream
+   stream
+   "|GC|["
+   (choose (reverse-polarity? self) "~" "")
+   "(" (stringified-kif-operator (proposition self)))
+  (special ((*printMode* :REALISTIC)
+            (*printLogicalFormStream* (wrap-native-output-stream stream)))
+    (foreach arg in (arguments (proposition self))
+        as argValue in (bindings self)
+        do (print-native-stream stream " ")
+           (print-as-kif-internal (choose (null? argValue) arg argValue))))
+  (print-native-stream stream ") time: " (timestamp self)
+                       " ctxt: " (context-number (goal-context self)) "]"))
+
+(defglobal *succeeded-goals-cache* (VECTOR OF ATOMIC-GOAL-CACHE)
+           (new VECTOR :array-size 1541))
+(defglobal *failed-goals-cache* (VECTOR OF ATOMIC-GOAL-CACHE)
+           (new VECTOR :array-size 1541))
+
+(defun clear-query-results-cache ()
+  ;; Clear cache tables and reset variables.
+  ;; Used mainly for debugging and benchmarking.
+  (foreach cache in *succeeded-goals-cache*
+      where (defined? cache)
+      do (set-goal-cache-list (proposition cache) NULL))
+  (clear *succeeded-goals-cache*)
+  (clear *failed-goals-cache*)
+  (setq *failed-goal-cutoffs* 0)
+  (setq *succeeded-goal-cutoffs* 0))
+
+(defun print-query-results-cache ((limit INTEGER))
+  ;; Print the current content of the query results cache.
+  ;; Print at most `limit' entries per cache (default=100).
+  ;; Used for debugging.
+  (when (null? limit) (setq limit 100))
+  (let ((count limit))
+    (print "Failed goal cutoffs:    " *failed-goal-cutoffs* EOL)
+    (print "Succeeded goal cutoffs: " *succeeded-goal-cutoffs* EOL EOL)
+    (print "Cached failed goals:" EOL)
+    (foreach cache in *failed-goals-cache*
+        as i in (interval 0 NULL)
+        where (and (defined? cache)
+                   (not (deleted? (proposition cache)))
+                   (not (deleted? (operator (proposition cache))))
+                   (not (exists arg in (arguments (proposition cache))
+                            as binding in (bindings cache)
+                            where (or (deleted? arg)
+                                      (and (defined? binding)
+                                           (deleted? binding))))))
+        do (when (<= count 0)
+             (break))
+           (print i ": " cache EOL)
+           (-- count))
+    (setq count limit)
+    (print EOL "Cached succeeded goals:" EOL)
+    (foreach cache in *succeeded-goals-cache*
+        as i in (interval 0 NULL)
+        where (and (defined? cache)
+                   (not (deleted? (proposition cache)))
+                   (not (deleted? (operator (proposition cache))))
+                   (not (exists arg in (arguments (proposition cache))
+                            as binding in (bindings cache)
+                            where (or (deleted? arg)
+                                      (and (defined? binding)
+                                           (deleted? binding))))))
+        do (when (<= count 0)
+             (break))
+           (print i ": " cache EOL)
+           (-- count))))
+
+(defun (succeeded-goal-index INTEGER) ((frame CONTROL-FRAME))
+  ;; Return the cache table index for the succeeded goal represented
+  ;;    by `frame'.
+  :globally-inline? TRUE
+  (return (hashmod (goal-hash-code frame) 1541)))
+
+(defun (failed-goal-index INTEGER) ((frame CONTROL-FRAME))
+  ;; Return the cache table index for the failed goal represented by `frame'.
+  :globally-inline? TRUE
+  (return (hashmod (goal-hash-code frame) 1541)))
+
+(defun (goal-hash-code INTEGER) ((frame CONTROL-FRAME))
+  ;; Compute a hash code for the goal represented by `frame'.
+  ;; This uses an `equal' hashing scheme, such that two different frames
+  ;;    that represent the same goal will generate the same hash code.
+  (let ((proposition (proposition frame))
+        (operator (cached-goal-operator proposition))
+        (arguments (arguments proposition))
+        (code 0))
+    ;; FIGURE OUT: MAYBE WE SHOULDN'T INCLUDE THE CONTEXT IN THE HASH CODE
+    ;;    TO MAKE CACHED RESULTS AVAILABLE IN HYPOTHETICAL SUBCONTEXTS.
+    (setq code (hash-code *context*))
+    (when (reverse-polarity? frame)
+      ;; 48312004 = (hash-string "REVERSE-POLARITY" 0):
+      (setq code (logxor (rotate-hash-code code) 48312004)))
+    (setq code (logxor (rotate-hash-code code) (safe-hash-code operator)))
+    ;; Use `goal-bindings' so we don't have to recompute `argument-bound-to'
+    ;;    to dereference surrogates and the-like:
+    (foreach arg in arguments
+        as argValue in (goal-bindings frame)
+        do (when (null? argValue)
+             ;; we are looking at a variable:
+             (setq argValue (bound-to arg))
+             (when (null? argValue)
+               (setq code (hash-unbound-goal-variable arg arguments code))
+               (continue)))
+           (setq code (hash-goal-argument argValue code)))
+    (return code)))
+
+(defun (hash-unbound-goal-variable INTEGER)
+    ((var PATTERN-VARIABLE) (arguments VECTOR) (code INTEGER))
+  ;; Hash the unbound goal variable `var' into the hash `code' computed so far.
+  ;; Maps `var' onto a canonical variable name based on `var's number of first
+  ;;    appearance in `arguments'.
+  (let ((varIndex 1))
+    (foreach arg in arguments
+        as i in (interval 0 NULL)
+        do (cond ((eql? var arg)
+                  (return (hash-string "#v" (+ code varIndex))))
+                 ((and (isa? arg @PATTERN-VARIABLE)
+                       (= (position arguments arg 0) i))
+                  (++ varIndex))))
+    (error "Shouldn't get here!")))
+
+(defun (hash-goal-argument INTEGER) ((arg OBJECT) (code INTEGER))
+  ;; Hash the goal argument `arg' into the hash `code' computed so far.
+  (let ((hashedArg arg))
+    (typecase arg
+      (SKOLEM NULL)
+      (LOGIC-OBJECT
+       ;; this handles descriptions as well:
+       (when (null? (surrogate-value-inverse arg))
+         (setq hashedArg (stringify arg))))
+      (otherwise NULL))
+    (return (logxor (rotate-hash-code code) (safe-equal-hash-code hashedArg)))))
+
+(defslot NAMED-DESCRIPTION goal-cache-list :type ATOMIC-GOAL-CACHE
+  :documentation "Points at the beginning of a chain of cached values
+for some named description")
+
+(defun (cached-goal-operator SURROGATE) ((goal PROPOSITION))
+  ;; Return the operator surrogate of `goal', or NULL if `goal' is
+  ;;    of the wrong kind or its operator has been uninterned.
+  (case (kind goal)
+    ((:ISA :PREDICATE :FUNCTION)
+     (let ((operator (operator goal)))
+       (when (and (defined? operator)
+                  (isa? operator @SURROGATE)
+                  (not (deleted? operator)))
+         (return (safe-cast operator SURROGATE)))))
+    (otherwise NULL))
+  (return NULL))
+
+(defun (get-goal-cache-list ATOMIC-GOAL-CACHE) ((goal PROPOSITION))
+  ;; Return the beginning of the chain of cached succeeded goals
+  ;;    that have the same operator/description as `goal'.
+  ;; Similar to `find-goal-cache-table'.
+  (let ((operator (cached-goal-operator goal))
+        (description NAMED-DESCRIPTION (only-if (defined? operator)
+                                             (get-description operator))))
+    (if (and (defined? description)
+             (not (deleted? description)))
+      (return (goal-cache-list description))
+      (return NULL))))
+
+(defun (set-goal-cache-list ATOMIC-GOAL-CACHE)
+    ((goal PROPOSITION) (firstCache ATOMIC-GOAL-CACHE))
+  ;; Set the beginning of the chain of cached succeeded goals that
+  ;;    have the same operator/description as `goal' to `firstCache'.
+  (let ((operator (cached-goal-operator goal))
+        (description NAMED-DESCRIPTION (only-if (defined? operator)
+                                                (get-description operator))))
+    (if (and (defined? description)
+             (not (deleted? description)))
+        (return
+          (setf (goal-cache-list description) firstCache))
+      (return NULL))))
+
+(defun (create-atomic-goal-cache ATOMIC-GOAL-CACHE)
+    ((frame CONTROL-FRAME) (cache ATOMIC-GOAL-CACHE) (success? BOOLEAN))
+  ;; Create a goal cache entry for `frame'.
+  ;; `success?' indicates whether `frame' failed or succeeded.
+  ;; Creates a new cache entry or overwrites `cache' if it was supplied
+  ;;    as non-NULL.
+  ;(when (defined? cache)
+  ;  (print "Collision: " (proposition frame) " " cache EOL))
+  (when (null? cache)
+    (setq cache (new ATOMIC-GOAL-CACHE)))
+  (let ((proposition (proposition frame)))
+    (when success?
+      (when (defined? (next cache))
+        (setf (previous (next cache)) (previous cache))
+        (when (null? (previous cache))
+          (set-goal-cache-list (proposition (next cache)) (next cache))))
+      (when (defined? (previous cache))
+        (setf (next (previous cache)) (next cache)))
+      (setf (previous cache) NULL)
+      (setf (next cache) NULL)
+      (let ((previousStart (get-goal-cache-list proposition)))
+        (unless (eql? cache previousStart)
+          (when (defined? previousStart)
+            (setf (previous previousStart) cache)
+            (setf (next cache) previousStart))))
+      (set-goal-cache-list proposition cache))
+    (setf (goal-context cache) *context*)
+    (setf (timestamp cache) (get-now-timestamp))
+    (setf (reverse-polarity? cache) (reverse-polarity? frame))
+    (setf (proposition cache) proposition)
+    (setf (bindings cache) (yield-goal-bindings proposition))
+    (setf (justification cache)
+      (choose success? (justification frame) NULL))
+    (setf (truth-value cache) (truth-value frame))
+    (when (partial-match-mode?)
+      (set-cache-partial-truth frame cache))
+    ;; Indicate that `frame' is already cached:
+    (setf (cached-goal-result? frame) TRUE)
+    (return cache)))
+
+(defspecial *unification-vector-1* VECTOR (new VECTOR :array-size 10))
+(defspecial *unification-vector-2* VECTOR (new VECTOR :array-size 10))
+
+(defun (cache-matches-goal? BOOLEAN)
+    ((cache ATOMIC-GOAL-CACHE) (goal CONTROL-FRAME)
+     (success? BOOLEAN) (mode KEYWORD))
+  ;; Return TRUE if `cache' matches `goal' relative to `success?'
+  ;;    and the current state of the KB.
+  ;; `cache' and `goal' must either be equal to each other, or
+  ;;    instantiate each other according to `mode'.
+  ;; TO DO: MAKE THE SUCCESS CASE MORE LIBERAL.
+  (ignore success?)
+  (when (and (= (get-now-timestamp) (timestamp cache))
+             ;; CAN WE USE A SUB-CONTEXT TEST HERE??
+             (eql? *context* (goal-context cache))
+             ;; MAYBE RELAX THIS, SO WE CAN EXPLOIT A CACHED FALSITY AND FAIL:
+             (eql? (reverse-polarity? goal) (reverse-polarity? cache)))
+    (let ((goalProposition (proposition goal))
+          (goalArguments (arguments goalProposition))
+          (cacheProposition (proposition cache))
+          (cacheArguments (arguments cacheProposition))
+          (nofGoalArguments (length goalArguments))
+          (uVector1 (the-array *unification-vector-1*))
+          (uVector2 (the-array *unification-vector-2*)))
+      (when (and (eql? (operator goalProposition) (operator cacheProposition))
+                 (= nofGoalArguments (length cacheArguments)))
+        (when (> nofGoalArguments (array-size *unification-vector-1*))
+          ;; resize vectors by hand, so we don't have to use the somewhat
+          ;;    expensive `insert-at' method in the loops below:
+          (resize-vector *unification-vector-1* (* 2 nofGoalArguments))
+          (resize-vector *unification-vector-2* (* 2 nofGoalArguments))
+          (setq uVector1 (the-array *unification-vector-1*))
+          (setq uVector2 (the-array *unification-vector-2*)))
+        (foreach goalArg in goalArguments
+            as goalBinding in (goal-bindings goal)
+            as cacheBinding in (bindings cache)
+            as i in (interval 0 NULL)
+            do (when (null? goalBinding)
+                 (setq goalBinding (bound-to goalArg)))
+               (setf (nth uVector1 i) goalBinding)
+               (setf (nth uVector2 i) cacheBinding))
+        (let ((subArguments goalArguments)
+              (subBindings uVector1)
+              (subArgBinding OBJECT NULL)
+              (superArguments cacheArguments)
+              (superBindings uVector2)
+              (unifiedArg OBJECT NULL))
+          (case mode
+            (:GOAL-INSTANTIATES-CACHE NULL)
+            (:CACHE-INSTANTIATES-GOAL
+             ;; Switch places:
+             (setq subArguments cacheArguments)
+             (setq subBindings uVector2)
+             (setq superArguments goalArguments)
+             (setq superBindings uVector1)))
+          ;; Perform some simple unification matching sub against super:
+          (foreach subArg in subArguments
+              as superArg in superArguments
+              as i in (interval 0 NULL)
+              do (setq subArgBinding (nth subBindings i))
+                 (setq unifiedArg (nth superBindings i))
+                 (when (defined? unifiedArg)
+                   (if (not (eql? subArgBinding unifiedArg))
+                       (return FALSE)
+                     (continue)))
+                 (when (null? subArgBinding)
+                   (setq subArgBinding subArg))
+                 ;; Super argument is an unbound variable, bind it
+                 ;;    (this plays it safe when super and sub vars are eq):
+                 (foreach supArg in superArguments
+                     as i in (interval 0 NULL)
+                     where (eql? supArg superArg)
+                     do (setf (nth superBindings i) subArgBinding)))
+          (return TRUE)))))
+  (return FALSE))
+
+(defun (goal-instantiates-cache? BOOLEAN)
+    ((goal CONTROL-FRAME) (cache ATOMIC-GOAL-CACHE) (success? BOOLEAN))
+  ;; Return TRUE if `goal' is equal to or instantiates the goal in `cache'
+  ;;    relative to `success?' and the current state of the KB.
+  :globally-inline? TRUE
+  (return (cache-matches-goal? cache goal success? :GOAL-INSTANTIATES-CACHE)))
+
+(defun (cache-instantiates-goal? BOOLEAN)
+    ((cache ATOMIC-GOAL-CACHE) (goal CONTROL-FRAME) (success? BOOLEAN))
+  ;; Return TRUE if the goal in `cache' is equal to or instantiates `goal'
+  ;;    relative to `success?' and the current state of the KB.
+  :globally-inline? TRUE
+  (return (cache-matches-goal? cache goal success? :CACHE-INSTANTIATES-GOAL)))
+
+#|
+;; REPLACED BY A REAL SLOT:
+(defun (cached-goal-result? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; Return TRUE if the result of the goal represented by `frame'
+  ;;    has been cached.
+  :globally-inline? TRUE
+  (return (= (starting-clock-ticks frame) NULL-INTEGER)))
+
+(defun (cached-goal-result?-setter BOOLEAN)
+    ((frame CONTROL-FRAME) (value BOOLEAN))
+  ;; Setter method for `cached-goal-result?'.
+;  :globally-inline? TRUE  ; Disable until inliner can handle function/procedure difference.
+  (return
+    (= (setf (starting-clock-ticks frame) (choose value NULL 0))
+       NULL-INTEGER)))
+|#
+
+(defun dont-cache-goal-failure-between-frames
+    ((topFrame CONTROL-FRAME) (bottomFrame CONTROL-FRAME))
+  ;; Mark all frames from `topFrame' down to `bottomFrame' so that their
+  ;;    failure won't be cached.
+  ;; This is needed for cases such as duplicate subgoal or maxdepth cutoffs.
+  (loop
+    (setf (dont-cache-goal-failure? topFrame) TRUE)
+    (when (eql? topFrame bottomFrame)
+      (return))
+    (setq topFrame (up topFrame))))
+
+(defun cache-goal ((frame CONTROL-FRAME) (success? BOOLEAN)
+                   (keepFrame? BOOLEAN) (clockTicks INTEGER))
+  ;; If `frame' corresponds to an atomic goal, cache its `success?' or failure.
+  ;;    This is called on every move up in the state machine.
+  ;; `clockTicks' is used to compute whether the goal was expensive enough
+  ;;    to warrant it's being cached.
+  (ignore keepFrame?)
+  (when (eql? (state frame) :ATOMIC-GOAL)
+    (when (null? (goal-bindings frame)) (return))
+    (when success?
+      ;; Make sure we do this all the time regardless of `clockTicks':
+      (setf (dont-cache-goal-failure? frame) TRUE))
+
+; (print "CACHE-GOAL:")
+;; (print "    strategy: " (current-strategy frame) EOL)
+; (print "      PROP:  " (proposition frame) EOL)
+; (print "      GOAL BINDINGS:  " (goal-bindings frame) EOL)
+; (print "   NULL-GOAL-BINDINGS: " (null? (goal-bindings frame)) EOL)
+    
+    ;; don't cache the goal twice:
+    (when (cached-goal-result? frame)
+      (return))
+    
+    ;; BEGIN TO FIGURE OUT WHETHER WE ARE MISSING THINGS THAT
+    ;;    SHOULD BE CACHED:
+#|
+    (let ((desc (surrogate-to-description (relationRef (proposition frame)))))
+      (when (and (not (>= (- clockTicks (starting-clock-ticks frame)) 
+                          *cache-goal-quantum*))
+                 (test-property? desc PL-KERNEL/@FRAME-PREDICATE))
+        (print "FAILED TO CACHE FP: " (proposition frame) EOL)))
+|#
+
+    (when (or (>= (- clockTicks (starting-clock-ticks frame)) 
+                  *cache-goal-quantum*)
+              ;; THIS DIDN'T HELP AT ALL ON FIRST TEST: -rmm
+              (and FALSE
+                   (test-property? 
+                    (surrogate-to-description (relationRef (proposition frame)))
+                    PL-KERNEL/@FRAME-PREDICATE)))
+      (case (kind (proposition frame))
+        ((:ISA :PREDICATE :FUNCTION)
+         ;; TO DO: FIGURE OUT WHICH OTHER OPERATORS SHOULD NOT
+         ;;    BE CACHED BESIDES 'FORK':
+         (when (member? (quote (PL-KERNEL/@FORK 
+                                PL-KERNEL/@COLLECT-INTO-SET))
+                        (operator (proposition frame)))
+           (return))
+         (when (trace-keyword? :GOAL-CACHES)
+           (print "=========> CACHED "
+                  (choose success? "SUCCESS" "FAILURE")
+                  " AT " (failed-goal-index frame) ": "
+                  (proposition frame) EOL))
+         (update-now-timestamp :EXECUTE-QUERY)
+         ;; mark description so that we will check it for goals in the future:
+         (setf (check-for-cached-goals?
+                (surrogate-to-description (relationRef (proposition frame))))
+               TRUE)
+         (let ((index INTEGER NULL)
+               (cachedGoal ATOMIC-GOAL-CACHE NULL))
+           (cond
+            ;; Handle succeeded goals:
+            (success?
+             (when (not *cache-succeeded-goals?*)
+               (return))
+             (setq index (succeeded-goal-index frame))
+             (setq cachedGoal (nth *succeeded-goals-cache* index))
+             (cond
+              ((or (null? cachedGoal)
+                   (not (goal-instantiates-cache? frame cachedGoal TRUE))
+                   ;; If we have a cache hit, but don't have the necessary
+                   ;;    justification, create a new cache to record it now:
+                   (and (record-justifications?)
+                        (null? (justification cachedGoal))))
+               (setf (nth *succeeded-goals-cache* index)
+                     (create-atomic-goal-cache frame cachedGoal TRUE)))
+              ((defined? cachedGoal)
+               ;; We had a matching cache, try to strengthen it:
+               (setf (truth-value cachedGoal)
+                 (strengthen-truth-value
+                  (truth-value cachedGoal) (truth-value frame))))))
+            ;; Handle failed goals:
+            (otherwise
+             (when (or (not *cache-failed-goals?*)
+                       (dont-cache-goal-failure? frame))
+               (return))
+             (setq index (failed-goal-index frame))
+             (setq cachedGoal (nth *failed-goals-cache* index))
+             (when (or (null? cachedGoal)
+                       (not (goal-instantiates-cache? frame cachedGoal FALSE)))
+               (setf (nth *failed-goals-cache* index)
+                 (create-atomic-goal-cache frame cachedGoal FALSE)))))))
+        (otherwise NULL)))))
+
+(defun (find-cached-goal ATOMIC-GOAL-CACHE)
+       ((frame CONTROL-FRAME) (successOrFailure KEYWORD))
+  ;; Check whether the success or failure of the goal represented
+  ;;    by `frame' has previously been cached, and, if so, return its
+  ;;    associated cache entry.
+  (when (eql? (state frame) :ATOMIC-GOAL)
+    (case (kind (proposition frame))
+      ((:ISA :PREDICATE :FUNCTION)
+       (let ((cachedGoal ATOMIC-GOAL-CACHE NULL))
+         (case successOrFailure
+           (:SUCCESS                    ;; Handle succeeded goals:
+            (when (not *cache-succeeded-goals?*)
+              (return NULL))
+            (setq cachedGoal
+                  (nth *succeeded-goals-cache* (succeeded-goal-index frame)))
+            (when (and (defined? cachedGoal)
+                       (goal-instantiates-cache? frame cachedGoal TRUE)
+                       ;; If we have a cache hit, but don't have the necessary
+                       ;;    justification, don't use the cached goal:
+                       (or (not (record-justifications?))
+                           (defined? (justification cachedGoal))))
+              (return cachedGoal)))
+           (:FAILURE                    ;; Handle failed goals:
+            (when (or (not *cache-failed-goals?*)
+                      (dont-cache-goal-failure? frame))
+              (return NULL))
+            (setq cachedGoal
+                  (nth *failed-goals-cache* (failed-goal-index frame)))
+            (when (and (defined? cachedGoal)
+                       (goal-instantiates-cache? frame cachedGoal FALSE))
+              (return cachedGoal))))))
+      (otherwise NULL)))
+  (return NULL))
+
+(defclass ATOMIC-GOAL-CACHE-ITERATOR (ITERATOR)
+  :parameters ((any-value :type ATOMIC-GOAL-CACHE))
+  :slots
+  ((goal :type CONTROL-FRAME)
+   (cache-list :type ATOMIC-GOAL-CACHE)))
+
+(defun (all-cached-propositions ATOMIC-GOAL-CACHE-ITERATOR)
+    ((goal CONTROL-FRAME))
+  ;; Return an iterator that iterates over all currently cached solutions
+  ;;    for the proposition stored in `goal'.
+  (let ((proposition (proposition goal))
+        (operator (operator proposition))
+        (cacheList (get-goal-cache-list proposition)))
+    (while (and (defined? cacheList)
+                (not (eql? (operator (proposition cacheList)) operator)))
+      (setq cacheList (next cacheList)))
+    (set-goal-cache-list proposition cacheList)
+    (return
+     (new ATOMIC-GOAL-CACHE-ITERATOR :goal goal :cache-list cacheList))))
+
+(defmethod (next? BOOLEAN) ((self ATOMIC-GOAL-CACHE-ITERATOR))
+  ;; Advance `self' to the next cached solution that instantiates
+  ;;    the proposition stored in `self's goal.
+  (let ((goal (goal self))
+        (cacheList (cache-list self)))
+    (when (and (defined? cacheList)
+               (not (eql? (operator (proposition goal))
+                          (operator (proposition cacheList)))))
+      ;; This should be rare: a collision made us lose the rest of the caches:
+      (setf (cache-list self) NULL)
+      (return FALSE))
+    (while (and (defined? cacheList)
+                (or (not (cache-instantiates-goal? cacheList goal TRUE))
+                    (and (not (using-default-knowledge?))
+                         (default-truth-value? (truth-value goal)))
+                    ;; If we have a cache hit, but don't have the necessary
+                    ;;    justification, don't use the cached goal:
+                    (and (record-justifications?)
+                         (null? (justification cacheList)))))
+      (setq cacheList (next cacheList)))
+    (cond ((defined? cacheList)
+           (setf (slot-value self value) cacheList)
+           (setf (cache-list self) (next cacheList))
+           (return TRUE))
+          (otherwise
+           (return FALSE)))))
+ 

@@ -1,0 +1,974 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: frame-support.ste,v 1.29 2006/05/11 07:05:10 hans Exp
+
+;;; Routines that compute various levels of canned queries.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; 'get-xxx'
+  ;;;
+
+;;; Very forgiving search for an object.
+
+(defun (coerce-to-instance-in-module OBJECT)
+       ((self OBJECT) (module MODULE) (local? BOOLEAN) (original OBJECT))
+  :public? TRUE
+  ;; Return the nearest logic instance referred to by 'self' visible in module
+  ;;    'module'.  If 'module' is NULL, search from the module that 'self' is 
+  ;;    interned in; if 'self' is not interned in a module, search from *module*.
+  ;; If we fail and 'original' is non-null, print a warning.
+  (when (null? self)
+    (when (defined? original)
+      (inform "Can't find the entity referenced as: " original "."))
+    (return NULL))
+  (typecase self
+    (LOGIC-OBJECT (return self))
+    (STRING-WRAPPER
+     (let ((name (wrapper-value self))
+           (moduleFromString MODULE NULL))
+       (when (qualified-stella-name? name)
+         (mv-setq (moduleFromString name)
+                  (compute-module-and-bare-name name)))
+       (when (null? module)
+         (if (defined? moduleFromString)
+           (setq module moduleFromString)
+           (setq module *module*)))
+       (let ((surrogate (lookup-surrogate-in-module name module local?)))
+         (when (or (null? surrogate)
+                   (null? (surrogate-value surrogate)))
+           ;; see whether we need to fetch from secondary storage:
+           (cond ((and (defined? surrogate)
+                       (defined? (home-object-store surrogate)))
+                  (fetch-instance (home-object-store surrogate) surrogate))
+                 ((and (null? surrogate)
+                       (defined? (object-store module)))
+                  (fetch-instance
+                   (object-store module)
+                   (intern-surrogate-in-module name module local?)))))
+         (if (and (defined? surrogate)
+                  (defined? (surrogate-value surrogate)))
+           (return
+            (coerce-to-instance-in-module surrogate module TRUE original))
+           (return NULL)))))
+    (SYMBOL
+     ;; QUESTION: SHOULD THE MODULE THAT 'self' IS INTERNED IN BE CONSIDERED
+     ;;    SIGNIFICANT OR NOT (CURRENTLY, IT IS) ???:
+     (let ((startingModule (choose (defined? module) module (interned-in self)))
+           (value 
+            (coerce-to-instance-in-module 
+             (lookup-surrogate-in-module 
+              (symbol-name self) startingModule local?)
+             NULL local? NULL)))
+       (cond
+        ((defined? value)
+         (return value))
+        ((not (eql? module *module*))
+         (return
+          (coerce-to-instance-in-module 
+             (lookup-surrogate-in-module (symbol-name self) *module* local?)
+              *module* local? original)))
+        ((defined? original)
+         (return (coerce-to-instance-in-module NULL NULL FALSE original)))
+        (otherwise (return NULL)))))
+    (SURROGATE
+     (let ((value (surrogate-value self)))
+       (if (defined? value)
+         (return (coerce-to-instance-in-module value NULL TRUE original))
+         (return (coerce-to-instance-in-module 
+                  (symbol-name self) (interned-in self) local? original)))))
+    (STELLA/RELATION (return (get-description self)))
+    (KEYWORD
+     (return
+       (coerce-to-instance-in-module 
+        (symbol-name self) module local? original)))
+    (THING (return self))
+    ;; possibly print warning message and then return NULL:
+    (PROPOSITION (return self))
+    (otherwise
+     (return (coerce-to-instance-in-module NULL NULL FALSE original)))) )
+
+#|
+(defun (get-instance OBJECT) ((instanceRef OBJECT))
+  :documentation "Return the nearest instance with name 'instanceRef'
+visible from the current module.  'instanceRef' can be a string, symbol,
+or surrogate.  If 'instanceRef' is a surrogate, the search originates
+in the module the surrogate was interned in."
+;; CAN'T BE CALLED FROM COMMON LISP IF ITS A COMMAND:
+;  :command? TRUE :evaluate-arguments? TRUE
+  :public? TRUE
+  (cond ((null? instanceRef)
+         (return NULL))
+        ((isa? instanceRef @LOGIC-OBJECT)
+         (return instanceRef))
+        (otherwise
+         (return
+           (memoize (instanceRef *module*)
+                    :max-values 100
+		    :timestamps :KB-UPDATE
+                    (coerce-to-instance-in-module
+                     instanceRef NULL FALSE NULL))))))
+|#
+
+;;; DON'T MEMOIZE THIS UNTIL WE DECIDE HOW TO DO THIS WITHOUT
+;;; REQUIRING THE BUMPING OF :KB-UPDATE TIME STAMPS.  ONCE WE DO
+;;; DECIDE `create-description' and `create-logic-instance' NEED
+;;; TO BE UPDATED ACCORDINGLY.
+
+(defun (get-instance OBJECT) ((instanceRef OBJECT))
+  :documentation "Return the nearest instance with name 'instanceRef'
+visible from the current module.  'instanceRef' can be a string, symbol,
+or surrogate.  If 'instanceRef' is a surrogate, the search originates
+in the module the surrogate was interned in."
+;; CAN'T BE CALLED FROM COMMON LISP IF ITS A COMMAND:
+;  :command? TRUE :evaluate-arguments? TRUE
+  :public? TRUE
+  (cond ((null? instanceRef)
+         (return NULL))
+        ((isa? instanceRef @LOGIC-OBJECT)
+         (return instanceRef))
+        (otherwise
+         (return (coerce-to-instance-in-module
+                  instanceRef NULL FALSE NULL)))))
+
+(defun (find-instance OBJECT) ((instanceRef OBJECT))
+  :documentation "Return the nearest instance with name 'instanceRef'
+visible from the current module.  'instanceRef' can be a string, symbol,
+or surrogate.  If 'instanceRef' is a surrogate, the search originates
+in the module the surrogate was interned in."
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  (return (get-instance instanceRef)) )
+
+(defun (get-self-or-prototype LOGIC-OBJECT) ((instanceRef OBJECT))
+  :documentation "Used to convert a computation to reference so-called
+'template' slots rather than 'own' slots:  If 'instanceRef' denotes a class,
+return a prototype of that class.  Otherwise, return 'instanceRef'."
+  (return (choose (class? instanceRef) (get-prototype instanceRef) instanceRef)) )
+
+(defun (get-class LOGIC-OBJECT) ((instanceRef OBJECT))
+  :documentation "Return the nearest class with name 'instanceRef'
+visible from the current module.  'instanceRef' can be a string, symbol,
+or surrogate.  If 'instanceRef' is a surrogate, the search originates
+in the module the surrogate was interned in."
+  :public? TRUE
+  (let ((instance 
+         (coerce-to-instance-in-module instanceRef NULL FALSE NULL)))
+    (if (class? instance)
+      (return instance)
+      (return NULL)) ))
+
+(defun (get-relation LOGIC-OBJECT) ((instanceRef OBJECT))
+  :documentation "Return the nearest relation with name 'instanceRef'
+visible from the current module.  'instanceRef' can be a string, symbol,
+or surrogate.  If 'instanceRef' is a surrogate, the search originates
+in the module the surrogate was interned in."
+  :public? TRUE
+  (let ((instance 
+         (coerce-to-instance-in-module instanceRef NULL FALSE NULL)))
+    (if (relation? instance)
+      (return instance)
+      (return NULL)) ))
+
+(defun (get-module MODULE) ((moduleRef OBJECT))
+  :documentation "Return a module named 'moduleRef'."
+  :public? TRUE
+  (typecase moduleRef
+    (STRING-WRAPPER
+     (return (get-stella-module (wrapper-value moduleRef) FALSE)))
+    ((SURROGATE SYMBOL)
+     (return (get-stella-module (symbol-name moduleRef) FALSE)))
+    (MODULE (return moduleRef))
+    (otherwise (return NULL))) )
+
+(defun (collection? BOOLEAN) ((objectRef OBJECT))
+  :documentation "Return TRUE if 'objectRef' denotes a relation or a class."
+  :public? TRUE
+  (let ((instance (get-instance objectRef)))
+    (when (null? instance)
+      (return FALSE))
+    (typecase instance
+      (LOGIC-OBJECT
+       (return (test-isa? instance PL-KERNEL/@COLLECTION)))
+      (otherwise (return FALSE)))))
+
+(defun (class? BOOLEAN) ((objectRef OBJECT))
+  :documentation "Return TRUE if 'objectRef' denotes a class."
+  :public? TRUE
+  (let ((instance (get-instance objectRef)))
+    (if (null? instance)
+        (return FALSE)
+      (return (test-isa? instance PL-KERNEL/@CLASS)))))
+
+(defun (relation? BOOLEAN) ((objectRef OBJECT))
+  :documentation "Return TRUE if 'objectRef' denotes a relation or a class."
+  :public? TRUE
+  (let ((instance (get-instance objectRef)))
+    (if (null? instance)
+        (return FALSE)
+      (return (test-isa? instance PL-KERNEL/@RELATION)))))
+
+(defun (function? BOOLEAN) ((relationRef OBJECT))
+  :documentation "Return TRUE if 'relationRef' references a function."
+  :public? TRUE
+  (let ((instance (get-instance relationRef)))
+    (if (or (null? instance)
+            ;; kludge to get past bootstrap problem:
+            (null? (surrogate-value PL-KERNEL/@FUNCTION)))
+        (return FALSE)
+      (return (test-isa? instance PL-KERNEL/@FUNCTION)))))
+
+;; TO DO: FIGURE OUT HOW TO AVOID SPECIAL TREATMENT FOR 'SCALAR':
+(defun (constant? BOOLEAN) ((objectRef OBJECT))
+  :documentation "Return TRUE if `objectRef' denotes a literal or scalar."
+  (typecase objectRef
+    (LITERAL-WRAPPER (return TRUE))
+    (SURROGATE (return (constant? (surrogate-value objectRef))))
+    ((THING LOGIC-OBJECT)
+     (return (or (test-isa? objectRef @LITERAL)
+                 (test-isa? objectRef PL-KERNEL/@SCALAR))))
+    (otherwise (return FALSE))) )
+
+(defun (relation-name STRING) ((self NAMED-DESCRIPTION))
+  :documentation "Given a relation object, return it's name."
+  (return (symbol-name (surrogate-value-inverse self))) )
+
+
+  ;;
+;;;;;; 'termify'
+  ;;
+
+(defun (termify OBJECT) ((self OBJECT))
+  :documentation "Convert 'self' into an equivalent PowerLoom object
+that can be passed as an argument wherever an instance is expected."
+  (typecase self
+    (LITERAL-WRAPPER (return (permanentify self)))
+    (SURROGATE
+     (when (defined? (surrogate-value self))
+       (return (value-of (surrogate-value self))))
+     (print "Can't termify the surrogate 'self' because it is undefined.")
+     (return NULL))
+    (LOGIC-OBJECT (return (value-of self)))
+    (THING (return self))
+    (otherwise
+     (print "Can't 'termify': " self)
+     (return NULL))) )
+
+
+  ;;
+;;;;;; Helping functions
+  ;;
+
+(defun (relation-arity-ok? BOOLEAN) ((relationRef SURROGATE) (arity INTEGER))
+  ;; Validate arity of 'relationRef'.
+  (let ((relation NAMED-DESCRIPTION (get-description relationRef)))
+    (when (null? relation)
+      (print "Reference to undefined relation " (symbol-name relationRef) EOL)
+      (return FALSE))
+    (when (not (eql? (arity relation) arity))
+      (print "Error:  Relation " (symbol-name relationRef) " has arity " (arity relation) EOL
+             "   when arity " arity " expected." EOL)
+      
+      (return FALSE))
+    (return TRUE) ))
+
+(defun (filter-out-unnamed-descriptions (CONS OF NAMED-DESCRIPTION))
+       ((descriptions (CONS OF LOGIC-OBJECT)))
+  ;; Helping function that filters out things which aren't named
+  ;;    descriptions.
+  (let ((namedOnes NIL))
+    (foreach d in descriptions
+             where (isa? d @NAMED-DESCRIPTION)
+             collect d into namedOnes)
+    (return namedOnes) ))
+
+
+  ;;
+;;;;;; Type computations for SHALLOW and SUBSUMPTION inference levels
+  ;;
+
+(defun (all-asserted-types (CONS OF NAMED-DESCRIPTION)) ((self OBJECT))
+  :documentation "Return a set of all of the types that are
+asserted to be satisfied by 'self'."
+  :public? TRUE
+  (let ((types NIL))
+    (foreach p in (all-true-dependent-isa-propositions self)
+        do (let ((description (get-description (relationRef p))))
+             ;; avoid duplicates
+             (when (not (member? types description))
+               (pushq types description))))
+    (return types) ))
+
+(defun (all-types (CONS OF NAMED-DESCRIPTION)) ((self OBJECT))
+  :documentation "Return a set of all of the types that are
+satisfied by 'self'."
+  :public? TRUE
+  (return
+    (memoize (self *context*)
+             :timestamps :KB-UPDATE :max-values 500
+             (help-all-types self))))
+
+(defun (help-all-types (CONS OF NAMED-DESCRIPTION)) ((self OBJECT))
+  ;; Helper function for `all-types'.
+  (let ((assertedTypes (all-asserted-types self))
+        (types (copy-cons-list assertedTypes)))
+    (foreach d in assertedTypes
+        do (foreach c in (all-supercollections d)
+               where (isa? c @NAMED-DESCRIPTION)
+               do (when (not (member? types c))
+                    (pushq types c))))
+    ;; TO DO:  Needs better inference:
+    ;; This needs to also go down the hierarchy to look for
+    ;; inferred types whose definitions are satisfied and
+    ;; add them as well!
+    (return types)))
+
+(defun (all-direct-types (CONS OF LOGIC-OBJECT)) ((self OBJECT))
+  :documentation "Return a set of most specific types that are
+satisfied by 'self'."
+  :public? TRUE
+  (return (most-specific-named-descriptions (all-asserted-types self))) )
+
+(defun (test-type-on-instance? BOOLEAN) ((self OBJECT) (type SURROGATE))
+  :documentation "Return TRUE if 'self' satisfies 'type'."
+  :public? TRUE
+  (return (levellized-test-type-on-instance?
+           (current-inference-level) self type)) )
+
+(defmethod (levellized-test-type-on-instance? BOOLEAN)
+           ((level SUBSUMPTION-INFERENCE-LEVEL) (self OBJECT) (type SURROGATE))
+  ;; Return TRUE if an asserted type for 'self' subsumes 'type'.
+  (return
+   (exists p in (all-true-dependent-propositions self type TRUE)
+           where (eql? (kind p) :ISA))) )
+
+(defmethod (levellized-test-type-on-instance? BOOLEAN)
+           ((level SHALLOW-INFERENCE-LEVEL) (self OBJECT) (type SURROGATE))
+  ;; Return TRUE if an asserted type for 'self' equals 'type'.
+  (return 
+   (exists p in (all-true-dependent-propositions self type FALSE)
+           where (eql? (kind p) :ISA))) )
+
+(defun (all-equivalent-relations (CONS OF NAMED-DESCRIPTION)) 
+       ((relation NAMED-DESCRIPTION) (reflexive? BOOLEAN))
+  :documentation "Return a list of all relations equivalent to 'relation'.
+If 'reflexive?', include 'relation' in the list."
+  (return
+    (memoize (relation *context* reflexive?)
+             :timestamps :META-KB-UPDATE :max-values 500
+             (filter-out-unnamed-descriptions
+              (all-equivalent-collections relation reflexive?)))))
+
+(defun (remove-equivalent-relations (LIKE self))
+       ((relationsList (CONS OF LOGIC-OBJECT)) (relation NAMED-DESCRIPTION))
+  ;; Helping function for 'all-xxxrelations'.
+  ;; If 'relation' belongs to 'relationsList', then 'relationsList'
+  ;;    contains a cycle of logically-equivalent relations that
+  ;;    includes 'relation'.  Remove that cycle from 'relationsList'.
+  (when (member? relationsList relation)
+    (foreach m in (all-equivalent-relations relation TRUE)
+             do (setq relationsList (remove relationsList m))))
+  (return relationsList) )
+
+(defun (help-memoize-all-superrelations (CONS OF NAMED-DESCRIPTION))
+       ((relation NAMED-DESCRIPTION) (removeEquivalents? BOOLEAN))
+  (let ((superSlots (filter-out-unnamed-descriptions
+                     (consify (all-supercollections relation)))))
+    (if removeEquivalents?
+      (return (remove-equivalent-relations superSlots relation))
+      (return superSlots)) ))
+
+(defun (all-superrelations (CONS OF NAMED-DESCRIPTION))
+       ((relation NAMED-DESCRIPTION) (removeEquivalents? BOOLEAN))
+  :documentation "Return a set of all relations that subsume relation."
+  :public? TRUE
+  (return
+    (memoize (relation *context* removeEquivalents?)
+             :timestamps :META-KB-UPDATE :max-values 500
+             (help-memoize-all-superrelations relation removeEquivalents?))))
+
+(defun (help-memoize-all-subrelations (CONS OF NAMED-DESCRIPTION))
+       ((relation NAMED-DESCRIPTION) (removeEquivalents? BOOLEAN))
+  (let ((subSlots (filter-out-unnamed-descriptions
+                   (consify (all-subcollections relation)))))
+    (if removeEquivalents?
+      (return (remove-equivalent-relations subSlots relation))
+      (return subSlots)) ))
+
+(defun (all-subrelations (CONS OF NAMED-DESCRIPTION))
+       ((relation NAMED-DESCRIPTION) (removeEquivalents? BOOLEAN))
+  :documentation "Return a set of all (named) relations that specialize
+relation."
+  :public? TRUE
+  (return
+    (memoize (relation *context* removeEquivalents?)
+             :timestamps :META-KB-UPDATE :max-values 1000
+             (help-memoize-all-subrelations relation removeEquivalents?))))
+
+(defun (all-direct-superrelations (CONS OF NAMED-DESCRIPTION)) 
+       ((relation NAMED-DESCRIPTION) (removeEquivalents? BOOLEAN))
+  :documentation "Return a set of relations that immediately subsume
+'relation'.  If 'removeEquivalents?' (recommended), don't include any
+relations equivalent to 'relation'."
+  :public? TRUE
+  (return
+    (memoize (relation *context* removeEquivalents?)
+             :timestamps :META-KB-UPDATE :max-values 500
+             (filter-out-unnamed-descriptions
+              (consify (all-direct-supercollections
+                        relation removeEquivalents?))))))
+
+(defun (all-direct-subrelations (CONS OF NAMED-DESCRIPTION)) 
+       ((relation NAMED-DESCRIPTION) (removeEquivalents? BOOLEAN))
+  :documentation "Return a set of relations that immediately specialize
+'relation'.  If 'removeEquivalents?' (recommended), don't include any
+relations equivalent to 'relation'."
+  :public? TRUE
+  (return
+    (memoize (relation *context* removeEquivalents?)
+             :timestamps :META-KB-UPDATE :max-values 500
+             (filter-out-unnamed-descriptions
+              (consify (all-direct-subcollections relation removeEquivalents?))))))
+
+(defun (test-subrelation? BOOLEAN)
+       ((subrelation SURROGATE) (superrelation SURROGATE))
+  :documentation "Return TRUE if 'subrelation' specializes 'superrelation'."
+  :public? TRUE
+  (when (eql? subrelation superrelation)
+    (return TRUE))
+  (let ((description (get-description subrelation)))
+    (return
+     (exists super in (all-supercollections description)
+             where (eql? (surrogate-value-inverse super) superrelation)))) )
+
+(defun (all-class-instances CONS) ((type SURROGATE))
+  :documentation "Return a set of instances that belong to the class 'type'."
+  :public? TRUE
+  (return (remove-duplicates
+           (levellized-all-class-instances
+            (current-inference-level) type))) )
+
+;; QUESTION: HOW IS THIS DIFFERENT FROM THE NORMAL LEVEL???:
+(defmethod (levellized-all-class-instances CONS)
+           ((level SUBSUMPTION-INFERENCE-LEVEL) (type SURROGATE))
+  ;; Return a list of instances that belong to the class 'type'
+  ;;    or to its subclasses.
+  (let ((members NIL))
+    (foreach m in (asserted-collection-members (get-description type) FALSE)
+             do (pushq members m))
+    (return members) ))
+
+(defmethod (levellized-all-class-instances CONS)
+           ((level ASSERTION-INFERENCE-LEVEL) (type SURROGATE))
+  ;; Return a list of instances asserted to belong to the class 'type'.
+  ;; Strategy: Generate all instances and filter out ones that aren't
+  ;;    directly asserted.
+  (let ((members NIL))
+    (foreach m in (asserted-collection-members (get-description type) TRUE)
+             where (levellized-test-type-on-instance? level m type) 
+             do (pushq members m))
+    (return members) ))
+
+
+  ;;
+;;;;;; 'all-relation-values' and friends
+  ;;
+
+(defun (all-relation-values CONS)
+       ((relation SURROGATE) (nMinusOneArguments CONS))
+  :documentation "Return a set of values that satisfy the relation
+'relation' (a surrogate) applied to 'nMinusOneArguments' plus that last value."
+  ;; This is the workhorse function for all slot value computations.
+  (when (not (relation-arity-ok? relation (1+ (length nMinusOneArguments))))
+    (return NIL))
+  (return (levellized-all-relation-values
+           (current-inference-level) relation nMinusOneArguments)) )
+
+(defmethod (levellized-all-relation-values CONS)
+           ((level SUBSUMPTION-INFERENCE-LEVEL) 
+            (relation SURROGATE) (nMinusOneArguments CONS))
+  ;; Return a set of values that each satisfy the relation 'relation'
+  ;;    (a surrogate) applied to 'nMinusOneArguments' plus that last value.
+  ;; Defined so that code for SHALLOW and SUBSUMPTION levels is combined into
+  ;;    this one method.
+  ;; BUG: DOESN'T WORK FOR COMPUTED PREDICATES YET.
+  (let ((values NIL))
+    (foreach p in (all-propositions-matching-arguments
+                   nMinusOneArguments relation
+                   (eql? level SUBSUMPTION-INFERENCE))
+      do (pushq-new values (value-of (last-argument p))))
+    (return values) ))
+
+(defun (test-relation-on-arguments? BOOLEAN)
+       ((relation SURROGATE) (arguments CONS))
+  :documentation "Return TRUE if 'relation' (a surrogate) is TRUE when
+applied to 'arguments'."
+  (when (not (relation-arity-ok? relation (length arguments)))
+    (return FALSE))
+  (return (levellized-test-relation-on-arguments?
+           (current-inference-level) relation arguments)) )
+
+(defmethod (levellized-test-relation-on-arguments? BOOLEAN)
+           ((level SUBSUMPTION-INFERENCE-LEVEL) 
+            (relation SURROGATE) (arguments CONS))
+  ;; Defined so that code for SHALLOW and SUBSUMPTION levels is combined into
+  ;;    this one method.
+  ;; BUG: DOESN'T WORK FOR COMPUTED PREDICATES YET.
+  (return (exists p on (all-propositions-matching-arguments
+                        arguments relation
+                        (eql? level SUBSUMPTION-INFERENCE)))) )
+
+
+  ;;
+;;;;;; Slot value computations for SHALLOW and SUBSUMPTION inference levels
+  ;;
+
+(defun (all-slot-values CONS) 
+       ((self LOGIC-OBJECT) (relation SURROGATE))
+  :documentation "Return a set of values for the slot 'relation' (a surrogate)
+applied to 'self' (an object)."
+  :public? TRUE
+  (return (all-relation-values relation (cons-list self))))
+
+(defun (get-slot-value OBJECT) ((self LOGIC-OBJECT) (relation SURROGATE))
+  :documentation "Return a single value for the slot 'relation' (a surrogate)
+applied to 'self' (an object)."
+  :public? TRUE
+  (return (first (all-slot-values self relation))) )
+
+(defun (test-slot-value? BOOLEAN) 
+       ((self LOGIC-OBJECT) (relation SURROGATE) (filler OBJECT))
+  :documentation "Return TRUE if the proposition '(<relation> <self> <filler>)'
+is true."
+  :public? TRUE
+  (return (test-relation-on-arguments? relation (cons-list self filler))) )
+
+(defun (get-slot-minimum-cardinality INTEGER)
+       ((self LOGIC-OBJECT) (relation SURROGATE))
+  :documentation "Return a minimum value for the number of fillers of relation
+'relation' (a surrogate) applied to the instance 'self' (an object)."
+  :public? TRUE
+  (return (levellized-get-slot-minimum-cardinality
+           (current-inference-level) self relation)) )
+
+(defmethod (levellized-get-slot-minimum-cardinality INTEGER)
+           ((level SHALLOW-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Compute min cardinality based on shallow min cardinality assertions and
+  ;;    counting the number of fillers.
+  ;; Very tricky: If called with 'level' = SHALLOW-LEVEL but a deeper default
+  ;;    level on *module*, this code implicitly accesses assertions
+  ;;    on @RANGE-CARDINALITY as well as on PL-KERNEL/@RANGE-MIN-CARDINALITY.
+  (let ((description (get-description relation))
+        (minCardinality (first (all-relation-values PL-KERNEL/@RANGE-MIN-CARDINALITY
+                                                    (cons-list description self))))
+        (fillerCount (length (all-slot-values self relation))))
+    (when (null? minCardinality)
+      (setq minCardinality 0))
+    (return (max minCardinality fillerCount)) ))
+
+(defmethod (levellized-get-slot-minimum-cardinality INTEGER)
+           ((level SUBSUMPTION-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Compute min cardinality based on shallow level inference plus inheritance
+  ;;    of min cardinality assertions on subrelations of 'relation'.
+  (let ((minCardinality
+         (levellized-get-slot-minimum-cardinality SHALLOW-INFERENCE self relation)))
+    (foreach subDescription in (all-subrelations (get-description relation) FALSE)
+             do
+             (let ((subMinCardinality
+                    (first
+                     (all-relation-values PL-KERNEL/@RANGE-MIN-CARDINALITY
+                                          (cons-list subDescription self)))))
+               (when (defined? subMinCardinality)
+                 (setq minCardinality 
+                       (max minCardinality subMinCardinality)))))
+    (return minCardinality)) )
+
+(defun (test-closed-slot? BOOLEAN) ((relation SURROGATE))
+  :documentation "Return TRUE if 'relation' (a surrogate) is asserted to 
+be closed or if the current module closes all relations."
+  :public? TRUE
+  (return (closed-term? (get-description relation))) )
+
+(defun (test-function-slot? BOOLEAN) ((relation SURROGATE))
+  :documentation "Return TRUE if 'relation' (a surrogate) is a function."
+  :public? TRUE
+  (return (function-description? (get-description relation))) )
+
+(defun (get-slot-maximum-cardinality INTEGER)
+       ((self LOGIC-OBJECT) (relation SURROGATE))
+  :documentation "Return a maximum value for the number of fillers of relation
+'relation' (a surrogate) applied to the instance 'self' (an object)."
+  :public? TRUE
+  (return (levellized-get-slot-maximum-cardinality
+           (current-inference-level) self relation)) )
+
+(defmethod (levellized-get-slot-maximum-cardinality INTEGER)
+       ((level SHALLOW-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Compute max cardinality based on (shallow) assertions of max cardinality
+  ;;    and by counting the fillers for the case that 'relation' is closed
+  ;;    or is a function.
+  ;; Note: If 'relation' is both closed and a function, we may return zero.
+  ;;    This may or may not be desirable semantics.
+  ;; Very tricky: If called with 'level' = SHALLOW-LEVEL but a deeper default
+  ;;    level on *module*, this code implicitly accesses assertions
+  ;;    on PL-KERNEL/@RANGE-CARDINALITY as well as on PL-KERNEL/@RANGE-MAX-CARDINALITY.
+  (let ((description (get-description relation))
+        (maxCardinality
+         (first (all-relation-values PL-KERNEL/@RANGE-MAX-CARDINALITY
+                                     (cons-list description self))))
+        (fillerCount INTEGER NULL))
+    (cond
+     ((test-closed-slot? relation)
+      (setq fillerCount (length (all-slot-values self relation))))
+     ((test-function-slot? relation)
+      (setq fillerCount 1)))
+    (cond
+     ((null? maxCardinality)
+      (return fillerCount))
+     ((null? fillerCount)
+      (return maxCardinality))
+     (otherwise
+      (return (min maxCardinality fillerCount)))) ))
+
+(defmethod (levellized-get-slot-maximum-cardinality INTEGER)
+           ((level SUBSUMPTION-INFERENCE-LEVEL)
+            (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Compute max cardinality using both SHALLOW strategies and
+  ;;    inheriting a max cardinality computation on superrelations of 'relation'.
+  (let ((maxCardinality
+         (levellized-get-slot-maximum-cardinality SHALLOW-INFERENCE self relation)))
+    (foreach superDescription in (all-superrelations (get-description relation) FALSE)
+             do
+             (let ((superMaxCardinality
+                    (first (all-relation-values PL-KERNEL/@RANGE-MAX-CARDINALITY
+                                                (cons-list superDescription self)))))
+               (when (defined? superMaxCardinality)
+                 (if (defined? maxCardinality)
+                   (setq maxCardinality 
+                         (min maxCardinality superMaxCardinality))
+                   (setq maxCardinality superMaxCardinality)))))
+    (return maxCardinality) ))
+
+(defun (get-slot-value-type NAMED-DESCRIPTION)
+       ((self LOGIC-OBJECT) (relation SURROGATE))
+  :documentation "Return a most specific type for fillers of the slot 'relation'
+(a surrogate) applied to 'self'. If there is more than one, pick one."
+  :public? TRUE
+  (return (first (all-slot-value-types self relation))) )
+
+(defun (all-slot-value-types (CONS OF NAMED-DESCRIPTION))
+       ((self LOGIC-OBJECT) (relation SURROGATE))
+  :documentation "Return a set of the most specific types for fillers
+of the slot 'relation' applied to 'self'."
+  :public? TRUE
+  (return (most-specific-named-descriptions
+           (levellized-all-slot-value-types
+            (current-inference-level) self relation))) )
+
+(defmethod (levellized-all-slot-value-types (CONS OF NAMED-DESCRIPTION))
+           ((level SHALLOW-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Return a set of types that fillers of 'relation' applied to 'self'
+  ;;    necessarily belong to.  Check for explicit PL-KERNEL/@RANGE-TYPE
+  ;;    assertions, and if 'relation' is closed, search for types
+  ;;    that subsume all slot fillers.
+  ;; Note: We do NOT filter out all but the most specific types here.
+  (let ((description (get-description relation))
+        (valueTypes
+         (all-relation-values PL-KERNEL/@RANGE-TYPE
+                              (cons-list description self))))
+    (when (or (test-closed-slot? relation)
+              (test-function-slot? relation))
+      (let ((fillers (all-slot-values self relation))
+            (possibleTypes (CONS OF LOGIC-OBJECT) NIL))
+        ;; collect candidate types by scanning fillers
+        (foreach f in fillers
+                 do
+                 (foreach d in (all-asserted-types f)
+                          where (not (member? possibleTypes d))
+                          do (pushq possibleTypes d)))
+        (foreach d in possibleTypes
+                 where
+                 (and (not (member? valueTypes d))
+                      (forall f in fillers
+                              always 
+                              (test-type-on-instance?
+                               f (surrogate-value-inverse d))))
+                 do (pushq valueTypes d))))
+    (return (filter-out-unnamed-descriptions valueTypes)) ))
+
+(defmethod (levellized-all-slot-value-types (CONS OF NAMED-DESCRIPTION))
+           ((level SUBSUMPTION-INFERENCE-LEVEL)
+            (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Compute max cardinality using both SHALLOW strategies and
+  ;;    inheriting a value types computation on superrelations of 'relation'.
+  ;; Note: We do NOT filter out all but the most specific types here.
+  (let ((valueTypes
+         (levellized-all-slot-value-types SHALLOW-INFERENCE self relation)))
+    (foreach superRelation in (all-superrelations (get-description relation) FALSE)
+             do
+             (foreach superType in
+                      (all-relation-values PL-KERNEL/@RANGE-TYPE
+                                           (cons-list superRelation self))
+                      where (not (member? valueTypes superType))
+                      do (pushq valueTypes superType)))
+    (return (filter-out-unnamed-descriptions valueTypes)) ))
+
+
+;-----------------------------------------------------------------------
+;; STUB RELATIONS UNTIL WE HAVE TIME TO REWRITE THEM TO DO BACKCHAINING.
+;; RIGHT NOW, ALL INFERENCE DEFAULTS TO SUBSUMPTION LEVEL:
+
+  ;;
+;;;;;; Methods for NORMAL-INFERENCE mode
+  ;;
+
+(defmethod (levellized-test-type-on-instance? BOOLEAN)
+           ((level NORMAL-INFERENCE-LEVEL) (self OBJECT) (type SURROGATE))
+  ;; Return TRUE if an asserted type for 'self' subsumes 'type'.
+  ;; Implements SHALLOW and SUBSUMPTION methods.
+  (return (apply-ask (?concept ?instance)
+                     (?concept ?instance)
+                     (type self))) )
+
+(defmethod (levellized-all-class-instances CONS)
+           ((level NORMAL-INFERENCE-LEVEL) (type SURROGATE))
+  ;; Return a list of instances that belong to the class 'type'
+  ;;    or to its subclasses.
+ (return (apply-retrieve (?concept ?x)
+                         (?concept ?x)
+                         (type NULL))))
+
+(defmethod (levellized-all-relation-values CONS)
+           ((level NORMAL-INFERENCE-LEVEL) 
+            (relation SURROGATE) (nMinusOneArguments CONS))
+  ;; Return a set of values that each satisfy the relation 'relation'
+  ;;    (a surrogate) applied to 'nMinusOneArguments' plus that last value.
+  ;; Defined so that code for BACKTRACKING and NORMAL levels is combined into
+  ;;    this one method.
+  (case (length nMinusOneArguments)
+    (0 (return (apply-retrieve (?relation ?x)
+                               (?relation ?x)
+                               (relation NULL))))
+    (1 (let ((arg1 (first nMinusOneArguments)))
+         (return (apply-retrieve (?relation ?x ?y)
+                                 (?relation ?x ?y)
+                                 (relation arg1 NULL)))))
+    (2 (let ((arg1 (first nMinusOneArguments))
+             (arg2 (second nMinusOneArguments)))
+         (return (apply-retrieve (?relation ?x ?y ?z)
+                                 (?relation ?x ?y ?z)
+                                 (relation arg1 arg2 NULL)))))
+    (3 (let ((arg1 (first nMinusOneArguments))
+             (arg2 (second nMinusOneArguments))
+             (arg3 (third nMinusOneArguments)))
+         (return (apply-retrieve (?relation ?w ?x ?y ?z)
+                                 (?relation ?w ?x ?y ?z)
+                                 (relation arg1 arg2 arg3 NULL)))))
+    (otherwise
+     (return
+       (consify (call-retrieve 
+		 (bquote (ALL ?X (& (symbolize relation) && nMinusOneArguments ?X)))))))))
+
+(defmethod (levellized-test-relation-on-arguments? BOOLEAN)
+           ((level NORMAL-INFERENCE-LEVEL) 
+            (relation SURROGATE) (arguments CONS))
+  ;; Defined so that code for BACKTRACKING and NORMAL levels is combined into
+  ;;    this one method.
+  (case (length arguments)
+    (1 (let ((arg1 (first arguments)))
+         (return (apply-ask (?relation ?x)
+                                 (?relation ?x)
+                                 (relation arg1)))))
+    (2 (let ((arg1 (first arguments))
+             (arg2 (second arguments)))
+         (return (apply-ask (?relation ?x ?y)
+                                 (?relation ?x ?y)
+                                 (relation arg1 arg2)))))
+    (3 (let ((arg1 (first arguments))
+             (arg2 (second arguments))
+             (arg3 (third arguments)))
+         (return (apply-ask (?relation ?x ?y)
+                                 (?relation ?x ?y)
+                                 (relation arg1 arg2 arg3)))))
+    (4 (let ((arg1 (first arguments))
+             (arg2 (second arguments))
+             (arg3 (third arguments))
+             (arg4 (fourth arguments)))
+         (return (apply-ask (?relation ?w ?x ?y ?z)
+                            (?relation ?w ?x ?y ?z)
+                            (relation arg1 arg2 arg3 arg4)))))
+    (otherwise
+     (return (true-truth-value?
+	      (call-ask (bquote ((& (symbolize relation) && arguments)))))))))
+
+
+(defmethod (levellized-get-slot-minimum-cardinality INTEGER)
+           ((level NORMAL-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Compute min cardinality based on shallow min cardinality assertions and
+  ;;    counting the number of fillers.
+  (let ((n (apply-retrieve (?relation ?object ?n)
+                           (RANGE-MIN-CARDINALITY ?relation ?object ?n)
+                           (relation self NULL))))
+    (if (empty? n)
+      (return 0)
+      (return (unwrap-integer (first n))))))
+
+(defmethod (levellized-get-slot-maximum-cardinality INTEGER)
+           ((level NORMAL-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Compute max cardinality based on (shallow) assertions of max cardinality
+  ;;    and by counting the fillers for the case that 'relation' is closed
+  ;;    or is a function.
+  ;; Note: If 'relation' is both closed and a function, we may return zero.
+  ;;    This may or may not be desirable semantics.
+  (let ((n (apply-retrieve (?relation ?object ?n)
+                          (RANGE-MAX-CARDINALITY ?relation ?object ?n)
+                          (relation self NULL))))
+    (if (empty? n)
+      (return NULL)
+      (return (unwrap-integer (first n))))))
+
+(defmethod (levellized-all-slot-value-types (CONS OF NAMED-DESCRIPTION))
+           ((level NORMAL-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
+  ;; Return a set of types that fillers of 'relation' applied to 'self'
+  ;;    necessarily belong to.  Check for explicit PL-KERNEL/@RANGE-TYPE
+  ;;    assertions, and if 'relation' is closed, search for types
+  ;;    that subsume all slot fillers.
+  ;; Note: We do NOT filter out all but the most specific types here.
+  (return (apply-retrieve (?relation ?object ?type)
+                          (AND (RANGE-TYPE ?relation ?object ?type) 
+                               (BOUND-VARIABLES ?type)
+                               (CONCEPT ?type))
+                          (relation self NULL))) )
+
+
+;; TEST CODE FOR CANNED FRAME QUERIES:
+#|
+(cc pl-user)
+
+(defconcept ANIMAL (?a))
+(defconcept PERSON (?p ANIMAL))
+(defconcept DOG (?d ANIMAL))
+(defconcept LABORADOR (?l DOG))
+(defrelation happy (?x))
+(defrelation ecstatic (?x)
+  :=> (happy ?x))
+(defrelation owns (?owner ?ownee))
+(defrelation pets (?owner ?pet))
+(assert (PL-KERNEL/subset-of pets owns))
+(assert (=> (pets ?x ?y) (owns ?x ?y)))
+
+(finalize-objects)
+
+(assert (ANIMAL hulk))
+(assert (DOG fido))
+(assert (DOG jake))
+(assert (ANIMAL jake))
+(assert (PERSON fred))
+(retract (DOG jake))
+(assert (happy jake))
+(retract (happy jake))
+(retract (ecstatic jake))
+
+(assert (pets fred jake))
+(assert (pets fred fido))
+(assert (range-min-cardinality @OWNS fred 3))
+(assert (range-max-cardinality @OWNS fred 4))
+(assert (range-type @OWNS fred ANIMAL))
+(assert (closed pets))
+(retract (closed pets))
+
+(retrieve all (?x ANIMAL))
+(retrieve all (?x PERSON))
+(retrieve all (?x LABORADOR))
+
+
+(setq *duplicateInstancesCacheCrossoverPoint* 2)
+
+
+(eval (all-propositions-matching-arguments
+       (cons-list (get jake)) :ISA NULL FALSE))
+
+(all-types (get jake))
+(all-asserted-types (get jake))
+(all-direct-types (get jake))
+(eval (test-type-on-instance? (get jake) @PERSON))
+(eval (test-type-on-instance? (get jake) @ANIMAL))
+
+(eval (all-equivalent-relations @ANIMAL TRUE))
+(eval (all-equivalent-relations @ANIMAL FALSE))
+(eval (all-superrelations (get-description "ANIMAL") FALSE))
+(eval (all-subrelations (get-description "ANIMAL") FALSE))
+(eval (all-direct-subrelations (get-description "ANIMAL") FALSE))
+(eval (all-superrelations (get-description "LABORADOR") FALSE))
+(eval (all-subrelations (get-description "LABORADOR") FALSE))
+(eval (all-direct-superrelations (get-description "LABORADOR") FALSE))
+
+(eval (test-subrelation? @DOG @ANIMAL))
+(eval (test-subrelation? @ANIMAL @DOG))
+(eval (test-subrelation? @DOG @PERSON))
+
+(eval (all-class-instances @DOG))
+(eval (all-class-instances @ANIMAL))
+(eval (all-class-instances @LABORADOR))
+
+(eval (all-relation-values @PETS (cons-list (get-instance "FRED"))))
+(eval (all-relation-values @PETS (cons-list (get-instance "FIDO"))))
+(eval (all-relation-values @OWNS (cons-list (get-instance "FRED"))))
+(eval (test-relation-on-arguments? @PETS (cons-list (get-instance "FRED") (get-instance "FIDO"))))
+(eval (test-relation-on-arguments? @PETS (cons-list (get-instance "FIDO") (get-instance "FRED"))))
+(eval (all-slot-values (get-instance "FRED") @PETS))
+(eval (get-slot-value (get-instance "FRED") @PETS))
+(eval (test-slot-value? (get-instance "FRED") @PETS (get-instance "JAKE")))
+(eval (test-slot-value? (get-instance "FRED") @PETS (get-instance "HULK")))
+(eval (get-slot-minimum-cardinality (get-instance "FRED") @PETS))
+(eval (get-slot-minimum-cardinality (get-instance "FRED") @OWNS))
+(eval (get-slot-maximum-cardinality (get-instance "FRED") @PETS))
+(eval (get-slot-maximum-cardinality (get-instance "FRED") @OWNS))
+(eval (get-slot-value-type (get-instance "FRED") @PETS))
+(eval (get-slot-value-type (get-instance "FRED") @OWNS))
+(eval (all-slot-value-types (get-instance "FRED") @PETS))
+(eval (all-slot-value-types (get-instance "FRED") @OWNS))
+|#

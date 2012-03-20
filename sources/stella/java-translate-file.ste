@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: java-translate-file.ste,v 1.30 2003/04/18 21:15:09 hans Exp
+;;; Version: java-translate-file.ste,v 1.35 2006/05/11 07:06:10 hans Exp
 
 ;;; Translating Stella files into Java.
 
@@ -48,6 +48,9 @@
 
 (in-module "STELLA")
 
+(defspecial *CURRENT-JAVA-OUTPUT-CLASS* CLASS NULL
+	    :public? FALSE
+	    :documentation "Holds the current Stella class being output in Java")
 
 (defun clt () 
   (change-module "STELLA")
@@ -76,7 +79,7 @@
     (return (make-file-name-from-relative-path bareFile :java))))
 
 (defmethod (java-make-code-output-file-name FILE-NAME) ((source CLASS) (dontTruncate? BOOLEAN))
-  (let ((bareFile (java-translate-class-name (symbolize (class-type source)))))
+  (let ((bareFile (java-translate-class-namestring (class-name source))))
     (return (java-make-code-output-file-name (wrapper-value bareFile) dontTruncate?)) ))
 
 (defun (java-make-global-output-file-name FILE-NAME) ((module MODULE) (dontTruncate? BOOLEAN))
@@ -87,77 +90,83 @@
 					  (functionHT HASH-TABLE)
 					  (codeModuleList (CONS of MODULE)))
   (let ((functions (CONS of TRANSLATION-UNIT) nil)
-	(globals (CONS of TRANSLATION-UNIT) nil))
+	(globals (CONS of TRANSLATION-UNIT) nil)
+	(filename FILE-NAME NULL)
+	(flotsam-files (CONS OF STRING-WRAPPER) nil))
     (foreach module in codeModuleList
-	do (setq globals (lookup globalsHT module))
-	   (unless (defined? globals)
-	     (setq globals nil))
-	   (setq functions (lookup functionHT module))
-	   (unless (defined? functions)
-	     (setq functions nil))
-	   (java-output-flotsam-units-to-file-for-module
-	    module NULL globals functions)) ))
+	do (within-module module
+             (setq filename (java-make-global-output-file-name module FALSE))
+	     (when (member? flotsam-files (wrap-string filename))
+	       ;; Should this be an error??
+	       (warn "Overwriting Flotsam file " filename ".  This is surely bad."))
+	     (pushq flotsam-files (wrap-string filename))
+	     (setq globals (lookup globalsHT module))
+	     (unless (defined? globals)
+	       (setq globals nil))
+	     (setq functions (lookup functionHT module))
+	     (unless (defined? functions)
+	       (setq functions nil))
+	     (java-output-flotsam-units-to-file-for-module
+	      filename module NULL globals functions))) ))
 
-(defun java-output-flotsam-units-to-file-for-module ((module MODULE)
+(defun java-output-flotsam-units-to-file-for-module ((classOutputFile FILE-NAME)
+						     (module MODULE)
 						     (classunit TRANSLATION-UNIT)
 						     (globals (CONS of TRANSLATION-UNIT)) 
 					             (functions (CONS of TRANSLATION-UNIT)))
-  (let ((classOutputFile FILE-NAME NULL)
-        (classOutputStream OUTPUT-FILE-STREAM NULL)
-	(translation NIL)
+ (special ((*current-java-output-class* NULL))
+  (let ((translation NIL)
 	(class CLASS NULL)
 	(classTranslation NIL))
     (within-module module
-      (setq classOutputFile (java-make-global-output-file-name module FALSE))
-      (setq classOutputStream (new OUTPUT-FILE-STREAM :filename classOutputFile))
-      (when (defined? classunit)
-	(setq class (the-object classunit))
-	(inform "Translating " class "...")
-	(setq classTranslation (rest (java-translate-define-native-class class))))
-      (special ((*current-stream* classOutputStream))
-	(when (>= *translationVerbosityLevel* 1)
-	  (if (defined? classunit)
-	    (inform "    Writing " classOutputFile " ...")
-	    (inform "Writing " classOutputFile "...")))
-	(java-output-file-header 
-	 classOutputStream (java-make-global-output-file-name module TRUE))
+      (with-output-file (classOutputStream classOutputFile)
+        (when (defined? classunit)
+	  (setq *current-java-output-class* (the-object classunit))
+	  (inform "Translating " class "...")
+	  (setq classTranslation (rest (java-translate-define-native-class *current-java-output-class*))))
+       (special ((*current-stream* classOutputStream))
+	 (when (>= *translationVerbosityLevel* 1)
+	   (if (defined? classunit)
+	       (inform "    Writing " classOutputFile " ...")
+	     (inform "Writing " classOutputFile "...")))
+	 (java-output-file-header 
+	  classOutputStream (java-make-global-output-file-name module TRUE))
 
-	(if (defined? classunit)
-	  (java-output-class-declaration classTranslation)
-	  (print-stream *current-stream*
-			"public class " (java-yield-flotsam-class-name module) " "))
-	(print-stream *current-stream* "{" EOL)
-      
-	(java-bump-indent)
+	 (if (defined? classunit)
+	     (java-output-class-declaration classTranslation)
+	     (print-stream *current-stream*
+			   "public class " (java-yield-flotsam-class-name module) " "))
+	 (print-stream *current-stream* "{" EOL)
+	 
+	 (java-bump-indent)
 	
-	;; VARIABLES
-	(when (defined? classunit)
-	  (java-output-class-variable-definitions 
-	   (cast (nth classtranslation 6) CONS)))
+	 ;; VARIABLES
+	 (when (defined? classunit)
+	   (java-output-class-variable-definitions 
+	    (cast (nth classtranslation 6) CONS)))
 	(foreach global in globals
-	    do (setq translation (java-translate-unit global))
-	       (java-output-global-definition (rest translation))
-	       (setf (translation global) NULL)
-	       (setf (code-register global) NULL))
+		 do (setq translation (java-translate-unit global))
+		 (java-output-global-definition (rest translation))
+		 (setf (translation global) NULL)
+		 (setf (code-register global) NULL))
 
 	;; CONSTRUCTORS AND METHODS
 	(when (defined? classunit)
 	  (java-output-class-constructors
 	   (cast (nth classtranslation 7) (CONS OF TRANSLATION-UNIT))
 	   (java-yield-flotsam-class-name module)
-	   (and (defined? class) (exception-class? class)))
+	   (and (defined? *current-java-output-class*) 
+		(exception-class? *current-java-output-class*)))
 	  (foreach statement in (cast (nth classtranslation 8) (CONS OF TRANSLATION-UNIT))
-	      do (java-output-statement (java-translate-unit statement))
-		 (setf (translation statement) NULL)
-		 (setf (code-register statement) NULL)))
+	     do (java-output-statement (java-translate-unit statement))
+		(setf (translation statement) NULL)
+		(setf (code-register statement) NULL)))
 	(foreach function in functions
-	    do (java-output-method (rest (java-translate-unit function)))
-	       (setf (translation function) NULL)
-	       (setf (code-register function) NULL))
+	   do (java-output-method (rest (java-translate-unit function)))
+	      (setf (translation function) NULL)
+	      (setf (code-register function) NULL))
 	(java-unbump-indent)
-	(print-stream *current-stream* "}" EOL)
-	(free classOutputStream)
-	))))
+	(print-stream *current-stream* "}" EOL) ))))))
 
 
 (defun java-output-file-header ((stream OUTPUT-STREAM) (fileName FILE-NAME))
@@ -207,19 +216,19 @@
      (print-stream stream EOL)))
 
 (defun java-output-class-to-file ((class CLASS))
+ (special ((*current-java-output-class* class))
   (within-context (home-module class)
     (let ((classOutputFile (java-make-code-output-file-name class FALSE))
-	  (classOutputStream (new OUTPUT-FILE-STREAM :filename classOutputFile))
 	  (translation NIL))
-      (special ((*current-stream* classOutputStream))
-	(inform "Translating " class "...")
-	(setq translation (java-translate-define-native-class class))
-	(when (>= *translationVerbosityLevel* 1)
-	  (inform "    Writing " classOutputFile "..."))
-	(java-output-file-header 
-	 classOutputStream (java-make-code-output-file-name class TRUE))
-	(java-output-class (rest translation) (exception-class? class))
-	(free classOutputStream) ))))
+      (with-output-file (classOutputStream classOutputFile)
+        (special ((*current-stream* classOutputStream))
+	  (inform "Translating " class "...")
+	  (setq translation (java-translate-define-native-class class))
+	  (when (>= *translationVerbosityLevel* 1)
+	    (inform "    Writing " classOutputFile "..."))
+	  (java-output-file-header 
+	   classOutputStream (java-make-code-output-file-name class TRUE))
+	  (java-output-class (rest translation) (exception-class? class)) ))))))
 
 (defun java-output-class-unit-to-file ((classUnit TRANSLATION-UNIT))
   (java-output-class-to-file (cast (the-object classUnit) CLASS)) )
@@ -247,7 +256,6 @@
 (defun java-output-startup-units-to-file 
     ((startupHT STRING-HASH-TABLE) (keyList (CONS of STRING-WRAPPER)))
   (let ((classOutputFile FILE-NAME NULL)
-        (classOutputStream OUTPUT-FILE-STREAM NULL)
 	(startupFunctions (CONS of TRANSLATION-UNIT) NULL))
     (special ((*current-stream* NULL))
       (foreach className in keyList
@@ -258,23 +266,26 @@
 	       (within-module (home-module (first startupFunctions))
 		 (setq classOutputFile (java-make-code-output-file-name 
 					(wrapper-value className) FALSE))
-		 (setq classOutputStream (new OUTPUT-FILE-STREAM :filename classOutputFile ))
-		 (setq *current-stream* classOutputStream)
-		 (when (>= *translationVerbosityLevel* 1)
-		   (inform "Writing " classOutputFile "..."))
-		 (java-output-file-header 
-		  classOutputStream (java-make-code-output-file-name (wrapper-value className) TRUE))
+		 (with-output-file (classOutputStream  classOutputFile)
+		   (setq *current-stream* classOutputStream)
+		   (when (>= *translationVerbosityLevel* 1)
+		     (inform "Writing " classOutputFile "..."))
+		   (java-output-file-header 
+		    classOutputStream (java-make-code-output-file-name (wrapper-value className) TRUE))
               
-		 (print-stream *current-stream* 
-			       "public class " (wrapper-value className) " {" EOL)
-		 (java-bump-indent)
-		 (foreach function in startupFunctions
-		     do (java-output-method (rest (java-translate-unit function)))
-			(setf (translation function) NULL)
-			(setf (code-register function) NULL))
-		 (java-unbump-indent)
-		 (print-stream *current-stream* "}" EOL)
-		 (free classOutputStream))))) ))
+;; Nope:  Doesn't work if a module spans more than one Java package:
+;                 (unless (eql? (nth (wrapper-value className) 0) #\_)
+;                   ;; An internal class name
+;                   (print-stream *current-stream* "public "))
+		   (print-stream *current-stream* 
+				 "public class " (wrapper-value className) " {" EOL)
+		   (java-bump-indent)
+		   (foreach function in startupFunctions
+		      do (java-output-method (rest (java-translate-unit function)))
+			 (setf (translation function) NULL)
+			 (setf (code-register function) NULL))
+		   (java-unbump-indent)
+		   (print-stream *current-stream* "}" EOL)))))) ))
 
 (defun java-push-into-hash-table ((HT HASH-TABLE)
 				  (key OBJECT)
@@ -375,15 +386,17 @@
 	     (let ((module (home-module (the-object classUnit)))
 		   (globals (CONS OF TRANSLATION-UNIT) nil)
 		   (functions (CONS OF TRANSLATION-UNIT) nil))
-	       (setq globals (lookup globalsHT module))
-	       (unless (defined? globals)
-		 (setq globals nil))
-	       (setq functions (lookup flotsamFunctionHT module))
-	       (unless (defined? functions)
-		 (setq functions nil))
-	       (java-output-flotsam-units-to-file-for-module
-		module classUnit globals functions)
-	       (remove codeModulesList module))
+               (within-module module
+                 (setq globals (lookup globalsHT module))
+	         (unless (defined? globals)
+		   (setq globals nil))
+	         (setq functions (lookup flotsamFunctionHT module))
+	         (unless (defined? functions)
+		   (setq functions nil))
+	         (java-output-flotsam-units-to-file-for-module
+                  (java-make-global-output-file-name module FALSE)
+		  module classUnit globals functions)
+	         (remove codeModulesList module)))
 	     (java-output-class-unit-to-file classUnit)))
     
     ;; TODO: add stuff for collecting functions, globals, etc

@@ -20,7 +20,7 @@
 # UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          #
 # 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               #
 #                                                                            #
-# Portions created by the Initial Developer are Copyright (C) 1996-2003      #
+# Portions created by the Initial Developer are Copyright (C) 1996-2006      #
 # the Initial Developer. All Rights Reserved.                                #
 #                                                                            #
 # Contributor(s):                                                            #
@@ -39,7 +39,7 @@
 #                                                                            #
 ############################# END LICENSE BLOCK ##############################
 
-# Version: Makefile,v 1.10 2003/04/18 21:16:02 hans Exp
+# Version: Makefile,v 1.12 2006/05/11 07:06:41 hans Exp
 #
 # Format a TeXINFO manual file and translate it into DVI, PS, INFO, and HTML
 #

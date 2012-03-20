@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-stella.lisp,v 1.31 2003/10/24 19:33:25 hans Exp
+;;; Version: load-stella.lisp,v 1.36 2006/05/16 18:28:19 tar Exp
 
 ;;; Load STELLA.
 
@@ -86,11 +86,13 @@ hash tables grow large).")
             (cond (*load-vector-struct-stella?* "vs")
                   (*load-cl-struct-stella?* "s")
                   (t ""))
-	    (CL:subseq (CL:namestring (cl:compile-file-pathname "f.lisp")) 2)))
+	    (CL:pathname-type (cl:compile-file-pathname "f.lisp"))))
 #+:lispworks
-(pushnew "sfasl" system::*binary-file-types* :test #'equal)
+(pushnew (concatenate 'string "s" system:*binary-file-type*)
+	 system::*binary-file-types* :test #'equal)
 #+:lispworks
-(pushnew "vsfasl" system::*binary-file-types* :test #'equal)
+(pushnew (concatenate 'string "vs" system:*binary-file-type*)
+	 system::*binary-file-types* :test #'equal)
 
 ;;; If this is T, Stella will compile/load/startup verbosely:
 (defvar *stella-verbose?* *load-verbose*)
@@ -199,10 +201,12 @@ hash tables grow large).")
 #+allegro (setq excl:*print-nickname* t)
 #+allegro (tpl:setq-default excl:*print-nickname* t)
 
-(unless (fboundp 'with-compilation-unit)
-  (defmacro with-compilation-unit ((&rest options) &body body)
-    (declare (ignore options))
-    `(progn ,@body)))
+#-:cmu19
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (unless (fboundp 'with-compilation-unit)
+    (defmacro with-compilation-unit ((&rest options) &body body)
+      (declare (ignore options))
+      `(progn ,@body))))
 
 (cond
  ((and (find-package "STELLA")

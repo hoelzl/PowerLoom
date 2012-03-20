@@ -1,0 +1,1460 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: backlinks.ste,v 1.40 2006/05/10 22:31:06 hans Exp
+
+;;; Indexing that maps proposition arguments to dependent propositions
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Adding and removing backlinks to propositions
+  ;;
+
+;; BUG: 'get-binary-indexing-vector' CALLS THIS, BUT IT'S NO LONGER RELIABLE:
+(defun (type-has-backlinks? BOOLEAN) ((type TYPE))
+  ;; Return TRUE if LOGIC-OBJECTs with logical-type 'type' have backlinks to
+  ;;    propositions and have variable-value-inverse-links.
+  (if (null? (surrogate-value type)) ;; don't break
+      (return FALSE)
+    (return (not (literal-type? type)))))
+
+(defslot THING dependent-propositions-index :type BACKLINKS-INDEX
+  :documentation "Enables instances of 'THING' to have backindexes to 
+propositions, making them first class logic objects."
+  :public? TRUE)
+
+(defslot PROPOSITION dependent-propositions-index :type BACKLINKS-INDEX
+  :documentation "Enables instances of 'PROPOSITION' to have (standard)
+backindexes to propositions (as well as their own special ones), making them
+first class logic objects."
+  :public? TRUE)
+
+(defun (create-backlinks-index BACKLINKS-INDEX) ((self OBJECT))
+  ;; Create a new backlinks index, and initialize the
+  ;;    'dependent-propositions-list' slot with a sequence index.
+  (let ((index (new BACKLINKS-INDEX)))
+    (setf (dependent-propositions-list index)
+          (choose (isa? self @PATTERN-VARIABLE)
+                  (create-sequence-index :NON-PAGING NIL)
+                  (create-sequence-index
+                   *module* (make-dependent-propositions-pattern self))))
+    (return index) ))
+
+(defun (get-backlinks-index BACKLINKS-INDEX) ((self OBJECT))
+  ;; Return a backlinks index for 'self', if one exists (i.e., if the
+  ;;    type of 'self' supports backindexing).
+  (when (null? self)
+    (return NULL))
+  (typecase self
+    ((LOGIC-OBJECT THING)
+     (let ((index (dependent-propositions-index self)))
+       (when (defined? index)
+         (return index))
+       (setq index (create-backlinks-index self))
+       (setf (dependent-propositions-index self) index)
+       (return index)))
+    (WRAPPER
+     (typecase self
+       ((INTEGER-LOGIC-WRAPPER FLOAT-LOGIC-WRAPPER STRING-LOGIC-WRAPPER)
+        (let ((index (dependent-propositions-index self)))
+          (when (defined? index)
+            (return index))
+          (setq index (create-backlinks-index self))
+          (setf (dependent-propositions-index self) index)
+          (return index)))
+       (otherwise NULL)))
+    (otherwise NULL))
+  (return NULL))
+
+(defglobal *specialized-backlinks-crossover-point* INTEGER 10
+  :documentation "When 'dependent-propositions-list' gets this long in a
+backlinks index, then we create a hash table index and other
+specialized indices.")
+
+(defun add-dependent-proposition-to-specialized-index
+    ((index BACKLINKS-INDEX) (proposition PROPOSITION) (argument OBJECT))
+  ;; Called by 'help-add-dependent-proposition'.
+  ;; Add `proposition' to specialized indices; create them if necessary.
+  ;; IMPORTANT: Once specialized indices are created, they contain the
+  ;;    same set of propositions as held in `dependent-propositions-list'
+  ;;    (this is relied upon by `unfiltered-dependent-propositions').
+  ;;    Conceivably (and if we knew how to iterate over hash tables),
+  ;;    we could delete the list at this point and solely rely on the
+  ;;    specialized inidices.
+  (let ((table (predicate-propositions-table index)))
+    (when (null? table)
+      ;; First time around: create a hash table and specialized lists and
+      ;;    fill them in with existing propositions:
+      (setq table (new (HASH-TABLE OF SURROGATE PROPOSITIONS-INDEX)))
+      (setf (predicate-propositions-table index) table)
+      (foreach prop in (dependent-propositions-list index)
+          do (add-dependent-proposition-to-specialized-index
+              index prop argument)))
+    (case (kind proposition)
+      (:ISA
+       (when (null? (dependent-isa-propositions-list index))
+         (setf (dependent-isa-propositions-list index)
+           (create-sequence-index *module* (make-isa-pattern argument))))
+       (insert (dependent-isa-propositions-list index) proposition))
+      (otherwise
+       (let ((surrogate (relationRef proposition))
+             (bucket PROPOSITIONS-INDEX NULL))
+         (setq bucket (lookup table surrogate))
+         (when (null? bucket)
+           (setq bucket 
+             (create-sequence-index
+              *module* (make-relation-pattern surrogate argument)))
+           (insert-at table surrogate bucket))
+         (insert bucket proposition))))))
+
+(defun help-add-dependent-proposition 
+       ((index BACKLINKS-INDEX) (proposition PROPOSITION) (argument OBJECT))
+  ;; Add 'proposition' to '(dependent-propositions-list index)', and possibly
+  ;;    hash it into '(predicate-propositions-table index)'.
+  ;; note: we don't check for duplicates because of possible quadratic
+  ;;    complexity.  Duplicates can occur (only) if the same argument appears
+  ;;    twice in a proposition:
+  (let ((allDependentPropositions (dependent-propositions-list index))
+        (table (predicate-propositions-table index)))
+    (when (null? table)
+      ;; if the number of dependent propositions is below
+      ;;    '*specialized-backlinks-crossover-point*', insert into
+      ;;    simple index and return:
+      ;; Experiment: we only measure the non-paging length here,
+      ;;    since how many propositions there are on secondary storage is
+      ;;    irrelevant to the decision at hand - doing this avoids many
+      ;;    calls to `estimated-length' when we do a persistent load:
+      (when (< (SEQUENCE-INDEX.estimated-length allDependentPropositions)
+               *specialized-backlinks-crossover-point*)
+        (insert allDependentPropositions proposition)
+        (return)))
+    (add-dependent-proposition-to-specialized-index
+     index proposition argument)
+    (insert allDependentPropositions proposition)))
+
+(defun add-dependent-proposition-link ((self OBJECT) (proposition PROPOSITION))
+  ;; Add `proposition' to the backlinks index of `self' (if it has one).
+  (let ((description?
+         ;; tricky/ugly: we are not always in description mode when dealing
+         ;;    with description propositions; keying in on the `descriptive?'
+         ;;    annotation works around that:
+         (or (description-mode?) (descriptive? proposition))))
+    (typecase self
+      (PROPOSITION
+       (case (kind self)
+         (:CONSTANT NULL)
+         (otherwise
+          (let ((index (dependent-propositions self)))
+            (when (eql? index NIL-NON-PAGING-INDEX)
+              (setq index (create-sequence-index :NON-PAGING NIL))
+              (setf (dependent-propositions self) index))
+            (insert (dependent-propositions self) proposition)))))
+      (LOGIC-OBJECT
+       ;; The backlinking and descriptions saga:
+       ;; - we need to make sure that "assertions" within descriptions are unfindable by
+       ;;   the regular assertion lookup machinery, since they are not top-level truths.
+       ;; - plain named logic-objects or named descriptions should never be
+       ;;   argument of a description proposition; instead, they are replaced
+       ;;   by surrogates which avoids their backlinking.
+       ;; - skolems and unnamed descriptions can wind up as arguments to descriptive
+       ;;   propositions in forward inference, for example:
+       ;;      (assert (=> (r ?x ?y) (exists ?z (s ?x ?z))))
+       ;;      (assert (=> (s ?x ?z) (forall ?e (=> (t ?e ?z) (t ?z ?e)))))
+       ;;      (assert (r a b))
+       ;;   This will generate an instantiated (forall ?e ...) that has ?z replaced
+       ;;   by a skolem.  We can't surrogatify skolems and descriptions but still
+       ;;   need to avoid backlinking; the upshot of this is that currently, the
+       ;;   only objects backlinked to description propositions are variables, since
+       ;;   they can never be part of a regular top-level assertion.  These backlinks
+       ;;   are used in some places such as the optimizer; conceivably, all backlinks
+       ;;   within descriptions could be eliminated, since we can always regenerate
+       ;;   them by walking the description proposition if necessary.
+       (safety 1 (or (not description?)
+                     (isa? self @SKOLEM)
+                     (and (isa? self @DESCRIPTION)
+                          (null? (surrogate-value-inverse self))))
+                 "INTERNAL ERROR: A named LOGIC-OBJECT such as " self " should never be "
+                 "argument to a description proposition such as " proposition)
+       ;; We used to generate warnings when we found skolems in descriptions, but since
+       ;;    those can legally occur (e.g., in forward inference - see above) we don't
+       ;;    do that anymore; however, once in a while, such skolems do point to incorrect
+       ;;    definitions, so we generate a warning if we are in debugging mode:
+       (when (and (eql? *powerloom-execution-mode* :DEBUGGING)
+                  description?
+                  (skolem? self)
+                  (not (variable? self))
+                  (not (hypothesized-instance? self))) ;; generated by classifier
+         (signal-proposition-warning
+          "Found skolem " self " in descriptive proposition " proposition))
+       ;; Finally, backlink the object if warranted:
+       (when (or (not description?)
+                 (variable? self))
+         (help-add-dependent-proposition (get-backlinks-index self) proposition self)))
+      (WRAPPER
+       ;; don't install back-links on wrapped literals in description mode:
+       (when (not description?)
+         (let ((index (get-backlinks-index self)))
+           ;; if its a logic-wrapper, backlink to 'proposition':
+           (when (defined? index)
+             (help-add-dependent-proposition index proposition self)))))
+      (THING
+       (when (not description?)
+         (help-add-dependent-proposition (get-backlinks-index self) proposition self)))
+      (otherwise
+       ;; no back link is installed on 'self' (could be a surrogate):
+       NULL)) ))
+
+(defun remove-dependent-proposition-link ((self OBJECT)
+                                          (proposition PROPOSITION))
+  ;; Remove `proposition' from the backlinks index of `self' (if it has one).
+  (typecase self
+    (PROPOSITION
+     (remove (dependent-propositions self) proposition))
+    (LOGIC-OBJECT
+     (help-remove-dependent-proposition
+      (get-backlinks-index self) proposition))
+    (WRAPPER
+     (let ((index (get-backlinks-index self)))
+       (when (defined? index)
+         (help-remove-dependent-proposition index proposition))))
+    (THING
+     (help-remove-dependent-proposition
+      (get-backlinks-index self) proposition))
+    ;; no back link is installed on 'self' (could be a surrogate):
+    (otherwise NULL)))
+
+(defun help-remove-dependent-proposition ((index BACKLINKS-INDEX)
+                                          (proposition PROPOSITION))
+  ;; Remove `proposition' from all its entries in `index'.
+  (let ((list (dependent-propositions-list index))
+        (table (predicate-propositions-table index)))
+    (when (defined? list)
+      (remove list proposition))
+    (when (defined? table)
+      (case (kind proposition)
+        (:ISA
+         (setq list (dependent-isa-propositions-list index))
+         (when (defined? list)
+           (remove list proposition)))
+        (otherwise
+         (setq list (lookup table (relationRef proposition)))
+         (when (defined? list)
+           (remove list proposition)))))))
+
+(defun remove-all-dependent-proposition-links ((self LOGIC-OBJECT))
+  ;; Remove backlinks to all propositions from 'self'.
+  (setf (dependent-propositions-index self) NULL) )
+
+
+  ;;
+;;;;;; Logic Argument Wrappers
+  ;;
+
+(startup-time-progn
+  (setq *wrapped-type-table*
+        (concatenate
+         *wrapped-type-table*
+         (bquote
+          ((@INTEGER-LOGIC-WRAPPER @INTEGER)
+           (@FLOAT-LOGIC-WRAPPER @FLOAT)
+           (@STRING-LOGIC-WRAPPER @STRING))))))
+
+(defglobal *INTEGER-LOGIC-WRAPPER-TABLE* INTEGER-HASH-TABLE (new INTEGER-HASH-TABLE))
+(defglobal *FLOAT-LOGIC-WRAPPER-TABLE* FLOAT-HASH-TABLE (new FLOAT-HASH-TABLE))
+(defglobal *STRING-LOGIC-WRAPPER-TABLE* STRING-HASH-TABLE (new STRING-HASH-TABLE))
+
+(defun (rewrap-argument OBJECT) ((argument OBJECT))
+  ;; Wrap 'argument' in a logic wrapper.
+  (let ((wrapper OBJECT NULL))
+    (typecase argument
+      (INTEGER-WRAPPER
+       (let ((value (wrapper-value argument)))
+         (setq wrapper (lookup *INTEGER-LOGIC-WRAPPER-TABLE* value))
+         (when (null? wrapper)
+           (setq wrapper (new INTEGER-LOGIC-WRAPPER :wrapper-value value))
+           (insert-at *INTEGER-LOGIC-WRAPPER-TABLE* value wrapper))))
+      (FLOAT-WRAPPER
+       (let ((value (wrapper-value argument)))
+         (setq wrapper (lookup *FLOAT-LOGIC-WRAPPER-TABLE* value))
+         (when (null? wrapper)
+           (setq wrapper (new FLOAT-LOGIC-WRAPPER :wrapper-value value))
+           (insert-at *FLOAT-LOGIC-WRAPPER-TABLE* value wrapper))))
+      (STRING-WRAPPER
+       (let ((value (wrapper-value argument)))
+         (setq wrapper (lookup *STRING-LOGIC-WRAPPER-TABLE* value))
+         (when (null? wrapper)
+           (setq wrapper (new STRING-LOGIC-WRAPPER :wrapper-value value))
+           (insert-at *STRING-LOGIC-WRAPPER-TABLE* value wrapper))))
+      (LITERAL-WRAPPER
+       (inform "Backlinking not implemented on literal of type: " 
+               (primary-type argument) EOL)
+       (return argument)))
+    (return wrapper) ))
+
+(defglobal *backlink-all-proposition-arguments?* BOOLEAN FALSE
+  :documentation "If TRUE, wrap all literal proposition arguments
+so that they can all support backlink indices.")
+
+;; TO DO: INVENT SCHEME FOR DECLARING INDICES ON RELATION DOMAINS, AND
+;;    ADD IT IN HERE:
+(defun (index-ith-domain? BOOLEAN) ((description NAMED-DESCRIPTION) (i INTEGER))
+  ;; Return TRUE if the ith domain of the relation 'description' is
+  ;;    indexed.
+  ;; If 'description' is a non-computed function with all literal arguments,
+  ;;    then we backindex on the first argument.
+  (return
+   (and (function-description? description)
+        (not (computed-relation? description))
+        (eql? i 0)
+        (forall t in (but-last (io-variable-types description))
+            always (logical-subtype-of-literal? t )))))
+
+(defun (rewrap-ith-argument? BOOLEAN)
+       ((argument OBJECT) (proposition PROPOSITION) (i INTEGER))
+  ;; Return TRUE if the ith argument of 'proposition' should have a
+  ;;    backlink to it (count starts at zero).
+  (typecase argument
+    ((LOGIC-OBJECT PROPOSITION SURROGATE THING KEYWORD)
+     (return FALSE))
+    (otherwise
+     (return
+      (or *backlink-all-proposition-arguments?*
+          (and (member? (quote (:PREDICATE :FUNCTION)) (kind proposition))
+               (index-ith-domain? (get-description (relationRef proposition)) i)))))) )
+
+(defun rewrap-proposition-arguments ((self PROPOSITION))
+  ;; Wrap those non-LOGIC-OBJECT arguments of 'self' that need
+  ;;    backlinks with Logic Argument Wrappers.
+  (foreach arg in (arguments self)
+           as i in (interval 0 NULL)
+           where (and (defined? arg)    ; protect against unfinished function
+                      (rewrap-ith-argument? arg self i))
+           do (setf (nth (arguments self) i) (rewrap-argument arg))) )
+
+
+  ;;
+;;;;;; Retrieving dependent propositions
+  ;;
+
+;;; Various changes to backlink handling to deal with page-in from persistent
+;;;    secondary stores such as Cyc.  The most important thing is to avoid
+;;;    unfiltered generation of :DEPENDENTS, since those sets might be huge.
+;;; The following places (at least) still need to be improved:
+;;;    - `transfer-propositions-and-backlinks' and friends
+;;;    - `clear-logic-module-hook' and friends
+
+;;; TO DO: SEE WHETHER WE CAN MERGE THIS WITH THE VARIOUS `SELECT-' FUNCTIONS.
+
+(defun (unfiltered-dependent-propositions PROPOSITIONS-INDEX) 
+    ((self OBJECT) (relation SURROGATE))
+  ;; Return an index containing propositions with operator 'relation'
+  ;;    that reference 'self'.  If 'relation' is NULL, return all
+  ;;    propositions that reference 'self'.
+  (typecase self
+    (PROPOSITION
+     (cond ((null? relation)
+            (return (dependent-propositions self)))
+           (otherwise
+            (let ((dependents (create-sequence-index :NON-PAGING NULL)))
+              (foreach prop in (dependent-propositions self)
+                  where (eql? (relationRef prop) relation)
+                  do (push dependents prop))
+              (return dependents)))))
+    (otherwise
+     (let ((index (get-backlinks-index self))
+           (allPropositionsIndex PROPOSITIONS-INDEX NULL))
+       (when (null? index)
+         (return NIL-NON-PAGING-INDEX))
+       ;; POSSIBLY PUT LOGIC IN 'get-backlinks-index' THAT CREATES NEW
+       ;;    PAGING INDEX:
+       (setq allPropositionsIndex (dependent-propositions-list index))
+       (when (null? relation)
+         (return allPropositionsIndex))
+       (let ((table (predicate-propositions-table index))
+             (list (choose (null? table)
+                           allPropositionsIndex
+                           (lookup table relation))))
+         (when (null? list)
+           ;; TRICKY: if `list' is NULL we must have a defined relation `table'
+           ;;    (thus, crossed the cross-over point), and since we didn't find
+           ;;    an entry in the table for `relation' it must be a class (see
+           ;;    `add-dependent-proposition-to-specialized-index'):
+           (setq list (dependent-isa-propositions-list index)))
+         (when (null? list)
+           (return NIL-NON-PAGING-INDEX))
+         (when (and (eql? list allPropositionsIndex)
+                    (isa? list @PAGING-INDEX))
+           ;; If we have a persistent module and a defined relation, we always want
+           ;;    a :RELATION index, even if we haven't reached the cross-over point:
+           (let ((store (store (cast list PAGING-INDEX)))
+                 (pagingList
+                  (choose (defined? store)
+                          (create-sequence-index
+                           store (make-relation-pattern relation self))
+                          NULL)))
+             (when (defined? pagingList)
+               (setf (the-sequence pagingList)
+                 (collect prop in (cast (the-sequence list) (CONS OF PROPOSITION))
+                          where (eql? (operator prop) relation)))
+               (setq list pagingList))))
+         (return list))))))
+
+;;; WOULD BE NICE IF WE COULD GET RID OF THESE TWO FUNCTIONS TO MAKE ALL THIS
+;;;    ACCESS MORE UNIFORM AND HANDLED IN AS FEW PLACES AS POSSIBLE (THERE IS 
+;;;    ONLY ONE PLACE LEFT THAT NEEDS THEM - MAYBE WE CAN TWEAK THE
+;;;    ALL-TRUE-DEPENDENT... GUYS TO OPTIONALLY NOT CHECK FOR TRUTH:
+(defun (all-specializing-dependent-propositions-next? BOOLEAN)
+       ((self ALL-PURPOSE-ITERATOR))
+  :public? TRUE
+  ;; Help generate specializing propositions.
+  (let ((iterator (iterator-nested-iterator self))
+        (relation NAMED-DESCRIPTION (first (iterator-cons-list self))))
+    (loop
+      (while (next? iterator)
+        (let ((proposition PROPOSITION (value iterator)))
+          (when (eql? (relationRef proposition) (surrogate-value-inverse relation))
+            (setf (slot-value self value) proposition)
+            (return TRUE))))
+      (setf (iterator-cons-list self) (rest (iterator-cons-list self)))
+      (setq relation (first (iterator-cons-list self)))
+      (when (null? relation)
+        (setf (slot-value self value) NULL)
+        (return FALSE))
+      (setq iterator (allocate-iterator
+                      (unfiltered-dependent-propositions
+                       (iterator-object self) 
+                       (surrogate-value-inverse relation))))
+      (setf (iterator-nested-iterator self) iterator)) ))
+
+(defun (all-specializing-dependent-propositions (ITERATOR OF PROPOSITION))
+       ((self OBJECT) (relationRef SURROGATE))
+  :public? TRUE
+  ;; Generate all propositions that reference 'self' and that specialize 'relation'.
+  ;; CAREFUL: May return additional propositions as well.
+  (let ((relation (get-description relationRef)))
+    (return
+     (new ALL-PURPOSE-ITERATOR
+          :iterator-object self
+          :iterator-cons-list (cons relation (all-subrelations relation FALSE))
+          :iterator-nested-iterator 
+          (allocate-iterator (unfiltered-dependent-propositions self relationRef))
+          :iterator-next-code
+          (the-code :function all-specializing-dependent-propositions-next?))) ))
+
+(defun (unfiltered-dependent-isa-propositions PROPOSITIONS-INDEX) ((self OBJECT))
+  ;; Return a sequence of propositions that contains all ISA propositions
+  ;;    that reference 'self'.
+  (typecase self
+    ((LOGIC-OBJECT THING)
+     (let ((index (get-backlinks-index self))
+           (list (choose (null? index)
+                         NIL-NON-PAGING-INDEX
+                         (dependent-isa-propositions-list index))))
+       (when (null? list)
+         (setq list (dependent-propositions-list index))
+         (when (isa? list @PAGING-INDEX)
+           (let ((store (store (cast list PAGING-INDEX)))
+                 (pagingList
+                  (choose (defined? store)
+                          (create-sequence-index store (make-isa-pattern self))
+                          NULL)))
+             (when (defined? pagingList)
+               (setf (the-sequence pagingList)
+                 (collect prop in (cast (the-sequence list) (CONS OF PROPOSITION))
+                          where (eql? (kind prop) :ISA)))
+               (setq list pagingList)))))
+       (return list)))
+    (otherwise
+     (let ((index (get-backlinks-index self))
+           (list (choose (null? index)
+                         NIL-NON-PAGING-INDEX
+                         (dependent-isa-propositions-list index))))
+       (if (defined? list)
+           (return list)
+         (return (dependent-propositions-list index)))))))
+
+;;; FIGURE OUT: IS THERE A REASON WHY WE NOT IMPLEMENT THIS AS
+;;;    `(unfiltered-dependent-propositions self PL-KERNEL/@SUBSET-OF)'?.
+  
+(defun (unfiltered-dependent-implies-propositions PROPOSITIONS-INDEX)
+    ((self OBJECT))
+  ;; Return a sequence of propositions that contains all IMPLIES propositions
+  ;;    that reference 'self'.
+  (typecase self
+    ((LOGIC-OBJECT THING)
+     (let ((index (get-backlinks-index self)))
+       (if (null? index)
+           (return NIL-NON-PAGING-INDEX)
+         (let ((table (predicate-propositions-table index))
+               (list SEQUENCE-INDEX NULL))
+           (when (defined? table)
+             (setq list (lookup table PL-KERNEL/@SUBSET-OF))
+             (when (null? list)
+               (setq list NIL-NON-PAGING-INDEX)))
+           (when (null? list)
+             (setq list (dependent-propositions-list index))
+             (when (isa? list @PAGING-INDEX)
+               (let ((store (store (cast list PAGING-INDEX)))
+                     (pagingList
+                      (choose
+                       (defined? store)
+                       (create-sequence-index
+                        store (make-relation-pattern PL-KERNEL/@SUBSET-OF self))
+                       NULL)))
+                 (when (defined? pagingList)
+                   (setf (the-sequence pagingList)
+                     (collect prop in (cast (the-sequence list)
+                                            (CONS OF PROPOSITION))
+                              where (eql? (operator prop) PL-KERNEL/@SUBSET-OF)))
+                   (setq list pagingList)))))
+           (return list)))))
+    (otherwise
+     (let ((index (get-backlinks-index self)))
+       (if (null? index)
+           (return NIL-NON-PAGING-INDEX)
+         (let ((table (predicate-propositions-table index)))
+           (if (defined? table)
+               (return (either (lookup table PL-KERNEL/@SUBSET-OF)
+                               NIL-NON-PAGING-INDEX))
+             (return (dependent-propositions-list index))))) ))))
+
+(defun (inherits-truth-from-master? BOOLEAN) ((self PROPOSITION))
+  ;; Called by 'applicable-rules-of-description'.
+  ;; Kludge because truth values in master proposition don't always
+  ;;    get propagated to its satellites.
+  ;; If the master is true, mark 'self' as true also, and return TRUE.
+  (let ((master (master-proposition self)))
+    (when (and (defined? master)
+               (true? master))
+      (assign-truth-value self TRUE)
+      (return TRUE)))
+  (return FALSE) )
+
+(defun (applicable-rules-of-description (CONS OF PROPOSITION)) 
+       ((self LOGIC-OBJECT) (direction KEYWORD) (trueRulesOnly? BOOLEAN))
+  ;; Return IMPLIES proposition marked as TRUE (in the current context)
+  ;;    having 'self' in the consequent position (or antecedent position
+  ;;    if `direction' is :FORWARD.
+  ;; Side-effect: Derive satellite rules for 'self' is not already done.
+  ;; TO DO: CONSIDER ADDING TYPE CHECKS TO REDUCE THE NUMBER OF RULES
+  (when (isa? self @DESCRIPTION)
+    (derive-deferred-satellite-rules self))
+  (let ((rules NIL))
+    (foreach p in (select-rule-propositions
+                   (make-rules-pattern
+                    (choose (eql? direction :FORWARD) NULL self)
+                    (choose (eql? direction :FORWARD) self NULL)))
+        where (or (and (true? p)
+                       ;; subsumption links are logically redundant
+                       ;;    and just slow down the backchainer:
+                       (not (subsumption-link? p)))
+                  (inherits-truth-from-master? p)
+                  ;; NOTE: We can't move this clause up, since
+                  ;;    `inherits-truth-from-master?' assigns truth as
+                  ;;    a side effect:
+                  (not trueRulesOnly?))
+        collect p into rules)
+    (return rules) ))
+
+
+  ;;
+;;;;;; Selecting propositions based on selection patterns
+  ;;
+
+;;; TO DO:
+;;; - Figure out what default assumptions we (should) make about context
+;;;   and truth/strength of the returned propositions.
+
+;;; Selection patterns are a simple query language that allows us to
+;;;    select sets of objects such as propositions from indices or
+;;;    secondary storage.  Currently, the following patterns are
+;;;    supported:
+;;;
+;;;    (:DEPENDENTS ([options]) <term>) selects all propositions that directly
+;;;        or indirectly reference <term> (which can be any object but will
+;;;        usually be a logic object).
+;;;        Note, that depending on the implementation of a particular
+;;;        proposition store, not all kinds of objects might be indexed.
+;;;    (:RELATION-EXTENSION ([options]) <relation-surrogate>) selects all
+;;;        propositions with <relation-surrogate> as their operator.
+;;;    (:ISA ([options]) <term>) selects all type propositions about <term>.
+;;;    (:RELATION ([options]) <relation-surrogate> [<term1>] ... [<termN>])
+;;;        selects proposition with <relation-surrogate> as their operator.
+;;;        If no terms are supplied, the whole relation extension will
+;;;        be selected.  If only <term1> is supplied, propositions
+;;;        that have <term1> as one of their arguments will be selected,
+;;;        i.e., <term1> will be matched independent of its position.
+;;;        If more than one term are supplied, their positions are
+;;;        significant.  Dont-care columns can be specified via a NULL
+;;;        term.  For example, `(:RELATION @R A NULL B)' selects all
+;;;        propositions with relation @R, A as its first and B as its
+;;;        third argument.  `(:RELATION @R A NULL)' will find propositions
+;;;        with A in its first position, as oppsed to `(:RELATION @R A)'
+;;;        which will match A in any position.
+;;;    (:RULES ([options]) <pos-relation> <neg-relation>)
+;;;        selects all implies rules that have <pos-relation> as
+;;;        a positive literal (consequent) and/or <neg-relation>
+;;;        as a negative literal (antecedent).
+;;;    (:CONTEXT-PROPOSITIONS ([options]) <context>) selects all propositions
+;;;        conceived in <context>.
+;;;    (:CONTEXT-INSTANCES ([options]) <context>) selects all instances
+;;;        conceived in <context>.
+
+;;; Various pattern creation and accessor functions.  Conceivably, we could
+;;;    have a separate data type, but for now we'll stick with using CONSes,
+;;;    since it makes iteration, substitution and recursive patterns
+;;;    easier to handle.
+
+;; defined in `sequence-indices.ste':
+;(deftype SELECTION-PATTERN CONS)
+
+(defun (make-selection-pattern SELECTION-PATTERN) ((kind KEYWORD)
+                                                   (options CONS)
+                                                   (arguments CONS))
+  ;; Create a selection pattern of `kind' with `options' and `arguments'.
+  :globally-inline? TRUE
+  (return (cons kind (cons (choose (null? options) NIL options) arguments))))
+
+(defun (pattern-kind KEYWORD) ((pattern SELECTION-PATTERN))
+  ;; Return the `kind' indicator of `pattern'.
+  :globally-inline? TRUE
+  (return (first pattern)))
+
+(defun (pattern-options CONS) ((pattern SELECTION-PATTERN))
+  ;; Return any `options' of `pattern' as a disembodied property list.
+  :globally-inline? TRUE
+  (return (second pattern)))
+
+(defun (pattern-arguments CONS) ((pattern SELECTION-PATTERN))
+  ;; Return the arguments (keys) of `pattern'.
+  :globally-inline? TRUE
+  (return (rest (rest pattern))))
+
+(defun (make-dependent-propositions-pattern SELECTION-PATTERN)
+    ((argument OBJECT))
+  ;; Create a pattern to select dependent propositions of `argument'.
+  :globally-inline? TRUE
+  (return (make-selection-pattern :DEPENDENTS NIL (cons argument NIL))))
+
+(defun (make-isa-pattern SELECTION-PATTERN) ((argument OBJECT))
+  ;; Create a pattern to select type propositions about `argument'.
+  :globally-inline? TRUE
+  (return (make-selection-pattern :ISA NIL (cons argument NIL))))
+
+(defun (make-relation-extension-pattern SELECTION-PATTERN)
+    ((relation SURROGATE))
+  ;; Create a pattern to select the extension of `relation'.
+  :globally-inline? TRUE
+  (return (make-selection-pattern :RELATION NIL (cons relation NIL))))
+
+(defun (make-relation-pattern SELECTION-PATTERN) ((relation SURROGATE)
+                                                  (argument OBJECT))
+  ;; Create a `relation' pattern with `argument' in any position.
+  :globally-inline? TRUE
+  (return
+    (make-selection-pattern :RELATION NIL (cons relation (cons argument NIL)))))
+
+(defun (make-relation-pattern-1 CONS) ((relation SURROGATE) (argument OBJECT))
+  ;; Create a `relation' pattern with `argument' in position 1.
+  :globally-inline? TRUE
+  (return (make-relation-pattern-2 relation argument NULL)))
+
+(defun (make-relation-pattern-2 SELECTION-PATTERN) ((relation SURROGATE)
+                                                    (argument1 OBJECT)
+                                                    (argument2 OBJECT))
+  ;; Create a `relation' pattern with `argument1' in position 1 and
+  ;;    `argument2' in position 2.
+  (return
+    (make-selection-pattern
+     :RELATION NIL (cons relation (cons argument1 (cons argument2 NIL))))))
+
+(defun (make-relation-pattern-3 SELECTION-PATTERN) ((relation SURROGATE)
+                                                    (argument1 OBJECT)
+                                                    (argument2 OBJECT)
+                                                    (argument3 OBJECT))
+  ;; Ternary version of `make-relation-pattern-2'.
+  (return
+    (make-selection-pattern
+     :RELATION
+     NIL
+     (cons relation (cons argument1 (cons argument2 (cons argument3 NIL)))))))
+
+(defun (make-relation-pattern-4 SELECTION-PATTERN) ((relation SURROGATE)
+                                                    (argument1 OBJECT)
+                                                    (argument2 OBJECT)
+                                                    (argument3 OBJECT)
+                                                    (argument4 OBJECT))
+  ;; Quarternary version of `make-relation-pattern-2'.
+  (return
+    (make-selection-pattern
+     :RELATION
+     NIL
+     (cons relation
+           (cons argument1
+                 (cons argument2
+                       (cons argument3
+                             (cons argument4 NIL))))))))
+
+(defun (make-relation-pattern-N SELECTION-PATTERN) ((relation SURROGATE)
+                                                    &rest (arguments OBJECT))
+  ;; N-ary version of `make-relation-pattern-2'.
+  (return
+    (make-selection-pattern
+     :RELATION NIL (cons relation (coerce-&rest-to-cons arguments)))))
+
+(defun (make-rules-pattern SELECTION-PATTERN) ((posRelation OBJECT)
+                                               (negRelation OBJECT))
+  ;; Return a selection pattern for rules with `posRelation' and/or
+  ;;    `negRelation'.
+  (return
+    (make-selection-pattern
+     :RULES NIL (cons posRelation (cons negRelation NIL)))))
+
+(defun (find-selection-key-with-equivalents LOGIC-OBJECT)
+    ((pattern SELECTION-PATTERN))
+  ;; Find the first key in pattern with equivalents and return it.
+  (let ((candidateKeys (pattern-arguments pattern)))
+    (case (pattern-kind pattern)
+      ((:DEPENDENTS :ISA) NULL)
+      (:RELATION
+       (setq candidateKeys (rest candidateKeys)))
+      ((:CONTEXT-PROPOSITIONS :CONTEXT-INSTANCES)
+       (setq candidateKeys (rest candidateKeys)))
+      (otherwise
+       (error "get-selection-key-equivalents: Can't yet handle pattern "
+              pattern)))
+    (foreach key in candidateKeys
+        do (typecase key
+             (LOGIC-OBJECT
+              (when (non-empty? (variable-value-inverse key))
+                (return key)))
+             (otherwise NULL)))
+    (return NULL)))
+
+;;; TO DO: FOLD RELEVANT PORTIONS OF `unfiltered-dependent-propositions'
+;;;    INTO THE SELECTION FUNCTIONS BELOW.
+
+(defun (select-propositions PROPOSITIONS-INDEX) ((pattern SELECTION-PATTERN))
+  ;; Select all propositions according to `pattern' relative to the current
+  ;;    module (and/or an associated persistent store).
+  ;; Return the selected set as a PROPOSITION-INDEX.  This index might have
+  ;;    only some of the selected propositions materialized, others might
+  ;;    materialize lazily during iteration over the index (depending on the
+  ;;    underlying storage mechanism).
+  ;; This selection mechanism is different than the various `unfiltered-...'
+  ;;    functions, since it guarantees that only propositions of the right
+  ;;    kind will be returned (which makes various follow-up control structure
+  ;;    simpler to write).
+  (let ((kind (pattern-kind pattern))
+        (arguments (pattern-arguments pattern)))
+    (case kind
+      (:DEPENDENTS
+       (return (unfiltered-dependent-propositions (first arguments) NULL)))
+      (:ISA
+       (return (select-isa-propositions pattern)))
+      (:RELATION
+       (return (select-relation-propositions pattern)))
+      (:RULES
+       (return (select-rule-propositions pattern)))
+      (otherwise
+       (error "select-propositions: Can't yet handle pattern " pattern)))))
+
+(defun (select-isa-propositions PROPOSITIONS-INDEX)
+    ((pattern SELECTION-PATTERN))
+  ;; Select type propositions selected by an :ISA pattern.
+  (let ((object (first (pattern-arguments pattern)))
+        (index (unfiltered-dependent-isa-propositions object)))
+    (typecase index
+      (PAGING-INDEX
+       (when (eql? (pattern-kind (selection-pattern index)) :ISA)
+         (return index)))
+      (otherwise NULL))
+    (let ((sequence (CONS OF PROPOSITION) (the-sequence index))
+          (filteredSequence NIL))
+      (when (empty? sequence)
+        (return NIL-NON-PAGING-INDEX))
+      ;; hand-inline sequence-index iteration:
+      (foreach prop in sequence
+          where (and (eql? (kind prop) :ISA)
+                     (not (deleted? prop)))
+          do (pushq filteredSequence prop))
+      (if (empty? filteredSequence)
+          (return NIL-NON-PAGING-INDEX)
+        (return
+          (new NON-PAGING-INDEX
+               :the-sequence filteredSequence))))))
+
+(defun (help-select-relation-propositions PROPOSITIONS-INDEX)
+    ((pattern SELECTION-PATTERN))
+  ;; Select predicate propositions according to a :RELATION pattern.
+  (let ((arguments (pattern-arguments pattern))
+        (relation (first arguments))
+        (keys (rest arguments))
+        (anchor (some key in keys
+                    where (and (defined? key)
+                               (instance-has-backlinks? key)))))
+    (when (null? anchor)
+      ;; we have a relation extension pattern:
+      (let ((description (get-description relation)))
+        (if (defined? description)
+            (return (get-description-extension description TRUE))
+          (return NIL-NON-PAGING-INDEX))))
+    (let ((index (unfiltered-dependent-propositions anchor relation))
+          (sequence (CONS OF PROPOSITION) (the-sequence index))
+          (filteredSequence NIL)
+          (allKeyValues CONS NULL))
+      (typecase index
+        (PAGING-INDEX
+         (when (and (defined? (store index))
+                    (eql? (pattern-kind (selection-pattern index)) :RELATION))
+           ;; We are paging in from a persistent store which will do the
+           ;; filtering; modify the pattern slot in case this `pattern' has more
+           ;; keys (exploits internals of `unfiltered-dependent-propositions'):
+           (setf (selection-pattern index) pattern)
+           (return index)))
+        (otherwise NULL))
+      (when (empty? sequence)
+        (return NIL-NON-PAGING-INDEX))
+      ;; this also selects matching :ISA propositions:
+      (foreach prop in sequence
+          where (equal? relation (operator prop)) ;; BUG!  FAILS FOR FUNCTION PROPOSITIONS BECAUSE THEY HAVE @EQUIVALENT AS THEIR OPERATOR RATHER THAN THE FUNCTION NAME!
+          do (when (null? allKeyValues)
+               (setq allKeyValues NIL)
+               (when (non-empty? (rest keys))
+                 ;; we have at least one key besides the anchor or need to
+                 ;;    test that it appears at the correct position:
+                 (foreach key in keys
+                     collect (value-of key) into allKeyValues)))
+             (when (non-empty? allKeyValues)
+               (let ((arguments (arguments prop)))
+                 (unless (and (defined? arguments) ;; in case prop is deleted
+                              (forall key in allKeyValues
+                                  as arg in arguments
+                                  always (or (null? key)
+                                             (equal? key (value-of arg))
+                                             (and (isa? key @PROPOSITION)
+                                                  (isa? (value-of arg) @PROPOSITION)
+                                                  (unify-propositions?
+                                                   key
+                                                   (value-of arg)
+                                                   (new ENTITY-MAPPING))))))
+                   (continue))))
+             (unless (deleted-proposition? prop)
+               (pushq filteredSequence prop)))
+      (if (empty? filteredSequence)
+          (return NIL-NON-PAGING-INDEX)
+        (return
+          (new NON-PAGING-INDEX :the-sequence filteredSequence))))))
+
+(defun (select-relation-propositions PROPOSITIONS-INDEX)
+    ((pattern SELECTION-PATTERN))
+  ;; Select predicate propositions according to a :RELATION pattern.
+  ;; This is memoized for efficiency to speed things up for repeated
+  ;;    calls and data-intensive queries.  One of the main reasons why
+  ;;    memoization helps here is that `count-backlinks-on-relation'
+  ;;    calls this to measure the number of hits before we actually
+  ;;    materialize the list.  This means that we might be able to
+  ;;    handle this more cleverly without memoization.
+  (let ((arguments (pattern-arguments pattern))
+        (relation (first arguments))
+        (key1 OBJECT NULL)
+        (key2 OBJECT NULL))
+    (setq arguments (rest arguments))
+    (when (empty? arguments)
+      ;; we have a relation extension, only memoize a few of those:
+      (return
+        (memoize (relation *context*)
+                 :timestamps :KB-UPDATE :max-values 50
+                 (help-select-relation-propositions pattern))))
+    (setq key1 (first arguments))
+    (setq arguments (rest arguments))
+    (when (empty? arguments)
+      (return
+        (memoize (relation key1 *context*)
+                 :timestamps :KB-UPDATE :max-values 1000
+                 (help-select-relation-propositions pattern))))
+    (setq key2 (first arguments))
+    (setq arguments (rest arguments))
+    (when (empty? arguments)
+      (return
+        (memoize (relation key1 key2 *context*)
+                 :timestamps :KB-UPDATE :max-values 1000
+                 (help-select-relation-propositions pattern))))
+    (return (help-select-relation-propositions pattern))))
+
+(defun (select-rule-propositions PROPOSITIONS-INDEX)
+    ((pattern SELECTION-PATTERN))
+  ;; Select rules according to a :RULE pattern.
+  (let ((arguments (pattern-arguments pattern))
+        (posRelation (first arguments))
+        ;; for now, we treat the keys as mutally exclusive:
+        (negRelation (second arguments))
+        (description DESCRIPTION NULL)
+        (store OBJECT-STORE NULL))
+    (when (defined? posRelation)
+      (typecase posRelation
+        (DESCRIPTION
+         (setq description posRelation))
+        (otherwise
+         (setq description (get-description posRelation))))
+      ;; for now treat them as mutually exclusive:
+      (setq negRelation NULL))
+    (when (defined? negRelation)
+      (typecase negRelation
+        (DESCRIPTION
+         (setq description negRelation))
+        (otherwise
+         (setq description (get-description negRelation)))))
+    (when (defined? description)
+      (derive-deferred-satellite-rules description)
+      (setq store (home-object-store description)))
+    (if (defined? store)
+        ;; we'll let the persistent store do the filtering:
+        (return (create-sequence-index store pattern))
+      (if (defined? description)
+          (return
+            (select-relation-propositions
+             (make-relation-pattern-2
+              PL-KERNEL/@SUBSET-OF negRelation posRelation)))
+        (return NIL-NON-PAGING-INDEX)))))
+
+(defun (evaluate-selection-pattern TRUTH-VALUE) ((pattern SELECTION-PATTERN))
+  ;; Evaluate the truth of the propositions specified by `pattern'
+  ;;    which is indicated by the truth of the first result proposition
+  ;;    selected by `pattern' whose truth value is defined.
+  ;; TO DO: TRY TO MAKE THIS MORE ELEGANT - DOING IT ON THE BACK OF SEQUENCE
+  ;;    INDEX ITERATORS IS SOMEWHAT STRANGE.  THE WHOLE SELECTION PATTERN
+  ;;    LANGUAGE AND SEMANTICS NEEDS TO BE CLEANED UP IN LIGHT OF BACKENDS
+  ;;    SUCH AS CYC THAT CAN PERFORM MUCH MORE SOPHISTICATED OPERATIONS THAN
+  ;;    A NORMAL DATABASE (E.G., TRANSITIVE `ISA' TESTS, ETC.).
+  (setq pattern
+    (make-selection-pattern
+     (pattern-kind pattern)
+     (bquote (:EVALUATE? TRUE && (pattern-options pattern)))
+     (pattern-arguments pattern)))
+  (foreach proposition in (select-propositions pattern)
+      where (not (unknown-truth-value? (truth-value proposition)))
+      do (return (truth-value proposition)))
+  (return UNKNOWN-TRUTH-VALUE))
+
+(defun (evaluation-selection-pattern? BOOLEAN) ((pattern SELECTION-PATTERN))
+  ;; Return TRUE if `pattern' is an evaluation pattern.
+  (let ((options (pattern-options pattern)))
+    (while (non-empty? options)
+      (when (and (eql? (first options) :EVALUATE?)
+                 (eql? (coerce-to-boolean (second options)) TRUE-WRAPPER))
+        (return TRUE))
+      (setq options (rest (rest options))))
+    (return FALSE)))
+
+
+  ;;
+;;;;;; 'select-argument-with-backlinks' and friend
+  ;;
+
+(defun (argument-discourages-backlinks? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' is an argument for which we prefer not
+  ;;    to maintain backlinks whenever there is another that doesn't
+  ;;    discourage backlinks.
+  :globally-inline? TRUE
+  ;; THIS SEEMS WRONG AND IF ANYTHING THE FILTERING FOR SALIENT
+  ;;    ASSERTIONS FOR `ALL-FACTS-OF' SHOULD BE DONE DIFFERENTLY.
+  ;(return (isa? self @NAMED-DESCRIPTION))
+  (return FALSE))
+
+(defun surrogatify-discouraged-arguments ((self PROPOSITION))
+  ;; If 'self' has one or more arguments that do not discourage backlinks,
+  ;;    convert any "discouraged" arguments to surrogates.
+  ;; This minimizes the number of facts backindexed on relations.
+  ;; THIS SEEMS WRONG AND IF ANYTHING THE FILTERING FOR SALIENT
+  ;;    ASSERTIONS FOR `ALL-FACTS-OF' SHOULD BE DONE DIFFERENTLY.
+  #|
+  ;; DISABLED FOR NOW UNTIL WE FIGURE OUT HOW TO DO THIS RIGHT.  USING IT
+  ;;    MAKES FORWARD INFERENCE AND ALL-FACTS-OF FASTER/MORE USEFUL, HOWEVER,
+  ;;    IT MAKES SOME IMPORTANT PROPOSITIONS SUCH AS SPECIALIST AND EVALUATOR
+  ;;    ASSERTIONS UNFINDABLE.
+  (let ((arguments (arguments self)))
+    (when (and (or (eql? (kind self) :PREDICATE)
+                   (eql? (kind self) :FUNCTION))
+               (exists arg in arguments where (argument-discourages-backlinks? arg)))
+      (let ((hasNonDiscouragedArgument? BOOLEAN NULL))
+        (if;;; BUG: CORRECT TEST BUT FOILED BY BOOSTRAP ISSUES:
+           (single-valued-term? (surrogate-to-description (relationRef self)))
+          (setq hasNonDiscouragedArgument?
+                (exists arg in (but-last arguments)
+                        where (and (not (argument-discourages-backlinks? arg))
+                                   (instance-has-backlinks? arg))))
+          (setq hasNonDiscouragedArgument?
+                (exists arg in arguments 
+                        where (and (not (argument-discourages-backlinks? arg))
+                                   (instance-has-backlinks? arg)))))
+        (when hasNonDiscouragedArgument?
+          (foreach arg in arguments
+                   as i in (interval 0 NULL)
+                   where (argument-discourages-backlinks? arg)
+                   do
+                   (setf (nth arguments i)
+                         (surrogate-value-inverse (cast arg NAMED-DESCRIPTION))))))) )
+    |#
+  NULL)
+
+(defun (count-backlinks-on-relation INTEGER) 
+    ((self OBJECT) (kind KEYWORD) (relation SURROGATE))
+  ;; Return an estimate of the number of tuples of type 'relation'
+  ;;    that have 'self' as an argument.
+  ;; Kludge:  If 'relation' has subrelations, we make the count at least 1
+  ;;    (otherwise, it can look like there are no matching tuples when
+  ;;    there really are).
+  ;; Return NULL if there is no reliable estimate.
+  (let ((index (get-backlinks-index self))
+        (equivalents
+         (choose (isa? self @LOGIC-OBJECT)
+                 (variable-value-inverse (cast self LOGIC-OBJECT))
+                 NIL))
+        (count 0))
+    (when (null? index)
+      (return NULL))
+    (setq count
+      (estimated-length
+       (select-propositions (make-relation-pattern relation self))))
+    (when (and (= count 0)
+	       (non-empty? (all-direct-subrelations
+			    (surrogate-to-description relation) FALSE)))
+      ;; KLUDGE:
+      (setq count 1))
+    (foreach equiv in equivalents
+        do (++ count (count-backlinks-on-relation equiv kind relation)))
+    (return count)))
+
+(defun (select-argument-with-backlinks OBJECT BOOLEAN) ((proposition PROPOSITION))
+  ;; Search the arguments of 'proposition' looking for one with the fewest 
+  ;;    backlinks.
+  ;; Return a second argument which is TRUE iff the returned argument supports
+  ;;    backlinks, but has none (THIS MIGHT BE OBSOLETE NOW).
+  (let ((relation (relationRef proposition))
+        (kind (kind proposition))
+        (value OBJECT NULL)
+        (count INTEGER NULL)
+        (lowestBacklinkCount INTEGER NULL)
+        (bestArgument OBJECT NULL)
+        (foundDiscouragedArgument? FALSE))
+    (foreach arg in (arguments proposition)
+        do (setq value (argument-bound-to arg))
+           (when (defined? value)
+             (when (argument-discourages-backlinks? value)
+               ;; tricky: because discouraged arguments are represented as
+               ;;    surrogates when other backlinks exist, we skip over
+               ;;    them here:
+               (setq foundDiscouragedArgument? TRUE)
+               (continue))             
+             (setq count (count-backlinks-on-relation value kind relation))
+             (when (and (defined? count)
+                        (or (null? lowestBacklinkCount)
+                            (< count lowestBacklinkCount)))
+               (setq lowestBacklinkCount count)
+               (setq bestArgument value))))
+    (when (and (null? lowestBacklinkCount)
+               foundDiscouragedArgument?)
+      ;; repeat using relation arguments:
+      (foreach arg in (arguments proposition)
+          do (setq value (argument-bound-to arg))             
+             (when (defined? value)
+               (when (not (argument-discourages-backlinks? value))
+                 (continue))
+               (setq count (count-backlinks-on-relation value kind relation))
+               (when (and (defined? count)
+                          (or (null? lowestBacklinkCount)
+                              (< count lowestBacklinkCount)))
+                 (setq lowestBacklinkCount count)
+                 (setq bestArgument value)))))
+    (cond
+     ((null? lowestBacklinkCount)
+      (return NULL FALSE))
+     (otherwise
+      (return bestArgument FALSE)))))
+
+(defun (instance-has-backlinks? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' supports backlinks.
+  (return (or (defined? (get-backlinks-index self))
+              (isa? self @PROPOSITION))) )
+
+(defun (select-instance-with-backlinks OBJECT) ((instances CONS) (relation SURROGATE))
+  ;; Search the arguments of 'instances' looking for a logic object.
+  ;; TO DO: UPGRADE TO CHOOSE AN ARGUMENT WITH FASTEST/SMALLEST BACK-LINK INDEX:
+  :inline instance-has-backlinks?
+  (ignore relation)
+  (foreach i in instances
+      where (and (defined? i)
+                 (not (argument-discourages-backlinks? i)))
+      do (let ((value (value-of i)))
+           (when (instance-has-backlinks? value)
+             (return value))))
+  (foreach i in instances
+      where (and (defined? i)
+                 (argument-discourages-backlinks? i))
+      do (let ((value (value-of i)))
+           (when (instance-has-backlinks? value)
+             (return value))))
+  (return NULL) )
+
+(defun (find-similar-propositions PROPOSITIONS-INDEX) ((self PROPOSITION))
+  ;; Helping function for 'find-duplicate-proposition' methods.
+  ;; Use backlinks on some argument of 'self' to search for propositions
+  ;;    that have matching 'kind' and 'operator' values.
+  (case (kind self)
+    (:FUNCTION
+     ;; BUG: THIS CAUSES US NOT TO FIND A DUPLICATE DEFINING PROPOSITION:
+     ;; tricky: don't want to find propositions attached to defined skolem:
+     (foreach arg in (but-last (arguments self))
+              where (instance-has-backlinks? (value-of arg))
+              do
+              (return (unfiltered-dependent-propositions 
+                       (value-of arg) (operator self)))))
+    (otherwise
+     (foreach arg in (arguments self)
+              where (instance-has-backlinks? arg)
+              do
+              (return (unfiltered-dependent-propositions arg (operator self))))))
+  ;; maybe we failed because a literal argument needs rewrapping:
+  (rewrap-proposition-arguments self)
+  (foreach arg in (arguments self)
+           ;; partially-built :FUNCTION proposition has NULL last argument:
+           where (and (defined? arg)
+                      (instance-has-backlinks? arg))
+           do
+           (return
+            (unfiltered-dependent-propositions arg (operator self))))
+  ;; zero arguments, or no arguments with backlinks:
+  (return NIL-NON-PAGING-INDEX) )
+
+(defun (find-matching-conceived-proposition PROPOSITION) ((goal PROPOSITION))
+  ;; Called by 'try-forward-goals-proof'.
+  ;; Find a proposition (not necessarily TRUE) equivalent to 'goal'.
+  (case (kind goal)
+    ((:PREDICATE :FUNCTION :ISA :EQUIVALENT)
+     (let ((backlinkedArgument (select-argument-with-backlinks goal)))
+       (when (null? backlinkedArgument)
+         (return NULL))
+       (return
+        (some p in (unfiltered-dependent-propositions
+                    backlinkedArgument (operator goal))
+              where (and (eql? (relationRef p) (operator goal))
+                         (arguments-match-arguments? p goal))))))
+    (otherwise
+     ;; assume that we wouldn't call this unless it contains no
+     ;;    query variables:
+     (return goal))) )
+
+
+  ;;
+;;;;;; Transferring backlinks
+  ;;
+
+(defun transfer-propositions-and-backlinks ((from OBJECT) (to OBJECT))
+  ;; Replace references in dependent propositions of 'from' from 'from' to 'to.
+  ;; Also, transfer backlinks, and add 'to' to any extension that 'from' is in.
+  (transfer-propositions-except-for from to NIL-LIST) )
+
+(defun transfer-propositions-except-for
+    ((from OBJECT) (to OBJECT) (exceptPropositions (LIST OF PROPOSITION)))
+  ;; Replace references in dependent propositions of 'from' from 'from' to 'to.
+  ;; Also, transfer backlinks, and add 'to' to any extensions that 'from'
+  ;;    resided in.
+  ;; Except, don't transfer any propositions listed in 'exceptPropositions'.
+  (when *loadingRegenerableObjects?*
+    (return))
+  (let ((toPropositions 
+         (collect p in (unfiltered-dependent-propositions to NULL)))
+        (toValue OBJECT NULL))
+    (when (null? exceptPropositions)
+      (setq exceptPropositions NIL-LIST))
+    (special ((*evaluationMode* :EXTENSIONAL-ASSERTION))
+      (foreach p in (unfiltered-dependent-propositions from NULL)
+          where (not (member? exceptPropositions p))
+          do ;; replace 'from' by 'to' in all dependent propositions;
+             ;; evaluate 'to' with respect to the type of the proposition, since
+             ;; in descriptive propositions it has to be replaced by its surrogate:
+            (if (descriptive? p)
+                (setq *evaluationMode* :DESCRIPTION)
+              (setq *evaluationMode* :EXTENSIONAL-ASSERTION))
+            (setq toValue (evaluate-term to))
+            (foreach arg in (arguments p)
+                as i in (interval 0 NULL)
+                where (eql? arg from)
+                do (setf (nth (arguments p) i) toValue))
+            ;; add 'p' to dependents if it is not a duplicate:
+            (when (not (exists toP in toPropositions
+                           where (equivalent-propositions? p toP NULL)))
+              (remove-dependent-proposition-link from p)
+              (add-dependent-proposition-link toValue p))))))
+
+(defun transfer-description-extension ((from NAMED-DESCRIPTION)
+                                       (to NAMED-DESCRIPTION))
+  ;; Move the extension on 'from' to 'to'.
+  (setf (extension to) (extension from))
+  (setf (extension from) NULL) )
+
+
+  ;;
+;;;;;; Description extensions (:ISA backlinks from description arguments)
+  ;;
+
+(defun (get-description-extension PROPOSITIONS-INDEX)
+       ((description NAMED-DESCRIPTION) (update? BOOLEAN))
+  ;; Find or create a description extension for 'self'.
+  ;; If 'update?', return a writable list.
+  ;; TO DO: RETHINK THE `update?' ARGUMENT, IT SEEMS OBSOLETE SINCE WE ALWAYS
+  ;;    WANT A PROPER INDEX FOR DESCRIPTIONS COMING FROM PERSISTENT STORES.
+  (let ((extension (extension description)))
+    (cond
+     ((and (defined? extension)
+           (not (eql? extension NIL-PAGING-INDEX)))
+      (return extension))
+     (update?
+      (setq extension 
+            (create-sequence-index 
+             :PAGING
+             (make-relation-extension-pattern
+              (surrogate-value-inverse description))))
+      (setf (extension description) extension)
+      (return extension))
+     (otherwise (return NIL-PAGING-INDEX))) ))
+
+(defun cleanup-description-extension ((description NAMED-DESCRIPTION))
+  ;; Remove any deleted members of the extension.
+  ;; TO DO: ADD A TIMESTAMP, SO WE DON'T CLEAN MORE THAN ONCE AFTER
+  ;;    THE LAST UPDATE.
+  (remove-deleted-members (extension description)) )
+
+(defun cleanup-all-description-extensions ()
+  ;; House-keeping function that removes deleted objects from all extensions.
+  ;; Used by `clear-logic-module-hook'.
+  ;; This might be too crude, let's see.
+  (foreach description in (all-named-descriptions NULL false)
+           where (and (defined? (extension description))
+                      (not (eql? (extension description) NIL-PAGING-INDEX)))
+           do
+           (remove-deleted-members (extension description))) )
+
+(defspecial *suppressInsertionIntoClassExtension?* BOOLEAN FALSE
+  :documentation "Used when creating a skolem (e.g., a prototype) that
+isn't visible in the corresponding class extension.")
+
+(defun update-description-extension ((self PROPOSITION))
+  ;; Called by 'fasten-down-one-proposition'.
+  ;; If 'self' is an :ISA, :PREDICATE or :FUNCTION, possibly add it to
+  ;;    the extension of its description.
+  ;; Side-effect: May create a new (primitive) class description.
+  ;; Tricky: We avoid duplicates by calling 'update-description-extension'
+  ;;    only upon first conception of the corresponding proposition.
+  (when (description-mode?)
+    (return))
+  (case (kind self)
+    ((:ISA :PREDICATE :FUNCTION)
+     (let ((description (get-description (relationRef self))))
+       ;; see if 'self' should not be added to the extension:
+       (foreach arg in (arguments self)
+                do
+                (typecase arg
+                  (PATTERN-VARIABLE
+                   ;; propositions with variables don't appear in extensions:
+                   (return))
+                  (SKOLEM
+                   (when (or (and (class-description? description)
+                                  (literal-type?
+                                   (surrogate-value-inverse description)))
+                             *suppressInsertionIntoClassExtension?*
+                             (hypothesized-instance? arg))
+                     (return)))
+                  (LOGIC-OBJECT
+                   (when (hypothesized-instance? arg)
+                     (return)))
+                  (otherwise NULL)))
+       ;; we need to force creation of the extension regardless of whether
+       ;;    or not we insert into it:
+       (let ((extension (get-description-extension description TRUE)))
+         ;; go ahead and insert it:
+         (when (not *loadingRegenerableObjects?*)
+           (insert extension self)))))
+    (otherwise NULL)) )
+
+(defun (all-extension-members ITERATOR) ((description NAMED-DESCRIPTION))
+  ;; Return an iterator that generates instances asserted to belong to
+  ;;    'description'.
+  ;; CAUTION: MAY GENERATE DUPLICATES.
+  (let ((extension (get-description-extension description TRUE)))
+    (remove-deleted-members extension)
+    (return (allocate-iterator extension)) ))
+
+
+  ;;
+;;;;;; xxx-implies-xxx?
+  ;;
+
+(defun (collection-implies-collection? BOOLEAN)
+    ((subCollection LOGIC-OBJECT) (superCollection LOGIC-OBJECT))
+  ;; Return true if a chain of :IMPLIES links connects `subCollection' to
+  ;;    `superCollection'.
+  ;; If *reversePolarity?*, switch the arguments.
+  ;; EXPERIMENT: instead of a specialized link chasing function, we now rely
+  ;;    on the more general `all-supercollections' and memoization to do the
+  ;;    work.  Until we upgrade the memoization scheme this might be a bit
+  ;;    slower, but the gained uniformity should be worth the price.
+  ;; TO DO: - introduce new :IMPLIES-LINK-UPDATE timestamp that changes
+  ;;          less frequently (would also need to consider EQUIV props).
+  ;;        - see `test-isa?' for other memoization improvement ideas.
+  (if (eql? subCollection superCollection)
+      (return TRUE)
+    (return (member? (all-supercollections subCollection) superCollection))))
+
+(defun (relation-implies-relation? BOOLEAN)
+       ((subRel NAMED-DESCRIPTION) (superRel NAMED-DESCRIPTION))
+  ;; Return TRUE if `subRel' recursively implies `superRel'.
+  ;; If *reversePolarity?*, switch the arguments.
+  :globally-inline? TRUE
+  (return (collection-implies-collection? subRel superRel)))
+
+(defun (description-implies-description? BOOLEAN)
+       ((subDesc DESCRIPTION) (superDesc DESCRIPTION))
+  ;; Return TRUE if `subDesc' recursively implies `superDesc'.
+  ;; If *reversePolarity?*, switch the arguments.
+  :globally-inline? TRUE
+  (return (collection-implies-collection? subDesc superDesc)))
+
+(defun (relationref-specializes-relationref? BOOLEAN)
+       ((relationRef1 SURROGATE) (relationRef2 SURROGATE))
+  ;; Return TRUE if the relation for 'relationRef1' is more specific than
+  ;;    that for 'relationRef2'.
+  ;; If *reversePolarity?*, switch the arguments.
+  :inline surrogate-to-description
+  (when (eql? relationRef1 relationRef2)
+    (return TRUE))
+  (let ((desc1 (surrogate-to-description relationRef1))
+        (desc2 (surrogate-to-description relationRef2)))
+    (return (and (defined? desc1)
+                 (defined? desc2)
+                 (relation-implies-relation? desc1 desc2)))))
+
+
+;;--------------------------------------------------------------------
+
+#|
+;; TESTING BACKINDEXING ON LITERALS:
+
+
+(clear-module "PL-USER")
+
+(in-module "PL-USER")
+
+;; CAN'T BE FINALIZED
+;(defclass CALENDAR-YEAR (THING)
+;  :slots ((leap-year :type BOOLEAN))
+;  :documentation " ")
+
+(defconcept CALENDAR-YEAR (?x)
+  :documentation " ")
+
+(defrelation leap-year ((?x CALENDAR-YEAR)))
+  
+(deffunction YearFn ((?n INTEGER)) :-> (?y CALENDAR-YEAR)
+  :=> (CALENDAR-YEAR ?y))
+
+(assert (leap-year (YearFn 1997)))
+
+(ask (leap-year (YearFn 1997)))
+
+(ask (= (YearFn 1997) (YearFn 1997)))
+
+(cc pl-user)
+(defmodule FOO-KB6 :documentation "Ooo")
+(eval (surrogate-value @FOO-KB6))
+(eval (setf (surrogate-value @FOO-KB6) (get-stella-module "FOO-KB6" TRUE)))
+
+(retrieve ?x (= ?x FOO-KB6))
+(defrelation bar (?m ?v))
+(assert (bar FOO-KB6 5))
+;; BUG: SURROGATE POINTS TO UNWRAPPED MODULE:
+;;    EITHER, REBIND SURROGATE, OR
+;;    REDEFINE 'value-of' TO SEARCH FOR WRAPPER (SOUNDS EXPENSIVE)
+(retrieve ?x (bar FOO-KB6 ?x))
+(Inspect (get-stella-module "FOO-KB6" TRUE))
+
+|#
+
+;;; KEPT JUST IN CASE THERE IS A GOOD IDEA HERE:
+;(defun (slotRef-less-or-equal? BOOLEAN) ((slot1 SLOTREF) (slot2 SLOTREF))
+;  ;; Return TRUE if 'slot1' lexically preceeds or equals 'slot2'.
+;  (return (<= (symbol-id slot1) (symbol-id slot2))) )
+;
+;(defun (slotRef-less-than? BOOLEAN) ((slot1 SLOTREF) (slot2 SLOTREF))
+;  ;; Return TRUE if 'slot1' lexically preceeds 'slot2'.
+;  (return (< (symbol-id slot1) (symbol-id slot2))) )
+;
+;(defun insert-sorted-by-slotref ((self (LIST OF PROPOSITION)) (proposition PROPOSITION))
+;  ;; Insert the the proposition 'proposition' into the sorted list 'self'.
+;  ;;    keys are sorted using the predicate 'slotRef-less-or-equal?'.
+;  (let ((cursor (the-cons-list self))
+;        (trailer CONS NULL)
+;        (key (relationRef proposition))
+;        (slotRef SLOTREF NULL))
+;    (when (empty? cursor)
+;      (setf (the-cons-list self) (cons-list proposition))
+;      (return))
+;    (while (non-empty? cursor)
+;      (setq slotRef (relationRef (value cursor)))
+;      (when (slotRef-less-or-equal? key slotRef)
+;        (when (eql? key slotRef)
+;          (setf (value cursor) proposition)
+;          (return))
+;        ;; insert new entry in front of cursor:
+;        (if (null? trailer)
+;          (setf (the-cons-list self) (cons proposition cursor))
+;          (setf (rest trailer) (cons proposition cursor)))
+;        (return))
+;      (setq trailer cursor)
+;      (setq cursor (rest cursor)))
+;    ;; insert new entry at end of list:
+;    (setf (rest trailer) (cons-list proposition)) ))

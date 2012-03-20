@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: primal.ste,v 1.115 2003/10/22 21:10:59 tar Exp
+;;; Version: primal.ste,v 1.140 2006/05/14 06:47:35 hans Exp
 
 ;;; Declarations for objects implemented by native constructs.
 
@@ -58,16 +58,6 @@
   ;;
 ;;;;;; Built-in constants:
   ;;
-
-(defconstant TRUE BOOLEAN
-  (verbatim :common-lisp CL:t :cpp "1" :java "true")
-  :public? TRUE
-  :documentation "Represents the boolean true truth value.")
-
-(defconstant FALSE BOOLEAN
-  (verbatim :common-lisp CL:nil :cpp "0" :java "false")
-  :public? TRUE
-  :documentation "Represents the boolean false truth value.")
 
 (defconstant PI FLOAT
   (verbatim :common-lisp "(cl:float CL:PI 0.0d0)"  ;; in case it's a long float
@@ -164,9 +154,21 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
 					:java "-128")
     :public? TRUE)
 
+(defun (lisp-null-array-symbol-string STRING) ((rank INTEGER))
+  ;; Used in the lisp translation code, insdie a verbatim
+  ;; to return Lisp-specific-code.
+  (CASE rank
+    (1 (return "STELLA::NULL-1D-ARRAY"))
+    (2 (return "STELLA::NULL-2D-ARRAY"))
+    (3 (return "STELLA::NULL-3D-ARRAY"))
+    (4 (return "STELLA::NULL-4D-ARRAY"))
+    (5 (return "STELLA::NULL-5D-ARRAY"))
+    (otherwise (return "STELLA::NULL"))))
+
   ;;
 ;;;;;; `null?' and `defined?':
   ;;
+
 
 (defmethod (null? BOOLEAN) ((x UNKNOWN))
   :documentation
@@ -181,6 +183,10 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
   "Return true if `x' is undefined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
 (defmethod (null? BOOLEAN) ((x NATIVE-VECTOR))
+  :documentation
+  "Return true if `x' is undefined (handled specially by all translators)."
+  :public? TRUE :native? TRUE)
+(defmethod (null? BOOLEAN) ((x ARRAY))	; cl-array-null
   :documentation
   "Return true if `x' is undefined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
@@ -222,6 +228,10 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
   "Return true if `x' is defined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
 (defmethod (defined? BOOLEAN) ((x NATIVE-VECTOR))
+  :documentation
+  "Return true if `x' is defined (handled specially by all translators)."
+  :public? TRUE :native? TRUE)
+(defmethod (defined? BOOLEAN) ((x ARRAY)) ; cl-array-null
   :documentation
   "Return true if `x' is defined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
@@ -385,6 +395,17 @@ Java, which don't have direct support for a true modulus function."
               :cpp "(x % y)"
               :java "(x % y)")))
 
+(defun (frem FLOAT) ((x FLOAT) (y FLOAT))
+  :documentation "Return the floating point remainder from dividing `x' by `y'.  The
+sign of the result is always the same as the sign of `x'.  This has slightly
+different behavior than the `mod' function, and has less overhead in C++ and
+Java, which don't have direct support for a true modulus function."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp (CL:rem x y)
+              :cpp "fmod(x, y)"
+              :java "(x % y)")))
+
 (defun (mod INTEGER) ((x INTEGER) (modulus INTEGER))
   :documentation "True modulus.  Return the result of `x' mod `modulo'.
 Note: In C++ and Java, `mod' has more overhead than the similar
@@ -404,6 +425,28 @@ different when the signs of `x' and `modulo' are different."
                        (setq remainder (+ modulus remainder))))
                     ((< remainder 0)
                      (when (> modulus 0)
+                       (setq remainder (+ modulus remainder))))))
+    (return remainder)))
+
+(defun (fmod FLOAT) ((x FLOAT) (modulus FLOAT))
+  :documentation "True modulus for floats.  Return the result of `x' mod `modulo'.
+Note: In C++ and Java, `mod' has more overhead than the similar
+function `rem'.  The  answers returned by `mod' and `rem' are only
+different when the signs of `x' and `modulo' are different."
+  :public? TRUE
+  (let ((remainder (verbatim :common-lisp (cl:mod x modulus)
+                             :otherwise (frem x modulus))))
+    ;; At this point, remainder is the correct answer in Common Lisp,
+    ;; but needs to be modified if the signs of x and modulus are
+    ;; different for the other languages that do not have a native
+    ;; modulus function.
+    (verbatim :common-lisp NULL
+              :otherwise
+              (cond ((> remainder 0.0)
+                     (when (< modulus 0.0)
+                       (setq remainder (+ modulus remainder))))
+                    ((< remainder 0.0)
+                     (when (> modulus 0.0)
                        (setq remainder (+ modulus remainder))))))
     (return remainder)))
 
@@ -430,26 +473,63 @@ different when the signs of `x' and `modulo' are different."
 (defun (round INTEGER) ((n NUMBER))
   :documentation "Round `n' to the closest integer and return the result."
   :native? TRUE :public? TRUE)
+(defun (truncate INTEGER) ((n NUMBER))
+  :documentation "Truncate `n' toward zero and return the result."
+  :native? TRUE :public? TRUE)
+
+
+(defun (integer-valued? boolean) ((x float)) 
+  :documentation "Returns `true' if `x' is the floating point representation of an integer."
+  :public? TRUE
+  (return (verbatim :common-lisp "(CL:ZEROP (CL:REM X 1.0d0))"
+                    :java "x == Math.floor(x)"
+                    :cpp "x == ::floor(x)"
+                    :otherwise (= x (cast (floor x) FLOAT)))))
+
+(defun (float-to-base60 (CONS OF NUMBER-WRAPPER)) ((x FLOAT) (all-integers? BOOLEAN))
+  :documentation "Returns a cons of `x' in a base-60 form.  That means
+the first value will be the integer part of `x', the next value
+the iteger value of the fraction part of `x' times 60 and the
+third value the fraction part of `x' time 3600.  If `all-integers?'
+is `true', then the last value will be rounded to an integer.
+This can be used to convert from decimal degree values to Degree-Minute-Second
+or from decimal hours to Hour-Minute-Second format."
+  :public? TRUE
+  (let ((degree INTEGER (floor x))
+        (minute INTEGER (floor (* (- x degree) 60.0)))
+        (fsecond FLOAT (- (* x 3600.0) (* degree 3600.0) (* minute 60.0))))
+    (if all-integers?
+      (return (cons-list degree minute (round fsecond)))
+      (return (cons-list degree minute fsecond)))))
+
+(defun (base60-to-float FLOAT) ((l (CONS OF NUMBER-WRAPPER)))
+  :documentation "Converts (x y z) into a float.  The return value
+is x + y/60 + z/3600.
+This can be used to convert from Degree-Minute-Second to decimal degrees
+or from Hour-Minute-Second format to decimal hours."
+  (let ((dvalue (first l))
+        (mvalue (second l))
+        (svalue (third l))
+        (d 0.0))
+    (typecase dvalue
+      ((FLOAT-WRAPPER INTEGER-WRAPPER)
+       (setq d dvalue)))
+    (typecase mvalue
+      ((FLOAT-WRAPPER INTEGER-WRAPPER)
+       (++ d (/ mvalue 60.0))))
+    (typecase svalue
+      ((FLOAT-WRAPPER INTEGER-WRAPPER)
+       (++ d (/ svalue 3600.0))))
+    (return d)))
 
 (defun (random INTEGER) ((n INTEGER))
   :public? TRUE
-  :documentation "Generate a random integer in the interval [0..n-1].
-`n' must be <= 2^15."
-  (when (> n 32768)
-    ;; This is a C++ restricition:
-    (error "random: Can only generate random numbers between 0 and (2^15)-1."))
+  :documentation "Generate a random integer in the interval [0..n-1]."
   (let ((rNum INTEGER
               (verbatim
                   :common-lisp (CL:random n)
-		  ;; NOTE: For large n (on the order of 2^13) this can
-		  ;; skew the distribution unless n is a factor of 2,
-		  ;; but this probably isn't worth worrying about. - TAR
-		  ;; 11/12/98
-                  :cpp "abs(rand()) % n"
-		  ;; NOTE: This might also produce some problems, since
-		  ;; the input of the random number generator is an
-		  ;; integer that has been converted to a double.
-		  :java "(int) Math.floor(Math.random()*n)"
+                  :cpp "::random() % n"
+		  :java "Native.RNG.nextInt(n)"
 		  )))
     (return rNum)))
 
@@ -457,8 +537,11 @@ different when the signs of `x' and `modulo' are different."
   :public? TRUE
   :documentation "Seeds the random number generator with the current time."
   (verbatim
-      :cpp "srand(time(NULL));"
+      :cpp "::srandom(time(NULL));"
       :otherwise NULL))
+
+(startup-time-progn
+  (seed-random-number-generator))
 
 ;; Some useful math library functions
 
@@ -612,6 +695,7 @@ Used for log 10 conversions.")
   ;;    with `stella_' which will solve this problem as a side-effect):
   (register-native-name (quote floor) :cpp :function)
   (register-native-name (quote round) :cpp :function)
+  (register-native-name (quote fmod) :cpp :function)
   ;; Once we translate literal methods to overloaded functions we'll need this:
   ;(register-native-name (quote abs) :cpp :function)
   ;; Some Unix'es have `random' as part of the standard C library:
@@ -711,7 +795,7 @@ are both undefined."
       (return (null? y))
     (return (and (defined? y)
                  (verbatim :common-lisp "(CL:string-equal x y)"
-			   :cpp "!strcasecmp(x, y)"
+			   :cpp "(strcasecmp(x, y) == 0)"
                            :java "x.equalsIgnoreCase(y)")))))
 
 (defun (string-compare INTEGER) ((x STRING) (y STRING) (case-sensitive? BOOLEAN))
@@ -1014,6 +1098,22 @@ corresponding member of `new-chars' in the string `self'.  Returns a new string.
            (++ resultCursor))
     (return result)))
 
+(defun (instantiate-string-template STRING) ((template STRING) &rest (vars&values STRING))
+  :documentation
+  "For each occurrence of a <var> string from `vars&values' in `template' replace it
+with its corresponding <value> string.  Replacement is done in sequence which
+means (part of) a value might be replaced further with a later <var> and <value>."
+  :public? TRUE
+  ;; TO DO: MAKE THIS MORE EFFICIENT.
+  (let ((var STRING NULL))
+    (foreach item in vars&values
+        do (cond ((defined? var)
+                  (setq template (replace-substrings template item var))
+                  (setq var NULL))
+                 (otherwise
+                  (setq var item))))
+    (return template)))
+
 (defun (insert-string INTEGER) ((source STRING)
 				(start INTEGER)
 				(end INTEGER)
@@ -1057,12 +1157,25 @@ The final value of target-index is returned."
   (return target-index))
 
 (defun (integer-to-string STRING) ((i INTEGER))
-  :documentation "Print `i' to a string and return the result.  This is more
-efficient than using a string stream."
+  :documentation "Convert `i' to its string representation and return the result.
+ This is more efficient than using a string stream."
+  :native? TRUE :public? TRUE)
+
+(defun (integer-to-hex-string STRING) ((i INTEGER))
+  :documentation "Convert `i' to a string representation in hexadecimal notation and return the result."
+  :native? TRUE :public? TRUE)
+
+(defun (integer-to-string-in-base STRING) ((i INTEGER) (base INTEGER))
+  :documentation "Convert `i' to a string representation in `base' and return the
+result.  `base' must be positive and not more than 36.
+
+Note that in the C++ version, only 8, 10 and 16 will work as `base' arguments,
+since that is all the underlying implementation supports.  Other argument
+values will be treated as `10'."
   :native? TRUE :public? TRUE)
 
 (defun (float-to-string STRING)   ((f FLOAT))
-  :documentation "Print `f' to a string and return the result.  This is more
+  :documentation "Convert `f' to its string representation and return the result.  This is more
 efficient than using a string stream."
   :native? TRUE :public? TRUE)
 
@@ -1126,6 +1239,23 @@ the truncation direction."
 		  (concatenate (make-string left padchar)
 			       input
 			       (make-string (- length len left) padchar)))))))) ))
+
+(defun (zero-pad-integer STRING) ((value INTEGER) (size INTEGER))
+  :public? TRUE
+  :documentation "Returns a string representing `value' of at least length
+'size', padded if necessary with 0 characters."
+  (return (verbatim :common-lisp "(cl:format cl:nil \"~v,'0D\" size value)"
+                    :otherwise 
+                    (choose (< value 0)
+                            (concatenate "-" (format-with-padding (integer-to-string (- value))
+                                                                  (1- size) #\0 :RIGHT FALSE))
+                             (format-with-padding (integer-to-string value)
+                                                  size #\0 :RIGHT FALSE)))))
+
+(defun (zero-pad-string STRING) ((input STRING) (size INTEGER))
+  :public? FALSE
+  ;; helping function for `generate-uuid'.
+  (return (format-with-padding input size #\0 :RIGHT FALSE)))
 
 
 (defmethod (member? BOOLEAN) ((self STRING) (char CHARACTER)) :native? TRUE :public? TRUE)
@@ -1264,6 +1394,16 @@ entire string."
   :native? TRUE
   :public? TRUE)
 
+(defmethod (last-position INTEGER)
+    ((string STRING) (character CHARACTER) (end INTEGER))
+  :documentation "Return the last position of `character' within `string'
+(counting from zero); or return NULL if `character' does not occur 
+within `string'.  If `end' was supplied as non-NULL, only consider
+the substring ending at `end', however, the returned position will
+always be relative to the entire string."
+  :native? TRUE
+  :public? TRUE)
+
 ;(defmethod (search INTEGER)
 ;    ((string STRING) (substring STRING) (start INTEGER))
 ;  :documentation "Return start position of the left-most occurrence of
@@ -1277,6 +1417,144 @@ entire string."
 `substring' in `string', beginning from `start'.  Return NULL if it is not
 a substring."
   :native? TRUE :public? TRUE)
+
+(defun (starts-with? BOOLEAN) ((string STRING) (prefix STRING) (start INTEGER))
+  :documentation "Return TRUE if `string' starts with `prefix' starting from
+`start' (which defaults to 0 if it is supplied as NULL)."
+  :public? TRUE
+  ;; For C++ it would pay to implement this natively, since we could
+  ;; avoid iterating over the whole `string' to determine its length.
+  (when (null? start) (setq start 0))
+  (let ((prefixLength (length prefix)))
+    (if (> (+ start prefixLength) (length string))
+        (return false)
+      (return
+        (forall i in (interval 0 (1- prefixLength))
+          as j in (interval start NULL)
+          always (eql? (nth prefix i) (nth string j)))))))
+
+(defun (help-find-matching-prefix-length INTEGER) ((string1 STRING) (start1 INTEGER) (end1 INTEGER)
+                                                   (string2 STRING) (start2 INTEGER) (end2 INTEGER))
+  :public? FALSE  :globally-inline? TRUE
+  :documentation "Helping function for `find-matching-prefix' that requires `end1' and `end2'
+to be properly set up."
+  (let ((i1 start1)
+        (i2 start2))
+    (while (and (< i1 end1)
+                (< i2 end2)
+                (eql? (nth string1 i1) (nth string2 i2)))
+      (++ i1)
+      (++ i2))
+    (return (- i1 start1))))
+  
+(defun (find-matching-prefix-length INTEGER) ((string1 STRING) (start1 INTEGER) (end1 INTEGER)
+                                              (string2 STRING) (start2 INTEGER) (end2 INTEGER))
+  :public? TRUE
+  :documentation "Finds the length of the matching prefix strings of `string1' and
+`string2', starting at position `start1' and `start2' respectively.
+The search will end when `end1' or `end2' is reached.  If either `end1'
+or `end2' is null, then they will be set to the length of their respective
+strings."
+  (when (null? end1)
+    (setq end1 (length string1)))
+  (when (null? end2)
+    (setq end2 (length string2)))
+  (return (help-find-matching-prefix-length string1 start1 end1 string2 start2 end2)))
+
+(defun (find-mismatch INTEGER INTEGER) ((string1 STRING) (start1 INTEGER) (end1 INTEGER)
+                                        (string2 STRING) (start2 INTEGER) (end2 INTEGER))
+  :public? TRUE
+  :documentation "Finds the first position in each of `string1' and `string2' where
+they mismatch, starting at position `start1' and `start2' respectively.
+The search will end when `end1' or `end2' is reached.  If either `end1'
+or `end2' is null, then they will be set to the length of their respective
+strings.  If there is no mismatch, then `null' values are returned."
+  (when (null? end1)
+    (setq end1 (length string1)))
+  (when (null? end2)
+    (setq end2 (length string2)))
+  (let ((len (help-find-matching-prefix-length string1 start1 end1 string2 start2 end2)))
+    (setq start1 (+ start1 len))
+    (setq start2 (+ start2 len))
+    (if (and (= start1 end1) (= start2 end2))
+      (return NULL NULL)
+      (return start1 start2))))
+
+(defun (non-matching-position-helper INTEGER) 
+       ((source STRING) (start INTEGER) (end INTEGER) (match STRING))
+  :public? FALSE :globally-inline? TRUE
+  :documentation "Helper for `non-matching-position' that requires `end' to not be `null'."
+  (while (and (< start end)
+              (member? match (nth source start)))
+    (++ start))
+  (return start))
+
+(defun (non-matching-position INTEGER) ((source STRING) (start INTEGER) (match STRING))
+  :public? TRUE
+  :documentation "Returns the index into `source', starting from `start', of the first
+character that is not included in `match'."
+  (return (non-matching-position-helper source start (length source) match)))
+
+(defun (help-advance-past-whitespace INTEGER) ((source STRING) (start INTEGER) (end INTEGER))
+  :public? FALSE :globally-inline? TRUE
+  :documentation "Helper for `advance-past-whitespace' that requires `end' to be properly set."
+  (while (and (< start end)
+              (white-space-character? (nth source start)))
+    (++ start))
+  (return start))
+
+(defun (advance-past-whitespace INTEGER) ((source STRING) (start INTEGER))
+  :public? TRUE
+  :documentation "Returns the first index into `source', starting from `start', of
+the first character that is not white space."
+  (return (help-advance-past-whitespace source start (length source))))
+
+(defun (eql-except-in-whitespace? BOOLEAN) ((s1 STRING) (s2 STRING))
+  :public? TRUE
+  :documentation "Return `true' if the strings `s1' and `s2' are the same
+except for the amounts of whitespace separating words.  Leading or
+trailing whitespace is also not considered."
+  (cond ((null? s1)
+         (return (null? s2)))
+        ((null? s2)
+         (return FALSE))
+        ;; Optimization, since this test is 10x faster (in MCL)
+        ;; than doing this full routine.
+        ((string-eql? s1 s2)
+         (return TRUE)))
+  (let ((len1 (length s1))
+        (len2 (length s2))
+        (i1 0)
+        (i2 0))
+    ;; i1 and i2 are at non-whitespace characters
+    (while (and (< i1 len1)
+                (< i2 len2))
+      (cond ((white-space-character? (nth s1 i1))
+             (if (white-space-character? (nth s2 i2))
+               (progn
+                 ;; inline by hand:
+                 ;(setq i1 (help-advance-past-whitespace s1 i1 len1))
+                 ;(setq i2 (help-advance-past-whitespace s2 i2 len2))
+                 (while (and (< i1 len1) (white-space-character? (nth s1 i1)))
+                   (++ i1))
+                 (while (and (< i2 len2) (white-space-character? (nth s2 i2)))
+                   (++ i2)))
+               (return FALSE)))
+            ((eql? (nth s1 i1) (nth s2 i2))
+             (++ i1) 
+             (++ i2))
+            (otherwise
+             (return FALSE))))
+
+    ;; inline by hand:
+    ;(setq i1 (help-advance-past-whitespace s1 i1 len1))
+    ;(setq i2 (help-advance-past-whitespace s2 i2 len2))
+    (while (and (< i1 len1) (white-space-character? (nth s1 i1)))
+      (++ i1))
+    (while (and (< i2 len2) (white-space-character? (nth s2 i2)))
+      (++ i2))
+    (return (and (= i1 len1) (= i2 len2)))))
+
 
 (defmethod (subsequence STRING)
     ((string STRING) (start INTEGER) (end INTEGER))
@@ -1580,7 +1858,7 @@ This is identical to `read-s-expression-from-string'."
     (register-native-name (quote hash-code) :java :function))
 
 (defglobal *hash-byte-random-table* (ARRAY (256) OF INTEGER) NULL
-  :documentation "A table of 256 26-bit random numbers that can be used to
+  :documentation "A table of 256 N-bit random numbers that can be used to
 hash sequences of bytes.  Each bit-column in the table has an approximately
 even number of 0's and 1's.")
 
@@ -1588,9 +1866,12 @@ even number of 0's and 1's.")
   (setq *hash-byte-random-table* (new (ARRAY (256) OF INTEGER)))
   (foreach i in (interval 0 255)
       do (setf (aref *hash-byte-random-table* i) 0))
-  ;; generate 26-bit random numbers (CL:FIXNUM restriction) that have an
-  ;;    approximately even number of 0's and 1's in each bit column:
-  (foreach bit in (interval 0 25)
+  ;; generate N-bit random numbers based on (CL:FIXNUM restriction) 
+  ;; in Common Lisp that have an approximately even number of 0's
+  ;; and 1's in each bit column:
+  (foreach bit in (interval 0 (verbatim 
+				:common-lisp "#.(cl:1- (cl:integer-length cl:most-positive-fixnum))"
+				:otherwise 31))
       do (foreach i in (interval 0 255)
              do (setf (aref *hash-byte-random-table* i)
                   (logor (aref *hash-byte-random-table* i)
@@ -1706,7 +1987,7 @@ do not necessarily generate different hash codes."
 
 (defmethod (hash-code INTEGER) ((self BOOLEAN-WRAPPER))
   :public? TRUE :globally-inline? TRUE
-  (return (choose (wrapper-value self) 27333705 31891526))) ;; random #'s
+  (return (choose (wrapper-value self) 7333705 1891526))) ;; random #'s
 
 (defmethod (hash-code INTEGER) ((self STRING))
   :public? TRUE :globally-inline? TRUE
@@ -1739,7 +2020,7 @@ do not necessarily generate different hash codes."
   (return (logxor (aref *hash-byte-random-table* (character-code self))
                   ;; some random number to differentiate character hash
                   ;;    codes from those of single-element strings:
-                  33485726)))
+                  15119378)))
 
 (defmethod (equal-hash-code INTEGER) ((self OBJECT))
   :documentation
@@ -1757,7 +2038,7 @@ hash codes."
 handle NULL components should use this function for recursive calls."
   :public? TRUE
   (if (null? self)
-      (return 63842277) ;; (hash-string "NULL" 0)
+      (return 16569644) ;; (hash-string "NULL" 0)
     (return (equal-hash-code self))))
 
 (defun (hash-string INTEGER) ((string STRING) (seedCode INTEGER))
@@ -1787,19 +2068,57 @@ having to concatenate them."
       (setq code (rotate-hash-code code)))
     (return code)))
 
+;;  NOTE:  The size of integer values in the following variables can
+;;  exceed the size of Lisp fixnums (used by Stella to implement fast integers)
+;;  Therefore, we have to go the route via strings, because otherwise
+;;  the translation of Java or C++ translators using the Lisp version
+;;  of Stella will fail.  By deferring the reading of the large integer
+;;  values until runtime, we are assured that Stella code never sees
+;;  BIGNUMs in Lisp.
+;;  Also note that we need to use VECTOR structures here, because the
+;;  infrastructure for CONS is not setup until after :early-inits.  But
+;;  the hash table support needs to be done very early.
+
+(defglobal *hash-table-size-prime-strings* (VECTOR OF STRING-WRAPPER) NULL
+  :documentation "List of prime numbers approximately growing by a factor of 2
+that are suitable to be used as hash table sizes.  This is in string
+format to enable processing by Lisps with different fixnum sizes."
+  :public? TRUE)
+
 (defglobal *hash-table-size-primes* (VECTOR OF INTEGER-WRAPPER) NULL
   :documentation "List of prime numbers approximately growing by a factor of 2
 that are suitable to be used as hash table sizes."
   :public? TRUE)
 
 (startup-time-progn :early-inits
+  (setq *hash-table-size-prime-strings* 
+        (vector      "29"      "53"      "97"      "193"    "389"   "769"
+                   "1543"    "3079"    "6151"    "12289"  "24593"
+                  "49157"   "98317"  "196613"   "393241" "786433"
+                "1572869" "3145739" "6291469" "12582917"
+                ;; 24 bit limit here
+                "25165843" "50331653" "100663319"
+                ;; 27 bit limit here
+                "201326611" "402653189"
+                ;; 29 bit limit here
+                "805306457" "1610612741"
+                ;; 31 bit limit here.  That means 32 bit signed can't use these:
+                #|"3221225473" "4294967291"|#
+                ))
   (setq *hash-table-size-primes*
-    (vector 29    53   97         193       389       769
-        1543       3079       6151      12289     24593
-        49157      98317      196613    393241    786433
-        1572869    3145739    6291469   12582917  25165843
-        50331653   100663319  201326611 402653189 #|805306457 
-        1610612741 3221225473 4294967291|#)))
+        (verbatim :common-lisp "(cl:apply #'vector 
+                 (cl:loop for index below (length *hash-table-size-prime-strings*)
+                          as i = (cl:parse-integer
+                                    (unwrap-string (nth *hash-table-size-prime-strings*
+                                                        index)))
+                          when (cl:typep i 'CL:FIXNUM)
+                          collect (wrap-integer i)))"
+                  :otherwise (new VECTOR :array-size (length *hash-table-size-prime-strings*))))
+  (verbatim :common-lisp NULL
+            :otherwise (foreach s in *hash-table-size-prime-strings*
+                         as i in (interval 0 NULL)
+                         do (setf (nth *hash-table-size-primes* i) (string-to-integer s))))
+  )
 
 (defun (pick-hash-table-size-prime INTEGER) ((minSize INTEGER))
   :documentation "Return a hash table prime of at least `minSize'."
@@ -1921,17 +2240,16 @@ are longer than what can be represented by a STELLA integer."
   :documentation "Copy file `fromFile' to file `toFile', clobbering
 any data already in `toFile'."
   :public? TRUE
-  (when (not (probe-file? fromFile))
-    (error "Can't copy non-existent file: " fromFile EOL))
+  (ensure-file-exists fromFile "copy-file")
   (with-input-file (from fromFile)
     (with-output-file (to toFile)
        (let ((buffer (make-tokenizer-byte-array *tokenizer-initial-buffer-size*))
              (bytes-read 0))
          (loop 
-           (setq bytes-read (byte-array-read-sequence buffer from
-                                                      0 *tokenizer-initial-buffer-size*))
+           (setq bytes-read (native-byte-array-read-sequence 
+                             buffer from 0 *tokenizer-initial-buffer-size*))
            (if (> bytes-read 0)
-             (byte-array-write-sequence buffer to 0 bytes-read)
+             (native-byte-array-write-sequence buffer to 0 bytes-read)
              (break)))))))
 
 
@@ -2034,6 +2352,52 @@ do that directly..."
 |#
 
   ;;
+;;;;;;  UUID generation.
+  ;;
+
+(defun (generate-uuid STRING) ((uuid-type KEYWORD))
+  :public? TRUE
+  :documentation "Generates a UUID of the specified type.  Legal types are
+a subset of the IETF RFC 4122 (see http://www.ietf.org/rfc/rfc4122.txt )
+UUID types.  Currently supported are:
+    :TYPE-4  :RANDOM       A type-4 (random) UUID.  These are synonyms."
+  (case uuid-type
+    ((:TYPE-4 :RANDOM)
+     (return (generate-random-uuid)))
+    (otherwise
+     (error "UUIDs of type " uuid-type " are not supported."))))
+
+(defun (generate-random-uuid STRING) ()
+  :public? TRUE
+  :documentation "Generates a random UUID (Type 4), according to the guidelines
+of IETF RFC 4122 (see http://www.ietf.org/rfc/rfc4122.txt )
+
+Take 16 random bytes (octets), put them all behind each other, for the description
+the numbering starts with byte 1 (most significant, first) to byte 16 
+   (least significant, last). Then put in the version and variant.
+To put in the version, take the 7th byte and perform an and operation using 0x0f,
+   followed by an or operation with 0x40. 
+To put in the variant, take the 9th byte and perform an and operation using 0x3f,
+   followed by an or operation with 0x80.
+To make the string representation, take the hexadecimal presentation of bytes 1-4
+   (without 0x in front of it) let them follow by a -, then take bytes 5 and 6, - 
+bytes 7 and 8, - bytes 9 and 10, - then followed by bytes 11-16."
+
+  (return (concatenate 
+           (zero-pad-string (integer-to-hex-string (random 65536)) 4)
+           (zero-pad-string (integer-to-hex-string (random 65536)) 4)
+           "-"
+           (zero-pad-string (integer-to-hex-string (random 65536)) 4)
+           "-"
+           (integer-to-hex-string (+ 16384 (random 4096)))
+           "-"
+           (integer-to-hex-string (+ 32768 (random 16384)))
+           "-"
+           (zero-pad-string (integer-to-hex-string (random 16777216)) 6)
+           (zero-pad-string (integer-to-hex-string (random 16777216)) 6))))
+
+
+  ;;
 ;;;;;; Lisp support functions -- converting Lisp object to Stella objectsn
   ;;
 
@@ -2080,6 +2444,40 @@ do that directly..."
     (verbatim :common-lisp "(cl:setq result? TRUE)"
               :otherwise NULL)
     (return result?)) )
+
+(defun (running-in-language KEYWORD) ()
+  :documentation "Returns the keyword for the language the current implementation is running in."
+  (return (verbatim :common-lisp (intern-keyword "COMMON-LISP")
+                    :cpp "internKeyword(\"CPP\")"
+                    :java "Stella.internKeyword(\"JAVA\")"
+                    :otherwise (intern-keyword "UNKNOWN"))))
+
+(defun (running-system-information STRING) ()
+  :documentation "Returns an information string about the current running system environment."
+  (let ((info ""))
+    (verbatim :common-lisp "(cl:setq info (cl:format cl:nil \"~%    Lisp: ~@[~A~] ~@[~A~]~%      OS: ~@[~A~] ~@[~A~]~%Hardware: ~@[~A~] ~@[~A~]\"
+             (cl:lisp-implementation-type)
+             (cl:lisp-implementation-version)
+             (cl:software-type)
+             (cl:software-version)
+             (cl:machine-type)
+             (cl:machine-version)))"
+              :java "      StringBuffer infoBuffer = new StringBuffer();
+      String[] infoKeys = new String [] {\"java.vendor\", \"java.version\", \"os.arch\", \"os.name\", \"os.version\"};
+      for (int i = 0; i < infoKeys.length; i++) {
+	infoBuffer.append(System.getProperty(\"line.separator\"));
+	try {
+	  infoBuffer.append(infoKeys[i]);
+	  infoBuffer.append(\" = \");
+	  infoBuffer.append(System.getProperty(infoKeys[i]));
+	    } catch (SecurityException se) {
+	  infoBuffer.append(\"??\");
+	}
+      }
+      info = infoBuffer.toString()"
+              :otherwise NULL)
+    (return info)))
+                                   
 
 
   ;;

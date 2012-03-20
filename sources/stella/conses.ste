@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: conses.ste,v 1.86 2003/10/28 20:05:39 hans Exp
+;;; Version: conses.ste,v 1.91 2006/05/11 07:05:50 hans Exp
 
 ;;; Procedures that manipulate cons lists.
 
@@ -114,6 +114,22 @@ will always be relative to the entire list."
            where (eql? element object)
            do (return position))
   (return NULL))
+
+(defmethod (last-position INTEGER) ((self CONS) (object OBJECT) (end INTEGER))
+  :documentation "Return the position of `object' within the cons-list
+`self' (counting from zero); or return `null' if `object' does not occur within 
+`self' (uses an `eql?' test).  If `start' was supplied as non-`null', only 
+consider the sublist ending at `end', however, the returned position 
+will always be relative to the entire list."
+  :public? TRUE
+  (let ((last-pos INTEGER NULL))
+    (when (null? end)
+      (setq end (- (length self) 1)))
+    (foreach element in self
+      as position in (interval 0 end)
+      where (eql? element object)
+      do (setq last-pos position))
+    (return last-pos)))
 
 ;;; OPTIMIZATION NOTE: WE MAY WISH TO DEFINE VERSIONS OF THIS THAT
 ;;;    SUBSTITUTE A FASTER EQUALITY TEST WHEN THE TYPE OF `object'
@@ -899,6 +915,34 @@ element types are GENERALIZED-SYMBOL, STRING, INTEGER, and FLOAT)."
 (sort *test-list* NULL) ;; takes about 1 sec; Lisp takes 0.2
 |#
 
+(defspecial *sort-tuple-compare-predicate* FUNCTION-CODE NULL)
+(defspecial *sort-tuple-compare-index* INTEGER 0)
+
+(defun (sort-tuple-compare? BOOLEAN) ((x CONS) (y CONS))
+  ;; KLUDGE: passes in a sort predicate and tuple-index via specials
+  ;;    to avoid having to generalize the sorting functions above.
+  ;;    Works but is not the most efficient.
+  (let ((n *sort-tuple-compare-index*)
+        (pred *sort-tuple-compare-predicate*))
+    (return (funcall pred (nth x n) (nth y n)))))
+
+(defmethod (sort-tuples (CONS OF (LIKE (any-value self))))
+    ((self CONS) (n INTEGER) (predicate FUNCTION-CODE))
+  :public? TRUE
+  :documentation
+  "Just like `sort' but assumes each element of `self' is a tuple (a cons)
+whose `n'-th element (0-based) will be used for comparison."
+  (when (and (null? predicate)
+             (non-empty? self))
+    (setq predicate (choose-sort-predicate (nth-rest (cast (first self) CONS) n))))
+  (special ((*sort-tuple-compare-predicate* predicate)
+            (*sort-tuple-compare-index* n))
+    (return (help-sort-cons-list
+             self
+             (length self)
+             (the-code :function sort-tuple-compare?)))))
+
+
   ;;
 ;;;;;; Cons tree and parse tree functions
   ;;
@@ -1000,6 +1044,103 @@ is O(N) in the number of elements of `self'."
        (substitute-cons-tree (rest tree) newValue oldValue)))
     (otherwise NULL))
   (return tree) )
+
+(defun (cons-tree-nth OBJECT) ((tree CONS) &rest (index INTEGER))
+  :documentation "Access an arbitrary element of `tree' identified by a path
+specified as a list of `index' values.  The first `index' specifies the
+`index'-th element of `tree', the second `index' the `index'-th subelement
+of that element, etc.  Example:
+	 
+  (cons-tree-nth (quote (a (b (c d e) f) g)) 1 1 2) => e
+	
+"
+  :public? TRUE
+  (let ((result OBJECT tree))
+    (foreach i in index
+        do (typecase result
+             (CONS
+              (setq tree result))
+             (otherwise
+              (return NULL)))
+           (setq result (nth tree i)))
+    (return result)))
+
+(defun (cons-tree-nth-rest CONS) ((tree CONS) &rest (index INTEGER))
+  :documentation "Access an arbitrary sublist of `tree' identified by a path
+specified as a list of `index' values.  The first `index' specifies the
+`index'-th element of `tree', the second `index' the `index'-th subelement
+of that element, ..., the last index specifies the `nth-rest' of the previous
+element (different from `cons-tree-nth').  Example:
+	 
+  (cons-tree-nth-rest (quote (a (b (c d e) f) g)) 1 1 1) => (d e)
+	
+"
+  :public? TRUE
+  (let ((result OBJECT tree)
+        (nofIndices (length index)))
+    (foreach i in index
+        as j in (interval 1 NULL)
+        do (typecase result
+             (CONS
+              (setq tree result))
+             (otherwise
+              (return NULL)))
+           (if (= j nofIndices)
+               (setq result (nth-rest tree i))
+             (setq result (nth tree i))))
+    (return result)))
+
+(defun (match-cons-tree KEY-VALUE-LIST) ((tree OBJECT)
+                                         (pattern OBJECT)
+                                         (bindings KEY-VALUE-LIST))
+  :documentation "Match `pattern' against `tree' and return a list of
+variable bindings if they match, or NULL otherwise.  `bindings' can
+be NULL or an initial list of bindings to consider.  Pattern variables
+use KIF syntax, i.e., they need to start with a `?' character.  A
+single question mark is interpreted as the anonymous variable. Example:
+	 
+  (match-cons-tree (quote (a (b (a d) e) (a d) f g))
+                   (quote (a (?x ?y ?) ?y ? g))
+                   NULL)
+  => |kv|(<?Y,(A D)> <?X,B>)
+	
+Variables can't be quoted but quoting can effectively be achieved by
+inserting to-be-quoted variables bound to themselves into `bindings'."
+  :public? TRUE
+  (when (null? bindings)
+    (setq bindings (new KEY-VALUE-LIST)))
+  (when (eql? pattern (quote ?)) ;; anonymous variable
+    (return bindings))
+  (typecase pattern
+    (SYMBOL
+     (if (eql? (nth (symbol-name pattern) 0) #\?)
+         ;; we have a pattern variable:
+         (let ((value (lookup bindings pattern)))
+           (cond ((null? value)
+                  (insert-at bindings pattern tree)
+                  (return bindings))
+                 ((equal? value tree)
+                  (return bindings))))
+       (when (eql? tree pattern)
+         (return bindings))))
+    (CONS
+     (typecase tree
+       (CONS
+        (when (and (= (length tree) (length pattern))
+                   (forall elt in tree
+                       as pat in pattern
+                       always (defined? (match-cons-tree elt pat bindings))))
+          (return bindings)))
+       (otherwise NULL)))
+    (otherwise
+     (when (eql? tree pattern)
+       (return bindings))))
+  (return NULL))
+
+(defun (cons-tree-match? BOOLEAN) ((tree OBJECT) (pattern OBJECT))
+  :documentation "Predicate version of `match-cons-tree' (which see)."
+  :public? TRUE
+  (return (defined? (match-cons-tree tree pattern NULL))))
 
 
   ;;

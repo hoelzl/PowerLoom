@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: memoize.ste,v 1.14 2003/10/21 00:40:49 hans Exp
+;;; Version: memoize.ste,v 1.17 2006/05/11 07:06:16 hans Exp
 
 ;;; Memoization support
 
@@ -83,7 +83,11 @@ memoized entries when they get bumped.")))
 maintenance and clearance purposes.")
 
 ;; switch for debugging and benchmarking (SHOULD THIS BE AN ENVIRONMENT FEATURE?):
-(defglobal *memoization-enabled?* BOOLEAN TRUE)
+(defglobal *memoization-enabled?* BOOLEAN FALSE)
+
+(startup-time-progn :classes
+  ;; delay memoization until we are far enough along in the STELLA bootstrap:
+  (setq *memoization-enabled?* TRUE))
 
 (defun enable-memoization ()
   :command? TRUE :public? TRUE
@@ -869,6 +873,7 @@ wrapped literals (with the exception of BOOLEANs)."
         (options PROPERTY-LIST NULL)
         (lookupFunction OBJECT NULL)
         (lookupTree NIL)
+        (valueTypeSpec TYPE-SPEC NULL)
         (allEq? TRUE)
         (eqVector 0))
 
@@ -942,19 +947,22 @@ wrapped literals (with the exception of BOOLEANs)."
                   (cons-list && inputArgs)
                   & (choose allEq? -1 eqVector))))))
 
+    ;; determine the value expression type:
+    (setq valueTypeSpec (compute-expression-type (first body) TRUE))
+
     ;; Put it all together:
     (return
       (bquote
-       (vrlet ((& memoTableVar MEMOIZATION-TABLE
-                  (surrogate-value & memoName))
+       (vrlet ((& memoTableVar MEMOIZATION-TABLE NULL)
                (& memoEntryVar CONS NULL)
                (& memoValueVar OBJECT NULL))
-         (when (null? & memoTableVar)
-           ;; first time around, initialize the table:
-           (initialize-memoization-table
-            & memoName & (stringify (the-plist options)))
-           (setq & memoTableVar (surrogate-value & memoName)))
          (when *memoization-enabled?*
+           (setq & memoTableVar (surrogate-value & memoName))
+           (when (null? & memoTableVar)
+             ;; first time around, initialize the table:
+             (initialize-memoization-table
+              & memoName & (stringify (the-plist options)))
+             (setq & memoTableVar (surrogate-value & memoName)))
            (setq & memoEntryVar & lookupTree)
            (setq & memoValueVar (first & memoEntryVar)))
          (cond
@@ -963,14 +971,14 @@ wrapped literals (with the exception of BOOLEANs)."
            (when (eql? & memoValueVar MEMOIZED-NULL-VALUE)
              (setq & memoValueVar NULL)))
           (otherwise
-           ;; No value has been memoized; compute it and  memoize it:
+           ;; No value has been memoized; compute it and memoize it:
            (setq & memoValueVar && body)
            (when *memoization-enabled?*
              (setf (value & memoEntryVar)
                (choose (null? & memoValueVar)
                        MEMOIZED-NULL-VALUE
                        & memoValueVar)))))
-         & memoValueVar)))))
+         (cast & memoValueVar & (yield-type-spec-tree valueTypeSpec)))))))
 
 
   ;;

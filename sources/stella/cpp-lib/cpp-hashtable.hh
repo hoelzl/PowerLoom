@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: cpp-hashtable.hh,v 1.8 2003/04/18 21:15:57 hans Exp
+// Version: cpp-hashtable.hh,v 1.9 2006/05/09 20:33:17 hans Exp
 
 // Native C++ hash table support for STELLA based on STL extensions
 
@@ -151,15 +151,15 @@ template <class Key_Type, class Data_Type> class Native_EQL_Hash_Table :
   public gc {
 public:
   Native_EQL_Hash_Table(Data_Type nv = (Data_Type)NULL) {
-    cerr << "new Native_EQL_Hash_Table: Unimplemented hash table type" << endl;
-    cerr << ((char*)nv)[0];
+    std::cerr << "new Native_EQL_Hash_Table: Unimplemented hash table type" << std::endl;
+    std::cerr << ((char*)nv)[0];
   }
   Data_Type get(Key_Type key) {}
   void erase(Key_Type key) {}
   Data_Type& operator[](Key_Type key) {}
 };
 
-class Native_EQL_Hash_Table<char*, int> {
+template <> class Native_EQL_Hash_Table<char*, int> {
 public:
   Native_EQL_Hash_Table(int nv) {}
   int get(char* key) {}
@@ -167,7 +167,7 @@ public:
   int& operator[](char* key) {}
 };
 
-class Native_EQL_Hash_Table<char*, Object*> {
+template <> class Native_EQL_Hash_Table<char*, Object*> {
 public:
   Native_EQL_Hash_Table(Object* nv = NULL) {}
   Object* get(char* key) {}
@@ -175,7 +175,7 @@ public:
   Object*& operator[](char* key) {}
 };
 
-class Native_EQL_Hash_Table<Object*, Object*> {
+template <> class Native_EQL_Hash_Table<Object*, Object*> {
 public:
   Native_EQL_Hash_Table(Object* nv = NULL) {}
   Object* get(Object* key) {}
@@ -183,7 +183,7 @@ public:
   Object*& operator[](Object* key) {}
 };
 
-class Native_EQL_Hash_Table<int, Object*> {
+template <> class Native_EQL_Hash_Table<int, Object*> {
 public:
 Native_EQL_Hash_Table(Object* nv = (Object*)NULL) {}
   Object* get(int key) {}
@@ -191,7 +191,7 @@ Native_EQL_Hash_Table(Object* nv = (Object*)NULL) {}
   Object*& operator[](int key) {}
 };
 
-class Native_EQL_Hash_Table<double, Object*> {
+template <> class Native_EQL_Hash_Table<double, Object*> {
 public:
 Native_EQL_Hash_Table(Object* nv = (Object*)NULL) {}
   Object* get(double key) {}

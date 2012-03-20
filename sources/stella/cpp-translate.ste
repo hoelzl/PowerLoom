@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cpp-translate.ste,v 1.97 2003/09/19 00:24:17 tar Exp
+;;; Version: cpp-translate.ste,v 1.106 2006/05/11 07:05:55 hans Exp
 
 ;;; Routines for translating Stella parse trees into C++ trees.
 
@@ -48,12 +48,35 @@
 
 (in-module "/STELLA")
 
+;;; General utilities
+
+(defun (overloaded-function-name-module MODULE) ((function-name SYMBOL) (class-type TYPE))
+  ;; Return the module in which the overloaded name for `function-name'
+  ;; on `class-type' should be interned.
+  (let ((symbol-module (home-module function-name))
+        (class-module (home-module class-type)))
+    (cond ((eql? symbol-module class-module)
+           (return symbol-module))
+          ((member? (parent-modules class-module) symbol-module)
+           (return class-module))
+          ((member? (parent-modules symbol-module) class-module)
+           (return symbol-module))
+          (otherwise
+           (return class-module)))))
+
 
 ;;; Stella parse tree to C++ translator
 
 (defun (cpp-use-garbage-collector? BOOLEAN) ()
   ;; Return TRUE if this translation relies on the Boehm/Weiser collector.
   (return (enabled-stella-feature? :use-cpp-garbage-collector)))
+
+(defglobal *cpp-true-string-wrapper* STRING-WRAPPER (wrap-literal "TRUE")
+  :public? FALSE
+  :documentation "Wrapped TRUE string, used to reduce consing.")
+(defglobal *cpp-FALSE-string-wrapper* STRING-WRAPPER (wrap-literal "FALSE")
+  :public? FALSE
+  :documentation "Wrapped FALSE string, used to reduce consing.")
 
 (defspecial *dummyDeclarations* CONS NULL
   :documentation "Temporary List of declarations for unused return parameters")
@@ -117,7 +140,7 @@
                    float for friend goto if inline int long
                    namespace new operator private protected public
                    register return short signed sizeof static struct switch
-                   template #| this |# throw try typedef
+                   template #| this |# throw try typedef typeid
                    union unsigned virtual void volatile while
                    ;; g++ needs this:
                    typename))
@@ -616,8 +639,7 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
                             :unbind-with-destructors))
              (setq initialValueTree
                (cpp-translate-a-tree
-                (type-to-walked-null-value-tree
-                 (type-spec-to-base-type type)))))
+                (type-to-walked-null-value-tree type (type-spec-to-base-type type)))))
            (return
              (bquote
               (CPP_SPECIAL
@@ -839,30 +861,23 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
 
 (defun (cpp-translate-foreach-tree CONS) ((tree CONS))
   ;; Translate a SYS-FOREACH tree.
-  ;; Tree has the form
   ;;    (SYS-FOREACH ((<iterVar> <type> <constructor expression>)*)
-  ;;                 ((<cursorVar> <type> <next expression>)*)
-  ;;                 <continuation test> <body>)
+  ;;                 (<value expression>*)
+  ;;                 (<bump expression>*)
+  ;;                 <continuation test>
+  ;;                 <body>*)
   (let ((iteratorBindings (CONS OF CONS) (second tree))
-        (cursorBindings (CONS OF CONS) (third tree))
-        (continuationTest (cpp-translate-a-tree (fourth tree)))
-        (body (cpp-translate-list-of-trees (nth-rest tree 4)))
+        (valueTrees (CONS OF CONS) (third tree))
+        (nextTrees (CONS OF CONS) (fourth tree))
+        (continuationTest (cpp-translate-a-tree (fifth tree)))
+        (body (cpp-translate-list-of-trees (nth-rest tree 5)))
         (declaration NIL)
-        (declarations NIL)
+        (declarations (CONS OF CONS) NIL)
+        (vaDeclarations (CONS OF CONS) NIL)
+        (valueAssignments NIL)
         (nextAssignments NIL)
-        (varArgsIterator SYMBOL NULL))
-    ;; Process cursor clauses (do this first, so user-supplied element
-    ;;    variables will appear first in the list of `declarations'):
-    (foreach binding in cursorBindings
-        do (pushq nextAssignments (cpp-translate-a-tree (third binding)))
-           (setq declaration
-             (bquote
-              (& (cpp-translate-and-pointerize-type-spec (second binding))
-                 & (cpp-translate-a-tree (first binding))
-                 & (cpp-translate-a-tree 
-                    (type-to-walked-null-value-tree
-                     (type-spec-to-base-type (second binding)))))))
-        collect declaration into declarations)
+        (varArgsIterator SYMBOL NULL)
+        (variables NIL))
     ;; Process iterator clauses:
     (foreach binding in iteratorBindings
         do (cond ((sub-type-spec-of? (second binding) @ARGUMENT-LIST-ITERATOR)
@@ -870,9 +885,9 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
                   ;;    which should not be called explicitly anywhere else
                   ;;    (see `cpp-translate-argument-list-tree'):
                   (setq varArgsIterator (first binding))
-                  (setq declarations
+                  (setq vaDeclarations
                     (concatenate
-                      declarations
+                      vaDeclarations
                       (cpp-yield-va-iterator-declarations varArgsIterator)))
                   (continue))
                  (otherwise
@@ -883,21 +898,40 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
                         & (cpp-translate-a-tree (first binding))
                         & (cpp-translate-a-tree (third binding)))))))
         collect declaration into declarations)
+    ;; Process value assignment clauses:
+    (foreach tree in valueTrees
+        collect (cpp-translate-a-tree tree) into valueAssignments)
+    ;; Process iterator bump trees:
+    (foreach tree in nextTrees
+        collect (cpp-translate-a-tree tree) into nextAssignments)
+    ;; Collect variables from declarations:
+    (foreach decl in vaDeclarations
+        collect (second decl) into variables)
+    (foreach decl in declarations
+        collect (second decl) into variables)
     ;; Piece it all together:
-    (return
-      (bquote
-       (CPP_BLOCK
-        & declarations
-        (CPP_STATEMENTS
-         && (choose (defined? varArgsIterator)
-                    (cpp-yield-va-start-tree varArgsIterator)
-                    NIL)
-         (CPP_FOREACH & continuationTest
-                      & (reverse nextAssignments)
-                      & body)
-         && (choose (defined? varArgsIterator)
-                    (cpp-yield-va-end-tree varArgsIterator)
-                    NIL)))))))
+    (if (non-empty? vaDeclarations)
+        (return
+          (bquote
+           (CPP_BLOCK
+            & (concatenate vaDeclarations declarations)
+            (CPP_STATEMENTS
+             && (cpp-yield-va-start-tree varArgsIterator)
+             (CPP_FOREACH & variables
+                          & continuationTest
+                          & valueAssignments
+                          & nextAssignments
+                          & body)
+             && (cpp-yield-va-end-tree varArgsIterator)))))
+      (return
+        (bquote
+         (CPP_BLOCK
+          & declarations
+          (CPP_FOREACH & variables
+                       & continuationTest
+                       & valueAssignments
+                       & nextAssignments
+                       & body)))))))
 
 ;;; Helper functions for iteration over a variable number of arguments:
 
@@ -1559,11 +1593,13 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
     ((symbol GENERALIZED-SYMBOL) (caseConvention KEYWORD))
   ;; Helper function for `cpp-change-case' to allow memoization.
   (let ((module (interned-in symbol))
-        (name (symbol-name symbol)))
+        (name (symbol-name symbol))
+        (all-upper? (all-upper-case-string? name))
+        (caps-break-keyword (choose all-upper? :clever :yes)))
     (when (null? module)
       (setq module *module*))
     (when (or (case-sensitive? module)
-	      (not (eq? (compute-symbol-escape-code name false) :unescaped)))
+	      (not all-upper?))
       (return 
 	(make-matching-name-full name
 				 :no :no "- "
@@ -1577,12 +1613,12 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
 					:upcase "_")))
       (:lowercase 
        (return (make-matching-name-full name
-					:clever :clever "- "
+					caps-break-keyword :clever "- "
 					"" "" "" ""
 					:titlecaseX "")))
       (:capitalized 
        (return (make-matching-name-full name
-					:clever :clever "- "
+					caps-break-keyword :clever "- "
 					"" "" "" ""
 					:titlecase ""))) )))
 
@@ -1710,12 +1746,17 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
       (cpp-substitute-forbidden-characters 
        (cpp-change-case nameSymbol :lowercase) :lowercase))))
 
+
 (defun (cpp-translate-global-name STRING-WRAPPER) ((nameSymbol SYMBOL))
   ;; Convert `nameSymbol' representing the name of a global variable
   ;;    into a C++ identifier.
   ;; Similar to `cpp-translate-name', except don't downcase name.
   (when (null? nameSymbol)
     (return (wrap-literal "NULL")))
+  (when (eq? nameSymbol (quote TRUE))
+    (return *cpp-TRUE-string-wrapper*))
+  (when (eq? nameSymbol (quote FALSE))
+    (return *cpp-FALSE-string-wrapper*))
   (return
     (cpp-yield-qualified-name
      (cpp-substitute-forbidden-characters
@@ -2116,7 +2157,11 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
          (rest (method-return-type-specifiers *methodBeingWalked*)))
 	(returnExpression OBJECT NULL)
 	(translatedReturnExpression CONS NIL)
-        (needTemporaryReturnVariable? FALSE))
+        (needTemporaryReturnVariable?
+         (and (non-empty? (rest (rest tree))) ;; multiple values?
+              ;; if the first expression is not side-effect free, we have
+              ;; to store it, since subsequent ones might be affected by that:
+              (not (side-effect-free-expression? (second tree))))))
     
     ;; Generate return variables when returning multiple values
     (foreach exp in (rest (rest tree))
@@ -2167,7 +2212,8 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
           (setq oTree 
             (bquote (CPP_RETURN & translatedReturnExpression))))
       (if needTemporaryReturnVariable?
-          (let ((tempVar "_return_temp"))
+          (let ((tempVar
+                 (cpp-translate-return-parameter-name (quote _return) 0)))
             (setq oTree
               (bquote
                (CPP_BLOCK
@@ -2236,10 +2282,10 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
   ;; Create a name for overloaded function based on the original name
   ;;   and a method's type
   (return
-    (intern-symbol
-     (concatenate 
-       (symbol-name classType)
-       (concatenate "-" (symbol-name functionName))))) )
+    (intern-symbol-in-module
+     (concatenate (symbol-name classType) "-" (symbol-name functionName))
+     (overloaded-function-name-module functionName classType)
+     TRUE)) )
 
 (defun (cpp-translate-method-call CONS) ((tree CONS) (referenced? BOOLEAN))
   ;; Translate a method call to appropriate C++ syntax.
@@ -2330,7 +2376,7 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
     ((argumentType TYPE) (argument OBJECT) (null? BOOLEAN))
   ;; Translate a call to `defined?' or `null?' by generating
   ;;    the necessary tests directly.
-  (let ((nullValue (type-to-walked-null-value-tree argumentType)))
+  (let ((nullValue (type-to-walked-null-value-tree argumentType argumentType)))
     (cond
      ((and (optimize-boolean-tests?)
 	   (subtype-of? argumentType @OBJECT))

@@ -1,0 +1,315 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: api-support.ste,v 1.28 2006/05/11 07:05:04 hans Exp
+
+;;; Support functions for Stella API
+;;; THIS FILE IS SEMI-OBSOLETE AND SHOULD BE FOLDED INTO OTHER PLACES.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+(defun (class-names-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Used by `class-names'
+  ;; Get next class name of associated class (names represented
+  ;;  as string wrappers)
+  (when (first-iteration? self)
+    (setf (first-iteration? self) FALSE)
+    (setf (slot-value self value)
+      (class-type (cast (iterator-object self) CLASS)))
+    (return TRUE))
+  ;; Iterate through synonyms
+  (let ((next? (next? (iterator-nested-iterator self))))
+    (when next?
+      (setf (slot-value self value)
+	(value (iterator-nested-iterator self))))
+    (return next?)))
+
+
+  ;;
+;;;;;; Logic object iterators
+  ;;
+
+(defun (all-propositions-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for the generator of all propositions.
+  (loop
+    (let ((iterator (iterator-nested-iterator self))
+          (module MODULE NULL))
+      (when (next? iterator)
+        (setf (slot-value self value) (value iterator))
+        (return TRUE))
+      (setq module (pop (cast (iterator-object self) LIST)))
+      (when (null? module)
+        (setf (slot-value self value) NULL)
+        (return FALSE))
+      (setf (iterator-nested-iterator self)
+            (allocate-iterator (locally-conceived-propositions module))))) )
+
+(defun (all-propositions (ITERATOR OF PROPOSITION))
+       ((module MODULE) (local? BOOLEAN))
+  :documentation
+  "Iterate over all conceived propositions visible from `module'.
+Only propositions that haven't been deleted will be considered.
+If `local?', only return propositions conceived locally in `module'."
+  :public? TRUE
+  (return
+   (new ALL-PURPOSE-ITERATOR
+        :iterator-object
+        (choose local?
+                (list module)
+                (reverse (listify (visible-modules module))))
+        :iterator-nested-iterator 
+        (allocate-iterator (locally-conceived-propositions module))
+        :iterator-next-code
+        (the-code :function all-propositions-next?))) )
+
+(defun (visible-term? BOOLEAN)
+    ((term LOGIC-OBJECT) (context CONTEXT) (local? BOOLEAN))
+  ;; Return TRUE if 'term' is visible from 'context'.
+  ;; If 'local?', don't consider any of 'context's parents.
+  (return (choose local?
+                  (eql? (home-context term) context)
+                  (visible-from? (home-context term) context))))
+
+(defun (all-unnamed-terms ITERATOR) ((module MODULE) (local? BOOLEAN))
+  :documentation
+  "Iterate over all unnamed terms visible from `module'.  A term can be
+an instance (or individual) as well as a description.  Only terms that
+haven't been deleted will be considered.  If `local?', only return
+terms created locally in `module'."
+  :public? TRUE
+  (let ((terms NIL)
+        (termsWithDuplicates NIL)
+        (term LOGIC-OBJECT NULL))
+    ;; Collect all unnamed terms by scanning the arguments of
+    ;;     module propositions (this might generate duplicates).  We still
+    ;;     use two lists, since defined skolems can be collected without
+    ;;     generating duplicates:
+    (foreach proposition in (all-propositions module local?)
+        do (foreach arg in (arguments proposition)
+               where (and (defined? arg) ;; don't break on bogus propositions
+                          (isa? arg @LOGIC-OBJECT)
+                          (not (deleted? arg)))
+               do (setq term arg)
+                  (when (or (not (visible-term? term module local?))
+                            ;; Named term or collected in step 1?
+                            (defined? (surrogate-value-inverse term)))
+                    (continue))
+                  (typecase term
+                    (PATTERN-VARIABLE NULL)
+                    (SKOLEM
+                     (if (defined? (defining-proposition term))
+                         (when (eql? (defining-proposition term)
+                                     proposition)
+                           (pushq terms term))
+                       (pushq termsWithDuplicates term)))
+                    (otherwise
+                     (pushq termsWithDuplicates term)))))
+    (return
+      (allocate-destructive-list-iterator
+       (new (LIST OF LOGIC-OBJECT)
+            :the-cons-list
+            (remove-duplicates termsWithDuplicates))))))
+
+#|
+(defun (all-named-terms-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for the generator of all named terms.
+  (let ((cursor (iterator-integer self))
+        (modules (iterator-cons-list self))
+        (surrogate SURROGATE NULL)
+        (value OBJECT NULL))
+    (special ((*suppressNonLogicObjectWarning?* TRUE))
+      (while (< cursor (iterator-second-integer self))
+	(setq surrogate (nth *surrogate-array* cursor))
+	(when (and (defined? surrogate)
+		   (member? modules (interned-in surrogate))
+		   (defined? (surrogate-value surrogate)))
+	  (setq value (value-of surrogate))
+        (when (defined? value)
+          (typecase value
+            (LOGIC-OBJECT
+             (when (or (deleted? value)
+                       (not (member? modules (home-context value))))
+               (setq value NULL)))
+            (THING
+             (when (deleted? value)
+               (setq value NULL)))
+            (otherwise (setq value NULL))))
+        (when (defined? value)
+          (setf (slot-value self value) value)
+          (setf (iterator-integer self) (+ cursor 1))
+          (return TRUE)))
+	(setq cursor (+ cursor 1)))
+      (return FALSE) )))
+
+(defun (all-named-terms (ITERATOR OF OBJECT))
+    ((module MODULE) (local? BOOLEAN))
+  :documentation
+  "Iterate over all named terms visible from `module'.  A term can be an
+instance (or individual) as well as a description.  Only terms that
+haven't been deleted will be considered.  If `local?', only return 
+terms created locally in `module'."
+  :public? TRUE
+  (return
+   (allocate-all-meta-objects-iterator
+    (1+ (top-symbol-offset *surrogate-array*))
+    (the-code :function all-named-terms-next?)
+    module local?)) )
+|#
+
+(defun (named-term? BOOLEAN) ((term OBJECT) (iter ALL-PURPOSE-ITERATOR))
+  (ignore iter)
+  (typecase term
+    (NAMED-DESCRIPTION
+     (return (not (deleted? term))))
+    ((DESCRIPTION PATTERN-VARIABLE)
+     (return FALSE))
+    ((LOGIC-OBJECT THING)
+     (return (not (deleted? term))))
+    (otherwise
+     (return FALSE))))
+
+(defun (all-named-terms (ITERATOR OF OBJECT))
+    ((module MODULE) (local? BOOLEAN))
+  :documentation
+  "Iterate over all named terms visible from `module'.  A term can be an
+instance (or individual) as well as a description.  Only terms that
+haven't been deleted will be considered.  If `local?', only return 
+terms created locally in `module'."
+  :public? TRUE
+  (if local?
+    (return (new ALL-PURPOSE-ITERATOR
+                 :iterator-nested-iterator (allocate-iterator
+                                            (locally-conceived-instances module))
+                 :iterator-next-code (the-code :function filtered-nested-iterator-next?)
+                 :iterator-filter-code (the-code :function named-term?)
+                 ))
+    ;; If non-local, then create a concatenated iterator of
+    ;; of all of the supers.
+    (let ((iterator1 (all-named-terms module TRUE))
+          (iteratorList NIL))
+      (foreach super in (all-super-contexts module)
+        collect (all-named-terms super TRUE) into iteratorList)
+      (if (empty? iteratorList)
+        (return iterator1)
+        (return (new ALL-PURPOSE-ITERATOR
+                     :iterator-nested-iterator iterator1
+                     :iterator-cons-list iteratorList
+                     :iterator-next-code
+                     (the-code :function filtered-concatenated-iterator-next?)))))))
+
+(defun (all-terms (ITERATOR OF OBJECT)) ((module MODULE) (local? BOOLEAN))
+  :documentation
+  "Return a list of all terms visible from `module'.  A term can be an
+instance (or individual) as well as a description.  Only terms that
+haven't been deleted will be considered.  If `local?', only return 
+terms created locally in `module'."
+  :public? TRUE
+  (if local?
+    (progn
+      (remove-deleted-members (locally-conceived-instances module))
+      (return (allocate-iterator (locally-conceived-instances module))))
+    ;; TO DO: REWRITE THIS TO USE THE 'locally-conceived-instances' SLOT:
+    (return
+     (concatenate
+      (all-named-terms module FALSE)
+      (all-unnamed-terms module FALSE)))) )
+
+(defun (filter-instance? BOOLEAN)
+    ((self LOGIC-OBJECT) (iterator ALL-PURPOSE-ITERATOR))
+  ;; Filter for `all-instances'.
+  (ignore iterator)
+  (return (not (isa? self @DESCRIPTION))))
+
+(defun (all-named-instances (ITERATOR OF LOGIC-OBJECT))
+    ((module MODULE) (local? BOOLEAN))
+  :documentation
+  "Iterate over all named instances (or individuals) visible from `module'.
+Only instances that haven't been deleted will be considered.  If `local?',
+only return instances created locally in `module'."
+  :public? TRUE
+  (return
+    (new ALL-PURPOSE-ITERATOR
+         :iterator-nested-iterator (all-named-terms module local?)
+         :iterator-next-code
+         (the-code :function filtered-nested-iterator-next?)
+         :iterator-filter-code (the-code :function filter-instance?))))
+
+(defun (all-instances (ITERATOR OF LOGIC-OBJECT))
+       ((module MODULE) (local? BOOLEAN))
+  :documentation
+  "Iterate over all instances (or individuals) visible from `module'.
+Only instances that haven't been deleted will be considered.  If `local?',
+only return instances created locally in `module'."
+  :public? TRUE
+  (let ((iterator ITERATOR (all-terms module local?))
+        (allPurposeIterator ALL-PURPOSE-ITERATOR NULL))
+    (if local?
+      (setq allPurposeIterator
+            (new ALL-PURPOSE-ITERATOR
+                 :iterator-nested-iterator iterator
+                 :iterator-next-code
+                 (the-code :function filtered-nested-iterator-next?)))
+      (setq allPurposeIterator iterator))
+    (setf (iterator-filter-code allPurposeIterator)
+          (the-code :function filter-instance?))
+    (return allPurposeIterator) ))
+
+
+  ;;
+;;;;;; 'get' for LOGIC-OBJECTs
+  ;;
+
+;;; This code allows the 'get' function to retrieve logic objects.
+
+(defun (string-to-logic-object LOGIC-OBJECT) ((string STRING))
+  (foreach sgt in (all-surrogates NULL FALSE)
+           where (and (eql? (symbol-name sgt) string)
+                      (defined? (surrogate-value sgt))
+                      (isa? (surrogate-value sgt) @LOGIC-OBJECT))
+           do (return (surrogate-value sgt)))
+  (return NULL) )
+
+(startup-time-progn
+  (insert-at *string-to-object-functions* @LOGIC-OBJECT
+             (the-code :function string-to-logic-object)) )

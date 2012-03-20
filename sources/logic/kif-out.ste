@@ -1,0 +1,1169 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: kif-out.ste,v 1.80 2006/05/11 07:05:16 hans Exp
+
+;;; Translation of logical STELLA parse trees to a KIF output stream.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Printing logic expressions
+  ;;
+
+(defspecial *prettyPrintLogicalForms?* BOOLEAN FALSE
+  :public? TRUE
+  :documentation "Controls whether logical forms print on single lines
+(unformatted) or multi-line indented.")
+
+;; This might be obsoleted by the above:
+(defspecial *prettyPrintKif?* BOOLEAN FALSE
+  :public? TRUE
+  :documentation "Controls whether KIF expressions print on single lines
+(unformatted) or multi-line indented.")
+
+(defspecial *printLogicalFormStream* OUTPUT-STREAM NULL
+  :public? TRUE
+  :documentation "Eliminates necessity of passing stream argument
+throughout 'print-logical-form' functions.")
+
+(defspecial *downCaseOperators?* BOOLEAN FALSE
+  :public? TRUE
+  :documentation "Controls whether down-casing happens during logical
+form printing (leading to lots more string garbage).")
+
+(defglobal *logic-dialect-print-functions*
+    (KEY-VALUE-LIST OF KEYWORD FUNCTION-CODE-WRAPPER)
+    (new (KEY-VALUE-LIST OF KEYWORD FUNCTION-CODE-WRAPPER))
+  :documentation "Table to allow extension of the logical form printing code
+by associating keywords with print functions.  Should have values added only
+via the associated function REGISTER-LOGIC-DIALECT-PRINT-FUNCTION.")
+
+(defun register-logic-dialect-print-function 
+    ((dialect KEYWORD) (fn FUNCTION-CODE-WRAPPER))
+  :documentation "Register `fn' as a logic-object print function for `dialect'.
+Each function should have the signature `((self OBJECT) (stream OUTPUT-STREAM))'.
+Any return values will be ignored."
+  :public? TRUE
+  (insert-at *logic-dialect-print-functions* dialect fn))
+
+(defun (maybe-downcase STRING) ((string STRING))
+  ;; Downcase `string' if so indicated.
+  (when (not (case-sensitive? *module*))
+    (when *downCaseOperators?*
+      (return (string-downcase string)))
+    (case string
+      ("FORALL" (return "forall"))
+      ("EXISTS" (return "exists"))
+      ("THE" (return "the"))
+      ("AND" (return "and"))
+      ("OR" (return "or"))
+      ("NOT" (return "not"))
+      ("KAPPA" (return "kappa"))
+      ("SUBSET-OF" (return "subset-of"))
+      ;("SETOF" (return "setof"))
+      ;("LISTOF" (return "listof"))
+      (otherwise NULL)))
+  (return string))
+
+(defspecial *indentCounter* INTEGER 0
+  :public? TRUE
+  :documentation "The number of spaces prepended during printing a logical form.")
+
+(defglobal *indent-quantum* INTEGER 3
+  :public? TRUE
+  :documentation "The number of spaces added by a call to 'increase-indent'.")
+
+(defun increase-indent ((indent INTEGER))
+  (when (null? indent)
+    (setq indent *indent-quantum*))
+  (setq *indentCounter* (+ *indentCounter* indent)) )
+
+(defun decrease-indent ((indent INTEGER))
+  (when (null? indent)
+    (setq indent *indent-quantum*))
+  (setq *indentCounter* (- *indentCounter* indent)) )
+
+(defun print-indent ((stream OUTPUT-STREAM) (indent INTEGER))
+  (when (null? indent)
+    (setq indent *indentCounter*))
+  (foreach i in (interval 1 indent)
+      do (ignore i)
+         (print-stream stream " ")))
+
+(defun print-logical-form-in-dialect
+    ((self OBJECT) (dialect KEYWORD) (stream OUTPUT-STREAM))
+  :public? TRUE
+  :documentation "Produce a stringified version of a logical representation
+of 'self' and write it to the stream 'stream'.  Use the dialect 'dialect',
+or use the current dialect if 'dialect' is NULL."
+  (when (null? self)
+    (return))
+  (when (null? dialect)
+    (setq dialect *logic-dialect*))
+  (case dialect
+    (:KIF (print-as-kif self stream))
+    ((:STELLA :PREFIX-STELLA) "Not yet implemented" (print-as-kif self stream))
+    (:SQL "Not yet implemented")
+    (otherwise
+     (let ((fn (lookup *logic-dialect-print-functions* dialect)))
+       (if (defined? fn)
+	 (funcall fn self stream)
+	 (error "Unknown dialect for printing logic forms: " dialect))))) )
+
+;; Main generic printing entry points:
+
+(defun print-logical-form ((form OBJECT) (stream OUTPUT-STREAM))
+  :public? TRUE
+  :documentation "Print the logical form `form' to `stream' according to
+the current setting of `*logic-dialect*'.  Pretty-printing is controlled
+by the current setting of `*prettyPrintLogicalForms?*'."
+  (print-logical-form-in-dialect form *logic-dialect* stream))
+
+(defun pretty-print-logical-form ((form OBJECT) (stream OUTPUT-STREAM))
+  :public? TRUE
+  :documentation "Pretty-print the logical form `form' to `stream' according
+to the current setting of `*logic-dialect*'."
+  (special ((*prettyPrintLogicalForms?* TRUE))
+    (print-logical-form-in-dialect form *logic-dialect* stream) ))
+
+(defun print-unformatted-logical-form ((form OBJECT) (stream OUTPUT-STREAM))
+  :public? TRUE
+  :documentation "Print the logical form `form' to `stream' according to
+the current setting of `*logic-dialect*'.  Pretty-printing is explicitly
+forced to be turned off."
+  (special ((*prettyPrintLogicalForms?* FALSE))
+    (print-logical-form-in-dialect form *logic-dialect* stream) ))
+
+(defun print-formula ((formula OBJECT) (indent INTEGER))
+  (special ((*indentCounter* indent))
+    (print-unformatted-logical-form formula STANDARD-OUTPUT) ))
+
+
+  ;;
+;;;;;; "print-as-kif"
+  ;;
+
+(defun print-as-kif ((self OBJECT) (stream OUTPUT-STREAM))
+  :public? TRUE
+  (let ((currentIndentCounter *indentCounter*))
+    (special ((*indentCounter* currentIndentCounter)
+	      (*printLogicalFormStream* stream)
+	      (*prettyPrintKif?* *prettyPrintLogicalForms?*))
+      (print-as-kif-internal self) )))
+
+(defun print-as-kif-internal ((self OBJECT))
+  (let ((stream *printLogicalFormStream*))
+      (when (null? self)
+	(print-stream stream "NULL")
+	(return))
+      (when (deleted? self)
+	(print-stream stream "DeLeTeD")
+	(return))
+      (typecase self
+	(PROPOSITION (print-kif-proposition self))
+	(WRAPPER (print-kif-wrapper self))
+	(DESCRIPTION (print-kif-description self))
+	(PATTERN-VARIABLE (print-kif-variable self))
+	(SKOLEM (print-kif-skolem self FALSE))
+	(LOGIC-OBJECT (print-kif-logic-object self))
+	(SURROGATE (print-stream stream (stringified-surrogate self)))
+        (KEYWORD (print-stream stream self))
+	(COLLECTION (print-kif-stella-collection self))
+        (LOGIC-THING
+         (print-stream stream (generate-term self)))
+	;; THIS ISN'T RIGHT, BUT ITS A START: -rmm
+	;; NEED A WAY TO NAME 'THINGs':
+	(THING (print-stream stream self))
+	(otherwise
+	 (print-stream stream "|Illegal Logical Form|: " self) )) ))
+
+(defun (visible-argument? BOOLEAN) ((self OBJECT))
+  ;; If 'self' is an ISA proposition marked with 'variable-type?' = TRUE, it
+  ;;     may not get printed.
+  (when (null? self)                    ; allow printing during debugging
+    (return TRUE))
+  (typecase self
+    (PROPOSITION
+     (when (and (eql? (kind self) :ISA)
+                (variable-type? self))
+       (when (printing-justification?)
+         (return TRUE))
+       (case *printMode*
+         ((:REALISTIC :ORIGINAL)
+          (return FALSE))
+         (otherwise NULL))))
+    (otherwise NULL))
+  (return TRUE) )
+
+(defun (visible-arguments-count INTEGER) ((arguments ARGUMENTS-VECTOR))
+  ;; Return the number of visible arguments in `arguments'.
+  (let ((count 0))
+    (foreach arg in arguments
+        where (visible-argument? arg)
+        do (++ count))
+    (return count)))
+
+(defun print-kif-arguments ((arguments ARGUMENTS-VECTOR)
+                            (separateLines? BOOLEAN)
+                            (omitLastArgument? BOOLEAN))
+  ;; Print a list of visible arguments in KIF format to 'stream'.
+  ;; If all arguments are invisible, print them all visibly to
+  ;;    ensure that we have at least some arguments (unless there
+  ;;    aren't any at all).
+  (when (null? arguments)
+    (return))
+  (let ((stream *printLogicalFormStream*)
+        (argumentsIterator
+         (choose omitLastArgument?
+                 (but-last arguments)
+                 (allocate-iterator arguments)))
+        (visibleArgCount (visible-arguments-count arguments))
+        (argIndex 0))
+    (when (and omitLastArgument?
+               (visible-argument? (last arguments)))
+      (-- visibleArgCount))
+    (foreach arg in argumentsIterator
+        where (or (visible-argument? arg)
+                  (= visibleArgCount 0))
+        do (++ argIndex)
+           (when (> argIndex 1)
+             (cond ((and separateLines?
+                         *prettyPrintKif?*)
+                    (print-stream stream EOL)
+                    (print-indent stream NULL))
+                   (otherwise
+                    (print-stream stream " "))))
+           (print-as-kif-internal arg))))
+
+(defun print-kif-operator-with-arguments
+    ((operator STRING) (arguments ARGUMENTS-VECTOR)
+     (separateLines? BOOLEAN) (omitLastArgument? BOOLEAN))
+  ;; Print a KIF `operator' with its `arguments'.
+  ;; If `separateLines?' is TRUE, put individual arguments onto
+  ;;    separate lines.
+  ;; If `omitLastArgument?' is TRUE, don't print the last argument.
+  (let ((stream *printLogicalFormStream*))
+    (print-stream stream "(" operator (choose (> (length arguments) 0) " " ""))
+    (increase-indent (+ (length operator) 2))
+    (print-kif-arguments arguments separateLines? omitLastArgument?)
+    (decrease-indent (+ (length operator) 2))
+    (print-stream stream ")")))
+
+;;; These "print-as-kif" methods print KIF representations of propositions:
+
+(defun (stringified-surrogate STRING) ((operator SURROGATE))
+  ;; Return a string representing the KIF representation of 'operator',
+  ;;    a surrogate representing a proposition operator.
+  (let ((description (get-description operator))
+        (string STRING NULL)
+        (visible? (visible-surrogate? operator)))
+    (if (defined? description)
+      (setq string (symbol-name
+                    (internal-stella-operator-to-kif
+                     (surrogate-to-symbol operator))))
+      (setq string (symbol-name operator)))
+    (when (and (or *printReadably?*
+                   (not visible?))
+               ;; try to intuit a relation term surrogate (e.g., from an
+               ;;    assertion such as `((f a) b)' and don't escape that:
+               (or (null? description)
+                   (not (eql? (first string) #\())))
+      (case (compute-symbol-escape-code string (case-sensitive? *module*))
+        (:UNESCAPED
+         ;; only `maybe-downcase' simple names:
+         (setq string (maybe-downcase string)))
+        (:ESCAPED
+         (setq string (concatenate "|" string "|")))
+        (:COMPLEX-ESCAPED
+         (setq string (replace-substrings string "\\\\" "\\"))
+         (setq string (replace-substrings string "\\|" "|"))
+         (setq string (concatenate "|" string "|")))))
+    (if (visible-surrogate? operator)
+        (return string)
+      (return (compute-full-name string (home-context operator))))))
+
+(defun (stringified-kif-operator STRING) ((self PROPOSITION))
+  ;; Return a string representing the KIF representation of the
+  ;;    operator of 'self'.
+  (let ((operator (operator self)))
+    (when (null? operator)
+      (return "NULL"))
+    (typecase operator
+      (SURROGATE
+       (return (stringified-surrogate operator)))
+      (SYMBOL
+       (return (maybe-downcase (symbol-name operator))))) ))
+
+;; Kludge, to support special semantics in top-level calls to
+;;    `print-kif-proposition':
+(defspecial *topLevelPrintKifProposition?* BOOLEAN TRUE)
+
+(defun print-kif-proposition ((self PROPOSITION))
+  (when (eql? self NULL)                ; avoid breaking while tracing
+    (return))
+  (let ((topLevel? *topLevelPrintKifProposition?*)
+        (stream *printLogicalFormStream*)
+        (printExplicitNegation?
+         (and topLevel?
+              (or (false? self)
+                  (default-false? self))
+              ;; special-case printing of FALSE-PROPOSITION's:
+              (not (eql? (operator self) PL-KERNEL-KB/@FALSE)))))
+    (special ((*topLevelPrintKifProposition?* FALSE))
+      (when printExplicitNegation?
+        (print-stream stream "(" (stringified-surrogate PL-KERNEL-KB/@NOT) " ")
+        (increase-indent 5))
+      (if (and (or (eql? *printMode* :REALISTIC)
+                   (eql? *printMode* :ORIGINAL))
+               topLevel?
+               (top-level-exists-proposition? self))
+          (print-kif-top-level-exists-proposition self)
+        (help-print-kif-proposition self))
+      (when printExplicitNegation?
+        (print-stream stream ")")
+        (decrease-indent 5)))))
+
+(defun help-print-kif-proposition ((self PROPOSITION))
+  (let ((stream *printLogicalFormStream*)
+        (operator STRING NULL)
+        (separateLines? FALSE))
+    (case (kind self)
+      ((:AND :OR)
+       (if (eql? (kind self) :AND)
+           (setq operator (stringified-surrogate PL-KERNEL-KB/@AND))
+         (setq operator (stringified-surrogate PL-KERNEL-KB/@OR)))
+       (setq separateLines? TRUE)
+       (when (= (visible-arguments-count (arguments self)) 1)
+         (case *printMode*
+           ((:REALISTIC :ORIGINAL)
+            ;; Eliminate single-argument `and/or':
+            (print-kif-arguments (arguments self) FALSE FALSE)
+            (return))
+           (otherwise NULL))))
+      (:NOT (setq operator (stringified-surrogate PL-KERNEL-KB/@NOT)))
+      (:EQUIVALENT
+       (setq operator "="))
+      ((:ISA :PREDICATE) (setq operator (stringified-kif-operator self)))
+      (:FUNCTION 
+       (if *printFunctionsAsRelations?*
+	   ;; Print as a proposition
+	   (setq operator (stringified-kif-operator self))
+	 (progn 
+	   (print-kif-function-proposition self)
+	   (return))))
+      (:IMPLIES
+       (print-kif-IMPLIES-proposition self)
+       (return))
+      ((:FORALL :EXISTS)
+       (print-kif-quantification self)
+       (return))
+      (:CONSTANT
+       (print-stream stream (symbol-name (relationRef self)))
+       (return))
+      (:CONTAINED-BY ;; this is here to avoid breaking during goal tracing
+       (setq operator ":CONTAINED-BY"))
+      (:DELETED
+       (setq operator ":DELETED"))
+      (otherwise  ;; don't break on oddball propositions:
+       (setq operator (symbol-name (kind self)))))
+    (print-kif-operator-with-arguments
+     operator (arguments self) separateLines? FALSE)))
+
+(defun print-kif-FUNCTION-proposition ((self PROPOSITION))
+  ;; Print 'self' as an equality between the function expression and '??'.
+  (let ((stream *printLogicalFormStream*)
+        (downCasedName (stringified-kif-operator self))
+        (lastArgument OBJECT (last-argument self)))
+    (print-stream stream "(= ")
+    (print-kif-operator-with-arguments
+     downCasedName (arguments self) FALSE TRUE)
+    (print-stream stream " ")
+    (when (defined? lastArgument)
+      (typecase lastArgument
+        (PATTERN-VARIABLE (print-kif-variable lastArgument))
+        (SKOLEM (print-kif-skolem lastArgument TRUE))
+        (otherwise (print-as-kif-internal lastArgument))))
+    (print-stream stream ")") ))
+
+(defun print-kif-FUNCTION-expression ((self PROPOSITION))
+  ;; Print 'self' as an operator applied to its input arguments.
+  (let ((downCasedName (stringified-kif-operator self)))
+    (print-kif-operator-with-arguments
+     downCasedName (arguments self) FALSE TRUE)))
+
+(defun print-kif-IMPLIES-proposition ((self PROPOSITION))
+  (let ((tailArg (nth (arguments self) 0))
+        (headArg (nth (arguments self) 1)))
+    (if (and (isa? headArg @DESCRIPTION)
+             (isa? tailArg @DESCRIPTION))
+      (print-descriptions-as-kif-rule headArg tailArg self FALSE)
+      (print-kif-operator-with-arguments
+       "subset-of" (arguments self) TRUE FALSE))))
+
+(defun print-kif-quantified-variables 
+       ((variables (VECTOR OF SKOLEM)) (includeTypes? BOOLEAN))
+  ;; Print list of typed KIF variables for use in FORALL or EXISTS or KAPPA.
+  ;; Allow skolems as variables to handle printing of top-level `exists'
+  ;;    propositions.
+  (when (null? variables)               ; allow printing in debug mode
+    (return))                           ;    before proposition is ready
+  (let ((stream *printLogicalFormStream*))
+    (print-stream stream "(")
+    (foreach vbl in variables
+             as i in (interval 1 NULL)
+             do
+             (let ((printType? (and includeTypes?
+                                    (not (eql? (logical-type vbl) @THING)))))
+               (when printType?
+                 (print-stream stream "("))
+             (typecase vbl
+               (PATTERN-VARIABLE
+                (print-quantified-variable vbl stream))
+               (SKOLEM
+                (print-value-of-chain vbl stream vbl)))
+             (when printType?
+               (print-stream stream " " (symbol-name (logical-type vbl)) ")"))
+             (when (< i (length variables))
+               (print-stream stream " "))))
+    (print-stream stream ")") ))
+
+(defun print-kif-quantification ((self PROPOSITION))
+  ;; Print :FORALL or :EXISTS proposition.
+  (let ((stream *printLogicalFormStream*)
+        (tail PROPOSITION (nth (arguments self) 0))
+        (head PROPOSITION
+              (only-if (eql? (length (arguments self)) 2)
+                       (nth (arguments self) 1)))
+        (implication? (defined? head))
+        (implicationOperator
+         (only-if implication?
+                  (choose-implication-operator self (forward-only? self)))))
+    (when (and (defined? implicationOperator)
+               (forward-only? self)
+               (not (eql? implicationOperator PL-KERNEL-KB/@<=)))
+      (let ((temp tail))
+        (setq tail head)
+        (setq head temp)))
+    (case (kind self)
+      (:FORALL
+       (print-stream stream
+                     "(" (stringified-surrogate PL-KERNEL-KB/@FORALL) " "))
+      (:EXISTS
+       (print-stream stream
+                     "(" (stringified-surrogate PL-KERNEL-KB/@EXISTS) " ")))
+    (print-kif-quantified-variables (io-variables self) FALSE)
+    (print-stream stream EOL)
+    (increase-indent NULL)
+    (print-indent stream NULL)
+    ;; TO DO: UPGRADE TO PRINT FORWARD-ONLY RULE USING "=>>":
+    (when implication?
+      (print-stream stream "(" (stringified-surrogate implicationOperator) " ")
+      (increase-indent (+ (length (symbol-name implicationOperator)) 2))
+      (print-kif-proposition head)
+      (print-stream stream EOL)
+      (print-indent stream NULL))
+    (print-kif-proposition tail)
+    (when implication?
+      (print-stream stream ")")
+      (decrease-indent (+ (length (symbol-name implicationOperator)) 2)))
+    (decrease-indent NULL)
+    (print-stream stream ")") ))
+
+(defun print-kif-top-level-exists-proposition ((self PROPOSITION))
+  ;; Print a top-level exists proposition whose variables got skolemized.
+  (let ((stream *printLogicalFormStream*))
+    (print-stream stream "(" (stringified-surrogate PL-KERNEL-KB/@EXISTS) " ")
+    (print-kif-quantified-variables
+     (collect-skolemized-exists-variables self) FALSE)
+    (print-stream stream EOL)
+    (increase-indent NULL)
+    (print-indent stream NULL)
+    (print-kif-proposition self)
+    (decrease-indent NULL)
+    (print-stream stream ")") ))
+
+
+;;; Printing KIF terms:
+
+(defun print-kif-wrapper ((self LITERAL-WRAPPER))
+  (let ((stream *printLogicalFormStream*))
+    (typecase self
+      (INTEGER-WRAPPER (print-stream stream (wrapper-value self)))
+      (FLOAT-WRAPPER (print-stream stream (wrapper-value self)))
+      (BOOLEAN-WRAPPER (print-stream stream (wrapper-value self)))
+      (STRING-WRAPPER
+       (special ((*printReadably?* TRUE))
+         (print-stream stream self)))
+      (CHARACTER-WRAPPER
+       (special ((*printReadably?* TRUE))
+         (print-stream stream self))))))
+
+(defun print-kif-logic-object ((self LOGIC-OBJECT))
+  (let ((stream *printLogicalFormStream*))
+    (if (defined? (surrogate-value-inverse self))
+      (print-stream stream (stringified-surrogate (surrogate-value-inverse self)))
+      (print-stream stream "Unnamed_Object")) ))
+
+
+(defun print-kif-skolem ((self SKOLEM) (suppressDefiningProposition? BOOLEAN))
+  ;; Print unbound skolem 'self' as a question  variable;
+  ;; Otherwise, print the skolem value.
+  (let ((stream *printLogicalFormStream*))
+    (cond (suppressDefiningProposition?
+	   (print-skolem self stream FALSE))
+	  ((defined? (defining-proposition self))
+	   (print-kif-FUNCTION-expression (defining-proposition self)))
+	  (otherwise
+	   (print-skolem self stream FALSE))) ))
+
+(defun print-kif-variable ((self PATTERN-VARIABLE))
+  ;; Print the name of the variable 'self', or its value.
+  (let ((stream *printLogicalFormStream*))
+    (print-variable self stream) ))
+
+;; NOT CLEAR THAT THIS IS HOW WE WANT TO PRINT NATIVE COLLECTIONS:
+(defun print-kif-stella-collection ((self COLLECTION))
+  (let ((stream *printLogicalFormStream*))                              
+    (print-stream stream "("
+                  (choose (no-duplicates? self)
+                          (stringified-surrogate PL-KERNEL-KB/@SETOF)
+                          (stringified-surrogate PL-KERNEL-KB/@LISTOF)))
+    (foreach m in self
+        do (print-stream stream " ")
+           (print-as-kif-internal m))
+    (print-stream stream ")") ))
+
+(defun print-kif-description ((self DESCRIPTION))
+  ;; Print a kappa expression for the description 'self'.
+  ;; Tricky: Temporarily bind '*queryIterator*' to insure that local variables
+  ;;    aren't interpreted as variables bound on a query goal stack.
+  (special ((*queryIterator* NULL))
+   (let ((stream *printLogicalFormStream*)
+         (complement (relative-complement self)))
+     (cond
+      ((defined? (surrogate-value-inverse self))
+       (print-stream
+        stream (stringified-surrogate (surrogate-value-inverse self))))
+      ((and (defined? complement)
+            (defined? (surrogate-value-inverse complement))
+            (not (or (eql? *printMode* :REALISTIC)
+                     (eql? *printMode* :ORIGINAL))))
+       (print-stream stream "not-"
+                     (stringified-surrogate
+                      (surrogate-value-inverse complement))))
+      ;; NOTHING CALLS THIS, BUT SOMETHING HAS TO PRINT OUT SETS CORRECTLY:
+#|
+      ((xnumeration? self)
+       (cond
+        ((test-property? self PL-KERNEL/@ORDERED)
+         (print-stream stream
+                       "(" (stringified-surrogate PL-KERNEL-KB/@LISTOF) ""))
+        ((test-property? self PL-KERNEL/@DUPLICATE-FREE)
+         (print-stream stream
+                       "(" (stringified-surrogate PL-KERNEL-KB/@SETOF) ""))
+        (otherwise
+         (print-stream stream
+                       "(" (stringified-surrogate PL-KERNEL-KB/@BAGOF) "")))
+       (foreach m in (description-extension self)
+                    do
+                    (print " ")
+                    (print-as-kif-internal m))
+       (print-stream stream ")"))
+|#
+      (otherwise
+       (print-stream stream "(" (stringified-surrogate PL-KERNEL-KB/@KAPPA) " ")
+       (print-kif-quantified-variables (io-variables self) TRUE)
+       (print-stream stream " ")
+       (print-kif-description-proposition self FALSE)
+       (print-stream stream ")") )) )))
+
+  ;;
+;;;;;; Goal tracing utilities
+  ;;
+
+(defun print-kif-description-proposition ((self DESCRIPTION)
+                                          (invert? BOOLEAN))
+  ;; Print the proposition of `self' and properly handle implicit existentials.
+  ;; If `invert?' print the negated body proposition.
+  (let ((stream *printLogicalFormStream*)
+        (existentials
+         (choose (non-empty? (internal-variables self))
+                 (copy-cons-list-to-variables-vector
+                  (top-level-existential-variables self))
+                 ZERO-VARIABLES-VECTOR)))
+    (when invert?
+      ;; we are applying a rule via Modus Tollens:
+      (print-stream stream
+                    "(" (stringified-surrogate PL-KERNEL-KB/@NOT) " ")
+      (increase-indent 4))
+    (when (non-empty? existentials)
+      (print-stream stream
+                    "(" (stringified-surrogate PL-KERNEL-KB/@EXISTS) " ")
+      (print-kif-quantified-variables existentials FALSE)
+      (print-stream stream EOL)
+      (increase-indent NULL)
+      (print-indent stream NULL))
+    (print-as-kif-internal (proposition self))
+    (when (non-empty? existentials)
+      (print-stream stream ")")
+      (decrease-indent NULL))
+    (when invert?
+      (print-stream stream ")")
+      (decrease-indent 4))))
+
+(defun (choose-implication-operator SURROGATE) ((rule PROPOSITION)
+                                                (forward? BOOLEAN))
+  ;; Choose a sugar-coated version of an implies operator.
+  ;; Pick a forward arrow if `forward?' is true, pick a backward
+  ;;    arrow otherwise.
+  (let ((operatorPrefix (choose forward? PL-KERNEL-KB/@=> PL-KERNEL-KB/@<=)))
+    (cond
+     ((eql? *printMode* :REALISTIC) NULL)
+     ((and forward?
+           (forward-only? rule))
+      (setq operatorPrefix PL-KERNEL-KB/@=>>))
+     ((and (backward-only? rule)
+           (not forward?))
+      (setq operatorPrefix PL-KERNEL-KB/@<<=)))
+    (when (and (default-true? rule)
+               (not (eql? *printMode* :REALISTIC)))
+      (case operatorPrefix
+        (PL-KERNEL-KB/@<= (setq operatorPrefix PL-KERNEL-KB/@<~))
+        (PL-KERNEL-KB/@=> (setq operatorPrefix PL-KERNEL-KB/@~>))
+        (PL-KERNEL-KB/@<<= (setq operatorPrefix PL-KERNEL-KB/@<<~))
+        (PL-KERNEL-KB/@=>> (setq operatorPrefix PL-KERNEL-KB/@~>>))))
+    (return operatorPrefix) ))
+
+(defun (create-skolem-mapping-table ENTITY-MAPPING)
+    ((oldVars VARIABLES-VECTOR) (newVars VARIABLES-VECTOR))
+  ;; Create a mapping table that maps each skolem/variable in `oldVars'
+  ;;    onto the corresponding skolem/variable in `newVars' and return
+  ;;    the result.  Return NULL if no mapping is necessary.
+  (let ((mapping ENTITY-MAPPING NULL))
+    ;; build a mapping table but only if we need to:
+    (foreach oldVar in oldVars
+        as newVar in newVars
+        where (not (eql? (variable-name oldVar) (variable-name newVar)))
+        do (when (null? mapping)
+             (setq mapping (new ENTITY-MAPPING)))
+           (insert-at mapping oldVar newVar))
+    (return mapping)))
+
+(defun print-descriptions-as-kif-rule ((head DESCRIPTION)
+                                       (tail DESCRIPTION)
+                                       (rule PROPOSITION)
+                                       (reversePolarity? BOOLEAN))
+  ;; Called by 'print-kif-implies-proposition' and 'trace-goal-tree'.
+  ;; `head' and `tail' are expected to correspond to head and tail of `rule'.
+  ;; The only reason they are supplied is that they might be optimized
+  ;;    versions generated by the query optimizer during a query.
+  ;; If `reversePolarity?' is true print a Modus Tollens version of `rule'.
+  ;; BUG: only works for IMPLIES rules, since it assumes that the io-variables
+  ;;    of `head' and `tail' correspond to each other by position.
+  (let ((stream *printLogicalFormStream*)
+        (forwardArrow?
+         (and (forward-only? rule)
+              (not reversePolarity?)))
+        (reverseArguments?
+         (or forwardArrow? reversePolarity?))
+        (mapHeadVariables? (named-description? head))
+        (currentIndentCounter *indentCounter*)
+        (operatorPrefix (choose-implication-operator rule forwardArrow?))
+	(operatorPrefixIndent (+ 2 (length (symbol-name operatorPrefix)))))
+    (when (or (deleted? head) (deleted? tail))
+      (print-stream stream "(=> <DeLeTeD ArGuMeNt(S)>)")
+      (return))
+    (when reverseArguments?
+      (let ((temp head))
+        (setq head tail)
+        (setq tail temp))
+      (setq mapHeadVariables? (not mapHeadVariables?)))
+    (special ((*indentCounter* currentIndentCounter))
+      (print-stream stream "(" (stringified-surrogate PL-KERNEL-KB/@FORALL) " ")
+      (print-kif-quantified-variables
+       (choose mapHeadVariables? (io-variables tail) (io-variables head))
+       FALSE)
+      (print-stream stream EOL)
+      (increase-indent NULL)
+      (print-indent stream NULL)
+      (print-stream stream "(" (stringified-surrogate operatorPrefix) " ")
+      (increase-indent operatorPrefixIndent)
+      ;; Print the head:
+      (special ((*skolemNameMappingTable*
+                 (choose mapHeadVariables?
+                         (create-skolem-mapping-table
+                          (io-variables head)
+                          (io-variables tail))
+                         NULL)))
+        (print-kif-description-proposition head reversePolarity?))
+      (print-stream stream EOL)
+      ;; Print the tail:
+      (print-indent stream NULL)
+      (special ((*skolemNameMappingTable*
+                 (choose (not mapHeadVariables?)
+                         (create-skolem-mapping-table
+                          (io-variables tail)
+                          (io-variables head))
+                         NULL)))
+        (print-kif-description-proposition tail reversePolarity?))
+      (print-stream stream "))")
+      (decrease-indent operatorPrefixIndent)
+      (decrease-indent NULL) )))
+
+
+  ;;
+;;;;;; KB Saving
+  ;;
+
+;;; TO DO: 
+;;; - Eventually handle the generation of class and relation
+;;;   definitions via `pretty-print-object' which generates a
+;;;   pretty-printed object definition directly from the object data
+;;;   structure.  However, until `pretty-print-object' does the right
+;;;   thing for classes and relations, we simply pretty-print the
+;;;   stringified source.
+
+;;; Filtering propositions that shouldn't be saved:
+
+(defspecial *excludedPropositions*
+    (HASH-TABLE OF PROPOSITION BOOLEAN-WRAPPER) NULL
+  :public? TRUE
+  :documentation
+  "List of propositions that shouldn't be saved by `save-module'.")
+
+(defun exclude-originated-propositions ()
+  ;; Collect all relation-originated propositions and mark them as
+  ;;    excluded, since they shouldn't be saved by `save-module'.
+  (foreach d in (all-named-descriptions NULL FALSE)
+      do (foreach prop in (originated-propositions d)
+	     do (insert-at *excludedPropositions* prop TRUE)))
+  ;; exclude additional propositions generated by `DEFRULE':
+  (foreach p in (locally-conceived-propositions *module*)
+      where (defined? (object-surrogate p))
+      do (foreach prop in (originated-propositions p)
+             do (insert-at *excludedPropositions* prop TRUE))))
+
+(defun (function-output-skolem? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' is a SKOLEM representing the
+  ;;    output of a function.
+  (typecase self
+    (SKOLEM
+     (return (choose (defined? (defining-proposition self)) TRUE FALSE)))
+    (otherwise (return FALSE))) )
+
+(defun (hidden-relation? BOOLEAN) ((relation-ref SURROGATE))
+  ;; Return `true' if `relation-ref' names a HIDDEN-RELATION.
+  ;; Alternate: 
+  ;; (return (test-property? (surrogate-value relation-ref) PL-KERNEL-KB/@HIDDEN-RELATION))
+  (return (next? (all-true-dependent-propositions (surrogate-value relation-ref)
+						  PL-KERNEL-KB/@HIDDEN-RELATION
+						  FALSE))))
+
+(defun (excluded-proposition? BOOLEAN) ((proposition PROPOSITION))
+  ;; Return TRUE if `proposition' shouldn't be saved.
+  (when (or (unknown? proposition)
+            (defined? (lookup *excludedPropositions* proposition))
+            ;; exclude results of rule inversion:
+            (defined? (master-proposition proposition)))
+    (return TRUE))
+  (case (kind proposition)
+    (:ISA
+     ;; Don't print type proposition on literals, skolems, or
+     ;;    instances of an enumerated class:
+     (when (or (isa? (nth (arguments proposition) 0) @LITERAL-WRAPPER)
+               ;;(isa? (nth (arguments proposition) 0) @SKOLEM)
+               (function-output-skolem? (nth (arguments proposition) 0))
+	       (hidden-relation? (relationRef proposition)))
+       (return TRUE)))
+    (:FUNCTION
+     ;; Don't print function propositions which just represent unbound
+     ;;    intensional individuals:
+     (let ((lastArg (last (arguments proposition))))
+       (when (or (and (skolem? lastArg)
+		      (eql? (value-of lastArg) lastArg)
+		      (not (top-level-exists-proposition? proposition)))
+		 (hidden-relation? (relationRef proposition)))
+         (return TRUE))))
+    (:PREDICATE
+     ;; NOW THAT ENUMERATED CLASSES ARE GONE, WHAT HAPPENS HERE?:
+     ;; Don't print redundant `(closed C)' propositions on enumerated
+     ;;    classes.  Pity we can't do the same for `(duplicate-free C)'
+     ;;    propositions without actually looking at the definition:
+     ;(when (and (eql? (operator proposition) PL-KERNEL/@CLOSED)
+     ;		FALSE)
+     ;  (return TRUE))
+     ;; Exclude propositions headed by hidden relations.
+     (when (hidden-relation?  (relationRef proposition))
+       (return TRUE)))
+    (otherwise NULL))
+  (return FALSE))
+
+
+;;; Pretty-printing of classes and relations
+
+(defun pretty-print-named-description 
+       ((self NAMED-DESCRIPTION) (stream OUTPUT-STREAM))
+  ;; Pretty-print the stringified source for 'self'.
+  (pretty-print-relation-definition-tree
+   (unstringify (stringified-source self))
+   stream) )
+
+;;; TO DO: ANNOTATE THE TYPE AND HOME CONTEXT OF THE DESCRIBED OBJECT -
+;;;    POSSIBLY HAVE A UTILITY FUNCITON IN `DESCRIBE.STE' THAT DOES THIS:
+
+(defmethod describe-object
+    ((self NAMED-DESCRIPTION) (stream OUTPUT-STREAM) (mode KEYWORD))
+  :documentation "Prints a description of 'self' to stream 'stream'.  'mode'
+can be :terse, :verbose, or :source.  Used by `describe'."
+  :public? TRUE
+  (case mode
+    (:terse
+     (describe-tersely self stream))
+    ((:verbose :source)
+     (pretty-print-named-description self stream))))
+
+;; THIS IS A KLUDGE THAT MAY BE OBSOLETE NOW THAT NAMED-DESCRIPTIONS
+;;    HAVE SUPPLANTED CLASSES FOR THE MOST PART:  -rmm   
+(defun (stella-relation-stringified-source STRING) ((self RELATION))
+  ;; Return source definition for 'self' if it exists.
+  (typecase self
+    (CLASS
+     (return (class-stringified-source self)))
+    (METHOD-SLOT
+     (return (method-stringified-source self)))
+    (otherwise (return NULL))) )
+
+(defun pretty-print-relation-definition
+    ((self RELATION) (stream OUTPUT-STREAM))
+  ;; KLUDGE: Print the definition of `self' by pretty-printing the
+  ;;    stringified source, since the `pretty-print-object' code for
+  ;;    classes and slots would need quite a bit more work to make
+  ;;    it do the right thing.  Until we support direct modification
+  ;;    of classes, etc., without using a parse tree representation
+  ;;    this isn't really a problem.
+  (let ((definitionString (stella-relation-stringified-source self)))
+    (when (defined? definitionString)
+      (pretty-print-relation-definition-tree
+       (unstringify definitionString)
+       stream))))
+
+(defun pretty-print-relation-definition-tree
+    ((tree CONS) (stream OUTPUT-STREAM))
+  (help-pretty-print-relation-definition-tree tree stream 0 2 TRUE)
+  (print-stream stream EOL))
+
+(defun help-pretty-print-relation-definition-tree
+    ((tree CONS) (stream OUTPUT-STREAM)
+     (startIndent INTEGER) (keyIndent INTEGER)
+     (forceFirstKeyOnSeparateLine? BOOLEAN))
+  ;; Pretty-print a relation definition `tree' onto `stream'.
+  ;; Assume that tree is a definition tree that starts with 0 or more
+  ;;    header elements, followed by 0 or more keyword-option/value pairs,
+  ;;    followed by 0 or more other elements.
+  ;; `startIndent' is the indentation at which printing of `tree' started.
+  ;; `keyIndent' is the extra indentation to be used for keys printed on
+  ;;    separate lines.
+  ;; If `forceFirstKeyOnSeparateLine?' is TRUE, the first option key will be
+  ;;    printed on a separate line even if there is only one option key
+  ;;    specified in `tree'.
+  ;; Special printing of nested :slots options is hardwired in.
+  (special ((*printReadably?* TRUE)
+            (*printPretty?* TRUE))
+    (let ((nofHeaderElements
+           (position tree (some element in tree where (keyword? element)) 0))
+          (options (new PROPERTY-LIST :the-plist (extract-options tree NULL)))
+          (keyLength INTEGER NULL))
+      (when (null? nofHeaderElements)
+        (setq nofHeaderElements (length tree)))
+      (setq forceFirstKeyOnSeparateLine?
+        (or forceFirstKeyOnSeparateLine?
+            (> (length options) 1)))
+      (print-stream stream "(")
+      (foreach element in tree
+          as i in (interval 1 nofHeaderElements)
+          do (when (> i 1)
+               (print-stream stream " "))
+             (print-stream stream element))
+      (foreach (key value) in options
+          as i in (interval 1 NULL)
+          do (cond ((and (= i 1)
+                         (not forceFirstKeyOnSeparateLine?))
+                    (when (> nofHeaderElements 0)
+                      (print-stream stream " ")))
+                   (otherwise
+                    (print-stream stream EOL)
+                    (print-indent stream (+ startIndent keyIndent))))
+             ;; In case of a syntactically incorrect definition, we might
+             ;;    have a non-keyword at the position of a key:
+             (typecase key
+               (KEYWORD
+                (setq keyLength (1+ (length (symbol-name key))))
+                (print-stream stream ":" (symbol-name key)))
+               (otherwise
+                (setq keyLength 4)
+                (print-stream stream key)))
+             (print-stream stream " ")
+             (cond ((and (or (eql? key :SLOTS)
+                             (eql? key :PUBLIC-SLOTS)
+                             (eql? key :METHODS)
+                             (eql? key :PUBLIC-METHODS))
+                         (cons? value))
+                    (print-stream stream "(")
+                    (foreach element in (cast value CONS)
+                        as i in (interval 1 NULL)
+                        do (when (> i 1)
+                             (print-stream stream EOL)
+                             (print-indent
+                              stream (+ keyIndent (+ keyLength 2))))
+                           (if (cons? element)
+                               (help-pretty-print-relation-definition-tree
+                                element stream
+                                (+ startIndent (+ keyIndent (+ keyLength 2)))
+                                keyIndent FALSE)
+                             (print-stream stream value)))
+                    (print-stream stream ")"))
+                   (otherwise
+                    (print-stream stream value))))
+      ;; There shouldn't really be anything following the options,
+      ;;    but just in case there is:
+      (foreach element in (nth-rest tree nofHeaderElements)
+          do (print-stream stream EOL)
+             (print-indent stream keyIndent)
+             (print-stream stream element))
+      (print-stream stream ")")
+      (free options))))
+
+;;; Pretty-printing assertions:
+
+(defun pretty-print-assertion
+    ((proposition PROPOSITION) (stream OUTPUT-STREAM))
+  ;; Print an assertion operation for `proposition' onto `stream'.
+  (let ((operator (choose (default-truth-value? (truth-value proposition))
+                          (quote PRESUME)
+                          (quote ASSERT)))
+        (name (surrogate-value-inverse proposition)))
+    (when (defined? name)
+      (pretty-print-named-rule name stream)
+      (return))
+    (special ((*printMode* :ORIGINAL)
+              (*printLogicalFormStream* stream)
+              (*indentCounter* 8))
+      (print-stream stream "(" operator " ")
+      (pretty-print-logical-form proposition stream)
+      (print-stream stream ")" EOL))))
+
+(defun pretty-print-named-rule ((ruleName SURROGATE) (stream OUTPUT-STREAM))
+  ;; Print a `defrule' definition for the rule named `ruleName' onto `stream'.
+  (let ((operator (quote DEFRULE))
+        (proposition PROPOSITION (surrogate-value ruleName)))
+    (special ((*printMode* :ORIGINAL)
+              (*printLogicalFormStream* stream)
+              (*indentCounter* 2))
+      (print-stream stream "(" operator " " (type-to-symbol  ruleName) EOL)
+      (print-indent stream NULL)
+      (pretty-print-logical-form proposition stream)
+      (foreach prop in (originated-propositions proposition)
+          do (case (kind prop)
+               ((:PREDICATE :FUNCTION)
+                (when (and (= (length (arguments prop)) 2)
+                           (eql? (first (arguments prop)) proposition))
+                  ;; special-case things printable as a keyword axiom:
+                  (print-stream stream EOL "  " (keywordify (operator prop)) " ")
+                  (pretty-print-logical-form (second (arguments prop)) stream)
+                  (continue)))
+               (otherwise NULL))
+             ;; print any other axioms here; ugly, if they do reference `proposition'
+             ;; they print with the full tree instead of just using the name:
+            (print-stream stream EOL "  :AXIOMS ")
+             (pretty-print-logical-form prop stream))
+      (print-stream stream ")" EOL))))
+
+
+(defglobal *built-in-module-names* (CONS OF STRING-WRAPPER)
+    (quote ("PL-USER" "PL-KERNEL-KB" "PLI" "LOOM-API"
+		      "CYC-FRAME-ONTOLOGY" "KIF-FRAME-ONTOLOGY"
+		      "IDL-THEORY" "IDL-USER-THEORY"
+		      "LOGIC" "STELLA" "COMMON-LISP")))
+
+(defun print-module-file-header ((module MODULE) (stream OUTPUT-STREAM))
+  ;; NOTE: Don't use the native package of the module, since the
+  ;;    commands we are generating are really all in STELLA:
+  (cl-output-file-header stream NULL FALSE)
+  (unless (member? *built-in-module-names* (name module))
+    (print-definition module stream))
+  (print-stream stream EOL)
+  (print-stream stream
+                "(IN-MODULE \"" (module-full-name module) "\")" EOL EOL
+                "(" (quote IN-DIALECT) " " *logic-dialect* ")" EOL EOL))
+
+(defun print-module-file-trailer ((module MODULE) (stream OUTPUT-STREAM))
+  ;; Does nothing.
+  ;;    commands we are generating are really all in STELLA:
+  (ignore module stream)
+  )
+
+;;; Top-level save methods:
+
+(defmethod store-native-relation ((store OBJECT-STORE) (relation RELATION))
+  ;; Store an appropriate definition of `relation' on `store'.
+  ;; This is the top-level method that needs to be appropriately specialized
+  ;;    on subclasses of OBJECT-STORE.
+  (ignore relation)
+  (error "store-native-relation: not implemented on " store))
+
+(defmethod store-relation ((store OBJECT-STORE) (relation NAMED-DESCRIPTION))
+  ;; Store an appropriate definition of `relation' on `store'.
+  ;; This is the top-level method that needs to be appropriately specialized
+  ;;    on subclasses of OBJECT-STORE.
+  (ignore relation)
+  (error "store-relation: not implemented on " store))
+
+(defmethod store-assertion ((store OBJECT-STORE) (proposition PROPOSITION))
+  ;; Store the assertion of `proposition' on `store'.
+  ;; This is the top-level method that needs to be appropriately specialized
+  ;;    on subclasses of OBJECT-STORE.
+  (ignore proposition)
+  (error "store-proposition: not implemented on " store))
+
+(defmethod store-module-header ((store OBJECT-STORE) (module MODULE))
+  ;; Store header information for `module' on `store'.  Can also be used
+  ;;     for pre-store setup.
+  ;; It is assumed that there is exactly one principal module per store.
+  ;; This is the top-level method that needs to be appropriately specialized
+  ;;    on subclasses of OBJECT-STORE.
+  (ignore module)
+  (error "store-module-header: not implemented on " store))
+
+(defmethod store-module-trailer ((store OBJECT-STORE) (module MODULE))
+  ;; Store trailer information for `module' on `store'.  Can also be
+  ;;   used for post-store cleanup.
+  ;; It is assumed that there is exactly one principal module per store.
+  ;; This is the top-level method that may need to be appropriately specialized
+  ;;    on subclasses of OBJECT-STORE.  But it gets a default do-nothing
+  ;;    implementation.
+  (ignore store module)
+  )
+
+(defmethod clear-object-store ((store OBJECT-STORE))
+  ;; Clear all entries in `store'
+  ;; This is the top-level method that needs to be appropriately specialized
+  ;;    on subclasses of OBJECT-STORE.
+  (error "clear-object-store: not implemented on " store))
+
+(defun save-object ((object OBJECT) (store OBJECT))
+  ;; Save an appropriate definition of `object' into `store'.
+  ;; Supported store types are output streams and persistent object stores.
+  (typecase object
+    (RELATION
+     (typecase store
+       (OUTPUT-STREAM
+        (pretty-print-relation-definition object store))
+       (OBJECT-STORE
+        (store-native-relation store object))))
+    (NAMED-DESCRIPTION
+     (when (undeclared? object)
+       (return))
+     (typecase store
+       (OUTPUT-STREAM
+        (pretty-print-named-description object store))
+       (OBJECT-STORE
+        (store-relation store object))))
+    (PROPOSITION
+     (typecase store
+       (OUTPUT-STREAM
+        (pretty-print-assertion object store))
+       (OBJECT-STORE
+        (store-assertion store object))))
+    (otherwise
+     (error "save-object: Don't know how to save " object " to " store))))
+
+;;; Saving a module:
+
+(defun do-save-module ((module MODULE) (store OBJECT))
+  :documentation "Save `module' to the persistent store `store' which can
+either be an output stream or a persistent OBJECT-STORE."
+  :public? TRUE
+  (special ((*printReadably?* true))
+    (within-module module
+      (typecase store
+	(OUTPUT-STREAM
+	 (print-module-file-header module store))
+	(OBJECT-STORE
+	 (store-module-header store module)))
+      (foreach description in (all-named-descriptions module TRUE)
+	  do (if (and (class-description? description)
+		      (defined? (native-relation description)))
+               (let ((class CLASS (native-relation description)))
+                 (save-object class store)
+                 (foreach slot in (class-local-slots class)
+                     where (defined? (stella-relation-stringified-source slot))
+                     do (save-object slot store)))
+	       (save-object description store)))
+      (foreach function in (all-functions module TRUE)
+	  where (defined? (stella-relation-stringified-source function))
+	  do (save-object function store))
+      (special ((*excludedPropositions* (new HASH-TABLE)))
+	(exclude-originated-propositions)
+	(let ((reversedPropositions NIL))
+	  (foreach p in (locally-conceived-propositions module)
+	      where (not (excluded-proposition? p))
+	      do (pushq reversedPropositions p))
+	  (foreach p in reversedPropositions
+	      do (save-object p store))))
+      (typecase store
+	(OUTPUT-STREAM
+	 (print-module-file-trailer module store))
+	(OBJECT-STORE
+	 (store-module-trailer store module))))))
+
+(defun save-module ((name NAME) (file STRING))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Save all definitions and assertions of module `name' to `file'."
+  (let ((module (coerce-to-module name TRUE)))
+    (when (defined? module)
+      (with-output-file (stream file)
+	(do-save-module module stream))) ))

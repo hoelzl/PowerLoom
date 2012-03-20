@@ -1,0 +1,891 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: unit-support.ste,v 1.15 2006/05/11 07:05:45 hans Exp
+
+(in-package "STELLA")
+
+(in-module "UNIT-SUPPORT")
+
+
+(defglobal *dim-number-hash-table* 
+  (STELLA-HASH-TABLE OF /UTILITIES/DIM-NUMBER DIM-NUMBER-LOGIC-WRAPPER)
+  (new STELLA-HASH-TABLE)
+  :documentation "Table for interning dim number logic wrappers")
+
+(defclass dim-number-logic-wrapper (QUANTITY-LOGIC-WRAPPER) ; (wrapper backlinks-mixin)
+  :public-slots
+  ((wrapper-value :type UTILITIES/DIM-NUMBER :required? true))
+  :print-form (if *printreadably?*
+                (print-native-stream stream (wrapper-value self))
+                (print-native-stream stream "|uw|" (wrapper-value self))))
+
+(defmethod (generate-specialized-term OBJECT) ((self DIM-NUMBER-LOGIC-WRAPPER))
+  (let ((term (function-term self))
+        (dim (wrapper-value self)))
+    (cond ((defined? term) (return term))
+          ((defined? dim)
+           (setq term (bquote (& (generate-term /unit-kb/@units)
+                                 & (get-magnitude dim (get-unit dim))
+                                 & (get-unit dim))))
+           (setf (function-term self) term)
+           (return term))
+          (otherwise
+           (signal-exception (new TERM-GENERATION-EXCEPTION
+                                  :message "Dim Number Wrapper doesn't have a value."
+                                  :offending-term self)))) ))
+
+(defmethod (hash-code INTEGER) ((self DIM-NUMBER-LOGIC-WRAPPER))
+  (if (defined? (wrapper-value self))
+    (return (hash-code (wrapper-value self)))
+    (return 0)))
+
+(defmethod (object-eql? boolean) ((self DIM-NUMBER-LOGIC-WRAPPER) (x OBJECT))
+  (return (and (defined? x)
+	       (isa? x @DIM-NUMBER-LOGIC-WRAPPER)
+	       (eql? (wrapper-value self)
+		     (wrapper-value (cast x DIM-NUMBER-LOGIC-WRAPPER))))))
+
+
+(defun (wrap-dim-number DIM-NUMBER-LOGIC-WRAPPER)  ((value /UTILITIES/DIM-NUMBER))
+  :public? TRUE
+  :documentation "Return an interned LOGIC-WRAPPER for `value'.  This assures us
+that all logic-wrapped DIM-NUMBERs are the same object."
+  (let ((wrapper (lookup *dim-number-hash-table* value)))
+    (when (null? wrapper)
+      (setf (preferred-units value) NULL)        ; Use default for canonical form.
+      (setq wrapper
+            (new DIM-NUMBER-LOGIC-WRAPPER :wrapper-value value))
+      (insert-at *dim-number-hash-table* value wrapper))
+    (return wrapper)))
+
+;; Convenience methods:
+
+(defmethod (get-unit STRING) ((self DIM-NUMBER-LOGIC-WRAPPER))
+  (return (get-unit (wrapper-value self))))
+
+(defmethod (get-base-unit STRING) ((self DIM-NUMBER-LOGIC-WRAPPER))
+  (return (get-base-unit (wrapper-value self))))
+
+(defmethod (get-magnitude FLOAT) ((self DIM-NUMBER-LOGIC-WRAPPER) (units STRING))
+  (return (get-magnitude (wrapper-value self) units)))
+
+(defun (help-get-dim-number DIM-NUMBER-LOGIC-WRAPPER) ((item OBJECT))
+  (typecase item
+    (DIM-NUMBER-LOGIC-WRAPPER
+     (return item))
+    (TIMEPOINT-SUPPORT/DATE-TIME-LOGIC-WRAPPER
+     (let ((value (wrapper-value item)))
+       (typecase value
+         (CALENDAR-DATE
+          (return NULL))
+         (TIME-DURATION
+          (return (new DIM-NUMBER-LOGIC-WRAPPER 
+                       :wrapper-value (time-duration-to-dim value)))))))
+    (LOGIC/PATTERN-VARIABLE
+     (let ((value (logic/safe-bound-to item)))
+       (if (defined? value)
+	 (return (help-get-dim-number value))
+	 (return NULL))))
+    (LOGIC/SKOLEM
+     (let ((value (logic/variable-value item)))
+       (when (null? value)
+	 (return NULL))
+       (typecase value
+	 (DIM-NUMBER-LOGIC-WRAPPER
+	  (return value))
+	 (LOGIC/SKOLEM
+	  (when (null? (logic/variable-value value))
+	    (return NULL))
+	  (if (isa? (logic/variable-value value) LOGIC/@SKOLEM)
+	    (return NULL)
+	    (return (help-get-dim-number (logic/variable-value value)))))
+	 (otherwise
+	  (if (isa? (logic/variable-value item) LOGIC/@SKOLEM)
+	    (return NULL)
+	    (return (help-get-dim-number (logic/variable-value item))))))))
+    (otherwise
+     (return NULL))))
+
+(defun (help-get-unit-value DIM-NUMBER-LOGIC-WRAPPER) ((magnitude OBJECT) (units OBJECT))
+  (typecase magnitude
+    ((FLOAT-WRAPPER INTEGER-WRAPPER)
+     (typecase units
+       (STRING-WRAPPER
+	(let ((value (wrapper-value magnitude))
+	      (return-value DIM-NUMBER-LOGIC-WRAPPER NULL))
+	  (exception-case
+	      (when (defined? value)
+		(setq return-value (wrap-dim-number (utilities/make-dim-number value units))))
+	    (STELLA-EXCEPTION ()
+	      NULL))
+	  (return return-value)))
+       (LOGIC/PATTERN-VARIABLE
+	(let ((unit-value (logic/safe-bound-to units)))
+	  (if (defined? unit-value)
+	    (return (help-get-unit-value magnitude unit-value))
+	    (return NULL))))
+       (LOGIC/SKOLEM
+	(let ((unit-value (logic/variable-value units)))
+	  (typecase unit-value
+	    (STRING-WRAPPER
+	     (return (help-get-unit-value magnitude unit-value)))
+	    (LOGIC/SKOLEM
+	     (if (isa? (logic/variable-value unit-value) LOGIC/@SKOLEM)
+	       (return NULL)
+	       (return (help-get-unit-value magnitude (logic/variable-value unit-value)))))
+	    (otherwise
+	     (if (isa? (logic/variable-value units) LOGIC/@SKOLEM)
+	       (return NULL)
+	       (return (help-get-unit-value magnitude (logic/variable-value units))))))))
+       (otherwise
+	(return NULL))))
+    (LOGIC/PATTERN-VARIABLE
+     (let ((value (logic/safe-bound-to magnitude)))
+       (if (defined? value)
+	   (return (help-get-unit-value value units))
+	   (return NULL))))
+    (LOGIC/SKOLEM
+     (let ((value (logic/variable-value magnitude)))
+       (typecase value
+	 (LOGIC/SKOLEM
+	  (if (isa? (logic/variable-value value) logic/@SKOLEM)
+	      (return NULL)
+	      (return (help-get-unit-value (logic/variable-value value) units))))
+	 (otherwise
+	  (if (isa? (logic/variable-value magnitude) logic/@SKOLEM)
+	      (return NULL)
+	      (return (help-get-unit-value (logic/variable-value magnitude) units)))))))
+    (otherwise
+     (return NULL))))
+
+
+(defun units-evaluator ((self logic/PROPOSITION))
+  ;; if the second value is a skolem, attach a stella calendar-date object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((magnitude (logic/value-of (nth (logic/arguments self) 0)))
+        (units (logic/value-of (nth (logic/arguments self) 1)))
+	(dim-number (logic/value-of (nth (logic/arguments self) 2)))
+	(value1 (help-get-unit-value magnitude units)))
+    (when (defined? value1)
+       (typecase dim-number
+	  (LOGIC/SKOLEM
+           (logic/bind-skolem-to-value dim-number value1 false))
+          ;;; issue: would need to extend `equate-values' to become extensible
+	  (DIM-NUMBER-LOGIC-WRAPPER
+	   (unless (eql? (wrapper-value value1) (wrapper-value dim-number))
+             (logic/signal-unification-clash value1 dim-number)))
+	  (/TIMEPOINT-SUPPORT/DATE-TIME-LOGIC-WRAPPER
+           (let ((the-dim (help-get-dim-number dim-number)))
+             (unless (and (defined? the-dim)
+                          (eql? (wrapper-value value1) (wrapper-value the-dim)))
+               (logic/signal-unification-clash value1 dim-number))))
+          (otherwise
+           (logic/signal-unification-clash value1 dim-number))))))
+
+
+
+(defun (units-specialist KEYWORD) ((frame logic/CONTROL-FRAME) (lastmove KEYWORD))
+  ;; If the third value is a skolem, attach a stella dim-number object
+  ;;    corresponding to the parsed version of the first two arguments.
+  (let ((proposition (logic/proposition frame))
+	(magnitude (logic/value-of (nth (logic/arguments proposition) 0)))
+        (units (logic/value-of (nth (logic/arguments proposition) 1)))
+	(dim (logic/value-of (nth (logic/arguments proposition) 2)))
+	(the-value (help-get-unit-value magnitude units))
+	(unit-string STRING NULL))
+       (ignore lastmove)
+  (cond ((defined? the-value)
+	 (typecase dim
+	   (LOGIC/PATTERN-VARIABLE
+	    (return (logic/select-proof-result (logic/bind-variable-to-value? dim the-value true) 
+					 false true)))
+	   (LOGIC/SKOLEM
+	    (setf (logic/variable-value dim) the-value)
+	    (return :final-success))
+	   (DIM-NUMBER-LOGIC-WRAPPER
+	    (return (logic/select-proof-result (object-eql? (wrapper-value the-value)
+						            (wrapper-value dim)) 
+					 false true)))
+           (TIMEPOINT-SUPPORT/DATE-TIME-LOGIC-WRAPPER
+            (let ((the-dim (help-get-dim-number dim)))
+              (if (null? the-dim)
+                (return :terminal-failure)
+                (return (logic/select-proof-result (object-eql? (wrapper-value the-value)
+						                (wrapper-value the-dim)) 
+					           false true)))))))
+	((defined? dim)
+	 (setq the-value (help-get-dim-number dim))
+	 (unless (defined? the-value)
+	   (return :failure))
+	 ;; We have a units expression, and either the first or
+	 ;; the second value is not bound, or both aren't.
+	 (setq unit-string (utilities/get-unit (wrapper-value the-value)))
+	 (typecase magnitude
+	   (logic/PATTERN-VARIABLE
+	    (typecase units
+	      (logic/PATTERN-VARIABLE
+	       (return (logic/select-proof-result 
+			(and (logic/bind-variable-to-value? units unit-string true)
+			     (logic/bind-variable-to-value? 
+			      magnitude
+			      (utilities/get-magnitude (wrapper-value the-value) unit-string)
+			      true))
+			false true)))
+	      (STRING-WRAPPER
+	       (let ((return-value :FAILURE))
+		 (exception-case
+		     (progn 
+		     (setq return-value
+		       (logic/select-proof-result
+			(logic/bind-variable-to-value? 
+			 magnitude
+			 (utilities/get-magnitude (wrapper-value the-value) (wrapper-value units))
+			 true)
+			false true)))
+		   (UTILITIES/INCOMPATIBLE-UNITS-EXCEPTION ()
+		     (setq return-value :terminal-failure))
+		   (STELLA-EXCEPTION ()
+		     NULL))
+		 (return return-value)))
+	      (logic/SKOLEM
+	       (setf (logic/variable-value units) unit-string)
+	       (return (logic/select-proof-result
+			(logic/bind-variable-to-value? 
+			 magnitude
+			 (utilities/get-magnitude (wrapper-value the-value) unit-string)
+			 true)
+			false true)))
+	      (otherwise
+	       ;; We can't come up with compatible units and magnitude
+	       (return :failure))))
+	   (logic/SKOLEM
+	    (typecase units
+	      (logic/PATTERN-VARIABLE
+	       (setf (logic/variable-value magnitude) 
+		 (utilities/get-magnitude (wrapper-value the-value) unit-string))
+	       (return (logic/select-proof-result
+			(logic/bind-variable-to-value? units unit-string true)
+			false true)))
+	      (STRING-WRAPPER
+	       (let ((return-value :FINAL-SUCCESS))
+		 (exception-case
+		     (progn
+		       (setf (logic/variable-value magnitude) 
+			 (utilities/get-magnitude (wrapper-value the-value) (wrapper-value units)))
+		       )
+		   (UTILITIES/INCOMPATIBLE-UNITS-EXCEPTION ()
+		     (setq return-value :TERMINAL-FAILURE))
+		   (STELLA-EXCEPTION ()
+		     (setq return-value :FAILURE)))
+		 (return return-value)))
+	      (logic/SKOLEM
+	       (setf (logic/variable-value units) unit-string)
+	       (setf (logic/variable-value magnitude) 
+		 (utilities/get-magnitude (wrapper-value the-value) unit-string))
+	       (return :FINAL-SUCCESS))
+	      (otherwise
+	       ;; We can't come up with compatible units and magnitude
+	       (return :failure))))
+	   (FLOAT-WRAPPER
+	    ;; We have a float value for the first argument, but
+	    ;;   the units aren't bound, so unless the first argument
+	    ;;   happens to match the magnitude, we stop without searching over
+	    ;;   all compatible units!
+	    (if (and (defined? (wrapper-value magnitude))
+		     (= (wrapper-value magnitude)
+			(utilities/get-magnitude (wrapper-value the-value) unit-string)))
+	      (typecase units
+		(logic/PATTERN-VARIABLE
+		 (return (logic/select-proof-result
+			  (logic/bind-variable-to-value? units unit-string true)
+			  false true)))
+		(logic/SKOLEM
+		 (setf (logic/variable-value units) unit-string)
+		 (return :FINAL-SUCCESS))
+		(otherwise
+		 ;; We can't come up with compatible units and magnitude
+		 (return :failure)))
+	      (return :FAILURE)))
+	   (INTEGER-WRAPPER
+	    ;; We have a integer value for the first argument, but
+	    ;;   the units aren't bound, so unless the first argument
+	    ;;   happens to match the magnitude, we stop without searching over
+	    ;;   all compatible units!
+	    (if (and (defined? (wrapper-value magnitude))
+		     (= (cast (wrapper-value magnitude) FLOAT)
+			(utilities/get-magnitude (wrapper-value the-value) unit-string)))
+	      (typecase units
+		(logic/PATTERN-VARIABLE
+		 (return (logic/select-proof-result
+			  (logic/bind-variable-to-value? units unit-string true)
+			  false true)))
+		(logic/SKOLEM
+		 (setf (logic/variable-value units) unit-string)
+		 (return :FINAL-SUCCESS))
+		(otherwise
+		 ;; We can't come up with compatible units and magnitude
+		 (return :failure)))
+	      (return :FAILURE)))
+	   (otherwise
+	    ;; we have a value for the first argument, but it doesn't represent
+	    ;; a valid time, or else there is some other problem with it.
+	    (return :terminal-failure))))
+	;; should this be :terminal-failure?
+	(otherwise
+	 (return :failure))) ))
+
+
+(define-computed-constraint u-plus-constraint ((x1 DIM-NUMBER-LOGIC-WRAPPER)
+					       (x2 DIM-NUMBER-LOGIC-WRAPPER)
+					       (x3 DIM-NUMBER-LOGIC-WRAPPER))
+  (setq value
+    (eql? (utilities/add (wrapper-value x1) (wrapper-value x2)) (wrapper-value x3)))
+  (setq value (choose (utilities/compatible-units? (wrapper-value x3) (wrapper-value x2))
+		      (wrap-dim-number (utilities/subtract (wrapper-value x3) (wrapper-value x2)))
+		      NULL))
+  (setq value (choose (utilities/compatible-units? (wrapper-value x3) (wrapper-value x1))
+		      (wrap-dim-number (utilities/subtract (wrapper-value x3) (wrapper-value  x1)))
+		      NULL))
+  (setq value (choose (utilities/compatible-units? (wrapper-value x1) (wrapper-value x2))
+		      (wrap-dim-number (utilities/add (wrapper-value x1) (wrapper-value x2)))
+		      NULL)))
+
+(define-computed-constraint u-minus-constraint ((x1 DIM-NUMBER-LOGIC-WRAPPER)
+						(x2 DIM-NUMBER-LOGIC-WRAPPER)
+						(x3 DIM-NUMBER-LOGIC-WRAPPER))
+  (setq value
+    (eql? (utilities/subtract (wrapper-value x1) (wrapper-value x2)) (wrapper-value x3)))
+  (setq value (choose (utilities/compatible-units? (wrapper-value x3) (wrapper-value x2))
+		      (wrap-dim-number (utilities/add (wrapper-value x3) (wrapper-value x2)))
+		      NULL))
+  (setq value (choose (utilities/compatible-units? (wrapper-value x3) (wrapper-value x1))
+		      (wrap-dim-number (utilities/subtract (wrapper-value  x1) (wrapper-value x3)))
+		      NULL))
+  (setq value (choose (utilities/compatible-units? (wrapper-value x1) (wrapper-value x2))
+		      (wrap-dim-number (utilities/subtract (wrapper-value x1) (wrapper-value x2)))
+		      NULL)))
+
+(define-computed-constraint u-times-constraint ((x1 DIM-NUMBER-LOGIC-WRAPPER)
+						(x2 DIM-NUMBER-LOGIC-WRAPPER)
+						(x3 DIM-NUMBER-LOGIC-WRAPPER))
+  (setq value
+    (eql? (utilities/multiply (wrapper-value x1) (wrapper-value x2)) (wrapper-value x3)))
+  (setq value (choose (eql? (utilities/magnitude (wrapper-value x2)) 0.0)
+		      NULL
+		      (wrap-dim-number (utilities/divide (wrapper-value x3) (wrapper-value x2)))))
+  (setq value (choose (eql? (utilities/magnitude (wrapper-value x1)) 0.0)
+		      NULL
+		      (wrap-dim-number (utilities/divide (wrapper-value x3) (wrapper-value  x1)))))
+  (setq value (wrap-dim-number (utilities/multiply (wrapper-value x1) (wrapper-value x2)))))
+
+(define-computed-constraint u-divide-constraint ((x1 DIM-NUMBER-LOGIC-WRAPPER)
+						 (x2 DIM-NUMBER-LOGIC-WRAPPER)
+						 (x3 DIM-NUMBER-LOGIC-WRAPPER))
+
+;;  More efficient, but sometimes gives problems with floating point rounding:
+;;  (setq value
+;;	(eql? (wrapper-value x1) (utilities/multiply (wrapper-value x2) (wrapper-value x3))))
+  (setq value
+	(choose (eql? (utilities/magnitude (wrapper-value x2)) 0.0)
+		(eql? (wrapper-value x1) (utilities/multiply (wrapper-value x2) (wrapper-value x3)))
+		(eql? (wrapper-value x3) (utilities/divide (wrapper-value x1) (wrapper-value x2)))))
+  (setq value (wrap-dim-number (utilities/multiply (wrapper-value x2) (wrapper-value x3))))
+  (setq value (choose (eql? (utilities/magnitude (wrapper-value x3)) 0.0)
+		      NULL
+		      (wrap-dim-number (utilities/divide (wrapper-value x1) (wrapper-value  x3)))))
+  (setq value (choose (eql? (utilities/magnitude (wrapper-value x2)) 0.0)
+		      NULL
+		      (wrap-dim-number (utilities/divide (wrapper-value x1) (wrapper-value x2))))))
+
+(defun (u-ABS-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle the absolute value computation
+  ;; It requires at least one argument to be bound.
+  ;; Since it is a fully defined, it will
+  ;;    return :TERMINAL-FAILURE if it can't find any more bindings.
+  (let ((proposition (proposition frame))
+        (mainArg (first (arguments proposition)))
+        (mainArgValue (argument-bound-to mainArg))
+	(mainArgDim (choose (null? mainArgValue) 
+			    NULL 
+			    (help-get-dim-number mainArgValue)))
+        (absArg (second (arguments proposition)))
+        (absArgValue (argument-bound-to absArg))
+	(absArgDim  (choose (null? absArgValue) 
+			    NULL 
+			    (help-get-dim-number absArgValue)))
+        (iterator (iterator frame))
+        (collection NIL))
+    (ignore lastMove)
+    (when (null? iterator)  ;; First time
+      (if (null? absArgValue)
+	  (if (null? mainArgValue)
+	      ;; we require at least one bound argument:
+	      (return :TERMINAL-FAILURE)
+	    (if (defined? mainArgDim)
+	      (return
+		  (select-proof-result
+		   (bind-argument-to-value? 
+		    absArg (wrap-dim-number 
+			    (/utilities/absolute-value (wrapper-value mainArgDim)))
+		    TRUE)
+		   FALSE TRUE))
+	      (return :TERMINAL-FAILURE)))
+	(if (defined? absArgDim)
+	    (if (/stella/< (/utilities/magnitude (wrapper-value absArgDim)) 0.0)
+		(return :TERMINAL-FAILURE)
+		(setq collection
+		  (cons-list absArgDim
+			     (wrap-dim-number 
+			      (/utilities/negate (wrapper-value absArgDim))))))
+	  (return :TERMINAL-FAILURE))))
+    (when (defined? mainArgDim)
+      ;; both arguments are bound, just check for membership:
+      (if (member? collection mainArgDim)
+          (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+		 (return :FINAL-SUCCESS))
+	  (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		 (return :TERMINAL-FAILURE))))
+    (when (null? iterator)
+      (setq iterator (allocate-iterator collection))
+      (setf (iterator frame) iterator))
+    (if (and (next? iterator)
+             (bind-argument-to-value? mainArg (/stella/value iterator) TRUE))
+        (return :CONTINUING-SUCCESS)
+      (return :TERMINAL-FAILURE))))
+
+(defun (u-signum-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle the signum computation
+  ;; It requires the first argument to be bound.
+  ;; Since it is a fully defined, it will
+  ;;    return :TERMINAL-FAILURE if it can't find any more bindings.
+  (let ((proposition (proposition frame))
+        (mainArg (first (arguments proposition)))
+        (mainArgValue (argument-bound-to mainArg))
+	(mainArgDim (choose (null? mainArgValue) 
+			    NULL 
+			    (help-get-dim-number mainArgValue)))
+        (signumArg (second (arguments proposition)))
+        (signumArgValue (argument-bound-to signumArg)))
+    (ignore lastMove)
+    (if (null? mainArgValue)
+      (return :FAILURE)  ;; Needs first argument bound.
+      (if (null? signumArgValue)
+	(if (defined? mainArgDim)
+	  (return
+	    (select-proof-result
+	     (bind-argument-to-value? 
+	      signumArg (wrap-integer (/utilities/signum (wrapper-value mainArgDim)))
+	      TRUE)
+	     FALSE TRUE))
+	  (return :TERMINAL-FAILURE))
+	;; both arguments are bound, just check for consistency:
+	(if (and (isa? signumArgValue @INTEGER-WRAPPER)
+		 (defined? mainArgDim))
+	  (if (= (/utilities/signum (wrapper-value mainArgDim))
+		 (wrapper-value (cast signumArgValue INTEGER-WRAPPER)))
+	    (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+		   (return :FINAL-SUCCESS))
+	    (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		   (return :TERMINAL-FAILURE)))
+	  (return :TERMINAL-FAILURE))))
+    ))
+
+
+(defun (MINIMUM-OF-UNITS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of unit expressions, return the smallest.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (minArg (second (arguments proposition)))
+	(minValue (argument-bound-to MinArg))
+        (minimum /utilities/DIM-NUMBER NULL)
+	(missingUnits? FALSE))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'MINIMUM-OF-UNITS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE))
+	  (dimValue DIM-NUMBER-LOGIC-WRAPPER NULL))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+	  do (setq dimValue (help-get-dim-number v))
+	  (if (defined? dimValue)
+	      (when (or (null? minimum)
+			(/utilities/less? (wrapper-value dimValue)
+					   minimum))
+		 (setq minimum (wrapper-value dimValue)))
+	       (setq missingUnits? TRUE)))
+      (when (null? minimum)
+        (return :TERMINAL-FAILURE))
+
+      (when missingUnits?   ;; We can still check for failure
+	(if (and (defined? minValue)
+		 (defined? (help-get-dim-number minValue))
+		 (/utilities/greater? (wrapper-value (help-get-dim-number minValue))
+				      minimum))
+	  (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		 (return :TERMINAL-FAILURE))
+	  (progn (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+		 (return :FAILURE))))	; :TERMINAL-FAILURE ?
+
+      (if (bind-argument-to-value? 
+	   minArg (wrap-dim-number minimum) TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+(defun (MAXIMUM-OF-UNITS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of unit expressions, return the largest.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (maxArg (second (arguments proposition)))
+	(maxValue (argument-bound-to MaxArg))
+        (maximum /utilities/DIM-NUMBER NULL)
+	(missingUnits? FALSE))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'MAXIMUM-OF-UNITS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE))
+	  (dimValue DIM-NUMBER-LOGIC-WRAPPER NULL))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+	  do (setq dimValue (help-get-dim-number v))
+	  (if (isa? v @DIM-NUMBER-LOGIC-WRAPPER)
+	       (when (or (null? maximum)
+			 (/utilities/greater? (wrapper-value dimValue)
+					      maximum))
+		 (setq maximum (wrapper-value dimValue)))
+	       (setq missingUnits? TRUE)))
+      (when (null? maximum)
+        (return :TERMINAL-FAILURE))
+
+      (when missingUnits?   ;; We can still check for failure
+	(if (and (defined? maxValue)
+		 (defined? (help-get-dim-number maxValue))
+		 (/utilities/less? (wrapper-value (help-get-dim-number maxValue))
+				   maximum))
+	  (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		 (return :TERMINAL-FAILURE))
+	  (progn (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+		 (return :FAILURE))))	; :TERMINAL-FAILURE ?
+
+      (if (bind-argument-to-value? 
+	   maxArg (wrap-dim-number maximum) TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+(defun (SUM-OF-UNITS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the sum.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (sumArg (second (arguments proposition)))
+        (sum /utilities/DIM-NUMBER NULL))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'SUM-OF-NUMBERS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE))
+	  (dimValue DIM-NUMBER-LOGIC-WRAPPER NULL))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (exception-case 
+	  (foreach v in listValue
+	      do (setq dimValue (help-get-dim-number v))
+	      (if (defined? dimValue)
+                (if (null? sum)
+                  (setq sum (wrapper-value dimValue))
+                  (setq sum (/utilities/add 
+                             sum (wrapper-value dimValue))))
+                (return :FAILURE)))	; :TERMINAL-FAILURE ?
+	(/utilities/INCOMPATIBLE-UNITS-EXCEPTION () ; Can't add all the values!
+	  (return :TERMINAL-FAILURE)))
+      (when (null? sum)
+        (return :TERMINAL-FAILURE))
+      (if (bind-argument-to-value? 
+	   sumArg (wrap-dim-number sum) TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+;;;
+;;; Units Meta predicate specialists:
+;;;
+
+(defun (u-value-measure-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle the mapping from a unit dimension to a measure
+  ;; if something like that exists.
+  ;; It requires the first argument to be bound.
+  (let ((proposition (proposition frame))
+        (mainArg (first (arguments proposition)))
+        (mainArgValue (argument-bound-to mainArg))
+        (measureArg (second (arguments proposition)))
+        (measureArgValue (argument-bound-to measureArg)))
+    (ignore lastMove)
+    (if (null? mainArgValue)
+      (return :FAILURE)  ;; Needs first argument bound.
+      (if (null? measureArgValue)
+	(if (isa? mainArgValue @DIM-NUMBER-LOGIC-WRAPPER)
+          (let ((measure (utilities/get-measure (wrapper-value
+                                                 (cast mainArgValue DIM-NUMBER-LOGIC-WRAPPER))))
+                (measure-instance (choose (defined? measure)
+                                          (lookup *measure-instance-table* measure)
+                                          NULL)))
+            (if (defined? measure-instance)
+              (return
+	       (select-proof-result 
+                (bind-argument-to-value? measureArg measure-instance TRUE)
+	        FALSE TRUE))
+              (return :FAILURE)))
+	  (return :TERMINAL-FAILURE))
+	;; both arguments are bound, just check for consistency:
+        (let ((measure (utilities/get-measure (wrapper-value
+                                               (cast mainArgValue DIM-NUMBER-LOGIC-WRAPPER))))
+              (measure-instance (choose (defined? measure)
+                                        (lookup *measure-instance-table* measure)
+                                        NULL)))
+          (if (defined? measure-instance)
+	    (if (eql? measureArgValue measure-instance)
+	      (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+		     (return :FINAL-SUCCESS))
+	      (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		     (return :TERMINAL-FAILURE)))
+	    (return :TERMINAL-FAILURE)))))
+    ))
+
+(defun (argument-matches-list-helper? BOOLEAN)  ((argument OBJECT) (the-list LIST))
+  ;; Helper function that returns TRUE if the logic object in `argument'
+  ;; is a list that matches `the-list'
+  ;; TO DO: DOES THIS NEED TO CHECK THE OPERATOR OF THE defining-proposition
+  ;;        TO MAKE SURE IT IS @LISTOF OR SIMILAR?
+  (typecase argument
+    (PATTERN-VARIABLE
+     (let ((value (bound-to argument)))
+       (if (defined? value)
+         (return (argument-matches-list-helper? value the-list))
+         (return TRUE))))
+    (SKOLEM
+     (let ((prop (defining-proposition argument))
+           (args (choose (defined? prop) (arguments prop) NULL))
+           (list-length (length the-list)))
+       (cond ((null? args)
+              (return false))
+             ((= (length args) (1+ list-length))
+              (foreach item in the-list
+                as i in (interval 0 NULL)
+                do (unless (eql? item (nth args i))
+                     (return FALSE)))
+              (return TRUE))
+             (otherwise
+              (return FALSE)))))
+    ;; What other cases can we have?
+    (otherwise
+     (return FALSE))) )
+
+
+(defun (integer-to-measures-helper KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD) (code INTEGER))
+  ;; Helper to decode the integer `code' into its constituent base-measure
+  ;; objects.  Binds or checks the values coming into this function.
+  ;; BUG: THIS IS IMPLEMENTED USING LISTOF, BUT IT REALLY SHOULDN'T BE
+  ;;      ORDERED.  ON THE OTHER HAND, WE DON'T HAVE A 'BAG' (UNORDERED,
+  ;;      WITH DUPLICATES) DATA STRUCTURE IN POWERLOOM.  WE WOULD NEED THAT
+  ;;      FIRST.
+  (ignore lastMove)
+  (let ((proposition (proposition frame))
+        (listArg (second (arguments proposition)))
+        (listArgValue (argument-bound-to listArg))
+        (measuresList (new LIST)))
+    (foreach m in (compute-measures-for-integer code)
+      collect (lookup *measure-instance-table* m) into measuresList)
+    (safety 2 (forall i in measuresList always (defined? i)) "Undefined measure found.")
+    (cond ((null? listArgValue)
+           (return
+            (select-proof-result 
+             (bind-argument-to-value? listArg (create-logical-list measuresList) TRUE)
+             FALSE TRUE)))
+          ((argument-matches-list-helper? listArg measuresList)
+           (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+           (return :FINAL-SUCCESS))
+          (otherwise
+           (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+           (return :TERMINAL-FAILURE))) ))
+
+(defun (u-base-measures-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle the mapping from a unit dimension to a measure
+  ;; if something like that exists.
+  ;; It requires the first argument to be bound.
+  (let ((proposition (proposition frame))
+        (mainArg (first (arguments proposition)))
+        (mainArgValue (argument-bound-to mainArg))
+        (value INTEGER NULL))
+    (if (null? mainArgValue)
+      (return :FAILURE)  ;; Needs first argument bound.
+      (typecase mainArgValue
+        (DIM-NUMBER-LOGIC-WRAPPER
+         (case (operator proposition)
+           (/UNIT-KB/@NUMERATOR-MEASURES
+            (setq value (/utilities/numerator 
+			 (/utilities/pid (wrapper-value mainArgValue)))))
+           (/UNIT-KB/@DENOMINATOR-MEASURES
+            (setq value (/utilities/denominator
+			 (/utilities/pid (wrapper-value mainArgValue))))))
+         (return (integer-to-measures-helper frame lastMove value)))
+        (LOGIC-OBJECT
+         (let ((measure (lookup *instance-measure-table* mainArgValue)))
+           (when (defined? measure)
+	     (case (operator proposition)
+	       (/UNIT-KB/@NUMERATOR-MEASURES
+		(setq value (/utilities/numerator
+			     (/utilities/prime-id measure))))
+	       (/UNIT-KB/@DENOMINATOR-MEASURES
+		(setq value (/utilities/denominator
+			     (/utilities/prime-id measure)))))
+	     (return (integer-to-measures-helper frame lastMove value))))
+          (return :FAILURE))
+        (otherwise
+         (return :FAILURE)))) ))
+
+(defun (get-object-pid RATIO) ((obj OBJECT))
+  ;; Returns the pid, or NULL if non exists.
+  ;; Can throw an error.
+  (typecase obj
+    (DIM-NUMBER-LOGIC-WRAPPER
+     (return (pid (wrapper-value obj))))
+    (STRING-WRAPPER
+     (let ((string-value (wrapper-value obj)))
+       (if (null? string-value)
+	   (return NULL)
+	   (mv-bind (dummy pid)
+		    (unit-to-scale-factor-and-id string-value)
+		    (ignore dummy)
+	      (return pid)))))
+    (NUMBER-WRAPPER
+     (return *ratio-one*))
+    (otherwise
+     (return NULL))))
+
+(defun (comensurate-units-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle the mapping from a unit dimension to a measure
+  ;; if something like that exists.
+  ;; It requires the first argument to be bound.
+  (let ((proposition (proposition frame))
+        (arg1 (first (arguments proposition)))
+        (arg1-value (argument-bound-to arg1))
+        (arg2 (second (arguments proposition)))
+        (arg2-value (argument-bound-to arg2)))
+    (ignore lastmove)
+    (if (or (null? arg1-value) (null? arg2-value))
+      (return :FAILURE)  ;; Needs both arguments bound.
+      ;; This case could eventually consider looking at the types
+      ;; of skolems to see if they are the same, and therefore
+      ;; comensurate.
+      (exception-case
+        (let ((arg1-pid (get-object-pid arg1-value))
+	      (arg2-pid (get-object-pid arg2-value)))
+	  (if (and (defined? arg1-pid) (defined? arg2-pid))
+	      (return (select-test-result (object-eql? arg1-pid arg2-pid) 
+					  TRUE frame))
+	      (return :FAILURE)))
+	(BAD-ARGUMENT-EXCEPTION ()
+	  (return (select-test-result FALSE TRUE frame))))) ))
+
+;;;;
+;;;;  SETUP ONTOLOGY OF MEASURES FROM STELLA INFORMATION
+;;;;
+
+(defglobal *measure-instance-table* (HASH-TABLE of /UTILITIES/MEASURE LOGIC-OBJECT)
+  (new HASH-TABLE)
+  :documentation "Mapping table from measure objects to their PowerLoom representation.")
+
+(defglobal *instance-measure-table* (HASH-TABLE of LOGIC-OBJECT /UTILITIES/MEASURE)
+  (new HASH-TABLE)
+  :documentation "Mapping table from PowerLoom representations of measures to measure objects")
+
+(defun initialize-measure-concepts ()
+  (within-context (get-stella-context "PL-KERNEL-KB" TRUE)
+    (let ((i LOGIC-OBJECT NULL)
+          (measure (pli/get-concept "/UNIT-KB/MEASURE" NULL NULL))
+          (base-measure (pli/get-concept "/UNIT-KB/BASE-MEASURE" NULL NULL))
+          (unit-relation (pli/get-relation "/UNIT-KB/MEASURE-UNIT" NULL NULL))
+          (measure-name STRING NULL))
+      (foreach m in /utilities/*all-measures*
+        ;; Create measure instances
+        do (setq measure-name (concatenate "/UNIT-KB/" 
+                                           (string-upcase (name m))
+                                           "-MEASURE"))
+           ;; If there is an existing instance, then we reuse it.
+           ;; Otherwise we create one.
+           (setq i (pli/get-concept measure-name null null))
+           (unless (defined? i)
+             (setq i (pli/create-concept measure-name measure null null)))
+           (pli/assert-unary-proposition measure i null null)
+
+           ;; Create base measure instances
+           (when (member? *base-measures* m)
+             (pli/assert-unary-proposition base-measure i null null))
+           (insert-at *measure-instance-table* m i)
+           (insert-at *instance-measure-table* i m)
+
+           ;; Make unit assertions about measures
+           (foreach u in (/utilities/get-units m)
+             do (pli/assert-binary-proposition unit-relation i u null null))) )))

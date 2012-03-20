@@ -1,0 +1,665 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: manuals.ste,v 1.11 2006/05/11 07:06:56 hans Exp
+
+;;; Support for automatic creation of manuals
+
+(in-package "STELLA")
+
+(in-module "UTILITIES")
+
+
+  ;;
+;;;;;; Utilities
+  ;;
+
+(defglobal *texinfo-style-features* (LIST OF KEYWORD) (list)
+  :documentation "A list of features that can modulate some aspects of
+how certain objects are described.  Currently understood features:
+:INFIX-PARAMETER-LISTS.")
+
+(defun (texinfo-special-character? BOOLEAN) ((ch CHARACTER))
+  ;; Return TRUE if 'ch' is a special texinfo character that
+  ;;    needs to be escaped.
+  (return (member? "@{}" ch)))
+
+(defun (texinfo-escape-string STRING) ((string STRING))
+  ;; Escape all special characters in 'string' and return the result.
+  (let ((n-of-special-chars 0)
+        (escaped-string MUTABLE-STRING string))
+    (foreach ch in string
+             where (texinfo-special-character? ch)
+             do (++ n-of-special-chars))
+    (when (> n-of-special-chars 0)
+      (setq escaped-string
+        (make-string (+ (length string) n-of-special-chars) NULL))
+      (let ((i 0))
+        (foreach
+         ch in string
+         do
+         (when (texinfo-special-character? ch)
+           (setf (nth escaped-string i) #\@)
+           (++ i))
+         (setf (nth escaped-string i) ch)
+         (++ i))))
+    (return escaped-string)))
+
+(defun (yield-texinfo-type-spec STRING) ((type-spec OBJECT))
+  (let ((tree OBJECT type-spec))
+    (typecase type-spec
+      (CONS (ignore type-spec))
+      ((SYMBOL SURROGATE)
+       ;; avoid generating module prefix:
+       (setq tree (symbol-name type-spec)))
+      (TYPE-SPEC
+       (setq tree (yield-type-spec-tree type-spec))))
+    (return
+     (concatenate
+      "@sc{"
+      (texinfo-escape-string
+       (string-downcase (choose (string? tree) tree (stringify tree))))
+      "}"))))
+
+(defun (yield-texinfo-bare-name STRING) ((name OBJECT))
+  (typecase name
+    (STRING-WRAPPER
+     (return (wrapper-value name)))
+    (SYMBOL
+     (return (texinfo-escape-string (string-downcase (symbol-name name)))))
+    (CONS
+     (return (yield-texinfo-bare-name (first name))))))
+
+(defun (yield-texinfo-parameter-name STRING) ((name STRING))
+  (when (not (exists ch in name
+                 where (not (eql? ch (upcase-character ch)))))
+    (setq name (string-downcase name)))
+  (return (texinfo-escape-string name)))
+
+(defun (yield-texinfo-constant STRING) ((name SYMBOL))
+  (return
+    (concatenate
+      "@code{"
+      (concatenate
+        (texinfo-escape-string (string-downcase (symbol-name name)))
+        "}"))))
+
+(defglobal *texinfo-word-delimiters* STRING NULL)
+(startup-time-progn
+    (let ((delimiters MUTABLE-STRING "     .:;,!?()[]{}\""))
+      (setf (nth delimiters 0) #\Space)
+      (setf (nth delimiters 1) #\Tab)
+      (setf (nth delimiters 2) #\Linefeed)
+      (setf (nth delimiters 3) #\Return)
+      (setf (nth delimiters 4) #\Page)
+      (setq *texinfo-word-delimiters* delimiters)))
+
+(defun (texinfo-get-paragraph-command STRING) ((string STRING) (start INTEGER))
+  ;; If `string' at position `start' contains a paragraph command return it.
+  ;;    Otherwise, return NULL.
+  ;; A paragraph command is of the form <tab><space>*<eol>, where the
+  ;;    number of spaces encodes the type of the command.
+  ;; Using such paragraph commands makes it possible to add invisible
+  ;;    formatting information to documentation strings that can be
+  ;;    utilized by the texinfo generator.
+  (let ((command-index 0))
+    (loop
+      (++ start)
+      (case (nth string start)
+        (#\Space (++ command-index))
+        ((#\Newline #\Return) (break))
+        (otherwise (return NULL))))
+    (case command-index
+      (0 (return "end"))
+      (1 (return "example"))
+      (otherwise
+       (return "unknown")))))
+  
+(defun texinfo-describe-documentation-string
+    ((object OBJECT) (documentation STRING) (stream OUTPUT-STREAM)
+     (parameters (LIST OF SYMBOL)))
+  (let ((quoted-name STRING NULL)
+        (closing-quote-position INTEGER NULL)
+        (beginning-of-line? TRUE)
+        (paragraph-command STRING NULL)
+        (pending-paragraph-commands (LIST OF STRING-WRAPPER) (list)))
+    (when (null? parameters)
+      (setq parameters NIL-LIST))
+    (when (null? documentation)
+      (setq documentation "Not documented."))
+    (when (defined? documentation)
+      (foreach ch in documentation
+          as i in (interval 0 NULL)
+          do (case ch
+               ((#\` #\')
+                (cond ((eq? i closing-quote-position)
+                       (print-stream stream "}")
+                       (continue))
+                      ((or (eq? i 0)
+                           (member? *texinfo-word-delimiters*
+                                    (nth documentation (1- i))))
+                       (setq closing-quote-position
+                         (position documentation #\' (1+ i)))
+                       (when (defined? closing-quote-position)
+                         (setq quoted-name
+                           ;; Upcasing should be based on the module:
+                           (string-upcase
+                            (subsequence
+                             documentation (1+ i) closing-quote-position)))
+                         (if (exists pName in parameters
+                                 where (string-eql? (symbol-name pName)
+                                                    quoted-name))
+                             (print-stream stream "@var{")
+                           (print-stream stream "@code{"))
+                         (continue))))
+                (print-stream stream ch))
+               ((#\Linefeed #\Return)
+                (setq beginning-of-line? TRUE)
+                (print-stream stream ch)
+                (continue))
+               (#\Tab
+                (cond
+                 ((and beginning-of-line?
+                       (setq? paragraph-command
+                              (texinfo-get-paragraph-command
+                               documentation i)))
+                  (cond
+                   ((eql? paragraph-command "end")
+                    (if (empty? pending-paragraph-commands)
+                      (progn 
+                        (warn "Mismatched @end command on " object)
+                        (setq paragraph-command "mismatched @end command"))
+                      (setq paragraph-command (pop pending-paragraph-commands)))
+                    (print-stream stream "@end " paragraph-command EOL))
+                   (otherwise
+                    (push pending-paragraph-commands paragraph-command)
+                    (print-stream stream EOL "@" paragraph-command))))
+                 (otherwise
+                  (print-stream stream ch))))
+               (otherwise
+                (if (texinfo-special-character? ch)
+                    (print-stream stream #\@ ch)
+                  (print-stream stream ch))))
+             (setq beginning-of-line? FALSE)))
+    (print-stream stream EOL)))
+
+
+  ;;
+;;;;;; Describing variables
+  ;;
+
+(defun texinfo-describe-variable
+    ((variable GLOBAL-VARIABLE) (stream OUTPUT-STREAM))
+  (print-stream stream "@defvr ")
+  (cond ((variable-constant? variable)
+         (print-stream stream "Constant "))
+        ((variable-special? variable)
+         (print-stream stream "@w{Special Variable} "))
+        (otherwise
+         (print-stream stream "Variable ")))
+  (print-stream stream (yield-texinfo-bare-name (variable-name variable)) " : "
+                (yield-texinfo-type-spec
+                 (choose (defined? (variable-type-specifier variable))
+                         (variable-type-specifier variable)
+                         (variable-type variable)))
+                EOL)
+  (texinfo-describe-documentation-string
+   variable (variable-documentation variable) stream NULL)
+  (print-stream stream "@end defvr" EOL))
+
+
+  ;;
+;;;;;; Describing classes
+  ;;
+
+(defun texinfo-describe-class ((class CLASS) (stream OUTPUT-STREAM))
+  ;; Write Texinfo documentation for `class' to `stream'.
+  ;; Currently this describes all native and parameter slots.
+  ;; TO DO:
+  ;; - describe various important slot features such as allocation, initial value, etc.
+  ;; - describe other important abstract slots such as :renames
+  (print-stream
+   stream
+   "@deftp Class "
+   (yield-texinfo-type-spec (class-symbol class)))
+  (foreach super in (class-direct-supers class)
+      as i in (interval 1 NULL)
+      do (if (= i 1)
+             (print-stream stream " : ")
+           (print-stream stream ", "))
+         (print-stream stream (yield-texinfo-type-spec super)))
+  (print-stream stream EOL)
+  (texinfo-describe-documentation-string class (class-documentation class) stream NIL-LIST)
+  (foreach slot in (class-local-slots class)
+      where (and (storage-slot? slot)
+                 (parameter-slot? slot))
+      do (texinfo-describe-slot slot stream))
+  (foreach slot in (class-local-slots class)
+      where (and (storage-slot? slot)
+                 (native-slot? slot))
+      do (texinfo-describe-slot slot stream))
+  (print-stream stream "@end deftp" EOL)
+  NULL)
+
+(defun texinfo-describe-slot ((slot STORAGE-SLOT) (stream OUTPUT-STREAM))
+  ;; Write Texinfo documentation for `slot' to `stream'.
+  (let ((category "Slot")
+        (type (first-defined (slot-type-specifier slot) (slot-base-type slot))))
+    (cond ((parameter-slot? slot)
+           (setq category "@w{Class Parameter}"))
+          ((abstract? slot)
+           (setq category "@w{Abstract Slot}")))
+    (print-stream stream "@defcv " category " "
+                  ;; if we print the slot as part of a class description, we
+                  ;; don't really want to repeat the owner class for each slot:
+                  "{}" ;;(yield-texinfo-type-spec (owner slot))
+                  " "
+                  (yield-texinfo-bare-name (slot-name slot)) " : "
+                  (yield-texinfo-type-spec type) EOL)
+    (texinfo-describe-documentation-string slot (slot-documentation slot) stream NIL-LIST)
+    (print-stream stream "@end defcv" EOL)))
+
+
+  ;;
+;;;;;; Describing methods
+  ;;
+
+(defun (texinfo-get-real-method-parameter-names (LIST OF STRING-WRAPPER))
+    ((method METHOD-SLOT))
+  (let ((result (list))
+        (documentation (documentation method))
+        (p-name STRING NULL)
+        (p-name-length INTEGER NULL)
+        (start INTEGER NULL)
+        (end INTEGER NULL))
+    (when (null? documentation)
+      (setq documentation ""))
+    (setq end (1- (length documentation)))
+    (foreach parameter in (method-parameter-names method)
+        do (setq p-name (symbol-name parameter))
+           (setq p-name-length (length p-name))
+           (setq start
+             (some i in (interval 1 (- end p-name-length))
+               where (and (or (eql? (nth documentation (1- i)) #\`)
+                              (eql? (nth documentation (1- i)) #\'))
+                          (eql? (nth documentation (+ i p-name-length)) #\')
+                          (forall ch in p-name
+                              as j in (interval 0 (1- p-name-length))
+                              always (eql? (upcase-character ch)
+                                           (upcase-character
+                                            (nth documentation (+ i j))))))))
+           (when (defined? start)
+             (setq p-name
+               (subsequence documentation start (+ start p-name-length))))
+        collect (wrap-literal p-name) into result)
+    (return result)))
+
+(defun (texinfo-get-real-method-parameters-and-types
+        (LIST OF STRING-WRAPPER) LIST LIST)
+    ((method METHOD-SLOT))
+  (let ((stringified-source (method-stringified-source method))
+        (real-parameter-names (texinfo-get-real-method-parameter-names method))
+        (real-parameter-types (list))
+        (real-return-types (list))
+        (definition-tree CONS NULL)
+        (return-types-tree NIL)
+        (parameters-tree (CONS OF CONS) NIL))
+    (foreach p-type in (method-parameter-type-specifiers method)
+        collect (yield-type-spec-tree p-type) into real-parameter-types)
+    (foreach rType in (method-return-type-specifiers method)
+        collect (yield-type-spec-tree rType) into real-return-types)
+    (when (defined? stringified-source)
+      (setq definition-tree (unstringify stringified-source))
+      (when (cons? (second definition-tree))
+        (setq return-types-tree (rest (cast (second definition-tree) CONS))))
+      (setq parameters-tree (third definition-tree))
+      (setq parameters-tree (remove parameters-tree (quote &rest)))
+      (setq parameters-tree (remove parameters-tree (quote &body)))
+      (foreach pTree in parameters-tree
+          as it on real-parameter-types
+          do (setf (value it) (last pTree)))
+      (foreach rTree in return-types-tree
+          as it on real-return-types
+          do (setf (value it) rTree)))
+    (return real-parameter-names real-parameter-types real-return-types)))
+
+(defun texinfo-describe-method ((method METHOD-SLOT) (stream OUTPUT-STREAM))
+  (let ((category "Function")
+        (endCmd "@end deffn"))
+    (cond ((method-macro? method)
+           (setq category "Macro"))
+          ((method-command? method)
+           (setq category "Command"))
+          ((not (method-function? method))
+           (setq category "Method")))
+    (unless (or (method-evaluate-arguments? method)
+                (method-macro? method))
+      (setq category (concatenate "N-" category)))
+    (cond ((not (method-function? method))
+           (print-stream
+            stream
+            "@defmethod " (yield-texinfo-type-spec (owner method))  " "
+            (yield-texinfo-bare-name (slot-name method))
+            " ")
+           (setq endCmd "@end defmethod"))
+          (otherwise
+           (print-stream
+            stream
+            "@deffn " category " "
+            (yield-texinfo-bare-name (slot-name method))
+            " ")
+           (setq endCmd "@end deffn")))
+    ;; List arguments:
+    (print-stream stream "(")
+    (mv-bind (parameter-names parameter-types returnTypes)
+        (texinfo-get-real-method-parameters-and-types method)
+      (let ((n-of-arguments (length parameter-names))
+            (modifier STRING NULL))
+        (foreach p-name in parameter-names
+            as p-type in parameter-types
+            as i in (interval 1 NULL)
+            do (setq modifier NULL)
+               (when (eq? i n-of-arguments)
+                 (when (method-variable-arguments? method)
+                   (setq modifier "&rest"))
+                 (when (method-body-argument? method)
+                   (setq modifier "&body")))
+               (if (and (= i 1)
+                        (eql? category "Method"))
+                   (print-stream stream (yield-texinfo-parameter-name p-name))
+                 (texinfo-describe-type-declaration p-name p-type modifier stream))
+               (when (< i n-of-arguments)
+                 (if (member? *texinfo-style-features* :INFIX-PARAMETER-LISTS)
+                     (print-stream stream ", ")
+                   (print-stream stream " "))))
+        (print-stream stream ")")
+        ;; List return types:
+        (print-stream stream " : ")
+        (foreach rType in returnTypes
+            do (print-stream stream (yield-texinfo-type-spec rType) " "))
+        (print-stream stream EOL)
+        (texinfo-describe-documentation-string
+         method (method-documentation method) stream (method-parameter-names method))
+        (print-stream stream endCmd EOL)))))
+
+(defun texinfo-describe-type-declaration ((parameter STRING)
+                                          (type TYPE-SPEC)
+                                          (modifier STRING)
+                                          (stream OUTPUT-STREAM))
+  (print-stream stream "@w{")
+  (when (defined? modifier)
+    (print-stream stream modifier " "))
+  (special ((*printReadably?* TRUE))
+    (cond ((member? *texinfo-style-features* :INFIX-PARAMETER-LISTS)
+           (print-stream
+            stream
+            (yield-texinfo-parameter-name parameter)
+            " : "
+            (yield-texinfo-type-spec type)))
+          (otherwise
+           (print-stream
+            stream
+            "("
+            (yield-texinfo-parameter-name parameter)
+            " "
+            (yield-texinfo-type-spec type)
+            ")")))
+    (print-stream stream "}")))
+
+  ;;
+;;;;;; Unimplemented objects
+  ;;
+
+(defun texinfo-describe-unimplemented-object
+    ((specification OBJECT) (stream OUTPUT-STREAM))
+  (print-stream
+   stream
+   "@deffn ??? " (yield-texinfo-bare-name specification) EOL
+   "Not yet implemented." EOL
+   "@end deffn" EOL))
+
+
+  ;;
+;;;;;; Generating manuals
+  ;;
+
+(defspecial *manual-output-language* KEYWORD :texinfo)
+
+(defglobal *documented-objects-registry* HASH-TABLE (new HASH-TABLE))
+
+(defun register-documented-object ((object OBJECT))
+  (insert-at *documented-objects-registry* object object))
+
+(defun (already-documented-object? BOOLEAN) ((object OBJECT))
+  (return (defined? (lookup *documented-objects-registry* object))))
+
+(defun clear-documented-objects-registry ()
+  ;; This create a new hash table, but we don't have a clear operation yet.
+  (initialize-hash-table *documented-objects-registry*))
+
+(defun (lookup-object-from-specification OBJECT) ((specification OBJECT))
+  (let ((object OBJECT NULL))
+    (typecase specification
+      (SURROGATE (setq object (type-class specification)))
+      (SYMBOL
+       (setq object (lookup-function specification))
+       (when (null? object)
+         (setq object (lookup-global-variable specification)))
+       (when (null? object)
+         (setq object (lookup-class specification)))
+       (when (null? object)
+         (setq object (get-object (symbol-name specification) NULL))))
+      (CONS                             ; must be a method spec
+       (let ((classSymbol SYMBOL (second specification))
+             (class CLASS NULL))
+         (within-module (home-context classSymbol)
+           (setq class (get-stella-class 
+                        (cast (second specification) SYMBOL) FALSE)))
+         (when (null? class)
+           (print "Can't find a class named " (second specification))
+           (return NULL))
+         (return (lookup-slot class (first specification)))))
+      (STRING
+       (setq object (get-stella-module specification FALSE)))
+      (otherwise NULL))
+    (return object)))
+
+(defun (texinfo-object< BOOLEAN) ((object1 OBJECT) (object2 OBJECT))
+  ;; Return TRUE if 'object1' should come before 'object2' in a
+  ;;    sorted list of objects.
+  (let ((name1 STRING NULL)
+        (name2 STRING NULL))
+    (typecase object1
+      (SLOT (setq name1 (visible-name (slot-name object1))))
+      (GLOBAL-VARIABLE (setq name1 (visible-name (variable-name object1)))))
+    (typecase object2
+      (SLOT (setq name2 (visible-name (slot-name object2))))
+      (GLOBAL-VARIABLE (setq name2 (visible-name (variable-name object2)))))
+    (return (string< name1 name2))))
+
+(defun manual-describe-uncategorized-objects ((module MODULE)
+                                              (stream OUTPUT-STREAM))
+  ;; Describe all as yet uncategorized objects in `module' to `stream'.
+  ;; So far, we only catch functions and methods here.
+  (let ((methods (new (LIST OF METHOD-SLOT))))
+    (foreach function in (all-functions module TRUE)
+        where (and (defined? (method-documentation function))
+                   (not (already-documented-object? function)))
+        collect function into methods)
+    (foreach method in (all-methods module TRUE)
+        where (and (defined? (method-documentation method))
+                   (not (already-documented-object? method)))
+        collect method into methods)
+    (sort methods (the-code :function texinfo-object<))
+    (foreach method in methods
+        do (manual-describe-object method NULL stream)
+           (print-stream stream EOL))))
+
+(defun manual-describe-object ((object OBJECT)
+                               (specification OBJECT)
+                               (stream OUTPUT-STREAM))
+  ;; Describe `object' in the current `*manual-output-language*' onto `stream'.
+  ;; If `object' is NULL, try to look it up from `specification'.
+  ;; This is user-extensible via special handler functions of the form:
+  ;;    (<language>-describe-<object-type> <object> <stream>)
+  (when (null? object)
+    (setq object (lookup-object-from-specification specification)))
+  (case *manual-output-language*
+    (:texinfo
+     (cond
+      ((null? object)
+       (when (defined? specification)
+         (texinfo-describe-unimplemented-object specification stream)))
+      (otherwise
+       (typecase object
+         (GLOBAL-VARIABLE
+          (texinfo-describe-variable object stream))
+         (CLASS
+          (texinfo-describe-class object stream))
+         (METHOD-SLOT
+          (texinfo-describe-method object stream))
+         (MODULE
+          (manual-describe-uncategorized-objects object stream))
+         (otherwise
+          ;; try to be generic in this way, since we can't define a method
+          ;;    on OBJECT here that would then be specialized by others
+          ;;    (unless we put this all into the STELLA module):
+          (let ((handlerName
+                 (intern-symbol-in-module
+                  (concatenate "TEXINFO-DESCRIBE-"
+                               (symbol-name (primary-type object)))
+                  (interned-in (quote manual-describe-object))
+                  TRUE))
+                (handler (lookup-function handlerName)))
+            (when (defined? handler)
+              (funcall (function-code handler) object stream)))))
+       (register-documented-object object))))))
+
+(defun generate-manual ((manual-spec (CONS OF CONS)))
+  :documentation "Generate a TEXINFO file containing a list of
+documented commands.  'manual-spec' is a CONS list of entries, where each
+entry is of the following form:
+
+      (<filename> <object-spec1> <object-spec2> ... <object-specN>)
+
+The objects specified by <object-spec>s will be documented in sequence onto
+file <filename>.  An object spec can be a simple symbol to name a function,
+macro or variable, a dotted symbol to name a method or slot, a surrogate
+to name a class, or a string (pathname) to name a module.  If a module is
+specified, all as yet undocumented objects in that module that have a
+documentation string defined will be documented (this is a catch-all option)."
+  (let ((stream OUTPUT-FILE-STREAM NULL))
+    (clear-documented-objects-registry)
+    (foreach fileSpec in manual-spec
+        do (setq stream
+             (new OUTPUT-FILE-STREAM
+                  :filename (wrapper-value
+                             (cast (first fileSpec) STRING-WRAPPER))))
+           (foreach spec in (rest fileSpec)
+               do (manual-describe-object NULL spec stream)
+                  (print-stream stream EOL))
+           (free stream))))
+
+
+;;; New-style manual generation via template expansion:
+
+(defspecial *manual-output-stream* OUTPUT-STREAM NULL)
+(defglobal *manual-template-command-prefix* STRING "#$")
+
+(defun generate-manual-from-template ((templateFile FILE-NAME)
+                                      (outputFile FILE-NAME))
+  ;; Read `templateFile', expand all template commands and write the result
+  ;;    to `outputFile'.
+  (with-output-file (out-stream outputFile)
+    (special ((*manual-output-stream* out-stream))
+      (with-input-file (in-stream  templateFile)
+        (foreach line in (lines in-stream)
+          do (print-stream *manual-output-stream*
+                           (manual-expand-template-commands line) EOL))))))
+
+(defun (manual-expand-template-commands STRING) ((line STRING))
+  ;; Expand all template commands in `line' and return the result.
+  (let ((commandStart (string-search line *manual-template-command-prefix* 0)))
+    (when (null? commandStart)
+      (return line))
+    (exception-case
+        (let ((prefix (subsequence line 0 commandStart))
+              (restLine
+               (new STRING-INPUT-STREAM
+                    :the-string (subsequence
+                                 line
+                                 (+ commandStart
+                                    (length *manual-template-command-prefix*))
+                                 NULL)))
+              (expression
+               (read-s-expression restLine)))
+          (special ((*manual-output-stream* (new STRING-OUTPUT-STREAM)))
+            (evaluate expression)
+            (setq line (read-line restLine))
+            (when (null? line)
+              (setq line ""))
+            (return (concatenate prefix
+                                 (the-string
+                                  (cast *manual-output-stream*
+                                        STRING-OUTPUT-STREAM))
+                                 (manual-expand-template-commands line))))) 
+      (NATIVE-EXCEPTION (e)
+        (print "*** ERROR while expanding template command: "
+               (exception-message e) EOL
+               "    Error occured in line: `" line "'" EOL)
+        (return line)))))
+
+;;; Template commands:
+
+(defun texinfo-insert-doc ((spec OBJECT))
+  :command? TRUE :evaluate-arguments? FALSE
+  ;; Print the documentation for the object specified by `spec' in TexInfo
+  ;;    format onto `*manual-output-stream*'.
+  (special ((*manual-output-language* :TEXINFO))
+    (manual-describe-object NULL spec *manual-output-stream*)))
+
+(defun texinfo-insert-preamble ()
+  :command? TRUE
+  (special ((*manual-output-language* :TEXINFO))
+    (print-stream *manual-output-stream*
+                  "@c DO NOT MODIFY THIS FILE, "
+                  "IT WAS GENERATED AUTOMATICALLY FROM A TEMPLATE!")))

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cpp-output.ste,v 1.67 2003/04/18 21:14:38 hans Exp
+;;; Version: cpp-output.ste,v 1.72 2006/05/11 07:05:53 hans Exp
 
 ;;; Routines for outputing a formatted C++ program.
 
@@ -89,29 +89,32 @@
   ;;    its list of body statements will be returned.
   ;; If `statements' was a single unflattenable statement, it will
   ;;    be returned unmodified.
-  (typecase (first statements)
-    (CONS
-     (let ((flattenedSubTree NIL)
-           (flattenedTree NIL))
-       (while (not (nil? statements))
-         (setq flattenedSubTree
-           (cpp-flatten-statements (first statements)))
-         (if (cons? (first flattenedSubTree))
-             ;; we have a list of statements:
-             (setq flattenedTree
-               (concatenate (reverse flattenedSubTree) flattenedTree))
-           ;; we have a single statement:
-           (pushq flattenedTree flattenedSubTree))
-         (setq statements (rest statements)))
-       (return (reverse flattenedTree))))
-    (SYMBOL
-     (case (first statements)
-       ((CPP_PROGN CPP_STATEMENTS)
-        (if (empty? (rest statements))
-            (return NIL)
-          (return (cpp-flatten-statements (rest statements)))))
-       (otherwise
-        (return statements))))))
+  (if (and (defined? statements)
+           (non-empty? statements))
+      (typecase (first statements)
+        (CONS
+         (let ((flattenedSubTree NIL)
+               (flattenedTree NIL))
+           (while (not (nil? statements))
+             (setq flattenedSubTree
+               (cpp-flatten-statements (first statements)))
+             (if (cons? (first flattenedSubTree))
+                 ;; we have a list of statements:
+                 (setq flattenedTree
+                   (concatenate (reverse flattenedSubTree) flattenedTree))
+               ;; we have a single statement:
+               (pushq flattenedTree flattenedSubTree))
+             (setq statements (rest statements)))
+           (return (reverse flattenedTree))))
+        (SYMBOL
+         (case (first statements)
+           ((CPP_PROGN CPP_STATEMENTS)
+            (if (empty? (rest statements))
+                (return NIL)
+              (return (cpp-flatten-statements (rest statements)))))
+           (otherwise
+            (return statements)))))
+    (return statements)))
 
 (defun (cpp-prognify-statement CONS) ((statement OBJECT))
   ;; Ensure `statement' is wrapped into a `progn'.
@@ -629,18 +632,59 @@
 
 (defun cpp-output-foreach ((loop CONS))
   ;; Output a C++ foreach statement.  "loop" has the form
-  ;;   (<continuationTest> <nextAssignments> <body>)
-  (let ((continuationTest (first loop))
-	(nextAssignments CONS (second loop))
-	(body CONS (third loop)))
-    (print-stream *current-stream* "while (")
-    (cpp-output-statement continuationTest)
-    (print-stream *current-stream* ") {" EOL)
+  ;;   (<variables>
+  ;;    <continuationTest>
+  ;;    <valueAssignments>
+  ;;    <nextAssignments>
+  ;;    <body>)
+  ;; All <variables> are already assumed to be declared in
+  ;;    a surrounding block.
+  (let ((variables (CONS OF CONS) (first loop))
+        (nofVariables (length variables))
+        (continuationTest (second loop))
+        (valueAssignments CONS (third loop))
+	(nextAssignments CONS (fourth loop))
+        (nofNextAssignments (length nextAssignments))
+	(body CONS (fifth loop))
+        (eolSeparateExpressions?
+         (or (> nofVariables 2)
+             (> *cpp-indent-chars* 35))))
+    (cpp-indent)
+    (if eolSeparateExpressions?
+        (print-stream *current-stream* "for  (")
+      (print-stream *current-stream* "for ("))
     (cpp-bump-indent)
-    (setf (second loop) NULL)  ;; clip so we won't break during GC
-    (setf (third loop)
-      (cpp-flatten-statements (concatenate nextAssignments body)))
-    (cpp-output-statements (third loop))
+    (cpp-bump-indent)
+    (cpp-bump-indent)
+    (foreach var in variables
+        as i in (interval 1 NULL)
+        do (cpp-output-statement var)
+           (unless (= i nofVariables)
+             (print-stream *current-stream* ", ")))
+    (print-stream *current-stream* "; ")
+    (when (and (non-empty? variables)
+               eolSeparateExpressions?)
+      (print-stream *current-stream* EOL)
+      (cpp-indent))
+    (cpp-output-statement continuationTest)
+    (print-stream *current-stream* "; ")
+    (when (non-empty? nextAssignments)
+      (when eolSeparateExpressions?
+        (print-stream *current-stream* EOL))
+      (foreach next in nextAssignments
+          as i in (interval 1 NULL)
+          do (when eolSeparateExpressions?
+               (cpp-indent))
+             (cpp-output-statement next)
+             (unless (= i nofNextAssignments)
+               (if eolSeparateExpressions?
+                   (print-stream *current-stream* "," EOL)
+                 (print-stream *current-stream* ", ")))))
+    (print-stream *current-stream* ") {" EOL)
+    (cpp-unbump-indent)
+    (cpp-unbump-indent)
+    (cpp-output-statements
+     (cpp-flatten-statements (concatenate valueAssignments body)))
     (cpp-unbump-indent)
     (cpp-indent)
     (print-stream *current-stream* "}" EOL) ))
@@ -742,19 +786,38 @@
   :globally-inline? TRUE
   (return (replace-substrings string new character)))
 
+(defglobal *cpp-max-string-literal-length* INTEGER 1024
+  :documentation "C++ string literals longer than this are broken
+into multiple pieces to avoid problems with certain MS compilers.")
+
 (defmethod cpp-output-literal ((string STRING))
-  ;; Output `string'.
-  ;; NOTE: Need to insert `\' before double quotes and `\'s and insert 
-  ;;       `\n' in place of #\return.
-  (print-stream *current-stream* #\" 
-		(replace-character-with-substring
-		 (replace-character-with-substring
-		  (replace-character-with-substring
-		   (replace-substrings string "\\\\" "\\")
-		   "\\\"" #\")
-		  "\\n" #\LINEFEED)
-		 "\\r" #\RETURN)
-		#\") )
+  ;; Output `string', quote special characters and translate
+  ;;    linefeeds and returns into the appropriate C++ syntax.
+  ;; Literals longer than `*cpp-max-string-literal-length*'
+  ;;    are broken up into multiple adjacent pieces (works
+  ;;    around a problem of some MS Visual C++ compilers).
+  (let ((free *cpp-max-string-literal-length*))
+    (print-stream *current-stream* #\")
+    (foreach ch in string
+        do (when (<= free 1)
+             (print-stream *current-stream* "\" \"")
+             (setq free *cpp-max-string-literal-length*))
+           (case ch
+             ((#\\ #\")
+              (print-stream *current-stream* #\\)
+              (-- free))
+             (#\linefeed
+              (print-stream *current-stream* #\\)
+              (-- free)
+              (setq ch #\n))
+             (#\return
+               (print-stream *current-stream* #\\)
+               (-- free)
+               (setq ch #\r))
+             (otherwise NULL))
+           (print-stream *current-stream* ch)
+           (-- free))
+    (print-stream *current-stream* #\")))
   
 (defmethod cpp-output-literal ((string STRING-WRAPPER))
   ;; Output `string'.

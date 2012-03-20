@@ -1,0 +1,2753 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: logic-in.ste,v 1.131 2006/05/11 07:05:17 hans Exp
+
+;;; Evaluating and loading logic commands
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; PowerLoom Features
+  ;;
+
+(defglobal *available-powerloom-features* (LIST OF KEYWORD)
+           (list :trace-subgoals :trace-solutions :trace-classifier
+                 :iterative-deepening 
+                 :justifications :just-in-time-inference
+                 :emit-thinking-dots)
+  :documentation "List of PowerLoom environment features.")
+
+(defglobal *current-powerloom-features* (LIST OF KEYWORD) (list)
+  :documentation "List of currently enabled PowerLoom environment features.")
+
+(defglobal *default-powerloom-features* (LIST OF KEYWORD) (list :just-in-time-inference :emit-thinking-dots)
+  :documentation "List of PowerLoom environment features enabled upon call to
+'reset-features'.")
+
+(defun print-features ()
+  :command? TRUE :public? TRUE
+  :documentation
+  "Print the currently enabled and available PowerLoom environment features."
+  (print "Currently enabled PowerLoom features:" EOL
+         "   " *current-powerloom-features* EOL EOL
+         "Available PowerLoom features:" EOL
+         "   " *available-powerloom-features* EOL))
+
+(defun (list-features LIST) ()
+  :command? TRUE :public? TRUE
+  :documentation
+  "Return a list containing two lists, a list of currently enabled PowerLoom
+features, and a list of all available PowerLoom features."
+  (return (list *current-powerloom-features* *available-powerloom-features*)) )
+
+(defun set-powerloom-feature ((feature KEYWORD))
+  :documentation "Enable the PowerLoom environment feature `feature'."
+  (unless (member? *current-powerloom-features* feature)
+    (case feature
+      (:trace-subgoals
+       (add-trace :GOAL-TREE))
+      (:trace-solutions
+       (add-trace :TRACE-SOLUTIONS))
+      (:trace-classifier
+       (add-trace :CLASSIFIER-INFERENCES))
+      (:closed-world
+       ;;(setq *globally-closed-collections?* TRUE) ;; BROKEN!!! -hc (why? -rmm)
+       )
+      (:iterative-deepening
+       (setq *iterative-deepening-mode?* TRUE))
+      (:justifications
+       (setq *record-justifications?* TRUE))
+      (:just-in-time-inference
+       (setq *just-in-time-forward-inference?* TRUE))
+      (:emit-thinking-dots
+       (setq *emit-thinking-dots?* TRUE))
+      (otherwise
+       (warn "No such PowerLoom environment feature: " feature)
+       (print-features)
+       (return)))
+    (insert *current-powerloom-features* feature)))
+
+(defun (set-feature (LIST OF KEYWORD)) (&rest (features NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Enable the PowerLoom environment feature(s) named by `features'.
+Return the list of enabled features.  Calling `set-feature' without any
+arguments can be used to display the currently enabled features.
+The following features are supported:
+
+`just-in-time-inference': Enables interleaving of forward chaining inference
+within backward chaining queries.
+
+`iterative-deepening': Tells the query processor to use iterative deepening
+instead of a depth-first search to find answers.  This is less efficient
+but necessary for some kinds of highly recursive queries.
+
+`trace-subgoals': Enables the generation of subgoaling trace information during
+backchaining inference.
+
+`trace-solutions': Prints newly found solutions during retrieval right when they
+are generated as opposed to when the query terminates.
+
+`trace-classifier': Tells the classifier to describe the inferences it draws.
+
+`justifications': Enables the generation of justifications during inference,
+which is a prerequiste for the generation of explanations with `(why)'.
+
+`emit-thinking-dots': Tells PowerLoom to annotate its inference progress by
+outputting characters indicating the completion of individual reasoning steps.
+
+By default, the features `emit-thinking-dots' and `just-in-time-inference'
+are enabled, and the others are disabled.
+"
+  (exception-case
+      (foreach featureName in features
+          do (set-powerloom-feature
+              (keywordify (coerce-to-string featureName))))
+    (LOGIC-EXCEPTION (e) 
+      (print-stream STANDARD-ERROR (exception-message e))))
+  (return *current-powerloom-features*))
+
+(defun unset-powerloom-feature ((feature KEYWORD))
+  :documentation "Disable the PowerLoom environment feature `feature'."
+  (if (member? *current-powerloom-features* feature)
+      (case feature
+        (:trace-subgoals
+         (drop-trace :GOAL-TREE))
+        (:trace-solutions
+         (drop-trace :TRACE-SOLUTIONS))
+        (:trace-classifier
+         (drop-trace :CLASSIFIER-INFERENCES))
+        (:closed-world
+         ;; (setq *globally-closed-collections?* FALSE) ;; broken
+         )
+        (:iterative-deepening
+         (setq *iterative-deepening-mode?* FALSE))
+        (:justifications
+         (setq *record-justifications?* FALSE))
+        (:just-in-time-inference
+         (setq *just-in-time-forward-inference?* FALSE))
+        (:emit-thinking-dots
+         (setq *emit-thinking-dots?* FALSE)))
+    (when (not (member? *available-powerloom-features* feature))
+      (warn "No such PowerLoom environment feature: " feature)
+      (print-features)))
+  (remove *current-powerloom-features* feature))
+
+(defun (unset-feature (LIST OF KEYWORD)) (&rest (features NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Disable the PowerLoom environment feature(s) named by `features'.
+Return the list of enabled features.  Calling `unset-feature' without any
+arguments can be used to display the currently enabled features.
+See `set-feature' for a description of supported features."
+  (exception-case
+      (foreach featureName in features
+          do (unset-powerloom-feature
+              (keywordify (coerce-to-string featureName))))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))))
+    (return *current-powerloom-features*))
+
+(defun (reset-features (LIST OF KEYWORD)) ()
+  :command? TRUE :public? TRUE
+  :documentation
+  "Reset the PowerLoom environment features to their default settings."
+  (foreach f in (copy *current-powerloom-features*)
+           where (not (member? *default-powerloom-features* f))
+           do (unset-powerloom-feature f))
+  (foreach f in *default-powerloom-features*
+           where (not (member? *current-powerloom-features* f))
+           do (set-powerloom-feature f))
+  (return *current-powerloom-features*))
+
+(defun (enabled-powerloom-feature? BOOLEAN) ((feature KEYWORD))
+  :documentation "Return true if the STELLA `feature' is currently enabled."
+  :public? TRUE :globally-inline? TRUE
+  (return (memb? *current-powerloom-features* feature)))
+
+(defun (disabled-powerloom-feature? BOOLEAN) ((feature KEYWORD))
+  :documentation "Return true if the STELLA `feature' is currently disabled."
+  :public? TRUE :globally-inline? TRUE
+  (return (not (memb? *current-powerloom-features* feature))))
+
+
+(startup-time-progn :globals
+  (reset-features))
+
+
+  ;;
+;;;;;; Defining PowerLoom commands
+  ;;
+
+;;; Various support for the (soon to be written) DEFPLCOM macro/operator.
+
+(defun (coerce-option-value OBJECT) ((value OBJECT) (type TYPE))
+  ;; Coerce `value' to `type' and return the result.
+  ;; Return NULL if coercion is not possible.
+  (case type
+    (@INTEGER
+     (typecase value
+       (INTEGER (return value))
+       (FLOAT (return (floor value)))
+       (otherwise NULL)))
+    (@FLOAT
+     (typecase value
+       ((INTEGER FLOAT)
+        (return (* value 1.0)))
+       (otherwise NULL)))
+    (@NUMBER
+     (typecase value
+       ((INTEGER FLOAT)
+        (return value))
+       (otherwise NULL)))
+    (@KEYWORD
+     (typecase value
+       ((GENERALIZED-SYMBOL STRING-WRAPPER)
+        (return (keywordify value)))
+       (otherwise NULL)))
+    (@SYMBOL
+     (typecase value
+       (KEYWORD
+        (return (intern-symbol (symbol-name value))))
+       (SURROGATE
+        (return (intern-derived-symbol value (symbol-name value))))
+       (SYMBOL
+        (return value))
+       (STRING-WRAPPER
+        (return (intern-symbol value)))
+       (otherwise NULL)))
+    (@BOOLEAN
+     (return (coerce-to-boolean value)))
+    (@MODULE
+     (return (coerce-to-module value FALSE)))
+    ((@DESCRIPTION @NAMED-DESCRIPTION)
+     (return (coerce-to-description value NULL)))
+    (otherwise
+     (cond ((null? type)
+            (return value))
+           ((isa? value type)
+            (return value))
+           ((isa? value (type-to-wrapped-type type))
+            (return value)))))
+  ;; error, not coercible:
+  (return NULL))
+
+(defun (parse-logic-command-options PROPERTY-LIST) ((options OBJECT)
+                                                    (legalOptions&Types CONS)
+                                                    (coercionError? BOOLEAN)
+                                                    (allowOtherKeys? BOOLEAN))
+  ;; Parse `options', check their validity according to `legalOptions&Types'
+  ;;    and return the result as a PROPERTY-LIST.  `legalOptions&Types'
+  ;;    has to either be NULL or a list of legal <keyword> <coercionType>
+  ;;    pairs.  A type specifcation of @IDENTITY means don't perform any
+  ;;    coercion.
+  ;; If `coercionError?' is TRUE, raise an error if a coercion failed.
+  ;; If `allowOtherKeys?' is TRUE options other than those specified in
+  ;;    `legalOptions&Types' are allowed but won't be coerced since we
+  ;;    don't know their type.
+  ;; TO DO:
+  ;; - handle default values
+  ;; - handle parametric types such as (CONS OF KEYWORD)
+  (let ((legalOptions (new PROPERTY-LIST :the-plist legalOptions&Types))
+        (parsedOptions PROPERTY-LIST NULL)
+        (type SURROGATE NULL)
+        (corecedValue OBJECT NULL))
+    (typecase options
+      (CONS
+       (when (odd? (length options))
+         (signal-parsing-error "Odd-length command options list: " options))
+       (setq parsedOptions (new PROPERTY-LIST :the-plist options)))
+      (PROPERTY-LIST (setq parsedOptions options))
+      (otherwise
+       (signal-parsing-error "Illegal command options specification: " options)))
+    (when (defined? legalOptions)
+      (foreach (key value) in parsedOptions
+          do (setq type (lookup legalOptions key))
+             (when (and (null? type)
+                        (not allowOtherKeys?))
+               (signal-parsing-error "Illegal option: " key))
+             (unless (or (eql? type @IDENTITY)
+                         (null? value))
+               (setq corecedValue (coerce-option-value value type))
+               (when (and coercionError?
+                          (null? corecedValue))
+                 (signal-parsing-error "Can't corerce " value " to type " type))
+               (insert-at parsedOptions key corecedValue))))
+    (return parsedOptions)))
+
+
+  ;;
+;;;;;; PowerLoom listener
+  ;;
+
+(defglobal *logic-prompt* STRING "|= "
+  :documentation "The prompt used by the PowerLoom listener."
+  :public? TRUE)
+
+(defspecial *prompt-show-module?* BOOLEAN TRUE
+  :documentation "Flag to control whether the logic prompt shows the module name."
+  :public? TRUE)
+
+(defun print-logic-prompt ()
+  ;; Print a prompt for the logic command-loop.
+  (when *prompt-show-module?*
+    (print (module-name *module*) " "))
+  (print *logic-prompt*))
+
+(defglobal *logic-command-result-indent* STRING "")
+
+(defun print-logic-command-result ((result OBJECT))
+  ;; Print the 'result' of a logic command to standard output.
+  (let ((printContext
+         ;; print relative to the inference cache if it exists,
+         ;;    so forward-inferred propositions will look asserted:
+         (first-defined
+          (lookup-constraint-propagation-world *context*)
+          *context*)))
+    (special ((*printMode* :REALISTIC)
+              (*prettyPrintLogicalForms?* TRUE)
+              (*context* printContext))
+      (when (defined? result)
+        (print *logic-command-result-indent* result EOL)))))
+
+(defspecial *careful-logic-command-loop-exit*? BOOLEAN
+  (verbatim :common-lisp FALSE
+            :otherwise TRUE)
+  :documentation "If TRUE exiting from the logic-command loop (or PowerLoom
+listener) will be protected by a confirmation dialog.  This is mainly useful
+for C++ where exiting the listener will also exit the program."
+  :public? TRUE)
+
+(defun (logic-command-loop-exit? BOOLEAN BOOLEAN) ((command OBJECT))
+  ;; Determine whether 'command' is a command-loop exit command.
+  ;; Return TRUE if the command-loop should be exited (confirm with
+  ;;    the user if '*careful-logic-command-loop-exit*?' is TRUE).
+  ;; As a second value, return TRUE if command was an exit command.
+  ;;    The second value is used for cases where the user entered an
+  ;;    exit command but then changed his/her mind during confirmation.
+  (let ((exit? FALSE))
+    (typecase command
+      (KEYWORD
+       (case command
+         ((:BYE :EXIT :HALT :QUIT :STOP)
+          (setq exit? TRUE))
+         (otherwise NULL)))
+      (SYMBOL
+       (case (symbol-name command)
+         (("BYE" "EXIT" "HALT" "QUIT" "STOP"
+           "bye" "exit" "halt" "quit" "stop")
+          (setq exit? TRUE))
+         (otherwise NULL)))
+      (otherwise NULL))
+    (when (and exit? *careful-logic-command-loop-exit*?)
+      (setq exit? (yes-or-no? "Really exit? (yes or no) "))
+      (when exit? (print EOL))
+      (return exit? TRUE))
+    (return exit? exit?)))
+
+(defun logic-command-loop ((module MODULE))
+  ;; Run a read/eval/print loop that reads logic commands from the standard
+  ;;    input, evaluates them, and prints their results.
+  ;; Exit if the user entered a termination command as determined by
+  ;;    'logic-command-loop-exit?'.
+  ;; The initial module for command execution is set to `module'.
+  (let ((command OBJECT NULL)
+        (result OBJECT NULL)
+        (exit? FALSE)
+        (exitCommand? FALSE))
+    (within-module (first-defined module *module*)
+      (loop
+	(exception-case
+	    (progn
+	      (print EOL)
+	      (print-logic-prompt)
+	      (setq command (read-s-expression STANDARD-INPUT))
+	      (print EOL)
+	      (mv-setq (exit? exitCommand?)
+		(logic-command-loop-exit? command))
+	      (when exit?
+		(break))
+	      (when exitCommand?
+		(continue))
+	      (setq result (evaluate-logic-command command FALSE))
+	      (print-logic-command-result result))
+	  (STELLA-EXCEPTION (e)
+            (print-stream STANDARD-ERROR ">> Error: "
+                          (exception-message e))))))))
+
+  ;;
+;;;;;; Evaluating logic commands
+  ;;
+
+(defun (evaluate-logic-command OBJECT)
+    ((command OBJECT) (finalize? BOOLEAN))
+  ;; Evaluate a top-level logic 'command' and return its result.
+  ;; If 'finalize?' is TRUE, finalize relations before returning
+  ;;    the result.
+  (special ((*translationErrors* 0)
+            (*translationWarnings* 0)
+            (*ignoreTranslationErrors?* FALSE)
+            (*translationUnits* NULL)
+            (*translationPhase* :DEFINE)
+            (*evaluationTree* NULL))
+    (let ((operator OBJECT NULL)
+          (operatorName STRING NULL)
+          (result OBJECT NULL))
+      (typecase command
+        (CONS
+         (setq operator (value command))
+         (typecase operator
+           (SYMBOL
+            (setq operatorName (symbol-name operator))
+            (when (string-equal? operatorName "DEFMODULE")
+              (setq operator (quote DEFMODULE))
+              (setf (value command) operator))
+            (cond ((string-equal? operatorName "IN-MODULE")
+                   (handle-in-module-tree command FALSE))
+                  ;; Ignore 'in-package':
+                  ((string-equal? operatorName "IN-PACKAGE")
+                   NULL)
+                  ((declaration-tree? command)
+                   ;; Handle top-level expressions such as PROGN or macros
+                   ;;    (they should really be handled by `evaluate'):
+                   (setq *translationUnits* (list))
+                   (walk-top-level-tree command FALSE)
+                   (case (length (reverse *translationUnits*))
+                     (0 (signal EVALUATION-EXCEPTION "Translation failed: " command))
+                     (1 (setq result
+                          (the-object (first *translationUnits*))))
+                     (otherwise
+                      (let ((results NIL))
+                        (foreach unit in *translationUnits*
+                            collect (the-object unit) into results)
+                        (setq result results)))))
+                  (otherwise
+                   ;; Treat it as a command:
+                   (with-process-lock *powerloom-lock*
+                     (setq result (evaluate command))))))
+           (otherwise
+	    (with-process-lock *powerloom-lock*
+	      (setq result (evaluate command))))))
+        ((KEYWORD SURROGATE)
+         (setq result command))
+        (otherwise
+	 (with-process-lock *powerloom-lock*
+	   (setq result (evaluate command)))))
+      (when (and (not (translation-errors?))
+                 finalize?)
+        (setq *translationPhase* :FINALIZE)
+        (finalize-objects))
+      (return result))))
+
+  ;;
+;;;;;; Loading logic files
+  ;;
+
+;;; TO DO: Once PowerLoom has its own Lisp package we can have a different
+;;;        versions of `load' in STELLA without running into name problems.
+;;;        We will still need a separate PowerLoom version, since we still
+;;;        might need two-pass loading for a while and we also need to bind
+;;;        special variables such as `*logic-dialect*', etc.
+
+;;; The load-path machinery should probably be promoted into STELLA:
+(defglobal *file-load-path* (CONS OF STRING-WRAPPER) NIL)
+
+(defun (parse-directory-path (CONS OF STRING-WRAPPER)) ((path STRING))
+  ;; Parse a |-separated directory `path' into a list of directories.
+  (let ((separator #\|)
+        (length (length path))
+        (start 0)
+        (end 0)
+        (parsedPath NIL))
+    (loop
+      (setq end (position path separator start))
+      (pushq parsedPath (file-name-as-directory (subsequence path start end)))
+      (if (and (defined? end)
+               (< end (1- length)))
+          (setq start (1+ end))
+        (break)))
+    (return (reverse parsedPath))))
+
+(defun (set-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
+  :documentation "Set the PowerLoom load path to the |-separated
+directories listed in `path'.  Return the resulting load path."
+  :public? TRUE :command? TRUE
+  (setq *file-load-path* (parse-directory-path path))
+  (return *file-load-path*))
+
+(defun (get-load-path (CONS OF STRING-WRAPPER)) ()
+  :documentation "Return the current PowerLoom load path."
+  :public? TRUE :command? TRUE
+  (return *file-load-path*))
+
+(defun (push-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
+  :documentation "Add the directories listed in the |-separated
+`path' to the front of the PowerLoom load path.  Return the
+resulting load path."
+  :public? TRUE :command? TRUE
+  (setq *file-load-path*
+    (concatenate (parse-directory-path path) *file-load-path*))
+  (return *file-load-path*))
+
+(defun (pop-load-path STRING) ()
+  :documentation "Remove the first element from the PowerLoom load path
+and return the removed element."
+  :public? TRUE :command? TRUE
+  (return (popq *file-load-path*)))
+
+(defun (add-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
+  :documentation "Append the directories listed in the |-separated
+`path' to the end of the PowerLoom load path.  Return the
+resulting load path."
+  :public? TRUE :command? TRUE
+  (setq *file-load-path*
+    (concatenate *file-load-path* (parse-directory-path path)))
+  (return *file-load-path*))
+
+(defun (drop-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
+  :documentation "Remove the directories listed in the |-separated
+`path' from the PowerLoom load path."
+  :public? TRUE :command? TRUE
+  (foreach dir in (parse-directory-path path)
+      do (setq *file-load-path* (remove *file-load-path* dir)))
+  (return *file-load-path*))
+
+(defun (find-file-in-load-path STRING) ((file STRING)
+                                        (extensions (CONS OF STRING-WRAPPER)))
+  :documentation "Try to find `file' in the current load path and, if found,
+return its full name.  If `file' doesn't have its own extension try to find
+it with any of the listed `extensions'.  If `extensions' is NULL it defaults
+to `*powerloom-kb-file-extensions*', therefore, to not default to any extensions
+the value has to be supplied as NIL."
+  :public? TRUE
+  (let ((type (file-extension file))
+        (expandedFile file))
+    (when (null? extensions)
+      (setq extensions *powerloom-kb-file-extensions*))
+    (foreach dir in (cons "" *file-load-path*)
+        do (setq expandedFile
+             (concatenate (unwrap-string dir) file))
+           (when (probe-file? expandedFile)
+             (return expandedFile))
+           (when (null? type)
+             (foreach ext in extensions
+                 do (setq expandedFile
+                      (concatenate (unwrap-string dir) file ext))
+                    (when (probe-file? expandedFile)
+                      (return expandedFile)))))
+    (return NULL)))
+
+(defglobal *powerloom-kb-file-extensions* CONS (quote (".plm" ".ploom"))
+  :documentation "If the extension of a KB file is unspecified in a
+`load' or `demo' command, try to find it with one of these extensions."
+  :public? TRUE)
+
+(startup-time-progn
+  ;; standard KB file locations:
+  (add-load-path "PL:kbs;"))
+
+(defun load ((file STRING) &rest (options OBJECT))
+  :documentation "Read logic commands from `file' and evaluate them.
+By default, this will check for each asserted proposition whether an
+equivalent proposition already exists and, if so, not assert the
+duplicate.  These duplicate checks are somewhat expensive though and
+can be skipped by setting the option :check-duplicates? to false.
+This can save time when loading large KBs where it is known that no
+duplicate assertions exist in a file."
+  :command? TRUE :public? TRUE
+  (setq file
+    (first-defined
+     (find-file-in-load-path file *powerloom-kb-file-extensions*)
+     file))
+  (ensure-file-exists file "load")
+  (let ((theOptions
+             (parse-logic-command-options
+              (coerce-&rest-to-cons options)
+              (bquote (:check-duplicates? @BOOLEAN))
+              TRUE FALSE))
+        (topLevelInvocation? (null? *currentFile*))
+	(inputStream INPUT-FILE-STREAM NULL))
+    (unwind-protect
+	(special ((*currentFile* (file-base-name file))
+                  (*dont-check-for-duplicate-propositions?*
+                   (not (lookup-with-default theOptions :check-duplicates? TRUE))))
+	  (setq inputStream (new INPUT-FILE-STREAM :filename file))
+	  (load-stream inputStream))
+      (when topLevelInvocation?
+	(sweep-transients))
+      (when (defined? inputStream)
+	(free inputStream)))))
+
+(defun (definition-name? BOOLEAN) ((name SYMBOL))
+  ;; KLUDGE:  Assume any operator name begining with "DEF"
+  ;;          is a definition name.  Note that this is a case
+  ;;          sensitive test!!!
+  :public? FALSE
+  (let ((name-string (symbol-name name)))
+    (return (and (> (length name-string) 2)
+                 (= (nth name-string 0) #\D)
+                 (= (nth name-string 1) #\E)
+                 (= (nth name-string 2) #\F)))))
+
+(defun load-stream ((stream INPUT-STREAM))
+  :documentation "Read logic commands from `stream' and evaluate them."
+  :public? TRUE
+  ;;; TO DO: CHANGE TWO-PASS LOADING SCHEME TO ONLY EVALUATE DEFINITION COMMANDS
+  ;;;        WITHOUT OPTION PROCESSING IN THE FIRST PASS AND IN THE SECOND PASS
+  ;;;        SIMPLY EVALUATE EVERYTHING IN SEQUENCE (THIS WILL ALLOW MULTIPLE
+  ;;;        `IN-MODULE' DECLARATIONS ALSO).
+  (let ((currentDialect *logic-dialect*)
+        (skipCommand? FALSE)
+        (seenInModule? FALSE)
+        (commands NIL))
+    (special ((*logic-dialect* currentDialect))
+      (within-module *module*
+        (foreach tree in (s-expressions stream)
+            do (typecase tree
+                 (CONS
+                  (mv-setq (skipCommand? seenInModule?)
+                    (handle-in-module-tree tree seenInModule?))
+                  (when skipCommand?
+                    (continue))
+                  (let ((operator (first tree)))
+                    (typecase operator
+                      (SYMBOL
+                       ;; Commands are split into three groups:
+                       (case operator
+                         ;; (1) Those that are evaluated right away:
+                         ((DEFMODULE CLEAR-MODULE
+                           DEFCLASS  DEFSLOT DEFUN DEFMETHOD
+                           DEFCONCEPT DEFFUNCTION DEFRELATION
+                           DEFOBJECT DEFINSTANCE)
+                          (evaluate-logic-command tree FALSE))
+                         ;; (2) Those that are evaluated right away as well
+                         ;;     as after finalization to properly change
+                         ;;     state in both phases:
+                         ((IN-DIALECT)
+                          (evaluate-logic-command tree FALSE)
+                          (pushq commands tree))
+                         ;; (3) Those that are evaluated after finalization:
+                         ;;     These are all commands except definition commands.
+                         (otherwise
+                          (if (and (not (definition-name? operator))
+                                   (defined? (lookup-command operator)))
+                            (pushq commands tree)
+                            (evaluate-logic-command tree FALSE)))))
+                      (otherwise
+                       (evaluate-logic-command tree FALSE)))))
+                 (otherwise
+                  (evaluate-logic-command tree FALSE))))
+        (special ((*translationPhase* :FINALIZE))
+          (finalize-objects))
+        (foreach tree in (reverse commands)
+            do (evaluate-logic-command tree TRUE))))))
+
+  ;;
+;;;;;; Demo
+  ;;
+
+(defspecial *demo-level* INTEGER 0)
+
+(defun print-demo-prompt ()
+  ;; Print a demo prompt.
+  ;; Indicate the number of recursive demo invocations by printing a
+  ;;    corresponding number of spaces.
+;  (foreach i in (interval 1 *demo-level*)
+;      do (ignore i)
+;         (print " "))
+  (print *logic-prompt*))
+
+(defun (demo-skip-to-command BOOLEAN) ((stream INPUT-STREAM))
+  ;; Gobble up any initial whitespace from `stream' without echoing it.
+  ;; Then read up to the next significant (non-comment) character,
+  ;;    echo everything except that character, and put the character
+  ;;    back into the input stream.
+  ;; Return TRUE if EOF was encountered.
+  ;; This is a little bit messy to get the echoing right, but it makes demo
+  ;;    comments and whitespace interact nicely with the demo prompt and
+  ;;    result printing.
+  (let ((ch CHARACTER NULL)
+        (eof? FALSE)
+        (echo? FALSE)
+        (echoStream (echo-stream stream)))
+    (loop
+      (setf (echo-stream stream) NULL)
+      (mv-setq (ch eof?) (read-character stream))
+      (when eof?
+        (return TRUE))
+      (when echo?
+        (setf (echo-stream stream) echoStream))
+      (cond ((white-space-character? ch)
+             ;; skip whitespace:
+             (when echo?
+               (print-stream echoStream ch)))
+            ((eql? ch #\;)
+             ;; skip comments:
+             (setq echo? TRUE)  ;; we are past initial whitespace
+             (setf (echo-stream stream) echoStream)
+             (print-stream echoStream ch)
+             ;;; Our fancy read-line seems to not do the right thing here:
+             ;(setq eof? (null? (read-line stream)))
+             (setq eof? (null? (native-read-line stream)))
+             (when eof?
+               (return TRUE)))
+            (otherwise
+             (setf (echo-stream stream) echoStream)
+             (unread-character ch stream)
+             (break))))
+    ;; return here for non-EOF to make Java happy:
+    (return FALSE)))
+
+(defun (demo-pause? BOOLEAN BOOLEAN) ((pause? BOOLEAN))
+  ;; If 'pause?' is TRUE print a pause prompt, read a line of user input,
+  ;;    and handle any pause-prompt commands the user might have entered.
+  ;; The first return value is TRUE if pausing is still enabled, the second
+  ;;    return value is true if the user wants to exit this demo.
+  ;; If 'pause?' is FALSE, only print some blank lines for proper printing
+  ;;    of the result.
+  (let ((exit? FALSE)
+        (input STRING NULL))
+    (cond (pause?
+           (print "------ pause ------")
+           (setq input (read-line STANDARD-INPUT))
+           (print EOL)
+           (when (> (length input) 0)
+             (case (upcase-character (nth input 0))
+               (#\C (setq pause? FALSE))
+               (#\Q (when (y-or-n? "Really exit demo? (y or n) ")
+                      (setq pause? FALSE)
+                      (setq exit? TRUE)))
+               ((#\H #\?)
+                (print "Type `c' to continue without pausing," EOL
+                       "     `q' to quit from this demo," EOL
+                       "     `?' or `h' to get this message," EOL
+                       "     or any other key to continue." EOL)
+                (return (demo-pause? pause?)))
+               (otherwise NULL))))
+          (otherwise
+           (print EOL)))
+    (return pause? exit?)))
+
+(defun demo-file ((file FILE-NAME) (pause? BOOLEAN))
+  ;; Demo `file' (see `demo').
+  (setq file
+    (first-defined
+     (find-file-in-load-path file *powerloom-kb-file-extensions*)
+     file))
+  (ensure-file-exists file "demo-file")
+  (let ((currentLevel *demo-level*)
+        (command OBJECT NULL)
+        (result OBJECT NULL)
+        (exit? FALSE))
+    (with-input-file (inputStream file)
+      (special ((*careful-logic-command-loop-exit*? FALSE)
+                (*demo-level* (1+ currentLevel)))
+        (setf (echo-stream inputStream) STANDARD-OUTPUT)
+        (within-module *module*
+          (when pause?
+            (print
+             "Now reading from `" file "'." EOL
+             "Type `?' at the pause prompt for a list of available commands."
+             EOL))
+          (loop
+	    (exception-case
+	      (progn 
+		(print EOL)
+		(setq exit? (demo-skip-to-command inputStream))
+		(print-demo-prompt)
+		(unless exit?
+		  (mv-setq (command exit?)
+		           (read-s-expression inputStream)))
+		(when (or exit? (logic-command-loop-exit? command))
+		  (break))
+		(mv-setq (pause? exit?) (demo-pause? pause?))
+		(when exit?
+		  (break))
+		(setq result
+		      (evaluate-logic-command command FALSE))
+		(print-logic-command-result result))
+	      (EVALUATION-EXCEPTION (e)
+                (print-stream STANDARD-ERROR ">> Error: " (exception-message e)))))
+          (print EOL EOL *logic-command-result-indent*
+                 "Finished demo `" file "'." EOL))))))
+
+;;; Running example demos from a menu:
+
+(startup-time-progn
+  (add-load-path "PL:sources;logic;demos;"))
+
+(defglobal *demo-files* (CONS OF (CONS OF STRING-WRAPPER))
+	   (bquote
+            (("basics"
+              "Basic PowerLoom commands"
+              "test-suite")
+             ("classes"
+              "Primitive and defined classes"
+              "test-suite")
+             ("collections"
+              "Reasoning with collections"
+              "test-suite")
+             ("append"
+              "Prolog-style `append'"
+              "test-suite")
+             ("inequalities"
+              "Reasoning with inequalities"
+              "test-suite")
+             ("recursion"
+              "Reasoning with recursive rules"
+              "test-suite")
+             ("negation"
+              "Reasoning with negation"
+              "test-suite")
+             ("constraints"
+              "Constraint propagation"
+              "test-suite")
+             ("equations"
+              "Simple equational reasoning"
+              "test-suite")
+             ("subsumption"
+              "Simple subsumption reasoning"
+              "test-suite")
+             ("family"
+              "Subsumption reasoning within a family ontology"
+              "test-suite")
+             ("relation-hierarchy"
+              "Finding sub, super and equivalent concepts and relations"
+              "test-suite")
+             ("defaults"
+              "Default reasoning with Tweety and friends"
+              "test-suite")
+             ("defaults2"
+              "More default reasoning"
+              "test-suite")
+             ("definition-syntax"
+              "The whole scoop on relation definition, funny arrows, etc."
+              "test-suite")
+             ("meta-relations"
+              "Using meta-properties and relations"
+              "test-suite")
+             ("partial-match"
+              "Reasoning with partial information"
+              "test-suite")
+             ("probability-learning"
+              "Learning to answer probabilistic queries"
+              "test-suite")
+	     ("regression-demo"
+	      "Learning to predict functions")
+	     ("rule-induction-demo"
+	      "Learning inference rules")
+             ("test-suite"
+              "PowerLoom test suite"
+              "test-suite")
+             ))
+  :documentation "List of example demo files.
+Each entry is a `(<file> <description>)' pair.")
+
+(defun (demo-entry-file STRING) ((demoEntry (CONS OF STRING-WRAPPER)))
+  ;; Return the full file name of the demo specified by `demoEntry'.
+  (let ((demoBaseFile STRING (first demoEntry)))
+    (return
+      (first-defined
+       (find-file-in-load-path demoBaseFile NULL)
+       demoBaseFile))))
+
+(defun (demo-entry-description STRING) ((demoEntry (CONS OF STRING-WRAPPER)))
+  ;; Return the description of the demo specified by `demoEntry'
+  ;;    or its base file name if no description was specified.
+  (return (choose (defined? (second demoEntry))
+                  (second demoEntry)
+                  (first demoEntry))))
+
+(defun (demo-entry-test-suite? BOOLEAN) ((demoEntry (CONS OF STRING-WRAPPER)))
+  ;; Return TRUE if the demo specified by `demoEntry' is part of the test suite.
+  (return (and (string? (third demoEntry))
+               (eql? (wrapper-value (third demoEntry)) "test-suite"))))
+
+(defun (select-example-demo STRING) ((index INTEGER))
+  ;; Return the full file name of example demo `index' (1-based).
+  (let ((entry (nth *demo-files* (1- index))))
+    (if (defined? entry)
+        (return (demo-entry-file entry))
+      (return NULL))))
+
+(defun (select-example-demo-from-menu STRING) ()
+  ;; Let the user select an example demo from a menu and return its
+  ;;    full pathname.
+  ;; Return NULL if the user chose to quit out of the menu.
+  (print "Choose a demo:" EOL)
+  (foreach entry in *demo-files* 
+      as i in (interval 1 NULL)
+      do (print "       " i ".  ")
+	 (when (< i 10) (print " "))
+	 (print (demo-entry-description entry) EOL))
+  (print "       " "Q.   Quit demoing" EOL)
+  (print "Your choice: ")
+  (let ((selection (read-s-expression STANDARD-INPUT))
+        (file STRING NULL))
+    (typecase selection
+      (INTEGER-WRAPPER
+       (setq file (select-example-demo selection))
+       (when (defined? file)
+         (return file)))
+      (otherwise
+       (when (string-equal? (stringify selection) "Q")
+         (return NULL))))
+    (print ">> ERROR: Illegal choice `" selection
+           "'; enter a number between 1 and " (length *demo-files*) "!"
+           EOL EOL)
+    (return (select-example-demo-from-menu))))
+
+(defun demo-example-demos ()
+  ;; Repeatedly run example demos chosen from a menu until the user
+  ;;    chooses to quit the loop.
+  (let ((file STRING NULL))
+    (loop
+      (print EOL)
+      (setq file (select-example-demo-from-menu))
+      (when (null? file)
+        (return))
+      (print EOL)
+      (demo-file file TRUE))))
+
+(defun demo (&rest (fileAndPause OBJECT))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Read logic commands from a file, echo them verbatimly to standard output,
+and evaluate them just as if they had been typed in interactively.
+When called with no arguments, present a menu of example demos, otherwise,
+use the first argument as the name of the file to demo.
+Pause for user confirmation after each expression has been read but
+before it is evaluated.  Pausing can be turned off by suppling FALSE
+as the optional second argument, or by typing `c' at the pause prompt.
+Typing `?' at the pause prompt prints a list of available commands."
+  (let ((theFileAndPause (coerce-&rest-to-cons fileAndPause))
+        (fileSpec (first theFileAndPause))
+        (pause? (not (eql? (second theFileAndPause) (quote FALSE))))
+        (file STRING NULL))
+    (when (integer? fileSpec)
+      (setq file (select-example-demo (cast fileSpec INTEGER-WRAPPER)))
+      (if (defined? file)
+          (setq fileSpec file)
+        (setq fileSpec NULL)))
+    (if (null? fileSpec)
+        (demo-example-demos)
+      (typecase fileSpec
+        (STRING-WRAPPER (demo-file fileSpec pause?))
+        (otherwise
+         (print ">> ERROR: Illegal file specification: " fileSpec))))))
+
+;; Rudimentary regression testing support:
+
+(defun test-logic-file ((file FILE-NAME))
+  ;; Test-run the logic file `file'.
+  ;; Similar to `demo-file', but doesn't echo comments, nor pause, etc.
+  (ensure-file-exists file "test-logic-file")
+  (let ((currentLevel *demo-level*)
+        (command OBJECT NULL)
+        (result OBJECT NULL)
+        (exit? FALSE)
+        (inputStream INPUT-STREAM (new INPUT-FILE-STREAM :filename file))
+        (fileBaseName (file-name-without-directory file)))
+    (special ((*careful-logic-command-loop-exit*? FALSE)
+              (*demo-level* (1+ currentLevel))
+              (*printReadably?* TRUE)
+              (*printPretty?* FALSE)) ;; for easier comparison with C++
+      (within-module *module*
+        (print EOL "Now testing file `" fileBaseName "':" EOL)
+        (loop
+	  (exception-case
+	      (progn 
+		(print EOL)
+		(print-demo-prompt)
+		(unless exit?
+		  (mv-setq (command exit?)
+		    (read-s-expression inputStream)))
+		(when (or exit? (logic-command-loop-exit? command))
+		  (break))
+		(print command EOL EOL)
+		(setq result
+		  (evaluate-logic-command command FALSE))
+		(print-logic-command-result result))
+	    (EVALUATION-EXCEPTION (e) 
+	      (print-stream STANDARD-ERROR ">> Error: " (exception-message e)))))
+        (free inputStream)
+        (print EOL EOL *logic-command-result-indent*
+               "Finished testing file `" fileBaseName "'." EOL)))))
+
+(defun (get-formatted-date-and-time STRING) ()
+  ;; Return a formatted version of the current date and time as a string.
+  ;; This is somewhat obsolete due to the new date/time support.
+  (return
+    (calendar-date-to-string (make-current-date-time) (get-local-time-zone) FALSE TRUE)))
+
+(defun run-powerloom-tests ()
+  :command? TRUE :public? TRUE
+  :documentation
+  "Run the PowerLoom test suite.  Currently this simply runs all demos and
+echos commands and their results to standard output.  The output can then
+be diffed with previously validated runs to find deviations."
+  (let ((PLUser (get-stella-module "PL-USER" TRUE))
+	(start-time (make-current-date-time))
+	(finish-time CALENDAR-DATE NULL)
+        (logLevel (lookup-logging-parameter "PowerLoom" :level :low)))
+    ;; temporarily turn off logging to avoid output mismatches due to time differences;
+    ;; ideally, we would have a time-less logging format that avoids this issue:
+    (set-logging-parameters "PowerLoom" :level :none)
+    (print "RUNNING POWERLOOM TEST SUITE" EOL
+	   "============================" EOL EOL)
+    (print "STELLA version:    " *stella-version-string* EOL
+	   "PowerLoom version: " *powerloom-version-string* EOL
+	   "Start time:        " (calendar-date-to-string start-time (get-local-time-zone) FALSE TRUE)
+	   EOL EOL)
+    (clear-context PLUser)
+    (foreach child in (copy (child-contexts PLUser))
+        do (destroy-context child))
+    (setq *skolem-id-counter* 0)
+    (foreach entry in *demo-files*
+        where (demo-entry-test-suite? entry)
+        do (test-logic-file (demo-entry-file entry)))
+    (setq finish-time (make-current-date-time))
+    (print EOL "FINISHED RUNNING POWERLOOM TEST SUITE"
+	   EOL "====================================="
+	   EOL "Finish time:   "
+	   (calendar-date-to-string finish-time (get-local-time-zone) FALSE TRUE)
+	   EOL "Elapsed time:  "
+	   (time-duration-to-string (cast (time-subtract finish-time start-time)
+					  TIME-DURATION))
+	   EOL EOL)
+    (set-logging-parameters "PowerLoom" :level logLevel)))
+
+(defun (time-command OBJECT) ((command CONS))
+  :documentation "Execute `command', measure and report its CPU and elapsed time
+needed for its execution, and then return its result."
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  (let ((startTime (make-current-date-time))
+        (startCPU (get-ticktock))
+        (result (evaluate command))
+        (endCPU (get-ticktock))
+        (elapsedTime TIME-DURATION (time-subtract (make-current-date-time) startTime)))
+    (print "CPU Time:     " (ticktock-difference startCPU endCPU) " secs" EOL)
+    (print "Elapsed Time: ")
+    (when (> (days elapsedTime) 0)
+      (print (days elapsedTime) " days, "))
+    (print (/ (millis elapsedTime) 1000.0) " secs" EOL)
+    (return result)))
+
+
+  ;;
+;;;;;; Error messages
+  ;;
+
+(defspecial *termSourceBeingParsed* STRING NULL
+  :documentation "Points to the source of the relation being parsed.")
+
+(defspecial *descriptionUnderConstruction* OBJECT NULL
+  :documentation "Pofints to a description or its parse tree which
+is the input to the description being constructed.")
+
+(defspecial *termUnderConstruction* OBJECT NULL
+  :documentation "Points to the parse tree which is the input to the
+proposition being constructed.")
+
+(defglobal *expression-size-cutoff* INTEGER 300
+  :documentation "Limit on how big an s-expression we will print within
+an error message.")
+
+(defun print-formula-containing-error ((self OBJECT) (stream OUTPUT-STREAM))
+  ;; Print pretty version of 'self' to stream, unless its too big,
+  ;;    in which case we print dots.
+  ;; TO DO: REWRITE USING Tom's PRETTY PRINTING.
+  (let ((temp (new STRING-OUTPUT-STREAM))
+        (expressionString STRING NULL))
+    (print-stream temp self)
+    (setq expressionString (the-string temp))
+    (when (> (length expressionString) *expression-size-cutoff*)
+      (setq expressionString
+        (concatenate
+          (subsequence expressionString 0 *expression-size-cutoff*)
+          " ......)")))
+    (print-stream stream expressionString)))
+
+(defun help-signal-proposition-error ((stream OUTPUT-STREAM) (warningOrError KEYWORD))
+  ;; Print out the context of a proposition error.
+  (let ((bestOutputObject OBJECT *termUnderConstruction*)
+        (typeName (choose (defined? bestOutputObject) "proposition" "relation")))
+    (when (null? bestOutputObject)
+      (setq bestOutputObject *descriptionUnderConstruction*))
+    (when (and (null? bestOutputObject)
+               (defined? *termSourceBeingParsed*))
+      (setq bestOutputObject *termSourceBeingParsed*))
+    (when (defined? bestOutputObject)
+      (print-stream stream "   ")
+      (case warningOrError
+        (:ERROR (print-stream stream "Error"))
+        (:WARNING (print-stream stream "Warning")))
+      (print-stream stream " occurred while parsing the " typeName ": ")
+      (typecase bestOutputObject
+        (NAMED-DESCRIPTION
+         (print-stream stream (relation-name bestOutputObject) EOL)
+         (return))
+        ((PROPOSITION DESCRIPTION CONS)
+         (print-stream stream EOL "   ")
+         (print-formula-containing-error *termUnderConstruction* stream))
+        (STRING
+         (print-stream stream EOL)
+         (let ((sExpression (unstringify bestOutputObject)))
+           (print-formula-containing-error sExpression stream)))
+        ;; avoid breaking on bad input:
+        (otherwise NULL))
+      (print-stream stream EOL)) ))
+
+
+  ;;
+;;;;;; Definition of named logic objects
+  ;;
+
+;;; THIS IS OBSOLETE AND SHOULD BE REPLACED BY AN ASSERTION MECHANISM THAT
+;;;    CAN SPECIFY GENERATION PATTERNS FOR RELATIONS, SPECIALISTS, ETC.
+(defslot NAMED-DESCRIPTION permutation-table :type (KEY-VALUE-LIST OF VECTOR SLOT)
+         :option-keyword :permutation-table)
+
+;;; THIS IS PROBABLY OBSOLETE TOO:
+;;; Should we have accessors that provide a uniform interface to parameter
+;;; names and types of relations which might be represented as functions,
+;;; classes, slots, or tables?
+(defslot TABLE relation-parameter-type-specifiers :renames tuple-domains)
+
+(defslot MODULE module-logic-dialect :type KEYWORD
+         :default NULL   ; Was :KIF, but needs to be NULL for Java translation.
+	 :option-keyword :logic-dialect
+	 :public? TRUE)
+
+;;; NOT USED - NEEDS UPGRADE OR ELIMINATION:
+(defun (logic-dialect KEYWORD) ((self OBJECT))
+  ;; Return the logic dialect that should be used to parse the
+  ;;    definition and the axioms associated with 'self'.
+  ;; We cannot reliably use '*logic-dialect*', since that might
+  ;;    be different at relation finalization time than what it
+  ;;    was when 'self' got defined.
+  ;; This should look at the home module of 'self', or a slot that
+  ;;    recorded the dialect when 'self' got defined.
+  ;; For now, just look at the dialect of the home module:
+  (typecase self
+    (RELATION (return (logic-dialect (home-module self))))
+    (MODULE (let ((dialect (module-logic-dialect self)))
+	      (if (defined? dialect)
+		(return dialect)
+		(return :KIF))))) )
+
+(defun (lookup-logic-object-surrogate SURROGATE) ((name SYMBOL)
+                                                  (definitionModule MODULE))
+  ;; Lookup the logic-object surrogate named by `name' assuming we are about
+  ;;    to re/define a PowerLoom object in `definitionModule'.
+  ;; Exists to properly handle cases where `name' is explicitly qualified
+  ;;    (relative to `definitionModule').  In that case we want to look
+  ;;    for the surrogate in `name's module.
+  (setq definitionModule (first-defined definitionModule *module*))
+  (if (explicitly-qualified-logic-object-name? name definitionModule)
+      (return
+        (lookup-surrogate-in-module (symbol-name name) (interned-in name) TRUE))
+    ;; should we lookup in `definitionModule' here?
+    (return (lookup-surrogate name))))
+
+(defun (intern-logic-object-surrogate SURROGATE) ((name SYMBOL))
+  ;; Intern a surrogate for `name' in the current module to which a newly
+  ;;    re/defined logic object can be bound;  return the surrogate.
+  ;; Signal an error if this is not possible or would illegally (i.e.,
+  ;;    not sanctioned by the user) shadow a term in a parent module.
+  ;; User interaction will only be triggered if shadowing is required
+  ;;    and `*warnIfRedefine?*' is true.
+  (when (not (clearable? *module*))
+    (signal-proposition-error
+     "Can't define the term " name " in the unclearable module "
+     (module-full-name *module*)))
+  (let ((oldSurrogate (lookup-logic-object-surrogate name *module*))
+        (oldValue (only-if (defined? oldSurrogate)
+                           (surrogate-value oldSurrogate)))
+        (oldModule (only-if (defined? oldValue)
+                            (home-module oldValue))))
+    (when (and (defined? oldValue)
+               (not (eql? oldModule *module*)))
+      (when *warnIfRedefine?*
+        ;;; NOTE: THIS USER INTERACTION HAS TO BE DONE DIFFERENTLY IF WE ARE
+        ;;;    RUNNING AS A SERVER OR THROUGH A GUI SUCH AS ONTOSAURUS.
+        ;;;    ONE WAY TO DO THIS IS THROUGH A SESSION ABSTRACTION, ANOTHER IS
+        ;;;    TO ALWAYS ABORT TO THE TOP LEVEL, HAVE THE GUI (OR USER) ANALYZE
+        ;;;    THE ERROR, FIX THE PROBLEM AND THEN RERUN THE TRANSACTION.
+        (inform "Defining " name " would cause a term with the same name" EOL
+                "   of type " (name-object-metaclass oldValue)
+                " in module " (module-full-name oldModule) " to be shadowed.")
+        (inform
+         "CAUTION: Automatic shadowing can be dangerous, because forward " EOL
+         "   references to a shadowed object may be bound to the now shadowed "
+         EOL "   object.  Suggestion: Explicitly shadow the name using" EOL
+         "   DEFMODULE's `:shadow' option.")
+        (unless (yes-or-no? "Do it anyway? ")
+          (signal-proposition-error
+           "Couldn't shadow name " name " in " (module-full-name *module*)))))
+    (if (explicitly-qualified-logic-object-name? name *module*)
+        (within-module (interned-in name)
+          (return (shadow-surrogate name)))
+      (return (shadow-surrogate name)))))
+
+(defun (name-object-metaclass string) ((self object))
+  ;; Return a string naming the metaclass of `self'.
+  (typecase self
+    (DESCRIPTION
+     (cond
+      ((class? self) (return "concept"))
+      ((function? self) (return "function"))
+      (otherwise (return "relation"))))
+    (LOGIC-OBJECT
+     (return "logic object"))
+    (otherwise
+     (return (string-downcase (symbol-name (primary-type self)))))))
+
+(defun (logic-object-definition-type KEYWORD) ((name SYMBOL)
+                                               (oldObject OBJECT)
+                                               (newObject OBJECT))
+  ;; Return a keyword indicating the type of definition for `newObject'.
+  ;;    The possibilities are :DEFINITION (for a new definition),
+  ;;    :PROPER-DEFINITION for the definition of a forward-referenced object,
+  ;;    and :REDEFINITION for a legal redefinition.
+  ;; Signal an error in the case of an illegal redefinition.
+  (when (null? oldObject)
+    (return :DEFINITION))
+  (let ((oldKind (name-object-metaclass oldObject))
+        (newKind (name-object-metaclass newObject)))
+    (typecase oldObject
+      (NAMED-DESCRIPTION
+       (unless (eql? oldKind newKind)
+         (signal-proposition-error
+          "Can't redefine " oldKind " " name " with a " newKind "." EOL
+          "   Explicitly destroy the old object first before you redefine it"))
+       (unless (or (= (arity oldObject)
+                      (arity (cast newObject NAMED-DESCRIPTION)))
+                   ;; KLUDGE: at this point we don't yet know about any
+                   ;; variable arity assertions, so, if the definition string
+                   ;; looks like it might contains one - assume it does; we
+                   ;; should also check for minimum arity compatibility once
+                   ;; we define what that is and can enforce it:
+                   (and (defined? (stringified-source newObject))
+                        (defined? (string-search (stringified-source newObject)
+                                                 "VARIABLE-ARITY" 0))))
+         (signal-proposition-error
+          "Can't redefine " oldKind " " name " with a different arity." EOL
+          "   Explicitly destroy the old object first before you redefine it"))
+       (return :REDEFINITION))
+      (LOGIC-OBJECT
+       (typecase newObject
+         (NAMED-DESCRIPTION
+          (return :PROPER-DEFINITION))
+         (LOGIC-OBJECT
+          (return :REDEFINITION))
+         (otherwise NULL)))
+      (otherwise
+       (when (eql? (primary-type oldObject) (primary-type newObject))
+         (return :REDEFINITION))))
+    (signal-proposition-error
+     "Can't redefine " oldKind " " name " with a " newKind "." EOL
+     "   Explicitly destroy the old object first before you redefine it")))
+
+(defun bind-logic-object-to-surrogate ((name SYMBOL) (object OBJECT))
+  ;; Helping function for various definition functions.
+  ;; Bind `object' to a surrogate corresponding to `name'.
+  ;; If the surrogate is already bound, check wether we have a redefinition,
+  ;;    a proper definition of a forward-referenced object or a conflicting
+  ;;    definition and carry out the required updates or signal an error.
+  (typecase object
+    ((LOGIC-OBJECT PROPOSITION) NULL)
+    (otherwise
+     (error "INTERNAL ERROR: Can't yet define logic objects of type "
+            (primary-type object))))
+  (let ((nameSurrogate (intern-logic-object-surrogate name))
+        (objectSurrogate (object-surrogate object))
+        (oldObject (surrogate-value nameSurrogate))
+        (definitionType KEYWORD NULL))
+    (when (and (defined? oldObject)
+               (deleted? oldObject))
+      ;; shouldn't happen, but let's be robust:
+      (setq oldObject NULL)
+      (setf (surrogate-value nameSurrogate) NULL))
+    (when (and *warnIfRedefine?*
+               (defined? objectSurrogate)
+               (not (eql? objectSurrogate nameSurrogate)))
+      (inform "The " (name-object-metaclass object) " now named " name
+              " used to be named " (symbolize objectSurrogate) "." EOL
+              "    Unlinking it from its old name.")
+      (setf (surrogate-value objectSurrogate) NULL))
+    ;; name the new object first so error messages will work:
+    (setf (object-surrogate object) nameSurrogate)
+    (setq definitionType (logic-object-definition-type name oldObject object))
+    ;; now that we know things are ok, make surrogate point to the new object
+    ;;    and unname any old one so its deletion won't unset that link:
+    (setf (surrogate-value nameSurrogate) object)
+    (when (and (defined? oldObject)
+               (not (eql? oldObject object)))
+      (setf (object-surrogate oldObject) NULL))
+    (case definitionType
+      (:DEFINITION NULL)
+      (:PROPER-DEFINITION
+       ;; We have a proper definition of a forward-referenced
+       ;;    relation; transfer `oldObject's propositions to the
+       ;;    now properly defined 'object' and delete `oldObject':
+       (transfer-propositions-and-backlinks oldObject object)
+       (typecase oldObject
+         ((LOGIC-OBJECT PROPOSITION)
+          (setf (deleted? oldObject) TRUE))))
+      (:REDEFINITION
+       (redefine-logic-object name oldObject object)))))
+
+(defun redefine-logic-object ((name SYMBOL)
+                              (oldObject OBJECT)
+                              (newObject OBJECT))
+  ;; Redefine `oldObject' named `name' to `newObject' by destroying all its
+  ;;    definitional propositions, transferring all non-definitional
+  ;;    propositions to `newObject' and finally destroying it.
+  (let ((originatedProps (originated-propositions oldObject))
+        (exceptProps (copy originatedProps)))
+    (foreach prop in originatedProps
+        do (foreach satellite in (satellite-propositions prop)
+               do (insert-new exceptProps satellite)))
+    (when (and *warnIfRedefine?*
+               (not (eql? (stringified-source oldObject)
+                          (stringified-source newObject))))
+      (pl-log :low "Redefining the " (name-object-metaclass oldObject)
+              " named " name))
+    ;; do this first, since we need backlinks to lookup current synonyms:
+    (transfer-synonyms oldObject newObject)
+    (transfer-propositions-except-for oldObject newObject exceptProps)
+    (when (isa? oldObject @NAMED-DESCRIPTION)
+      (transfer-description-extension oldObject newObject))
+    (foreach prop in originatedProps
+        do (destroy-proposition prop))
+    ;; don't destroy if same proposition was redefined with different options:
+    (unless (eql? oldObject newObject)
+      (destroy-object oldObject))))
+
+;;; Mapping names onto objects:
+
+;;; The routines below handle how symbols in logic parse trees get
+;;; mapped onto the proper logic objects named by those symbols.  The general
+;;; problem is to map a symbol whose module is SM onto a logic object surrogate
+;;; whose module is OM all relative to the current module M.  The surrogates
+;;; are then pointing at the actual logic objects, however, due to forward
+;;; references an object surrogate might not yet be pointing at an object.
+;;; The mapping mechanism is complicated and kludgy for a variety of reasons:
+;;; (1) parallel symbol/surrogate spaces: the internal names used by logic
+;;;     objects are surrogates but external names typed by users are symbols.
+;;;     Symbols and surrogates need to be kept in sync for proper connection
+;;;     between internal and external names.
+;;; (2) disappearing explicit qualification: once the STELLA reader has
+;;;     read an expression, we don't know anymore which of the read symbols
+;;;     was explicitly qualified.  The only symbols for which we can reliably
+;;;     make this determination are those not visible from the current module.
+;;;     This is really a bug, but fixing it requires an extensive change to
+;;;     all logic input routines, so we postpone that for now.
+;;; (3) forward references: if we read a name of an as yet undefined object
+;;;     we need to allocate a surrogate and object for it so that we can
+;;;     build appropriate data structures.  But where should that be allocated
+;;;     if the module of the name used is not the same as the current module?
+;;; (4) symbol pollution: modules such as PL-KERNEL use code modules such as
+;;;     LOGIC or STELLA that make available a large set of symbols that
+;;;     are picked up by the reader when used as logic terms, but which often
+;;;     don't have corresponding logic definitions (leads to problem (3)).
+
+;;; Access/lookup rules:
+;;;
+;;; unqualified symbol:
+;;; - case 1: SM = M (i.e., symbol module = current module)
+;;;   - case 1.1: a bound object surrogate with module OM already exists
+;;;          and OM = SM.  This is the easiest case, we simply pick up that
+;;;          surrogate with its associated object.
+;;;   - case 1.2: a bound object surrogate with module OM already exists,
+;;;          OM is a parent of SM and there is no local surrogate in M.
+;;;          This is an unusual case, since the unqualified symbol must have
+;;;          been read before the object was defined.  Otherwise, the reader
+;;;          would have picked up the symbol from module OM.  Anyway, we pick
+;;;          up the surrogate with module OM.
+;;;   - case 1.3: an unbound object surrogate with module OM already exists.
+;;;          Regardless of whether OM = M or a parent of M, we generate a
+;;;          local bound surrogate.
+;;;   - case 1.4: no object surrogate exists in either M or any of its parents.
+;;;          We generate a local bound surrogate.
+;;; - case 2: SM is a parent of M
+;;;   - case 2.1: just like case 1.1.
+;;;   - case 2.2: just like case 1.2.
+;;;   - case 2.3: just like case 1.3.
+;;;   - case 2.3: just like case 1.4.
+
+;;; qualified symbol (note, that we can only determine those for modules
+;;; that are not visible from the current module M - for now):
+;;; - case 3: SM not visible from M:
+;;;   - case 3.1: just like case 1.1.
+;;;   - case 3.2: an unbound object surrogate with module OM already exists.
+;;;          Regardless of whether OM = SM or a parent of SM, we generate a
+;;;          local bound surrogate in SM whose value/object will have home
+;;;          module M.
+;;;   - case 3.3: no object surrogate exists in either SM or any of its parents.
+;;;          We generate a local bound surrogate in SM whose value/object will
+;;;          have home module M.
+
+;;; Examples (some uninteresting results are ommitted to save space):
+#|
+STELLA(61): (cc pl-user)
+STELLA(62): (defmodule "/EXTERNAL" :uses ())
+STELLA(63): (defmodule "PL-USER/TOP" :uses ())
+STELLA(64): (defmodule "TOP/MIDDLE" :uses ())
+STELLA(65): (defmodule "MIDDLE/BOTTOM" :includes "EXTERNAL" :uses ())
+STELLA(66): (cc top)
+STELLA(67): (eval (logic/defconcept a-top)) ;; case 1.4
+|c|A-TOP
+STELLA(68): (eval (logic/ask (concept a-top))) ;; case 1.1
+TRUE
+STELLA(69): (eval (logic/cc middle))
+STELLA(70): (eval (/logic/ask (concept a-top))) ;; case 2.1
+TRUE
+STELLA(71): (eval (stella/intern-symbol-in-module "A-TOP" stella/NULL stella/TRUE))
+A-TOP
+STELLA(72): (eval (stella/interned-in (stella/lookup-symbol "A-TOP")))
+|MDL|/PL-KERNEL-KB/PL-USER/TOP/MIDDLE
+STELLA(73): (eval (logic/ask (concept a-top))) ;; case 1.2
+TRUE
+STELLA(74): (eval (stella/intern-surrogate-in-module "A-MIDDLE"
+                    (stella/get-stella-module "TOP" stella/true) stella/true))
+/PL-KERNEL-KB/PL-USER/TOP/@A-MIDDLE
+STELLA(75): (home-module cl:*)
+|MDL|/PL-KERNEL-KB/PL-USER/TOP
+STELLA(76): (eval (logic/defconcept a-middle)) ;; case 1.3
+|c|A-MIDDLE
+STELLA(77): (home-module cl:*)
+|MDL|/PL-KERNEL-KB/PL-USER/TOP/MIDDLE
+STELLA(78): (home-module (object-name cl:**))
+|MDL|/PL-KERNEL-KB/PL-USER/TOP/MIDDLE
+STELLA(79): (eval (logic/defconcept b-middle))
+|c|B-MIDDLE
+STELLA(80): (eval (logic/cc external))
+STELLA(81): (eval (logic/defconcept a-external))
+|c|A-EXTERNAL
+STELLA(82): (eval (logic/cc middle))
+STELLA(83): (eval (logic/ask (concept /external/a-external)))
+UNKNOWN ;; because concept's home module is `external'
+STELLA(84): (eval (logic/defconcept /external/b-external))
+|c|/EXTERNAL/B-EXTERNAL
+STELLA(85): (home-module cl:*)
+|MDL|/PL-KERNEL-KB/PL-USER/TOP/MIDDLE
+STELLA(86): (eval (logic/ask (concept /external/b-external)))
+TRUE ;; because concept's home module is `middle', but its name is in `external'
+STELLA(87): (eval (logic/deffunction b-external (?x ?y)))
+|f|B-EXTERNAL
+STELLA(88): (eval (logic/cc bottom))
+STELLA(90): (eval (logic/ask (concept b-external)))
+UNKNOWN
+STELLA(91): (eval (logic/ask (function b-external)))
+TRUE
+STELLA(92): (eval (logic/ask (concept external/b-external)))
+TRUE
+STELLA(93): (eval (logic/ask (function external/b-external)))
+UNKNOWN
+|#
+
+;;; Emergency switch until we are confident that this works reasonably well:
+(defglobal *handle-explicitly-qualified-logic-objects?* BOOLEAN TRUE)
+
+(defun (explicitly-qualified-logic-object-name? BOOLEAN)
+    ((objectName GENERALIZED-SYMBOL) (definitionModule MODULE))
+  ;; Return TRUE if `objectName' is/would be an external (explicitly qualified)
+  ;;    name for a logic object defined in `definitionModule'.  For example,
+  ;;    if we wanted to define `(defconcept /a/foo)' in module PL-USER.
+  (when *handle-explicitly-qualified-logic-objects?*
+    (setq definitionModule (first-defined definitionModule *module*))
+    (return
+      ;; we can't use this, since its result can change after a symbol has
+      ;;    been coerced to a local unbound surrogate (at that point we find
+      ;;    a shadowing symbol which `explicitly-qualified-name?' considers):
+      ;;(explicitly-qualified-name? objectName definitionModule)
+      ;; so, the only "reliable" way for now to determine this is if
+      ;;    `objectName's module is not visible:
+      (not (visible-from? (interned-in objectName) definitionModule))))
+  (return FALSE))
+
+(defun (coerce-to-bound-or-local-surrogate SURROGATE) ((self GENERALIZED-SYMBOL))
+  ;; If 'self' is unqualified and does not have a value and it is not interned
+  ;;    in the current module, return a local surrogate that shadows 'self'.
+  ;; If it is an explicitly qualified symbol, coerce it to a bound surrogate
+  ;;    in `self's module.
+  ;; This is very hairy and tries to implement the cases outlined above -
+  ;;    don't change this light-heartedly, it's likely you don't understand
+  ;;    all the consequences - I usually very quickly forget what they are (hc).
+  (let ((surrogate SURROGATE NULL))
+    (when (explicitly-qualified-logic-object-name? self *module*)
+      (within-module (interned-in self)
+        (return (coerce-to-bound-or-local-surrogate self))))
+    (typecase self
+      (SURROGATE
+       (setq surrogate self))
+      (SYMBOL
+       ;; TRICKY (what else): we first start looking from the symbol module
+       ;;    in case the user qualified the name to disambiguate between two
+       ;;    inherited symbols of the same name (if we always started from
+       ;;    `*module*' we would not be able to do that; also if we could
+       ;;    reliably determine explicit qualification, we wouldn't have to
+       ;;    do this at all):
+       (setq surrogate
+         (lookup-surrogate-in-module (symbol-name self)
+                                     (interned-in self)
+                                     FALSE))
+       ;; If we failed above and the symbol module is different than `*module*'
+       ;;    we lookup again by simply ignoring the module information:
+       (when (and (null? surrogate)
+                  (not (eql? (interned-in self) *module*)))
+         (setq surrogate
+           (lookup-surrogate-in-module (symbol-name self)
+                                       *module*
+                                       FALSE)))))
+    (when (and (defined? surrogate)
+               (defined? (surrogate-value surrogate)))
+      (safety 3 (not (deleted? surrogate)) "HIT DELETED SURROGATE")
+      (return surrogate))
+    ;; we either didn't find the surrogate or it was unbound; assume it was
+    ;;    a reference to a local surrogate:
+    (return (shadow-surrogate (symbol-name self)))))
+
+
+  ;;
+;;;;;; Object definition axioms
+  ;;
+
+;;; The slot that holds definitional and other axiomatic information
+;;; associated with a named description is called 'axioms'.  The other
+;;; slots are just aliases to allow the dispatch of proper handlers
+;;; depending on the definition keywords used.  'axioms' holds the
+;;; combination of axioms and definitions converted into axioms.
+
+(defslot LOGIC-OBJECT object-axioms :type CONS :default NULL
+         :reader axioms
+         :option-keyword :AXIOMS
+         :option-handler definition-axioms-handler)
+
+(defslot PROPOSITION proposition-axioms :type CONS :default NULL
+         :writer axioms-setter
+         :option-keyword :AXIOMS
+         :option-handler definition-axioms-handler)
+
+(defun (axioms CONS) ((self OBJECT))
+  ;; Generic slot reader for the axioms of `self'.  Once/when LOGIC-OBJECT
+  ;;    and PROPOSITION descend from the same super class, this can go away.
+  (typecase self
+    (LOGIC-OBJECT (return (slot-value self object-axioms)))
+    (PROPOSITION (return (slot-value self proposition-axioms)))))
+
+(defun (axioms-setter OBJECT) ((self OBJECT) (axioms CONS))
+  ;; Generic slot writer for the axioms of `self'.  Once/when LOGIC-OBJECT
+  ;;    and PROPOSITION descend from the same super class, this can go away.
+  (typecase self
+    (LOGIC-OBJECT (setf (slot-value self object-axioms) axioms))
+    (PROPOSITION (setf (slot-value self proposition-axioms) axioms)))
+  (return axioms))
+
+(defslot NAMED-DESCRIPTION axioms-alias1 :renames object-axioms
+         :option-keyword :<=
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias2 :renames object-axioms
+         :option-keyword :=>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias3 :renames object-axioms
+         :option-keyword :<<=
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias4 :renames object-axioms
+         :option-keyword :=>>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias5 :renames object-axioms
+         :option-keyword :<=>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias6 :renames object-axioms
+         :option-keyword :<=>>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias7 :renames object-axioms
+         :option-keyword :<<=>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias8 :renames object-axioms
+         :option-keyword :<<=>>
+         :option-handler definition-half-rule-handler)
+
+(defslot NAMED-DESCRIPTION axioms-alias9 :renames object-axioms
+         :option-keyword :<~
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias10 :renames object-axioms
+         :option-keyword :~>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias11 :renames object-axioms
+         :option-keyword :<<~
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias12 :renames object-axioms
+         :option-keyword :~>>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias13 :renames object-axioms
+         :option-keyword :<~>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias14 :renames object-axioms
+         :option-keyword :<~>>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias15 :renames object-axioms
+         :option-keyword :<<~>
+         :option-handler definition-half-rule-handler)
+(defslot NAMED-DESCRIPTION axioms-alias16 :renames object-axioms
+         :option-keyword :<<~>>
+         :option-handler definition-half-rule-handler)
+
+(defun definition-axioms-handler
+    ((self OBJECT) (slot STORAGE-SLOT) (theAxioms OBJECT))
+  ;; Handle the definition of 'theAxioms' on the relation 'self'
+  ;;    and store them in 'self's 'axioms' (if necessary,
+  ;;    they will be combined with any other axioms already defined).
+  ;; 'theAxioms' can be a parse tree or a string.
+  ;; Implicitly AND-ed lists of axioms are allowed.
+  (ignore slot)
+  (when (string? theAxioms)
+    (setq theAxioms (unstringify-in-module theAxioms (home-module self))))
+  (setf (axioms self) (combine-axiom-lists (axioms self) theAxioms)))
+
+(defun definition-half-rule-handler
+       ((self NAMED-DESCRIPTION) (slot STORAGE-SLOT) (body OBJECT))
+  ;; Handle the definition of 'body' on the relation 'self'
+  ;;    and store them in 'self's 'axioms' (if necessary,
+  ;;    they will be combined with any axioms already defined).
+  ;; Half rules are abbreviated axioms of the form:
+  ;;
+  ;;    (forall (<relation-variable>+)
+  ;;      (<arrow> (<relation-name> <relation-variable>+)
+  ;;               <body>))
+  ;;
+  ;; To allow a correct expansion, the variables referenced in
+  ;;    'body' have to correspond to the relation variables
+  ;;    of 'self' and/or its self and value variables.
+  ;; 'body' can be a parse tree or a string.
+  (let ((keyword (slot-option-keyword slot))
+        (arrow (intern-symbol-in-module
+                (symbol-name keyword)
+                (get-stella-module "PL-KERNEL-KB" TRUE)
+                FALSE))
+        (newRule OBJECT NULL))
+    (when (null? body)
+      (signal-proposition-error "Missing value for arrow keyword"))
+    (when (string? body)
+      (setq body (unstringify-in-module body (home-module self))))
+    (setq newRule (complete-rule-definition self body arrow))
+    (setf (axioms self) (combine-axiom-lists (axioms self) newRule))))
+
+(defun (combine-axiom-lists CONS) ((oldAxioms CONS) (newAxioms OBJECT))
+  ;; Combine `oldAxioms' (which must be NULL, empty, or an implicitly
+  ;;    AND-ed list of axioms) with 'newAxioms' (which must be either
+  ;;    a single axiom or an implicitly AND-ed list) into an implicitly
+  ;;    AND-ed list of axioms and return the result.  Eliminate any
+  ;;    top-level AND's in `newAxioms'.
+  ;; This function is used to combine lists of entity axioms and constraints
+  ;;    into a single list of axioms.
+  (when (null? oldAxioms)
+    (setq oldAxioms NIL))
+  (when (null? newAxioms)
+    (setq newAxioms NIL))
+  (let ((normalizedNewAxioms NIL))
+    (typecase newAxioms
+      (CONS
+       (cond ((forall elt in newAxioms
+                  always (cons? elt))
+              ;; We have an implicitly AND-ed list of new axioms:
+              (setq normalizedNewAxioms newAxioms))
+             ((eql? (first newAxioms) (quote AND))
+              (setq normalizedNewAxioms (rest newAxioms)))
+             (otherwise
+              ;; we have a single new axiom:
+              (setq normalizedNewAxioms (cons newAxioms NIL)))))
+      (otherwise
+       ;; not sure what could be legal atoms here, propositional constants?
+       (setq normalizedNewAxioms (cons newAxioms NIL))))
+    (return (concatenate oldAxioms normalizedNewAxioms))))
+
+(defun (yield-relation-parameters-tree CONS) 
+    ((self NAMED-DESCRIPTION) (dropFunctionParameter? BOOLEAN) (typed? BOOLEAN))
+  ;; Generate the list of parameter variable for 'self'.
+  ;; Include type information if 'typed?' is true.
+  ;; The generated list can be used as the variables to a KAPPA or to
+  ;;    generate a constraint antecedent.
+  (let ((parameterList NIL)
+        (parameter OBJECT NULL))
+    (foreach pName in (io-variable-names self)
+        as pType in (io-variable-types self)
+        do (setq parameter pName)
+           (when (and typed?
+                      (not (eql? pType @THING)))
+             (setq parameter
+               (bquote (& parameter & (surrogate-to-symbol pType)))))
+           (pushq parameterList parameter))
+    (when (and dropFunctionParameter?
+               (function-description? self))
+      (setq parameterList (rest parameterList)))
+    (return (reverse parameterList)) ))
+
+(defun (complete-rule-definition OBJECT)
+    ((self NAMED-DESCRIPTION) (body OBJECT) (arrow SYMBOL))
+  ;; Complete the antecedent or consequent condition 'body' on the relation
+  ;;    'self' into a complete rule and return the result.
+  (let ((parameters (yield-relation-parameters-tree self FALSE FALSE)))
+    (return
+      (bquote
+       (forall & parameters
+         (& arrow
+            (& (description-name self) && parameters)
+            & (wrap-kif-with-forall body parameters)))))))
+
+
+  ;;
+;;;;;; Keyword axioms:
+  ;;
+
+;;; Keyword axioms provide a syntactic shorthand to assert unary or
+;;; binary relations about an object that is being defined.
+
+(defun definition-keyword-axioms-handler ((self OBJECT) (selfName SYMBOL)
+                                          (key KEYWORD) (value OBJECT))
+  ;; Helping function for 'defxxx's.
+  ;; Convert the keyword axiom `<key> <value>' into a regular axiom of the
+  ;;    form `(<key> <self> <value>)' where `key' is converted to a relation,
+  ;;    and add it to `self's axiom string.
+  ;; If 'value' is a CONS, generate multiple axioms.
+  ;; If `value' is TRUE or FALSE, we'll assert (or deny) an axiom of the
+  ;;    form `(<key> <self>)'.
+  ;; We pass `selfName' as an argument to be able to handle propositions
+  ;;    that come from `defrule' definitions.
+  (setf (axioms self)
+    (combine-axiom-lists
+     (axioms self)
+     (help-define-keyword-axioms selfName key value))))
+
+(defun (help-define-keyword-axioms CONS) ((selfName SYMBOL)
+                                          (key KEYWORD)
+                                          (value OBJECT))
+  ;; Helping function for 'definition-keyword-axioms-handler'.
+  ;; Generate the proposition tree specified by the keyword axiom
+  ;;    and return the result.
+  (let ((axioms NIL)
+        (relationName (intern-symbol (symbol-name key))))
+    (cond ((and (symbol? value)
+                (string-equal? (symbol-name (cast value SYMBOL)) "TRUE"))
+           (setq axioms (cons relationName (cons selfName NIL))))
+          ((and (symbol? value)
+                (string-equal? (symbol-name (cast value SYMBOL)) "FALSE"))
+           (setq axioms (bquote (not (& relationName & selfName)))))
+          ((cons? value)
+           (foreach val in (cast value CONS)
+               collect (cons relationName (cons selfName (cons val NIL)))
+               into axioms))
+          (otherwise
+           (setq axioms (cons relationName (cons selfName (cons value NIL))))))
+    (return axioms)))
+
+(defun assert-keyword-axiom ((self OBJECT) (selfName SYMBOL)
+                             (key KEYWORD) (value OBJECT))
+  ;; Just like `definition-keyword-axioms-handler' but asserts the
+  ;;    specified axioms right away (instead of deferring that until
+  ;;    finalization time).
+  ;; Needed by `defobject' for cases where we point at an object
+  ;;    that is not a logic object, since in that case we can't store
+  ;;    the axioms on the object for later finalization.
+  (foreach axiom in (combine-axiom-lists ;; trick to get implicitly and-ed list
+                     NIL (help-define-keyword-axioms selfName key value))
+      do (let ((props (update-proposition axiom :ASSERT-TRUE)))
+           (when (defined? props)
+             (foreach p in props
+                 do (typecase self
+                      ((LOGIC-OBJECT PROPOSITION)
+                       ;; in definitions we never hit this, since for such
+                       ;; objects we use `definition-keyword-axioms-handler' -
+                       ;; but put it here in case somebody calls this directly:
+                   (link-originated-proposition self p))
+                  (otherwise NULL)))))))
+
+
+  ;;
+;;;;;; Finalization of defined objects
+  ;;
+
+;;; Definition of objects such as concepts, relations, instances or
+;;; propositions (rules) happens in two steps: (1) creation of an
+;;; appropriate logic object or proposition and its association with a
+;;; name, and (2) assertion of various axioms related to the new
+;;; object.  Finalization asserts the axiom propositions that were
+;;; collected during an object's definition step and stored in its
+;;; `axioms' slot (more used to happen during finalization of
+;;; descriptions, but most of that has become unnecessary).  In
+;;; principle, all the axioms could be asserted immediately during the
+;;; definition step, but there are a couple of advantages of keeping the
+;;; 2-phase mechanism.  (1) it allows us to better handle some forward
+;;; reference problems by first creating all objects such as concepts
+;;; and relations and then asserting propositions that reference them,
+;;; and (2) it gives us a better way of accessing the propositions
+;;; associated with the definition of an object for purposes of
+;;; loading them into a persistent store.
+
+(defglobal *unfinalized-objects* LIST (list)
+   :documentation "List of objects whose definitions and/or associated
+axioms and constraints are not yet processed.")
+
+(defspecial *finalizeObjectsImmediately?* BOOLEAN FALSE)
+
+(defun register-unfinalized-object ((object OBJECT))
+  ;; Register `object' for later finalization.
+  ;; If `*finalizeObjectsImmediately?*' is true, trigger immediate
+  ;;    finalization of the registered object (and any others that
+  ;;    haven't been finalized yet).
+  (typecase object
+    ((LOGIC-OBJECT PROPOSITION)
+     (push *unfinalized-objects* object))
+    (otherwise
+     (error "INTERNAL ERROR: can't register objects of type "
+            (primary-type object) " for finalization")))
+  (when *finalizeObjectsImmediately?*
+    (finalize-objects)))
+
+(defun cleanup-unfinalized-objects ()
+  ;; Cleanup the unfinalized objects list.
+  (remove-deleted-members *unfinalized-objects*))
+
+(defun link-originated-proposition ((object OBJECT) (proposition PROPOSITION))
+  ;; Add 'proposition' to the list of propositions originated by `object'
+  ;;    during its definition.
+  (let ((propositions (originated-propositions object)))
+    (when (null-list? propositions)
+      (setq propositions (new LIST))
+      (setf (originated-propositions object) propositions))
+    (push propositions proposition)))
+
+(defun (help-finalize-object-axioms (CONS OF PROPOSITION)) ((theAxioms CONS))
+  ;; Convert 'theAxioms' into asserted propositions and return the list
+  ;;    of asserted propositions.
+  ;; If any one axiom caused an error, return NIL.
+  (if (null? theAxioms)
+      (return NIL)
+    (let ((propositions NIL)
+          (result OBJECT NULL))
+      (foreach axiom in theAxioms
+          do (setq result (update-proposition axiom :ASSERT-TRUE))
+             (typecase result
+               (CONS
+                (foreach r in result
+                  do (pushq propositions r)))
+               (PROPOSITION
+                (pushq propositions result))
+               (otherwise
+                ;; we had a proposition error:
+                (return NIL))))
+      (return (reverse propositions)))))
+
+(defun finalize-object-axioms ((self OBJECT))
+  ;; Finalize the defined relation 'self' by constructing its
+  ;;    definition and asserting its axioms.
+  (special ((*termSourceBeingParsed* NULL)
+            (*logic-dialect* :KIF))
+    (within-module (home-module self)
+      (typecase self ;; needed to set `bad?' slot:
+        ((LOGIC-OBJECT PROPOSITION)
+         (setq *termSourceBeingParsed* (stringified-source self))
+         (when (null? (axioms self))
+           (return))
+         ;; mildly tricky: mark 'self' as if finalization failed, and then
+         ;;    mark it as OK later if no exception occurred:
+         (setf (bad? self) TRUE)
+         (let ((theAxioms (help-finalize-object-axioms (axioms self))))
+           (if (empty? theAxioms)
+               ;; No axioms generated; exit leaving 'self' marked as 'bad':
+               (return)
+             (foreach p in theAxioms
+                 do (link-originated-proposition self p))))
+         (setf (axioms self) NULL)
+         (setf (bad? self) NULL))))))
+
+(defun check-description-argument-types ((self NAMED-DESCRIPTION))
+  ;; Verify that the types in 'self' are (defined) classes.
+  (within-module (home-module self)
+   (foreach type in (io-variable-types self)
+       do ;; QUESTION: SHOULD THESE BE JUST WARNINGS, OR CAUSE AN ERROR:
+         (let ((class (get-description type)))
+           (when (null? class)
+             (signal-proposition-error
+              "Undefined class " (symbol-name type) " appears as argument type"
+              EOL "   in the definition of relation " (description-name self) "." EOL))
+           (when (not (class-description? class))
+             (inform
+              "Non-class " (symbol-name type) " appears as argument type"
+              EOL "in the definition of relation " (description-name self) "." EOL))))))
+
+(defun finalize-object ((self OBJECT))
+  ;; Finalize `self' by asserting and linking all its axioms.
+  (when (or (deleted? self)
+            (finalized-object? self))
+    (return))
+  (exception-case
+      (typecase self
+        (NAMED-DESCRIPTION
+         (when (or (bad? self)
+                   (exists type in (io-variable-types self)
+                       where (deleted? type)))
+           (return))
+         (finalize-object-axioms self)
+         (check-description-argument-types self))
+        ((LOGIC-OBJECT PROPOSITION)
+         (when (bad? self)
+           (return))
+         (finalize-object-axioms self))
+        (otherwise NULL))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e)))))
+
+(defun (finalized-object? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' has been finalized.
+  ;; At present, successful finalization only asserts axioms and nullifies
+  ;;    associated axiom source definitions.
+  (return (null? (axioms self))))
+
+(defun (objects-are-finalized? BOOLEAN) ()
+  ;; Return TRUE if all defined objects are finalized.
+  :globally-inline? TRUE
+  (return (empty? (the-cons-list *unfinalized-objects*))))
+
+(defspecial *inhibitObjectFinalization?* BOOLEAN FALSE
+  :documentation "Used to prevent finalization from triggering in the
+middle of 'delicate' computations.  Also used to prevent recursive
+invocation of 'finalize-objects'.")
+
+(defun finalize-objects ()
+  :documentation "Finalize all currently unfinalized objects.
+The user-level entry point for this is `(process-definitions)'."
+  :public? TRUE
+  (when (or *inhibitObjectFinalization?*
+            (objects-are-finalized?)
+            ;; if we aren't in a world state, then there couldn't have
+            ;;    been any recent assertions, right?:
+            (not (world-state? *context*)))
+    (return))
+  ;; the special prevents recursive invocation of 'finalize-objects':
+  (special ((*inhibitObjectFinalization?* TRUE)
+            ;; insure that warnings generated during finalization don't
+            ;;    appear to come from rule or whatever it was that triggerd
+            ;;    finalization:
+            (*termSourceBeingParsed* NULL)
+            (*descriptionUnderConstruction* NULL)
+            (*termUnderConstruction* NULL))
+    (finalize-classes-and-slots)
+    ;; Try to finalize them in the order of definition:
+    (foreach object in (reverse *unfinalized-objects*)
+        do (finalize-object object))
+    (clear *unfinalized-objects*)))
+
+
+  ;;
+;;;;;; Relation definition support
+  ;;
+
+(defun (help-define-relation-from-parse-tree NAMED-DESCRIPTION)
+    ((tree CONS) (stringifiedSource STRING))
+  ;; Define a relation description from the parse tree 'tree' whose 
+  ;;    stringification is 'stringifiedSource', and return the result.
+  ;; If an identical relation already exists, return it instead.
+  ;; If the new relation redefines an already existing but different one,
+  ;;    the old relation/s will be properly undefined.
+  ;; This is the main workhorse used by 'deffunction', 'defrelation' and
+  ;;    `defconcept'.  It is assumed that `tree' is appropriately normalized
+  ;;    and partly syntax checked.  The only checking this function does is
+  ;;    for proper syntax within the parameter list and for proper options.
+  ;; The returned relations still require definition finalization to
+  ;;    assert all the definitional axioms.
+  (let ((operator SYMBOL (first tree))
+        (name SYMBOL (second tree))
+        (parameters CONS (third tree))
+        (options (nth-rest tree 3))
+        (class? (eql? operator (quote DEFCONCEPT)))
+        (function? (eql? operator (quote DEFFUNCTION)))
+        (description NAMED-DESCRIPTION NULL))
+    ;; Handle identical redefinitions:
+    (setq description (get-identical-relation name stringifiedSource))
+    (when (defined? description)
+      (return description))
+    (mv-bind (parameterNames parameterTypes variableArity?)
+        (parse-relation-parameters-tree parameters)
+      ;; create a description
+      (setq description
+            (create-primitive-description
+             parameterNames parameterTypes variableArity?
+             class? function? *module*))
+      (setq *descriptionUnderConstruction* description)
+      (setf (stringified-source description) stringifiedSource)
+      ;; temporarily mark 'description' as bad:
+      (setf (bad? description) TRUE)
+      ;; make a surrogate pointing to `description':
+      (bind-logic-object-to-surrogate name description)
+      ;; now that we have a surrogate, we can create the description body:
+      (ensure-description-body description)
+      (process-definition-options description options)
+      ;; no errors; remove 'bad?' mark:
+      (setf (bad? description) NULL)
+      (register-unfinalized-object description)
+      (return description))))
+
+(defun (parse-relation-parameters-tree
+        (LIST OF SYMBOL) (LIST OF TYPE) BOOLEAN) ((parameters CONS))
+  ;; Parse the 'parameters' of a relation and return three values:
+  ;;    (1) The list of relation parameter names
+  ;;    (2) The list of relation parameter types (untyped parameters
+  ;;           will be typed as @THING)
+  ;;    (3) A boolean indicating whether we had a sequence variable,
+  ;;           indicating a variable-arity relation.
+  (when (null? parameters)
+    (signal-proposition-error "Missing concept or relation parameters"))
+  (let ((name SYMBOL NULL)
+        (type OBJECT NULL)
+        (parameterNames (new LIST))
+        (parameterTypes (new LIST))
+        (variableArity? FALSE))
+    (foreach p in parameters
+        do (typecase p
+             (CONS
+              (unless (and (= (length p) 2)
+                           (symbol? (first p))
+                           (symbol? (second p)))
+                (signal-proposition-error "Illegal parameter: " p))
+              (setq name (first p))
+              (when (not (question-mark-symbol? name))
+                (signal-proposition-error
+                 "Expected a question mark variable: " name))
+              (setq type (second p)))
+             (SYMBOL
+              (setq name p)
+              (when (not (question-mark-symbol? name))
+                (signal-proposition-error
+                 "Expected a question mark variable: " name))
+              (setq type @THING))
+             (otherwise
+              (signal-proposition-error "Illegal parameter: " p)))
+           (when (sequence-variable-symbol? name)
+             (setq variableArity? TRUE))
+           (when (member? parameterNames name)
+             (signal-proposition-error "Duplicate relation parameter name: " name))
+           (push parameterNames name)
+           (push parameterTypes (coerce-to-bound-or-local-surrogate type))
+           (when variableArity?
+             (break)))  ;; skip any extraneous args
+    (when (null? parameterTypes)
+      (signal-proposition-error "Missing relation parameter list"))
+    (when (empty? parameterTypes)
+      (signal-proposition-error "Empty relation parameter list"))
+    (return (reverse parameterNames) (reverse parameterTypes) variableArity?)))
+
+(defun (get-identical-relation NAMED-DESCRIPTION) ((name SYMBOL)
+                                                   (stringifiedSource STRING))
+  ;; If a relation with 'name' exists whose stringified source is identical
+  ;;    to 'stringifiedSource', return it; otherwise, return NULL.
+  (let ((surrogate (lookup-logic-object-surrogate name *module*))
+        (surrogateValue (only-if (defined? surrogate)
+                          (surrogate-value surrogate)))
+        (description NAMED-DESCRIPTION NULL))
+    (when (and (defined? surrogateValue)
+               (isa? surrogateValue @NAMED-DESCRIPTION))
+      (setq description surrogateValue))
+    (when (defined? description)
+      (when (and (not (bad? description))
+                 (eql? (stringified-source description) stringifiedSource))
+        (return description)))
+    (return NULL)))
+
+(defmethod process-definition-options ((self NAMED-DESCRIPTION)
+                                       (options OBJECT))
+  ;; Process definition `options' of `self' and add the corresponding
+  ;;    axioms they define to `self's `axioms' slot.  If `self' is a
+  ;;    function or relation, also convert variable types into appropriate
+  ;;    `nth-domain' axioms.
+  ;; NOTE: this does not generate any actual assertions (unless a particular
+  ;;    option handler does so), instead only axiom definitions are collected.
+  ;; WOULD BE BETTER IF `VET-OPTIONS' WOULD SIGNAL A PROPOSITION ERROR;
+  ;;    THEN WE WOULD KNOW IN WHICH DEFINITION THE OPTION ERROR OCCURRED):
+  (foreach (key value) in (vet-options options NULL)
+      do (when (not (run-option-handler? self key value))
+           (definition-keyword-axioms-handler
+               self (description-name self)  key value)))
+  (unless (class? self)
+    ;; generate argument type assertions:
+    (let ((name (description-name self))
+          (ioVariables (io-variables self))
+          (ioVariableTypes (io-variable-types self))
+          (theAxioms (axioms self))
+          (typedArguments NIL)
+          (operator OBJECT NULL)
+          (firstArg OBJECT NULL)
+          (argumentTypeAxioms NIL))
+      (when (and (defined? theAxioms)
+                 (memb? ioVariableTypes PL-KERNEL/@THING))
+        ;; check for explicit type assertions to avoid generating redundant
+        ;;    `(nth-domain ?d ?i THING)' assertions whenever possible; we
+        ;;    could also check for real assertions established outside of
+        ;;    the definition, but then retraction of those becomes an issue:
+        (foreach axiom in theAxioms
+            do (typecase axiom
+                 (CONS
+                  (setq operator (first axiom))
+                  (setq firstArg (second axiom))
+                  (cond ((and (eql? operator (quote PL-KERNEL/NTH-DOMAIN))
+                              (eql? firstArg name)
+                              (integer? (third axiom)))
+                         (pushq typedArguments (nth ioVariables (third axiom))))
+                        ;; consider rewriting DOMAIN/RANGE right here:
+                        ((and (eql? operator (quote PL-KERNEL/DOMAIN))
+                              (eql? firstArg name))
+                         (pushq typedArguments (first ioVariables)))
+                        ((and (eql? operator (quote PL-KERNEL/RANGE))
+                              (eql? firstArg name))
+                         (pushq typedArguments (last ioVariables)))))
+                 ;; in case we allow propositional constants as axioms:
+                 (otherwise NULL))))
+      (foreach type in ioVariableTypes
+          as var in ioVariables
+          as i in (interval 0 NULL)
+          where (and (defined? type)
+                     (or (not (eql? type PL-KERNEL/@THING))
+                         (not (memb? typedArguments var))))
+          collect (bquote (PL-KERNEL/NTH-DOMAIN & name & i & (symbolize type)))
+          into argumentTypeAxioms)
+      (when (non-empty? argumentTypeAxioms)
+        (setf (axioms self)
+          ;; we reverse the order here to make variable type axioms come first:
+          (combine-axiom-lists argumentTypeAxioms theAxioms))))))
+
+
+  ;;
+;;;;;; Top-level definition commands
+  ;;
+
+(defun (deffunction NAMED-DESCRIPTION) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a logic function.  The accepted syntax is:
+	 
+ (deffunction <funconst> (<vardecl>+) [:-> <vardecl>]
+    [:documentation <string>]
+    [:<= <sentence>] | [:=> <sentence>] |
+    [:<<= <sentence>] | [:=>> <sentence>] | 
+    [:<=> <sentence>] | [:<=>> <sentence>] |
+    [:<<=> <sentence>] | [:<<=>> <sentence>] |
+    [:axioms {<sentence> | (<sentence>+)}]
+    [<keyword-option>*])
+	
+Function parameters can be typed or untyped.  If the `:->' option is
+supplied, it specifies the output variable of the function.  Otherwise,
+the last variable in the parameter list is used as the output variable.
+See `defrelation' for a description of `<keyword-option>'s.
+"
+  (exception-case
+      (return (call-deffunction (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(defun (call-deffunction NAMED-DESCRIPTION) ((arguments CONS))
+  :documentation "Callable version of the `deffunction' command (which see).
+Expects the same arguments as `deffunction' but supplied as a list."
+  :public? TRUE
+  (let ((definition (bquote (deffunction && arguments))))
+    (special ((*termSourceBeingParsed* (stringify definition))
+              (*descriptionUnderConstruction* NULL))
+      (setf (rest definition) (normalize-deffunction-arguments arguments))
+      ;; make sure we are allowed to define an object with this name:
+      (intern-logic-object-surrogate (second definition))
+      (return (help-define-relation-from-parse-tree
+               definition *termSourceBeingParsed*)))))
+
+(defun (normalize-deffunction-arguments CONS) ((arguments CONS))
+  ;; Normalize the arguments of a `deffunction' definition into the format
+  ;;    expected by `define-relation-from-parse-tree' and return the result.
+  ;; This primarily handles normalization of the return variable option plus
+  ;;    some syntax checking.
+  (let ((name (first arguments))
+        (parameters (second arguments))
+        (options (rest (rest arguments))))
+    (unless (symbol? name)
+      (signal-proposition-error
+       "Illegal function name where symbol expected: " name))
+    (typecase parameters
+      (CONS
+       (while (non-empty? options)
+         (when (and (eql? (first options) :->)
+                    (defined? (second options)))
+           (setq parameters (bquote (&& parameters & (second options))))
+           (setf (second arguments) parameters)
+           (setf (first options) NULL)
+           (setf (second options) NULL)
+           (setq options (remove (rest (rest arguments)) NULL))
+           (setf (rest (rest arguments)) options)
+           (break))
+         (setq options (rest (rest options))))
+       (when (empty? parameters)
+         (signal-proposition-error "Cannot have 0-arity functions")))
+      (otherwise
+       (signal-proposition-error "Illegal parameter list: " parameters)))
+    (return arguments)))
+  
+
+(defun (defrelation NAMED-DESCRIPTION) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a logic relation.  The accepted syntax is:
+	 
+ (defrelation <relconst> (<vardecl>+)
+    [:documentation <string>]
+    [:<= <sentence>] | [:=> <sentence>] |
+    [:<<= <sentence>] | [:=>> <sentence>] | 
+    [:<=> <sentence>] | [:<=>> <sentence>] |
+    [:<<=> <sentence>] | [:<<=>> <sentence>] |
+    [:axioms {<sentence> | (<sentence>+)}]
+    [<keyword-option>*])
+	
+Relation parameters can be typed or untyped.
+`<keyword-option>' represents a keyword followed by a value that states an
+assertion about `<relconst>'.  For example, including the option `:foo bar'
+states that the proposition `(foo <relconst> bar)' is true.  `:foo (bar fum)'
+states that both `(foo <relconst> bar)' and `(foo <relconst> fum)' are true.
+`:foo true' states that `(foo <relconst>)' is true, `:foo false' states that
+`(not (foo <relconst>))' is true.
+"
+  (exception-case
+      (return (call-defrelation (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(defun (call-defrelation NAMED-DESCRIPTION) ((arguments CONS))
+  :documentation "Callable version of the `defrelation' command (which see).
+Expects the same arguments as `defrelation' but supplied as a list."
+  :public? TRUE
+  (let ((definition (bquote (defrelation && arguments))))
+    (special ((*termSourceBeingParsed* (stringify definition))
+              (*descriptionUnderConstruction* NULL))
+      (setf (rest definition) (normalize-defrelation-arguments arguments))
+      ;; make sure we are allowed to define an object with this name:
+      (intern-logic-object-surrogate (second definition))
+      (return (help-define-relation-from-parse-tree
+               definition *termSourceBeingParsed*)))))
+
+(defun (normalize-defrelation-arguments CONS) ((arguments CONS))
+  ;; Normalize the arguments of a `defrelation' definition into the format
+  ;;    expected by `define-relation-from-parse-tree' and return the result.
+  ;; This primarily performs some error checking.
+  (let ((name (first arguments))
+        (parameters (second arguments))
+        (options (rest (rest arguments))))
+    (unless (symbol? name)
+      (signal-proposition-error
+       "Illegal relation name where symbol expected: " name))
+    (unless (cons? parameters)
+      (signal-proposition-error "Illegal parameter list: " parameters))
+    (when (empty? (cast parameters CONS))
+      (signal-proposition-error "Cannot have 0-arity relations"))
+    (when (member? options :->)
+      (signal-proposition-error
+       "'defrelation' does not allow a return value (':->') clause"))
+    (return arguments)))
+
+(defun (defconcept NAMED-DESCRIPTION) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation "Define (or redefine) a concept.  The accepted syntax is:
+	 
+ (defconcept <conceptconst> [(<var> <parent>*)]
+    [:documentation <string>]
+    [:<= <sentence>] | [:=> <sentence>] |
+    [:<<= <sentence>] | [:=>> <sentence>] | 
+    [:<=> <sentence>] | [:<=>> <sentence>] | [:<<=> <sentence>] |
+    [:<<=>> <sentence>] |
+    [:axioms {<sentence> | (<sentence>+)}] |
+    <keyword-option>*)
+	
+Declaration of a concept variable `<var>' is optional, unless any
+implication (arrow) options are supplied that need to reference it.  A
+possibly empty list of concept names following `<var>' is taken as the list
+of parents of `<conceptconst>'.  Alternatively, parents can be specified
+via the `:=>' option.  If no parents are specified, the parent of
+`<conceptconst>' is taken to be THING.  `<keyword-option>' represents a
+keyword followed by a value that states an assertion about `<conceptconst>'.
+See `defrelation' for a description of `<keyword-option>'s.
+"
+  (exception-case
+      (return (call-defconcept (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(defun (call-defconcept NAMED-DESCRIPTION) ((arguments CONS))
+  :documentation "Callable version of the `defconcept' command (which see).
+Expects the same arguments as `defconcept' but supplied as a list."
+  :public? TRUE
+  (let ((definition (bquote (defconcept && arguments))))
+    (special ((*termSourceBeingParsed* (stringify definition))
+              (*descriptionUnderConstruction* NULL))
+      (setf (rest definition) (normalize-defconcept-arguments arguments))
+      ;; make sure we are allowed to define an object with this name:
+      (intern-logic-object-surrogate (second definition))
+      (return (help-define-relation-from-parse-tree
+               definition *termSourceBeingParsed*)))))
+
+(defun (normalize-defconcept-arguments CONS) ((arguments CONS))
+  ;; Normalize the arguments of a `defconcept' definition into the format
+  ;;    expected by `define-relation-from-parse-tree' and return the result.
+  ;; This primarily deals with the many different ways to specify the
+  ;;    concept variable and associated types/parents.  It converts all
+  ;;    parents specified with the variable into explicit rules and types
+  ;;    the concept variable with the concept itself (which is expected by
+  ;;    `create-primitive-description').
+  (let ((name (first arguments))
+        (parameters CONS NULL)
+        (selfVariable (quote ?self))
+        (supers NIL)
+        (impliesRules NIL))
+    (unless (symbol? name)
+      (signal-proposition-error
+       "Illegal concept name where symbol expected: " name))
+    (when (cons? (second arguments))
+      (setq parameters (second arguments)))
+    (cond
+     ((defined? parameters)
+      (when (cons? (first parameters))
+        ;; eliminate redundant parentheses:
+        (setq parameters (first parameters)))
+      (cond ((empty? parameters)
+             (setq supers NIL))
+            ((question-mark-symbol? (first parameters))
+             (setq selfVariable (first parameters))
+             (setq supers (rest parameters)))
+            ((symbol? (first parameters))
+             ;; dwim old-style `defconcept' without variable:
+             (setq supers parameters))
+            (otherwise
+             (signal-proposition-error
+              "Illegal parameter list: " (second arguments))))
+      ;; convert super types into explicit :=> clauses:
+      (foreach super in supers
+          do (pushq impliesRules :=>)
+             (pushq impliesRules (bquote (& super & selfVariable))))
+      (setq impliesRules (reverse impliesRules))
+      (setf (rest arguments)
+        (bquote (((& selfVariable & name))
+                 && impliesRules
+                 && (rest (rest arguments))))))
+     ((empty? (rest arguments))
+      ;; no concept variable and keyword declarations:
+      (setf (rest arguments) (bquote (((& selfVariable & name))))))
+     ((keyword? (first (rest arguments)))
+      ;; omitted concept variable declarations:
+      (setf (rest (rest arguments))
+        (bquote (& (second arguments) && (rest (rest arguments)))))
+      (setf (second arguments) (bquote ((& selfVariable & name))))))
+    (return arguments)))
+
+(defun (define-relation-from-parse-tree NAMED-DESCRIPTION) ((tree CONS))
+  ;; Define a relation from the parse tree 'tree' and return the result.
+  ;; If an identical relation already exists, it will be returned instead.
+  ;; THIS IS SOMEWHAT OBSOLETE NOW.
+  (case (first tree)
+    (DEFCONCEPT
+      (return (call-defconcept (rest tree))))
+    (DEFRELATION
+      (return (call-defrelation (rest tree))))
+    (DEFFUNCTION
+      (return (call-deffunction (rest tree))))))
+
+
+(defun (defobject LOGIC-OBJECT) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a logic instance.  The accepted syntax is:
+	 
+ (defobject <constant>
+    [:documentation <string>]
+    [<keyword-option>*])
+	
+`<keyword-option>' represents a keyword followed by a value
+that states an assertion about <constant>.  See `defrelation' for a
+description of `<keyword-option>'s.
+
+`defobject' provides a sugar-coated way to assert a collection of facts
+about a logic constant, but otherwise adds nothing in terms of functionality.
+"
+  (exception-case
+      (return (call-defobject (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(defun (definstance LOGIC-OBJECT) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a logic instance (`definstance' is an alias
+for `defobject' which see)."
+  (exception-case
+      (return (call-defobject (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(defun (call-defobject LOGIC-OBJECT) ((arguments CONS))
+  :documentation "Callable version of the `defobject' command (which see).
+Expects the same arguments as `defobject' but supplied as a list."
+  :public? TRUE
+  (let ((definition (bquote (defobject && arguments)))
+        (name SYMBOL NULL)
+        (options NIL)
+        (term OBJECT NULL))
+    (special ((*termSourceBeingParsed* (stringify definition)))
+      (setq arguments (normalize-defobject-arguments arguments))
+      (setq name (first arguments))
+      (setq options (rest arguments))
+      ;; make sure we are allowed to define an object with this name:
+      (intern-logic-object-surrogate name)
+      (setq term (create-logic-instance NULL NULL))
+      (typecase term
+        (LOGIC-OBJECT
+         (setf (stringified-source term) *termSourceBeingParsed*)
+         (bind-logic-object-to-surrogate name term)
+         (process-definition-options term options)
+         (register-unfinalized-object term))
+        (otherwise
+         (bind-logic-object-to-surrogate name term)
+         ;; we don't know how to store the axioms, so we need to
+         ;;    assert them right away.
+         (foreach (key value) in (vet-options options NULL)
+             do (assert-keyword-axiom term name key value))))
+      (return term))))
+
+(defun (normalize-defobject-arguments CONS) ((arguments CONS))
+  ;; Normalize the arguments of a `defobject' definition into the format
+  ;;    expected by `call-defobject' and return the result.
+  ;; This primarily performs some error checking.
+  (let ((name (first arguments))
+        (options (rest arguments)))
+    (unless (symbol? name)
+      (signal-proposition-error
+       "Illegal object name where symbol expected: " name))
+    ;; no more error checking right now:
+    (ignore options)
+    (return arguments)))
+
+(defmethod process-definition-options ((self LOGIC-OBJECT)
+                                       (options OBJECT))
+  ;; Process definition `options' of `self' and add the corresponding
+  ;;    axioms they define to `self's `axioms' slot.
+  ;; NOTE: this does not generate any actual assertions (unless a particular
+  ;;    option handler does so), instead only axiom definitions are collected.
+  ;; WOULD BE BETTER IF `VET-OPTIONS' WOULD SIGNAL A PROPOSITION ERROR;
+  ;;    THEN WE WOULD KNOW IN WHICH DEFINITION THE OPTION ERROR OCCURRED):
+  (foreach (key value) in (vet-options options NULL)
+      do (when (not (run-option-handler? self key value))
+           (definition-keyword-axioms-handler
+               self (object-name self) key value))))
+
+
+(defun (defproposition PROPOSITION) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a named proposition.  The accepted syntax is:
+	 
+ (defproposition <name> <sentence>
+    [:documentation <string>]
+    [:forward-only? {true | false}]
+    [:backward-only? {true | false}]
+    [:dont-optimize? {true | false}]
+    [:confidence-level {:strict | :default}]
+    [<keyword-option>*])
+	
+<sentence> can be any sentence that is legal as a top-level assertion.
+<name> can be a string or symbol and will be bound to the asserted
+proposition represented by <sentence>.  After this definition every
+occurrence of <name> will be replaced by the associated proposition.
+
+The options :forward-only? and :backward-only? can be used to tell the
+inference engine to only use the rule in forward or backward direction
+(this can also be achieved by using the `<<=' or `=>>' implication
+arrows).  :dont-optimize?  tells the inference engine to not rearrange
+the order of clauses in the antecedent of a rule and instead evaluate
+them in their original order.  :confidence-level can be used to mark a
+proposition as default only.
+
+`<keyword-option>' represents a keyword followed by a value
+that states an assertion about the proposition <name>.  See `defrelation'
+for a description of `<keyword-option>'s.
+"
+  (exception-case
+      (return (call-defproposition (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(defun (defrule PROPOSITION) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation "Define (or redefine) a named rule (`defrule' is an alias
+for `defproposition' which see)."
+  (exception-case
+      (return (call-defproposition (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(defun (call-defproposition PROPOSITION) ((arguments CONS))
+  :documentation
+  "Callable version of the `defproposition' command (which see).
+Expects the same arguments as `defproposition' but supplied as a list."
+  :public? TRUE
+  (let ((definition (bquote (defproposition && arguments)))
+        (name SYMBOL NULL)
+        (options NIL)
+        (conception OBJECT NULL)
+        (proposition PROPOSITION NULL)
+        (oldTruthValue TRUTH-VALUE NULL))
+    (special ((*termSourceBeingParsed* (stringify definition)))
+      (setq arguments (normalize-defproposition-arguments arguments))
+      (setq name (first arguments))
+      ;; make sure we are allowed to define an object with this name:
+      (intern-logic-object-surrogate name)
+      ;; don't yet assert it as true, since that could trigger construction
+      ;;    of satellite rules which need to know about options such as
+      ;;    :forward-only?, :backward-only?, etc:
+      (setq conception
+        (smart-update-proposition (second arguments) :CONCEIVE))
+      (cond ((null? conception)
+             ;; we already generated an error message, simply return:
+             (return NULL))
+            ((cons? conception)
+             ;; NOTE: top-level options such as :forward-only? will not
+             ;;    trickle down to individual conjuncts - is this a problem?
+             (setq proposition (conjoin-propositions conception)))
+            (otherwise
+             (setq proposition conception)))
+      (setq options (rest (rest arguments)))
+      (setf (stringified-source proposition) *termSourceBeingParsed*)
+      ;; temporarily mark 'proposition' as bad:
+      (setf (bad? proposition) TRUE)
+      (bind-logic-object-to-surrogate name proposition)
+      (process-definition-options proposition options)
+      (when (eql? (kind proposition) :FORALL)
+        ;; remove any old satellite rules in case of a redefinition, since
+        ;;    they need to be rederived according to the new options - this
+        ;;    could be handled by `redefine-logic-object' also, but is very
+        ;;    specialized and probably better done here:
+        (foreach satellite in (satellite-propositions proposition)
+            do (destroy-proposition satellite))
+        (setf (satellite-propositions proposition) NULL))
+      ;; now that slot options such as :forward-only? have been assigned,
+      ;;    assign the truth value (tricky, don't use `help-update-top-level-
+      ;;    proposition' here to avoid further destructive normalization):
+      (setq oldTruthValue (truth-value proposition))
+      (cond ((eql? (lookup-annotation proposition :CONFIDENCE-LEVEL) :DEFAULT)
+             (remove-annotation proposition :CONFIDENCE-LEVEL)
+             (update-proposition-truth-value proposition :PRESUME-TRUE))
+            (otherwise
+             (update-proposition-truth-value proposition :ASSERT-TRUE)))
+      (when (eql? oldTruthValue (truth-value proposition))
+        ;; we had a redefinition, force demons to rederive satellite rules:
+        (run-goes-true-demons proposition))
+      ;; no errors; remove 'bad?' mark:
+      (setf (bad? proposition) NULL)
+      (register-unfinalized-object proposition)
+      (return proposition))))
+
+(defun (normalize-defproposition-arguments CONS) ((arguments CONS))
+  ;; Normalize the arguments of a `defproposition' definition into the
+  ;;    format expected by `call-defproposition' and return the result.
+  ;; This primarily performs some error checking and normalizes some options.
+  (let ((name (first arguments))
+        (proposition (second arguments))
+        (options PROPERTY-LIST NULL)
+        (value OBJECT NULL)
+        (annotations NIL))
+    (typecase (first arguments)
+      (SYMBOL NULL)
+      (STRING
+       (setq name (intern-symbol (first arguments)))
+       (setf (first arguments) name))
+      (otherwise
+       (signal-proposition-error
+        "Illegal proposition name where symbol or string expected: " name)))
+    ;; rename some special options undertstood by `defproposition' and
+    ;;    convert them into their canonical form or annotation format:
+    (setq options (vet-options (rest (rest arguments)) NULL))
+    (setq value (lookup options :FORWARD?))
+    (when (defined? value)
+      (remove-at options :FORWARD?)
+      (insert-at options :FORWARD-ONLY? value))
+    (setq value (lookup options :BACKWARD?))
+    (when (defined? value)
+      (remove-at options :BACKWARD?)
+      (insert-at options :BACKWARD-ONLY? value))
+    (setq value (lookup options :CONFIDENCE-LEVEL))
+    (when (defined? value)
+      (setq annotations (bquote (&& annotations :confidence-level & value)))
+      (remove-at options :CONFIDENCE-LEVEL))
+    (setq value (lookup options :WEIGHT))
+    (when (defined? value)
+      (setq annotations (bquote (&& annotations :weight & value)))
+      (remove-at options :WEIGHT))
+    (when (non-empty? annotations)
+      (setf (second arguments)
+        (bquote (about & proposition && annotations))))
+    (setf (rest (rest arguments)) (the-plist options))
+    (return arguments)))
+
+(defmethod process-definition-options ((self PROPOSITION)
+                                       (options OBJECT))
+  ;; Process definition `options' of `self' and add the corresponding
+  ;;    axioms they define to `self's `axioms' slot.
+  ;; NOTE: this does not generate any actual assertions (unless a particular
+  ;;    option handler does so), instead only axiom definitions are collected.
+  ;; WOULD BE BETTER IF `VET-OPTIONS' WOULD SIGNAL A PROPOSITION ERROR;
+  ;;    THEN WE WOULD KNOW IN WHICH DEFINITION THE OPTION ERROR OCCURRED):
+  ;; Reset options so we won't inherit old values if we redefined `self'
+  ;;    with different options (guarded, since these slots are dynamic):
+  (when (forward-only? self) (setf (forward-only? self) NULL))
+  (when (backward-only? self) (setf (backward-only? self) NULL))
+  (when (dont-optimize? self) (setf (dont-optimize? self) NULL))
+  (setf (axioms self) NULL)
+  (foreach (key value) in (vet-options options NULL)
+      do (when (not (run-option-handler? self key value))
+           (definition-keyword-axioms-handler
+               self (object-name self) key value))))
+
+
+;;; OLD/OBSOLETE syntax games (kept, since they show some alternative
+;;; full/term definition options for relations that used to be supported):
+
+#|
+(defconcpet PERSON)
+(deffunction father ((?c PERSON)) :-> (?f PERSON))
+(defrelation happy ((?p PERSON)))
+(deffunction age ((?p PERSON)) :-> (?a INTEGER))
+(deffunction weight ((?p PERSON)) :-> (?w INTEGER))
+
+;;; Definition options:
+
+(1) FULL:     (kappa ((?p PERSON) ?gf) (= (father (father ?p)) ?gf))
+(2) SENTENCE: (= (father (father ?p)) ?gf)
+(3) TERM:     (father (father ?p))         ;; for functions only
+
+;; This definition allocates a self variable, since '?p' is used
+;;    instead of '?self':
+(deffunction paternal-grandfather ((?p PERSON))
+  :is  (kappa ((?p PERSON) ?gf) (= (father (father ?p)) ?gf))) ;; FULL
+
+(deffunction paternal-grandfather ((?self PERSON)) :-> ?gf
+  :<=> (= (father (father ?self)) ?gf))                        ;; SENTENCE
+
+(deffunction paternal-grandfather ((?self PERSON))
+  := (father (father ?self)))                                  ;; TERM
+
+(defrelation very-happy ((?self PERSON))
+  :<=> (and (happy ?self)
+            (< (age ?self) (weight ?self))))
+
+(deffunction paternal-grandfather ((?p PERSON))
+  :-> ?gf
+  :type PERSON
+  :=  (father (father ?p))
+  :axioms (forall (?x Person)
+            (> (age (paternal-grandfather ?x))
+               (age ?x)))
+  :=> (> (age ?gf) (age (father ?p))))
+|#
+
+
+  ;;
+;;;;;; Command help
+  ;;
+
+(defglobal *logic-relevant-stella-commands* (CONS OF SYMBOL)
+           (bquote (CC CLEAR-MODULE DEFMODULE IN-MODULE LIST-MODULES)))
+
+(defun (command< BOOLEAN) ((command1 METHOD-SLOT) (command2 METHOD-SLOT))
+  ;; Return TRUE if 'command1' should come before 'command2' in a
+  ;;    sorted list of commands.
+  (return (string< (visible-name (slot-name command1))
+                   (visible-name (slot-name command2)))))
+
+(defun (list-logic-commands (LIST OF METHOD-SLOT)) ()
+  ;; Return a sorted list of available logic commands.
+  (let ((commands (new (LIST OF METHOD-SLOT))))
+    ;; THIS IS SOMEWHAT EXPENSIVE NOW, SINCE IT GENERATES ALL FUNCTION OBJECTS:
+    (foreach function in (all-functions (get-stella-module "/LOGIC" TRUE) TRUE)
+        where (and (method-command? function)
+                   (public? function))
+        collect function into commands)
+    ;; We use this list instead of inheriting all commands from Stella:
+    (foreach stellaCommand in *logic-relevant-stella-commands*
+        collect (lookup-command stellaCommand) into commands)
+    (return (sort commands (the-code :function command<)))))
+
+(defun help (&rest (commands SYMBOL))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Describe specific commands, or print a list of available commands."
+  (let ((theCommands (coerce-&rest-to-cons commands)))
+    (cond ((empty? theCommands)
+           (print "The following commands are available "
+                  "(type `(help <command>+)'" EOL
+                  "to get command-specific documentation):" EOL EOL)
+           (let ((allCommands (list-logic-commands)))
+             (foreach command in allCommands
+                 where (defined? (documentation command))
+                 do (print-documentation command STANDARD-OUTPUT TRUE))
+             (print EOL "Undocumented Commands:" EOL EOL)
+             (foreach command in allCommands
+                 where (not (defined? (documentation command)))
+                 do (print (slot-name command) ":" EOL))))
+          (otherwise
+           (foreach commandName in theCommands
+                    do (let ((command (lookup-command commandName)))
+                         (if (defined? command)
+                           (print-documentation command STANDARD-OUTPUT FALSE)
+                           (inform "Undefined command: " commandName))))))))

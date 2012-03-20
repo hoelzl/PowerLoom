@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: hierarchy.ste,v 1.173 2003/10/23 16:54:53 tar Exp
+;;; Version: hierarchy.ste,v 1.184 2006/05/11 07:06:02 hans Exp
 
 ;;; STELLA built-in classes.
 
@@ -1058,7 +1058,6 @@ owner slot, and therefore should be deleted if the owner is deleted.")
 
 (defclass COMPOUND-TYPE-SPECIFIER (STANDARD-OBJECT)
   :abstract? TRUE
-  :public? FALSE
   :print-form (print-native-stream stream "|TS|" (yield-type-spec-tree self)) )
 
 (defclass PARAMETRIC-TYPE-SPECIFIER (COMPOUND-TYPE-SPECIFIER)
@@ -1165,12 +1164,12 @@ class that participates in the PowerLoom side of things."
 (defclass MODULE (CONTEXT)
   :public-slots
   ((parent-modules :type (LIST OF MODULE) :allocation :embedded)
-   (documentation :type STRING)
-   (nicknames :type (LIST OF STRING-WRAPPER))
-   (uses :type (LIST OF MODULE) :allocation :embedded)
+   (documentation :type STRING :option-keyword :documentation)
+   (nicknames :type (LIST OF STRING-WRAPPER) :option-keyword :nicknames)
+   (uses :type (LIST OF MODULE) :allocation :embedded :option-keyword :uses)
    (used-by :type (LIST OF MODULE) :allocation :embedded)
    (shadowed-surrogates :type (LIST OF SURROGATE) :allocation :dynamic)
-   (requires :type (LIST OF MODULE))
+   (requires :type (LIST OF MODULE) :option-keyword :requires)
    ;; The package names are handled differently in different languages.
    ;; 
    ;; The lisp-package inherits along the module chain, so it has a
@@ -1184,14 +1183,22 @@ class that participates in the PowerLoom side of things."
    ;; The java-package does not inherit.  A pseudo inheritance scheme is
    ;; implemented by the Java translation code.  The slot denotes the
    ;; full pathname of the Java package for this module's definitions.
-   (module-lisp-package :type STRING :default "STELLA" :allocation :dynamic)
-   (module-cpp-package :type STRING :default "stella" :allocation :dynamic)
-   (java-package :type STRING :default NULL :allocation :dynamic)
-   (case-sensitive? :type BOOLEAN :initially FALSE)
+   (module-lisp-package :type STRING :default "STELLA" :allocation :dynamic 
+			:option-keyword :module-lisp-package)
+   (module-cpp-package :type STRING :default "stella" :allocation :dynamic
+		       :option-keyword :module-cpp-package)
+   (java-package :type STRING :default NULL :allocation :dynamic
+		 :option-keyword :java-package)
+   (case-sensitive? :type BOOLEAN :initially FALSE
+		    :option-keyword :case-sensitive?)
    (clearable? :type BOOLEAN :allocation :dynamic :default TRUE
                :option-keyword :clearable?)
-   (code-only? :type BOOLEAN :allocation :dynamic)
-   (api? :type BOOLEAN :allocation :dynamic)
+   (code-only? :type BOOLEAN :allocation :dynamic
+	       :option-keyword :code-only?)
+   (namespace? :type BOOLEAN :allocation :dynamic 
+	       :option-keyword :namespace?)
+   (api? :type BOOLEAN :allocation :dynamic
+	 :option-keyword :api?)
    (protect-surrogates? :type BOOLEAN :allocation :dynamic
 			:option-keyword :protect-surrogates?
                         :default TRUE)
@@ -1226,9 +1233,10 @@ class that participates in the PowerLoom side of things."
 		:inherits-through parent-modules)))
 
 (defclass WORLD (CONTEXT)
-  :public-slots ((parent-context :type CONTEXT)
-          (child-contexts :type (LIST OF WORLD) :allocation :embedded)
-          (world-name :type STRING :allocation :dynamic)) )
+  :public-slots
+  ((parent-context :type CONTEXT)
+   (child-contexts :type (LIST OF WORLD) :allocation :embedded)
+   (world-name :type STRING :allocation :dynamic)) )
 
 (defclass CS-VALUE (KEY-VALUE-LIST)
   :documentation "Contextualized value.  Contains a sorted kv-cons list indexed
@@ -1325,7 +1333,13 @@ the whole graph non-incrementally."
 (defclass END-OF-FILE-EXCEPTION (INPUT-OUTPUT-EXCEPTION)
   :public? TRUE)
 (defclass NO-SUCH-FILE-EXCEPTION (INPUT-OUTPUT-EXCEPTION)
-  :public? TRUE)
+  :public? TRUE
+  :public-slots
+  ((filename :type STRING)))
+(defclass FILE-ALREADY-EXISTS-EXCEPTION (INPUT-OUTPUT-EXCEPTION)
+  :public? TRUE
+  :public-slots
+  ((filename :type STRING)))
 
 (defclass UNHANDLED-EXCEPTION (STELLA-EXCEPTION)
   :public? TRUE)
@@ -1337,6 +1351,56 @@ the whole graph non-incrementally."
   :public? TRUE)
 (defclass NO-SUCH-CONTEXT-EXCEPTION (NO-SUCH-OBJECT-EXCEPTION)
   :public? TRUE)
+(defclass UNDEFINED-CLASS-EXCEPTION (NO-SUCH-OBJECT-EXCEPTION)
+  :public? TRUE)
+
+(defclass BAD-ARGUMENT-EXCEPTION (STELLA-EXCEPTION)
+  :public? TRUE)
+(defclass OBJECT-NOT-CLASS-EXCEPTION (BAD-ARGUMENT-EXCEPTION)
+  :public? TRUE)
+
+(defclass INCOMPATIBLE-QUANTITY-EXCEPTION (STELLA-EXCEPTION)
+  :public? TRUE
+  :documentation "Exception thrown when an operation is attempted on quantities
+that are not compatible with the requested operation.  For example,
+comparing dates and time durations.")
+
+;;;
+;;;  QUANTITY Class
+;;;
+;;;  This provides a common superclass for an extensible
+;;;  quantities architecture.  Currently only the comparison
+;;;  methods are extensible, but in the future this should
+;;;  be extended to basic arithmetic operations as well.
+;;;
+;;;  Examples of such quantities are the built-in DATE-TIME
+;;;  class and the extension for measurement units.
+;;;
+
+;; TO DO:  It would be preferable to make less? and greater? abstract
+;; methods with NULL bodies, but this is currently not handled by
+;; our C++ translator.
+(defclass QUANTITY (OBJECT)
+  :public? TRUE
+  :abstract? TRUE
+  :documentation "General superclass for extensible quantity objects"
+  :public-methods
+  ((coerce-to ((self QUANTITY) (other OBJECT)) :type QUANTITY
+              (if (isa? other (primary-type self))
+                (return other)
+                (return NULL)))
+   (less? ((self QUANTITY) (other OBJECT)) :type BOOLEAN
+          (ignore other)
+          (return FALSE))
+   (less-equal? ((self QUANTITY) (other OBJECT)) :type BOOLEAN
+                (return (or (object-eql? self other)
+                            (less? self other))))
+   (greater-equal? ((self QUANTITY) (other OBJECT)) :type BOOLEAN
+                   (return (or (object-eql? self other)
+                               (greater? self other))))
+   (greater? ((self QUANTITY) (other OBJECT)) :type BOOLEAN
+             (ignore other)
+             (return FALSE))))
 
 ;;; Literal Class Hierarchy
 
@@ -1479,51 +1543,69 @@ the whole graph non-incrementally."
 
 (defclass INTEGER-WRAPPER (NUMBER-WRAPPER)
   :public-slots ((wrapper-value :type INTEGER))
-  :print-form (if *printReadably?*
-                  (print-native-stream stream (wrapper-value self))
-                (print-native-stream stream "|L|" (wrapper-value self))))
+  :print-form (let ((value (wrapper-value self)))
+                (if (null? value)
+                  (if *printReadably?*
+                    (print-native-stream stream (quote NULL-INTEGER))
+                    (print-native-stream stream "|L|NULL-INTEGER"))
+                  (if *printReadably?*
+                    (print-native-stream stream value)
+                    (print-native-stream stream "|L|" value)))))
 
 (defclass FLOAT-WRAPPER (NUMBER-WRAPPER)
   :public-slots ((wrapper-value :type FLOAT))
-  :print-form (if *printReadably?*
-		    (print-native-stream stream (wrapper-value self))
-		  (print-native-stream stream "|L|" (wrapper-value self))))
+  :print-form (let ((value (wrapper-value self)))
+                (if (null? value)
+                  (if *printReadably?*
+                    (print-native-stream stream (quote NULL-FLOAT))
+                    (print-native-stream stream "|L|NULL-FLOAT"))
+                  (if *printReadably?*
+                    (print-native-stream stream value)
+                    (print-native-stream stream "|L|" value)))))
 
 (defclass STRING-WRAPPER (LITERAL-WRAPPER)
   :public-slots ((wrapper-value :type STRING))
   :print-form (let ((value (wrapper-value self)))
-                (if *printReadably?*
-                  (print-string-readably value stream)
-                  (if (defined? value)
-                      (print-native-stream stream "|L|" #\" value #\")
-                    (print-native-stream stream "|L|" "NULL-STRING")))))
+                (if (null? value)
+                  (if *printReadably?*
+                    (print-native-stream stream (quote NULL-STRING))
+                    (print-native-stream stream "|L|NULL-STRING"))
+                  (if *printReadably?*
+                    (print-string-readably value stream)
+                    (print-native-stream stream "|L|" #\" value #\")))))
 
 (defclass MUTABLE-STRING-WRAPPER (LITERAL-WRAPPER)
   :public-slots ((wrapper-value :type MUTABLE-STRING))
   :print-form (let ((value (wrapper-value self)))
-                (if *printReadably?*
-                  (print-string-readably value stream)
-                  (if (defined? value)
-                      (print-native-stream
-                       stream "|L|" #\" (mutable-string-to-string value) #\")
-                    (print-native-stream
-                     stream "|L|" "NULL-MUTABLE-STRING")))))
+                (if (null? value)
+                  (if *printReadably?*
+                    (print-native-stream stream (quote NULL-MUTABLE-STRING))
+                    (print-native-stream stream "|L|NULL-MUTABLE-STRING"))
+                  (if *printReadably?*
+                    (print-string-readably value stream)
+                    (print-native-stream stream 
+                                         "|L|" #\" (mutable-string-to-string value) #\")))))
 
 (defclass CHARACTER-WRAPPER (LITERAL-WRAPPER)
   :public-slots ((wrapper-value :type CHARACTER))
-  :print-form (if *printReadably?*
-                  (print-character (wrapper-value self) stream)
-                (progn
-                  (print-native-stream stream "|L|")
-                  (print-character (wrapper-value self) stream))))
+  :print-form (let ((value (wrapper-value self)))
+                (if (null? value)
+                  (if *printReadably?*
+                    (print-native-stream stream (quote NULL-CHARACTER))
+                    (print-native-stream stream "|L|NULL-CHARACTER"))
+                  (progn
+                    (unless  *printReadably?* (print-native-stream stream "|L|"))
+                    (print-character value stream)))))
 
 (defclass BOOLEAN-WRAPPER (LITERAL-WRAPPER)
   :documentation "Objectified version of the BOOLEAN data type.  The NULL
 value can be used for a 3-valued semantics (see THREE-VALUED-BOOLEAN)."
   :public-slots ((wrapper-value :type BOOLEAN :allocation :instance))
-  :print-form (print-native-stream
-               stream (choose *printReadably?* "" "|L|")
-               (choose (wrapper-value self) (quote TRUE) (quote FALSE))))
+  :print-form (progn
+                (unless *printReadably?* (print-native-stream stream "|L|"))
+                (if (wrapper-value self)
+                  (print-native-stream stream (quote TRUE))
+                  (print-native-stream stream (quote FALSE)))))
 
 (defclass CODE-WRAPPER (WRAPPER)
   :abstract? TRUE)
@@ -1751,7 +1833,8 @@ for tokenization."))
   :synonyms (FILE-OUTPUT-STREAM)
   :public-slots
   ((filename :type STRING :required? TRUE :public? TRUE)
-   (if-exists-action :type KEYWORD :initially :supersede :public? TRUE))
+   (if-exists-action :type KEYWORD :initially :supersede :public? TRUE)
+   (if-not-exists-action :type KEYWORD :initially :create :public? TRUE))
   :initializer initialize-file-output-stream
   :terminator terminate-file-output-stream?
   :print-form (print-native-stream stream "|FOS|'" (filename self) "'"))
@@ -1769,10 +1852,12 @@ for tokenization."))
 (defclass OUTPUT-STRING-STREAM (OUTPUT-STREAM)
   :synonyms (STRING-OUTPUT-STREAM)
   :public-slots ((the-string :type STRING :public? TRUE :reader the-string-reader))
+  :terminator terminate-string-output-stream?
   :initializer initialize-string-output-stream)
 
 (defclass INPUT-STRING-STREAM (INPUT-STREAM)
   :synonyms (STRING-INPUT-STREAM)
   :public-slots ((the-string :type STRING :required? TRUE :public? TRUE)
                  (buffering-scheme :initially :BLOCK))
+  :terminator terminate-string-input-stream?
   :initializer initialize-string-input-stream)

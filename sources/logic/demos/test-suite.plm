@@ -1,0 +1,1781 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;; Version: test-suite.plm,v 1.24 2006/05/10 22:43:32 hans Exp
+
+;;; Various PowerLoom tests
+;;; =======================
+
+;;; Still pending bugs are annotated with `<<< FIX >>>'.
+
+
+;; Standard demo preamble:
+
+(in-package "STELLA")
+
+(defmodule "PL-KERNEL/PL-USER/TEST")
+
+(in-module "TEST")
+(in-dialect :KIF)
+(reset-features)
+
+
+;;; BUILDING ODD-BALL PROPOSITIONS:
+
+(clear-module "TEST")
+
+(conceive (not (= 5 6)))
+
+
+;;; PROPER ADDING OF SKOLEMS TO EXTENSIONS:
+
+(clear-module "TEST")
+
+(defconcept PERSON (?p) 
+  :documentation "The class of PERSON beings.")
+(defrelation happy ((?p PERSON)))
+(deffunction age ((?p PERSON)) :-> (?age INTEGER))
+(deffunction father ((?p PERSON)) :-> (?f PERSON))
+
+
+(assert (PERSON fred))
+(assert (exists (?x PERSON) (= (father fred) ?x)))
+(retrieve all ?x (PERSON ?x))
+
+;;; PROPER ADDING OF FORWARD INFERENCE (FUNCTION OUTPUT) SKOLEMS TO EXTENSIONS:
+
+(clear-module "TEST")
+
+(defconcept PERSON (?p))
+(defconcept dog (?d)
+    :=> (exists (?p PERSON) (owner ?d ?p)))
+(deffunction owner ((?d DOG)) :-> (?o PERSON))
+(defrelation loves ((?p PERSON) (?d dog)))
+
+(assert (forall (?d dog) (exists (?p PERSON) (loves ?p ?d))))
+
+(assert (dog rex))
+(retrieve all (?x PERSON) (owner rex ?x))
+(retrieve all (?x PERSON) (loves ?x rex))
+(retrieve all (?x PERSON))
+
+;;; PROPER RETRACTION OF SKOLEMS INFERRED DURING FORWARD INFERENCE:
+
+(clear-module "TEST")
+
+(defconcept bridge (?b))
+
+(defconcept bridge-workaround (?bw)
+   :=> (exists (?b bridge) (bridge-of ?bw ?b)))
+(deffunction bridge-of ((?bw bridge-workaround)) :-> (?b BRIDGE))
+
+;(propagate-constraints)
+(assert (bridge-workaround bwa1))
+(retrieve (?x bridge) (bridge-of bwa1 ?x))
+(retrieve (?x bridge))
+(retract (bridge-workaround bwa1))
+;; NOW IT SHOULD DISAPPEAR:
+(retrieve (?x bridge) (bridge-of bwa1 ?x))
+(retrieve (?x bridge))
+(propagate-constraints)
+(assert (bridge-workaround bwa1))
+(retrieve (?x bridge) (bridge-of bwa1 ?x))
+;; <<< FIX >>> NOW IT SHOULD REAPPEAR:
+(retrieve (?x bridge))
+
+
+;;; DON'T BREAK ON FAILING `SUBSET' QUERIES:
+
+(clear-module "TEST")
+
+(defconcept bridge (?b))
+
+(ask (subset-of bridge thing))
+(ask (subset-of thing bridge))
+(ask (not (subset-of bridge thing)))
+(ask (not (subset-of thing bridge)))
+
+
+;;; EXPOSED A PROBLEM WITH ROOT-TYPES AND QUERIES ON ABSTRACT CLASSES:
+
+(clear-module "TEST")
+
+(defconcept animal (?a)
+  :axioms (ABSTRACT ANIMAL))
+(defconcept PERSON (?p animal))
+
+(assert (PERSON fred))
+(ask (animal fred))
+(ask (not (animal fred)))
+
+
+;;; USING THE CONTRAPOSITIVE
+
+(clear-module "TEST")
+
+(defconcept boat (?b))
+(deffunction max-current ((?b BOAT)) :-> (?mc FLOAT))
+
+(defconcept river (?r))
+(deffunction current ((?r RIVER)) :-> (?c FLOAT))
+(defrelation current-too-strong ((?x boat) (?y river))
+ :<=> (> (current ?y) (max-current ?x)))
+
+(assert (river nile))
+(assert (boat raft1))
+(assert (max-current raft1 3.0))
+(assert (current nile 2.0))
+
+(ask (current-too-strong raft1 nile))
+
+;;;; PROBLEM: `natural-deduction-mode?' KILLS THIS!!!!!!!!!!!!!!!!!
+
+;; THIS MUST RETURN TRUE:
+(ask (not (current-too-strong raft1 nile)))
+
+;; TEST SYMMETRIE: CONTRAPOSITIVE DERIVED FROM A `NEGATIVE' RULE:
+(defrelation current-too-strong2 ((?x boat) (?y river)))
+
+(assert (forall ((?x boat) (?y river))
+          (=> (not (> (current ?y) (max-current ?x)))
+              (not (current-too-strong2 ?x ?y)))))
+
+(assert (forall ((?x boat) (?y river))
+          (=> (not (current-too-strong2 ?x ?y))
+              (not (> (current ?y) (max-current ?x))))))
+
+(ask (current-too-strong2 raft1 nile))
+;; THIS MUST RETURN TRUE:
+(ask (not (current-too-strong2 raft1 nile)))
+
+
+;;; PROVING DISJUNCTIONS:
+
+(clear-module "TEST")
+
+(defconcept PERSON (?p)
+  :documentation "The class of PERSON beings.")
+(defrelation happy ((?p PERSON)))
+(defrelation married ((?p PERSON)))
+
+(assert (forall (?x person)
+                (=> (married ?x) (happy ?x))))
+
+(assert (person fred))
+
+(ask (or (not (married fred))
+         (happy fred)))
+
+(clear-module "TEST")
+
+(defconcept PERSON (?p)
+  :documentation "The class of PERSON beings.")
+
+(defrelation happy ((?p PERSON)))
+(defrelation rich ((?p PERSON)))
+(defrelation married ((?p PERSON)))
+
+(assert (forall (?x PERSON)
+          (=> (or (rich ?x)
+                  (and (married ?x)
+                       (not (rich ?x))))
+              (happy ?x))))
+
+(assert (PERSON fred))
+(assert (married fred))
+
+(ask (happy fred))
+
+
+;;; STRESS DUPLICATE SUBGOAL MECHANISM:
+
+(clear-module "TEST")
+
+(defconcept partially-tangible (?pt))
+
+(defrelation between
+    ((?a partially-tangible) (?b partially-tangible) (?c partially-tangible)))
+
+(defrule Commutative-Between
+  (forall ((?a Partially-Tangible)
+           (?b Partially-Tangible)
+           (?c Partially-Tangible))
+    (=> (Between ?a ?b ?c)
+        (Between ?a ?c ?b))))
+
+(defrule Transitive-Between 
+  (forall ((?a Partially-Tangible)
+           (?b Partially-Tangible)
+	   (?c Partially-Tangible)
+           (?d Partially-Tangible))
+    (=> (and (Between ?a ?d ?c)
+             (Between ?b ?a ?c))
+	(Between ?a ?d ?b))))
+
+(assert (partially-tangible city1))
+(assert (partially-tangible city2))
+(assert (partially-tangible city3))
+(assert (partially-tangible city4))
+
+;; THIS NEEDS TO FAIL AFTER TRYING ALL POSSIBILITES:
+(ask (between city1 city2 city3))
+
+(assert (between city1 city3 city2))
+
+;; TEST COMMUTATIVITY:
+(ask (between city1 city2 city3))
+
+(assert (between city4 city3 city1))
+
+;; TEST TRANSITIVITY (THIS IS SLOW):
+(ask (between city1 city4 city2))
+
+
+;;; CLOSED RELATIONS:
+
+(clear-module "TEST")
+
+(defconcept PERSON (?p))
+(defrelation nobel-prize-winner ((?p PERSON)))
+
+(assert (PERSON fred))
+(assert (PERSON einstein))
+(assert (nobel-prize-winner einstein))
+
+(ask (not (nobel-prize-winner fred)))
+(ask (not (nobel-prize-winner einstein)))
+
+(assert (closed nobel-prize-winner))
+
+(ask (not (nobel-prize-winner fred)))
+(ask (not (nobel-prize-winner einstein)))
+
+
+;;; FORWARD INFERENCE WITH EQUAL FUNCTION TERMS
+
+(clear-module "TEST")
+
+(defconcept PERSON (?p))
+(deffunction nof-brothers ((?p PERSON)) :-> (?n INTEGER))
+(deffunction nof-sisters ((?p PERSON)) :-> (?n INTEGER))
+(defrelation balanced-siblings ((?p PERSON)))
+
+(assert (forall (?x PERSON)
+          (=> (balanced-siblings ?x)
+              (= (nof-brothers ?x) (nof-sisters ?x)))))
+
+(assert (PERSON fred))
+
+(assert (balanced-siblings fred))
+
+(retrieve (?x integer) (= (NOF-BROTHERS fred) ?x))
+(retrieve (?x integer) (= (NOF-SISTERS fred) ?x))
+
+(assert (= (NOF-BROTHERS fred) 5))
+
+(retrieve (?x integer) (= (NOF-SISTERS fred) ?x))
+(retrieve (?x integer) (= (NOF-BROTHERS fred) ?x))
+
+
+;;; INEQUALITY FUN:
+
+(clear-module "TEST")
+
+(defconcept PERSON (?p))
+(deffunction height ((?p PERSON)) :-> (?h FLOAT))
+
+;; THIS RULE ISN'T NEEDED ANYMORE:
+;; BUG: CAN'T DEFINE A BICONDITIONAL:
+;(defrule greater-implies-less
+;    (forall ((?x NUMBER) (?y NUMBER))
+;      (<=> (> ?x ?y) (< ?y ?x))))
+
+(assert (PERSON fred))
+(assert (> (height fred) 20.0))
+(assert (PERSON joe))
+(assert (< (height joe) 20.0))
+(ask (< 20.0 (height fred)))
+(ask (> 20.0 (height joe)))
+
+(defconcept avlb (?avlb)
+  :=> (< (traffic-class ?avlb) 17))
+(deffunction traffic-class ((?avlb avlb)) :-> (?i INTEGER))
+
+(assert (avlb b1))
+(ask (< (traffic-class b1) 17))
+
+;;; ENFORCING VARIABLE TYPES DURING FORWARD INFERENCE:
+
+(clear-module "TEST")
+
+(defconcept animal (?a))
+(defconcept PERSON (?p))
+(deffunction loved-by ((?a ANIMAL)) :-> (?p PERSON))
+
+(defconcept dog (?d animal))
+(defconcept cat (?c animal))
+
+(defrelation loves ((?p PERSON) (?a animal)))
+
+;; BELOW WE INTENTIONALLY DUPLICATE THE VARIABLE TYPE RESTRICTION `(cat ?c)',
+;;    SINCE THAT EXPOSED A BUG IN THE SIMPLIFIER WHERE IT COMPLETELY LOST THEM:
+(defrule cat-lover-rule
+    (forall ((?p PERSON) (?c cat))
+      (=> (and (cat ?c)
+               (loves ?p ?c))
+          (= (loved-by ?c) ?p))))
+
+(assert (PERSON fred))
+(assert (dog fido))
+(assert (cat garfield))
+(assert (loves fred garfield))
+
+;;; THIS FAILS AS IT SHOULD:
+(ask (loved-by fido fred))
+;;; THIS SUCCEEDS:
+(ask (loved-by garfield fred))
+
+(propagate-constraints)
+
+;;; AFTER CONSTRAINT PROPAGATION THIS MUST STILL FAIL:
+(ask (loved-by fido fred))
+
+
+;;; STATE MACHINE FUN:
+
+(clear-module "TEST")
+
+(defconcept a)
+
+(defrelation r1 ((?a1 a) (?a2 a)))
+(defrelation r2 ((?a1 a) (?a2 a)))
+
+(assert (forall ((?a1 a) (?a2 a))
+          (=> (r2 ?a1 ?a2)
+              (r2 ?a2 ?a1))))
+
+(assert (a a1))
+(assert (a a2))
+(assert (r2 a1 a2))
+
+;; THIS EXPOSED A BUG IN THE STATE MACHINE:
+(ask (or (r1 a2 a1)
+         (r2 a2 a1)))
+
+
+;;; FUNCTION INVERSES:
+
+(clear-module "TEST")
+
+(defconcept person (?p))
+(deffunction boss ((?p PERSON)) :-> (?f PERSON))
+
+(assert (person fred))
+(assert (person john))
+(assert (person susi))
+(assert (person otto))
+
+(assert (= (boss fred) otto))
+(assert (= (boss john) otto))
+(assert (= (boss otto) susi))
+
+(retrieve all (?x person) (= (boss ?x) otto))
+(retrieve all ((?x person) (?y person)) (= (boss ?x) ?y))
+
+
+;;; ITERATIVE FORALL (SHOULD BECOME A STANDARD DEMO)
+
+(clear-module "TEST")
+
+(defconcept house (?h))
+(defconcept person (?p))
+(defrelation crazy ((?p PERSON)))
+(deffunction lives-in ((?p PERSON)) :-> (?f HOUSE))
+
+(defconcept nuthouse (?h house))
+
+(defrule nuthouse-rule
+    (forall (?h house)
+      (=> (forall (?p person)
+	    (=> (lives-in ?p ?h)
+		(crazy ?p)))
+	  (nuthouse ?h))))
+
+(assert (closed person))
+
+(assert (person fred))
+(assert (person mary))
+(assert (not (crazy fred)))
+(assert (crazy mary))
+(assert (house h1))
+(assert (lives-in fred h1))
+(assert (lives-in mary h1))
+
+(ask (nuthouse h1))
+
+(retract (not (crazy fred)))
+(assert (crazy fred))
+
+(ask (nuthouse h1))
+
+
+;;; CONSTRAINT PROPAGATION BUG DURING HYPOTHETICAL REASONING:
+
+(clear-module "TEST")
+
+(defconcept person (?p))
+(defrelation happy ((?p PERSON)))
+(defrelation rich ((?p PERSON)))
+
+
+(defrelation sibling ((?x person) (?y person)))
+
+(assert (forall (?x person)
+          (=> (happy ?x)
+              (exists (?y person)
+                (sibling ?x ?y)))))
+
+(assert (person fred))
+
+;; THIS NEEDS TO FAIL, BUT IT USED TO BREAK `mapped-value-of', SINCE
+;; `*queryIterator*' WAS STILL VISIBLE DURING THE CONSTRAINT PROPAGATION
+;; CAUSED BY THE ASSERTION IN THE HYPOTHETICAL WORLD:
+(ask (or (rich fred)
+         (not (happy fred))))
+
+
+;;; EQUALITY REASONING BUG WITH NESTED FUNCTIONS:
+
+(clear-module "TEST")
+
+(defconcept person (?p))
+(deffunction age ((?p PERSON)) :-> (?age INTEGER))
+(deffunction golf-handicap ((?p PERSON)) :-> (?age INTEGER))
+(deffunction son ((?p PERSON)) :-> (?f PERSON))
+
+(assert (person fred))
+(assert (person joe))
+(assert (= (son Fred) Joe))
+(assert (= (age Joe) 12))
+(assert (= (golf-handicap Fred) (age (son Fred))))
+
+(propagate-constraints)
+
+;; THIS MUST RETURN 12:
+(retrieve all (?x integer) (= (golf-handicap Fred) ?x))
+
+;; TRY AGAIN WITH DIFFERENT ORDER:
+(clear-module "TEST")
+
+(defconcept person (?p))
+(deffunction age ((?p PERSON)) :-> (?age INTEGER))
+(deffunction golf-handicap ((?p PERSON)) :-> (?age INTEGER))
+(deffunction son ((?p PERSON)) :-> (?f PERSON))
+
+(assert (person fred))
+(assert (person joe))
+(assert (= (age Joe) 12))
+(assert (= (golf-handicap Fred) (age (son Fred))))
+(assert (= (son Fred) Joe))
+
+(propagate-constraints)
+
+;; THIS MUST RETURN 12:
+(retrieve all (?x integer) (= (golf-handicap Fred) ?x))
+
+
+;; TRY AGAIN WITH DIFFERENT ORDER:
+(clear-module "TEST")
+
+(defconcept person (?p))
+(deffunction age ((?p PERSON)) :-> (?age INTEGER))
+(deffunction golf-handicap ((?p PERSON)) :-> (?age INTEGER))
+(deffunction son ((?p PERSON)) :-> (?f PERSON))
+
+(assert (person fred))
+(assert (person joe))
+(assert (= (golf-handicap Fred) (age (son Fred))))
+(assert (= (age Joe) 12))
+(assert (= (son Fred) Joe))
+
+(propagate-constraints)
+
+;; THIS MUST RETURN 12:
+(retrieve all (?x integer) (= (golf-handicap Fred) ?x))
+
+
+;;; CONSTANT INTRODUCTION BUG:
+
+(clear-module "TEST")
+
+(defconcept person (?p))
+(deffunction age ((?p PERSON)) :-> (?age INTEGER))
+(deffunction golf-handicap ((?p PERSON)) :-> (?age INTEGER))
+(deffunction son ((?p PERSON)) :-> (?f PERSON))
+
+;; THIS USED TO BREAK BECAUSE OF MISSING TYPE INFERENCE:
+(assert (and (person Mary)
+             (= (age Mary) 3)))
+
+
+;;; PROPOSITION ARGUMENTS BUG:
+
+(clear-module "TEST")
+
+(defconcept person (?p))
+(deffunction age ((?p PERSON)) :-> (?age INTEGER))
+(deffunction golf-handicap ((?p PERSON)) :-> (?age INTEGER))
+(deffunction son ((?p PERSON)) :-> (?f PERSON))
+
+(defrelation believes ((?x person) (?y proposition)))
+
+(assert (person fred))
+(assert (person joe))
+
+(assert (believes fred (son fred joe)))
+
+(retrieve (?x proposition) (believes fred ?x))
+(retrieve ?x (believes fred ?x))
+
+;;; TESTING RELATION HIERARCHY LOOKUP:
+
+(clear-module "TEST")
+
+(defconcept person (?p))
+(defrelation happy ((?p person)))
+(defrelation rich ((?p person)))
+(assert (person fred))
+(assert (forall (?x person) (=> (rich ?x) (happy ?x))))
+(assert (rich fred))
+(ask (happy fred))
+
+;;; COMPLEMENT TEST
+
+(clear-module "TEST")
+
+(defconcept person (?P))
+(defrelation parent ((?p1 person) (?p2 person)))
+(defrelation grandparent ((?p person)))
+(defrelation retired ((?p person)))
+(assert (person fred))
+(assert (not (grandparent fred)))
+(assert (=> (AND (RETIRED ?X) (FAIL (PARENT ?X1 ?X))) (GRANDPARENT ?X)))
+(assert (=> (AND (RETIRED ?X) (PARENT ?X1 ?X)) (NOT (GRANDPARENT ?X))))
+(ask (not (grandparent fred)))
+
+;;; HANDLING CLUSTERED OF CONJUNCTIONS:
+
+(clear-module "TEST")
+
+(set-feature trace-subgoals)
+
+(defconcept person (?p))
+(defrelation loves ((?x person) (?y person)))
+(defrelation hates ((?x person) (?y person)))
+
+(assert (person fred))
+(assert (person john))
+(assert (person susi))
+(assert (person debbie))
+
+(assert (loves fred susi))
+(assert (hates john debbie))
+
+;; MUST FAIL WITHOUT BACKTRACKING:
+(retrieve all (?x ?y ?z ?zz)
+          (and (loves ?x ?y)
+               (loves ?y ?x)
+               (hates ?z ?zz)
+               (hates ?zz ?z)))
+
+(assert (hates debbie john))
+
+;; MUST FAIL WITHOUT BACKTRACKING:
+(retrieve all (?x ?y ?z ?zz)
+          (and (loves ?x ?y)
+               (loves ?y ?x)
+               (hates ?z ?zz)
+               (hates ?zz ?z)))
+
+(assert (loves susi fred))
+
+;; 4 SOLUTIONS:
+(retrieve all (?x ?y ?z ?zz)
+          (and (loves ?x ?y)
+               (loves ?y ?x)
+               (hates ?z ?zz)
+               (hates ?zz ?z)))
+
+(unset-feature trace-subgoals)
+
+;;; CLUSTERED CONJUNCTION BUG
+
+(clear-module "TEST")
+
+(defconcept project)
+(defconcept person)
+(defconcept research-area)
+(defrelation works-on ((?u person) (?l project)))
+(defrelation topic ((?p project) (?a thing)))
+(defrelation related ((?t1 research-area) (?t2 research-area)))
+
+(assert (project electric-elves))
+(assert (project powerloom))
+(assert (project sims))
+
+(assert (topic electric-elves intelligent-agents))
+(assert (topic powerloom knowledge-representation))
+(assert (topic sims automated-planning))
+
+(assert (related intelligent-agents knowledge-representation))
+(assert (related automated-planning intelligent-agents))
+
+(assert (works-on craig-knoblock electric-elves))
+(assert (works-on craig-knoblock sims))
+
+(assert (works-on hans-chalupsky electric-elves))
+(assert (works-on hans-chalupsky powerloom))
+
+(defrelation overlapping-interests
+    ((?visitor PERSON) (?visitor-interest RESEARCH-AREA)
+     (?staff PERSON) (?staff-interest RESEARCH-AREA))
+  :<= (and (exists (?project)
+	     (and (works-on ?visitor ?project)
+		  (topic ?project ?visitor-interest)))
+	   (exists (?project)
+	     (and (works-on ?staff ?project)
+		  (topic ?project ?staff-interest)))
+           ;; THIS WOULD PREVENT CLUSTERING:
+           ;(not (= ?visitor ?staff))
+           ;; RESIDUE GOAL, DO BACKTRACK IF WE FAIL HERE:
+	   (or (related ?visitor-interest ?staff-interest)
+               (related ?staff-interest ?visitor-interest))))
+
+;;; 8 SOLUTIONS:
+(retrieve all (?v ?vi ?s ?si) (overlapping-interests ?v ?vi ?s ?si))
+
+;;; LAZY SATELITES PROBLEM:
+
+(clear-module "TEST")
+(defconcept person (?x))
+(defrelation happy ((?x person)))
+(defrelation rich ((?x person)))
+(assert (forall (?x person)
+           (=> (rich ?x) (happy ?x))))
+
+(assert (person fred))
+(assert (not (happy fred)))
+
+;;;THIS SHOULD RETURN FRED EVEN IF WE USE LAZY SATELLITES
+(retrieve all ?x (and (person ?x) (not (rich ?x))))
+
+;;; ASSERTION LOOKUP WITH EQUALITY AND SPECIALIZING RELATIONS
+
+(clear-module "TEST")
+(defconcept person (?x))
+(deffunction boss ((?x person)) :-> (?b person))
+(deffunction father ((?x person)) :-> (?f person))
+(deffunction mother ((?x person)) :-> (?m person))
+(defrelation rich ((?x person)))
+(defrelation happy ((?x person)))
+
+(assert (forall (?x person) (=> (rich ?x) (happy ?x))))
+(assert (person fred))
+(assert (person frank))
+(assert (person susi))
+(assert (rich (father frank)))
+(assert (= (father frank) (boss fred)))
+
+(ask (happy (father frank)))
+(ask (happy (boss fred)))
+(retrieve all (?x person) (happy ?x))
+
+;;; DON'T PICK UP DUPLICATE PROPOSITIONS/DESCRIPTIONS FROM UNRELATED CONTEXTS
+
+(clear-module "TEST")
+(defmodule "TEST/TEMP-A")
+(defmodule "TEST/TEMP-B")
+
+(defconcept person (?x))
+(defrelation parent ((?x person) (?y person)))
+(defrelation child ((?x person) (?y person)))
+(deffunction age ((?x person)) :-> (?a INTEGER))
+(assert (person fred))
+(assert (person susi))
+
+(cc "TEST/TEMP-A")
+(assert (parent fred susi))
+(assert (= (age fred) 42))
+(assert (forall (?x ?y) (=> (parent ?x ?y) (child ?y ?x))))
+(cc "TEST/TEMP-B")
+(assert (parent fred susi))
+(assert (= (age fred) 42))
+(assert (forall (?x ?y) (=> (parent ?x ?y) (child ?y ?x))))
+(clear-module "TEST/TEMP-A")
+;;; NOW THESE MUST STILL RETURN TRUE:
+(ask (parent fred susi))
+(ask (= (age fred) 42))
+(ask (child susi fred))
+(cc test)
+
+;;; EQUALITY/FORWARD-INFERENCE PROBLEMS
+
+(clear-module "TEST")
+(defconcept person (?x))
+(deffunction boss ((?x person)) :-> (?f person))
+(defrelation employee-of ((?emp person) (?boss person)))
+
+(assert (forall (?emp ?boss)
+          (=> (employee-of ?emp ?boss)
+              (= (boss ?emp) ?boss))))
+
+(assert (person fred))
+(assert (person frank))
+(assert (person susi))
+
+(assert (= (boss fred) (boss susi)))
+(assert (employee-of fred frank))
+;;; FIX: SHOULD RETURN FRANK
+(retrieve ?x (= (boss susi) ?x))
+;;; FIX: SHOULD RETURN FRANK
+(retrieve ?x (= (boss fred) ?x))
+;;; FIX: SHOULD RETURN FRANK
+(retrieve ?x (= (boss susi) ?x))
+
+;;; VARIANT: FIX DIFFERENT FORWARD-INF BEHAVIOR BETWEEN RULES THAT TURN
+;;;    INTO IMPLIES PROPOSITIONS AND OTHER RULES:
+(clear-module "TEST")
+(defconcept person (?x))
+(deffunction boss ((?x person)) :-> (?f person))
+;;; THIS DOESN'T TURN INTO AN IMPLIES:
+(defrelation has-employee ((?boss person) (?emp person)))
+
+(assert (forall (?emp ?boss)
+          (=> (has-employee ?boss ?emp)
+              (= (boss ?emp) ?boss))))
+
+(assert (person fred))
+(assert (person frank))
+(assert (person susi))
+
+(assert (= (boss fred) (boss susi)))
+(assert (has-employee frank fred))
+;;; FIX: STILL DOESN'T RETURN FRANK
+(retrieve ?x (= (boss susi) ?x))
+(retrieve ?x (= (boss fred) ?x))
+;;; BUT NOW IT DOES (ELABORATION ABOVE WASN'T GOOD ENOUGH)
+(retrieve ?x (= (boss susi) ?x))
+
+;;; INCREMENTAL RE-ELABORATION FOR META-ASSERTIONS:
+
+(clear-module "TEST")
+(defrelation foo (?x ?y))
+(assert (symmetric foo))
+(assert (reflexive foo))
+(assert (foo a b))
+;; THESE MUST BOTH BE TRUE:
+(ask (foo b a))
+(ask (foo b b))
+
+(defrelation foo2 (?x ?y))
+(assert (reflexive foo2))
+;; THIS STILL WORKS:
+(ask (foo2 a a))
+(assert (symmetric foo2))
+(assert (foo2 a b))
+;; THIS MUST STILL BE TRUE (IT WASN'T ALWAYS):
+(ask (foo2 b a))
+
+;;; USING NON-ATOMIC RELATION TERMS:
+
+(clear-module "TEST")
+(deffunction rfn (?x) :-> (?v relation))
+(deffunction ffn (?x) :-> (?v function))
+(deffunction cfn (?x) :-> (?v class))
+
+(assert ((rfn a) b))
+(ask (relation (rfn a)))
+(ask (class (rfn a)))
+(ask (function (rfn a)))
+(retrieve ?x (arity (rfn a) ?x))
+(retrieve all ?x ((rfn a) ?x))
+
+(assert ((ffn a) b c))
+(ask (relation (ffn a)))
+(ask (class (ffn a)))
+(ask (function (ffn a)))
+(retrieve ?x (arity (ffn a) ?x))
+(retrieve all ?x ((ffn a) b ?x))
+
+(assert ((cfn a) b))
+(ask (relation (cfn a)))
+(ask (class (cfn a)))
+(ask (function (cfn a)))
+(retrieve ?x (arity (cfn a) ?x))
+(retrieve all ?x ((cfn a) ?x))
+
+(assert (exists (?x) (= (rfn b) ?x)))
+(ask (exists (?x) (= (rfn b) ?x)))
+(assert (holds (rfn b) c))
+(ask (exists (?x) (= (rfn b) ?x)))
+(retrieve all ?x ((rfn b) ?x))
+
+;;; DIFFERENT FUNCTION VALUES CAN HAVE DIFFERENT ARITIES:
+(assert ((rfn c) d))
+(retrieve ?x (arity (rfn c) ?x))
+(assert ((rfn d) e f g))
+(retrieve ?x (arity (rfn d) ?x))
+;;; FIX: WE SHOULD GET AN ARITY VIOLATION HERE:
+(assert ((rfn d) e f))
+(retrieve ?x (arity (rfn d) ?x))
+
+;;; PRIOR ASSERTION CAN CONTROL THE NATURE OF THE RELATION DESCRIPTION:
+(assert (function (rfn e)))
+(assert (variable-arity (rfn e)))
+(assert ((rfn e) f g))
+(ask (function (rfn e)))
+(ask (variable-arity (rfn e)))
+(retrieve ?x (arity (rfn e) ?x))
+(retrieve all ?x ((rfn e) f ?x))
+
+;;; DON'T LOSE ASSERTIONS DURING SURROGATIFICATION:
+(assert ((cfn b) (rfn f)))
+(assert ((rfn f) g))
+(ask ((cfn b) (rfn f)))
+
+;;; DIFFERENT SYNTAXES, MAKE SURE WE PROPERLY PICK UP DUPLICATES:
+(assert (function (rfn g)))
+(assert (= ((rfn g) h) x))
+(assert ((rfn g) h x))
+(assert (= (value (rfn g) h) x))
+(assert (value (rfn g) h x))
+;;; WE SHOULD ONLY SEE ONE FUNCTION PROP HERE:
+(all-facts-of "X")
+
+(assert (= ((ffn g) h) y))
+(assert ((ffn g) h y))
+(assert (= (value (ffn g) h) y))
+(assert (value (ffn g) h y))
+;;; WE SHOULD ONLY SEE ONE FUNCTION PROP HERE:
+(all-facts-of "Y")
+
+(assert (= ((ffn h) i) j))
+(assert (= (value (ffn h) i) j))
+(assert ((ffn i) j ((ffn h) i)))
+(assert ((ffn i) j (value (ffn h) i)))
+;;; THIS MUST ONLY RETURN ONE SOLUTION:
+(retrieve all ?x ((ffn i) j ?x))
+
+;;; RULES:
+(assert (forall (?x ?y)
+          (=> ((rfn h) ?x ?y)
+              ((rfn i) ?y ?x))))
+(assert ((rfn h) i j))
+(ask ((rfn i) j i))
+
+(assert (forall (?x ?y)
+          (=> (= ((ffn j) ?x) ?y)
+              (= ((ffn k) ?y) ?x))))
+(assert (= ((ffn j) a) b))
+(assert (= ((ffn j) c) d))
+(ask (= ((ffn k) b) a))
+(retrieve all (?x ?y) (= ((ffn k) ?x) ?y))
+
+;;; GENERATING `SETOF' ELEMENTS FROM EQUIVALENT SKOLEMS:
+
+(clear-module "TEST")
+
+(defconcept person)
+(deffunction friends ((?p person)) :-> (?f set))
+
+(assert (= (setof hans franz) (friends fred)))
+(assert (= (friends hans) (setof fred franz)))
+
+;;; TRY BOTH ARGUMENT ORDERS:
+(retrieve all ?f (member-of ?f (friends fred)))
+(retrieve all ?f (member-of ?f (friends hans)))
+
+;;; PROPER HANDLING OF FULLY GROUND FUNCTION TERMS IN `INHERIT-DESCRIPTION':
+
+(clear-module "TEST")
+
+(defconcept person)
+(deffunction friends ((?p person)) :-> (?f set))
+
+;;; USES FULLY GROUND TERM `(friends hans)', WE DON'T WANT ITS OUTPUT TO
+;;;    BECOME SKOLEMIZED, INSTEAD WE WANT TO USE THE FUNCTION OUTPUT SKOLEM:
+(defconcept friend-of-hans (?x)
+            :<<=>> (member-of ?x (friends hans)))
+
+(defconcept has-hans-as-friend (?x)
+            :<<=>> (member-of hans (friends ?x)))
+
+(assert (person hans))
+(assert (person otto))
+(assert (person karl))
+(assert (friend-of-hans otto))
+(assert (has-hans-as-friend karl))
+
+(ask (friend-of-hans otto))
+(ask (has-hans-as-friend karl))
+
+;;; THIS MUST RETURN `(FRIENDS HANS)', NOT AN ANONYMOUS SKOLEM:
+(retrieve all ?x (member-of otto ?x))
+(retrieve all ?x (member-of hans ?x))
+
+;;; PROPER COMBINATION OF SUBRELATION LINKS AND RULES:
+
+(clear-module "TEST")
+
+(defrelation sibling-of (?x ?y))
+(defrelation brother-of (?x ?y))
+(defrelation son-of (?x ?y))
+
+(assert (forall (?x ?y)
+          (=> (brother-of ?x ?y)
+              (sibling-of ?x ?y))))
+
+(assert (forall (?x ?y ?f)
+          (=> (and (son-of ?x ?f)
+                   (son-of ?y ?f)
+                   (not (= ?x ?y)))
+              (brother-of ?x ?y))))
+
+(assert (son-of hans dad))
+(assert (son-of franz dad))
+
+;;; THIS SHOULD RETURN TRUE:
+(ask (sibling-of hans franz))
+
+;;; SUBSUMPTION TESTS AND INTERVAL UNIFICATION:
+
+(clear-module "TEST")
+
+(defconcept person)
+(deffunction age ((?x person)) :-> (?y integer))
+(defconcept teenager ((?x person)) :<=> (and (person ?x)
+                                             (< (age ?x) 20)
+                                             (> (age ?x) 12)))
+
+(assert (and (person mike) (age mike 15)))
+(ask (teenager mike))
+
+;;; SHOULD BE TRUE - CURRENTLY FAILS BECAUSE OF A STUPID ANTECEDENT
+;;; TYPE CHECK FAILURE; SETTING `*type-check-strategy*' TO :NONE FIXES IT:
+(ask (forall ?x (=> (and (person ?x)
+                         (< (age ?x) 20)
+                         (> (age ?x) 12))
+                    (teenager ?x))))
+;;; SHOULD BE TRUE:
+(ask (subset-of (kappa (?x)
+                  (and (person ?x)
+                       (< (age ?x) 20)
+                       (> (age ?x) 12)))
+                teenager))
+
+;;; SHOULD BE TRUE:
+(ask (forall ?x (=> (and (person ?x)
+                         (< (age ?x) 20)
+                         (> (age ?x) 15))
+                    (teenager ?x))))
+;;; SHOULD BE TRUE:
+(ask (subset-of (kappa (?x)
+                  (and (person ?x)
+                       (< (age ?x) 20)
+                       (> (age ?x) 15)))
+                teenager))
+
+;;; THIS SHOULD RETURN FALSE OR AT LEAST UNKNOWN:
+(ask (forall ?x (=> (and (person ?x)
+                         (< (age ?x) 23)
+                         (> (age ?x) 15))
+                    (teenager ?x))))
+;;; THIS SHOULD RETURN FALSE OR AT LEAST UNKNOWN:
+(ask (subset-of (kappa (?x)
+                  (and (person ?x)
+                       (< (age ?x) 23)
+                       (> (age ?x) 15)))
+                teenager))
+
+;;; INVERSE VALUE CLASH:
+
+(clear-module "TEST")
+
+(defconcept person)
+(deffunction age ((?x Person)) :-> (?y number))
+
+(assert (age Jeff 42))
+
+(ask (age Jeff 21))
+;;; FIX: THIS SHOULD BE TRUE:
+(ask (not (age Jeff 21)))
+
+;;; PROPER OPTIMIZATION OF HOLDS GOALS:
+
+(clear-module "TEST")
+
+(defconcept meta-property)
+(defconcept extensional)
+(defconcept entity)
+
+(defconcept extensional-p (?p)
+            :<=> (and (meta-property ?p)        
+                      (forall ?x
+                        (=> (and (entity ?x)
+                                 (?p ?x))
+                            (extensional ?x)))))
+
+(defconcept test-class (?x entity)
+            :axioms (extensional-p test-class))
+
+(assert (test-class fred))
+
+;;; THESE SHOULD ALL RETURN TRUE:
+(ask (extensional fred))
+(ask (holds test-class fred))
+(ask (extensional fred))
+
+;;; PROPER HANDLING OF INEQUALITY RETRACTION
+
+(clear-module "TEST")
+
+(deffunction age (?p) :-> (?a integer))
+
+(assert (< (age bill) 12))
+(assert (> (age bill) 10))
+
+;;; SHOULD RETURN 11:
+(retrieve ?x (= (age bill) ?x))
+
+(retract (< (age bill) 12))
+
+;;; SHOULD RETURN THE SKOLEM ONLY:
+(retrieve ?x (= (age bill) ?x))
+
+;;; TEST CLASH WITH ENUMERATED SETS VIA MEMBER-OF EVALUATOR:
+
+(clear-module "TEST")
+
+(defconcept Primary-Color (?c)
+  :<<=>> (member-of ?c (setof Red Green Blue)))
+
+(deffunction favorite-color (?x ?y))
+
+(assert (primary-color red))
+(assert (primary-color (favorite-color joe)))
+
+;;; SHOULD GENERATE 4 SOLUTIONS:
+(retrieve all (?x) (Primary-Color ?x))
+
+(assert (primary-color pink))
+
+;;; SHOULD GENERATE 5 SOLUTIONS AND A CLASH:
+(retrieve all (?x) (Primary-Color ?x))
+
+;;; REDEFINITION TESTS
+
+(clear-module "TEST")
+
+(defconcept A
+  :documentation "doc"
+  :synonym A-SYN)
+
+(defrelation r (?x))
+(assert (r a))
+(assert (synonym a a-syn2))
+
+(retrieve all ?x (documentation a ?x))
+(retrieve all ?x (documentation a-syn ?x))
+(retrieve all ?x (documentation a-syn2 ?x))
+(ask (r a))
+
+(defconcept A
+  :documentation "doc2")
+
+(retrieve all ?x (documentation a ?x))
+(retrieve all ?x (documentation a-syn ?x))
+(retrieve all ?x (documentation a-syn2 ?x))
+(ask (r a))
+
+(defproposition P (r foo)
+  :documentation "doc"
+  :synonym P-SYN)
+
+(assert (r p))
+(assert (synonym p p-syn2))
+
+(retrieve all ?x (documentation p ?x))
+(retrieve all ?x (documentation p-syn ?x))
+(retrieve all ?x (documentation p-syn2 ?x))
+(ask (r p))
+
+(defproposition P (r foo)
+  :documentation "doc2")
+
+(retrieve all ?x (documentation p ?x))
+(retrieve all ?x (documentation p-syn ?x))
+(retrieve all ?x (documentation p-syn2 ?x))
+(ask (r p))
+
+;;; TEST AGAIN BUT BEFORE A's AXIOMS ARE FINALIZED:
+
+(clear-module "TEST")
+
+(defconcept A
+  :documentation "doc"
+  :synonym A-SYN)
+
+(defrelation r (?x))
+(assert (r a))
+(assert (synonym a a-syn2))
+
+(defconcept A
+  :documentation "doc2")
+
+(retrieve all ?x (documentation a ?x))
+(retrieve all ?x (documentation a-syn ?x))
+(retrieve all ?x (documentation a-syn2 ?x))
+(ask (r a))
+
+(defproposition P (r foo)
+  :documentation "doc"
+  :synonym P-SYN)
+
+(assert (r p))
+(assert (synonym p p-syn2))
+
+(defproposition P (r foo)
+  :documentation "doc2")
+
+(retrieve all ?x (documentation p ?x))
+(retrieve all ?x (documentation p-syn ?x))
+(retrieve all ?x (documentation p-syn2 ?x))
+(ask (r p))
+
+;;; TEST PROPER REDEFINITION OF SATELLITE RULES:
+
+(clear-module "TEST")
+
+(defrelation r (?x ?y))
+(defrelation s (?x ?y))
+
+(defproposition p1 (=> (r ?x ?y) (s ?y ?x))
+  :backward-only? true)
+
+(assert (r a b))
+(ask (s b a))
+
+(unset-feature just-in-time-inference)
+
+(defproposition p1 (=> (r ?x ?y) (s ?y ?x))
+  :forward-only? true)
+
+;;; SHOULD BE UNKNOWN:
+(ask (s b a))
+
+(set-feature just-in-time-inference)
+
+;;; SHOULD BE TRUE:
+(ask (s b a))
+
+;;; TEST INSTANTIATION OF DESCRIPTIONS WITH EXTERNAL VARIABLES:
+
+(clear-module "TEST")
+
+(defrelation brother (?x ?y)
+  :closed true)
+
+(assert (and (brother fred joe)
+             (brother fred john)
+             (brother susi fred)))
+
+;;; SHOULD RETURN FRED AND 2:
+(retrieve all (?x ?c)
+          (and (brother susi ?x)
+               (= (cardinality (setofall (?f) (brother ?x ?f))) ?c)))
+;;; SHOULD RETURN FRED AND 2:
+(retrieve all (?c ?x)
+          (and (brother susi ?x)
+               (= (cardinality (setofall (?f) (brother ?x ?f))) ?c)))
+
+;;; FORWARD-INSTANTIATING FUNCTION RULES:
+
+(clear-module "TEST")
+
+(deffunction r (?x ?y) :<=> (s ?y ?x))
+(deffunction s (?x ?y) :<=> (r ?y ?x))
+
+(assert (r fred wilma))
+(assert (r barney betty))
+
+;;; SHOULD GENERATE 2 SOLUTIONS AND NOT BREAK WITH EVER GROWING FN TERMS
+;;; BY PROPERLY INSTANTIATING ON THE VALUES INSTEAD OF THE OUTPUT SKOLEMS:
+(retrieve all (s ?x ?y))
+
+;;; TEST MEMBER-OF ON DESCRIPTION ARGUMENTS:
+
+(clear-module "TEST")
+
+;;; SHOULD GENERATE 3 SOLUTIONS EACH:
+(retrieve 3 (member-of ?super
+                       (setofall ?x
+                         (superrelation concept ?x))))
+
+(retrieve all (member-of ?x (kappa (?y) (member-of ?y (setof "a" "b" "c")))))
+
+;;; TEST CASES FOR UNASSERT & RETRACT:
+
+(clear-module "TEST")
+
+(defrelation happy (?x))
+(deffunction father (?x ?y))
+
+(assert (happy fred))
+(unassert (happy fred))
+(ask (happy fred))
+
+(assert (not (happy fred)))
+(unassert (happy fred))
+(ask (not (happy fred)))
+
+(assert (happy fred))
+(unassert (not (happy fred)))
+(ask (happy fred))
+
+(assert (happy fred))
+(assert (happy joe))
+(unassert (and (happy fred) (happy joe)))
+(ask (happy fred))
+(ask (happy joe))
+
+(assert (not (happy fred)))
+(assert (happy joe))
+(unassert (and (happy fred) (happy joe)))
+(ask (not (happy fred)))
+(ask (happy joe))
+
+;;; UNASSERTING CONTRADICTIONS:
+(assert (happy fred))
+(assert (not (happy fred)))
+(ask (happy fred))
+(unassert (happy fred))
+(ask (happy fred))
+(assert (happy fred))
+(ask (happy fred))
+(assert (not (happy fred)))
+(ask (happy fred))
+(unassert (not (happy fred)))
+(ask (happy fred))
+(assert (happy fred))
+(ask (happy fred))
+
+(assert (= (father fred) dad))
+(unassert (= (father fred) dad))
+(ask (= (father fred) dad))
+
+;;; FIXED RETRACTION BUG WITH TWO FUNCTION PROPOSITION WITH SAME VALUE:
+(assert (= (father fred) dad))
+(assert (= (father joe) dad))
+(retract (= (father fred) dad))
+(ask (= (father fred) dad))
+
+(assert (= (father fred) dad))
+(assert (= (father joe) dad))
+(retract (= (father joe) dad))
+(ask (= (father joe) dad))
+
+(assert (= (father fred) dad))
+(assert (= (father joe) dad))
+(unassert (= (father fred) dad))
+(ask (= (father fred) dad))
+
+(assert (= (father fred) dad))
+(assert (= (father joe) dad))
+(unassert (= (father joe) dad))
+(ask (= (father joe) dad))
+
+;;; TESTS A BUG WITH PARTIAL-MATCHED OR'S IF THE LAST SUBGOAL WAS
+;;; A COMPOUND GOAL (SUCH AS AN AND) THAT FAILED:
+
+(clear-module "TEST")
+
+(defconcept a)
+(defconcept b)
+(assert (and (a b1) (a b2) (a b3)))
+
+(ask-partial
+ (OR (b a1)
+     (and (b a2)
+          (b a3)))
+ :match-mode :whynot-deep :minimum-score 0.0)
+
+;;; 3-VALUED TRUTH-VALUE PROPAGATION
+
+(defrelation happy (?x))
+
+(assert (not (happy joe)))
+(assert (not (happy susi)))
+
+(ask (and (happy joe) (happy fred)))
+;; UNKNOWN OK:
+(ask (and (happy fred) (happy joe)))
+;; SHOULD BOTH BE TRUE:
+(ask (not (and (happy fred) (happy joe))))
+(ask (and (happy fred) (happy joe)) :three-valued? true)
+
+;; SHOULD BOTH BE UNKNOWN:
+(ask (or (happy fred) (happy joe)))
+(ask (or (happy joe) (happy fred)))
+;; SHOULD BE FALSE:
+(ask (or (happy joe) (happy susi)))
+
+;;; SIMPLE REASONING BY CASES
+
+(clear-module "TEST")
+
+(defconcept person)
+(defconcept man (person))
+(defconcept woman (person))
+
+(assert (or (man fred) (woman fred)))
+
+;;; SHOULD RETURN TRUE:
+(ask (person fred) :inference-level :refutation)
+
+;;; SHOULD RETURN FRED:
+(retrieve (person ?x) :inference-level :refutation)
+
+;;; DISJUNCTIONS, REASONING BY CASES
+
+(clear-module "TEST")
+
+(defconcept human)
+(defconcept male)
+(defconcept female)
+(defconcept person(?x)
+  :<=> (AND (human ?x) (OR (male ?x) (female ?x))))
+(defconcept man(?x)
+  :<=> (AND (human ?x) (male ?x)))
+(defconcept woman(?x)
+  :<=> (AND (human ?x) (female ?x)))
+(defconcept gender(?x)
+  :<=> (OR (male ?x)(female ?x)))
+
+;;; NEED NATURAL DEDUCTION MODE TURNED OFF TO MAKE THESE
+;;; WORK, SINCE WE NEED THE CONTRAPOSITIVE RULES:
+
+(ask (subset-of person (kappa ?o (OR (man ?o) (woman ?o))))
+     :inference-level :refutation)
+
+;;; SHOULD RETURN TRUE BUT DOESN'T, SINCE WE CAN'T REASON BY
+;;; CASES TO FIGURE OUT (HUMAN ?O):
+(ask (subset-of (kappa ?o (OR (man ?o) (woman ?o))) person)
+     :inference-level :refutation)
+
+(ask (subset-of (kappa ?o (AND (human ?o) (OR (man ?o) (woman ?o)))) person)
+     :inference-level :refutation)
+
+(ask (subset-of person gender)
+     :inference-level :refutation)
+
+;;; QUERIES ON SUBTYPES OF LITERALS
+;;; (ONLY WORKS WITH `*backlink-all-proposition-arguments?*' TURNED ON!!):
+
+(clear-module "TEST")
+
+(defconcept nice-integer (integer))
+(defrelation nice-integer-pair ((?x nice-integer) (?y nice-integer)))
+
+(assert (nice-integer 13))
+(assert (nice-integer 15))
+
+(ask (nice-integer 13))
+(ask (nice-integer 15))
+(retrieve all (nice-integer ?x))
+
+(assert
+  (=> (and (nice-integer ?x)
+           (nice-integer ?y))
+      (nice-integer-pair ?x ?y)))
+
+(ask (nice-integer-pair 13 15))
+(retrieve all (nice-integer-pair ?x ?y))
+
+;;; HOLDS PROPOSITIONS WITH KAPPA ARGUMENTS
+
+(clear-module "TEST")
+
+(defconcept a)
+(defconcept b)
+(defrelation r (?x ?y))
+
+(assert (holds (kappa (?x) (and (a ?x) (b ?x))) fred))
+(ask (and (a fred) (b fred)))
+
+(assert (holds (kappa (?x ?y) (and (a ?x) (b ?y) (r ?x ?y))) joe susi))
+(ask (and (a joe) (b susi) (r joe susi)))
+
+(assert (=> (r ?x ?y) (holds (kappa (?s ?t) (and (a ?s) (b ?t))) ?x ?y)))
+(assert (r foo bar))
+(ask (and (a foo) (b bar)))
+
+;;; SUBSUMPTION WITH CONSTANT-ARG RELATIONS (ARGOS BUG)
+
+(clear-module "TEST")
+
+(defconcept GEO)
+
+(assert (GEO g_LA))
+(assert (GEO g_LACMSA))
+(assert (GEO g_CA))
+
+(defrelation geoPartOf ((?x GEO) (?y GEO))
+  :transitive TRUE)
+
+(assert (geopartof g_LA g_LACMSA))
+(assert (geopartof g_LACMSA g_CA))
+
+(defrelation r1 ((?point_id GEO) (?county_id GEO) (?taz GEO))  :<=>
+  (and 
+   (geoPartOf ?point_id ?taz)
+   (geoPartOf ?taz ?county_id)
+   (geoPartOf ?county_id g_LACMSA)))
+
+(defrelation r2 ((?point_id GEO) (?county_id GEO) (?taz GEO)) :<=>
+  (and 
+   (geoPartOf ?point_id ?taz)
+   (geoPartOf ?taz ?county_id)
+   (= ?county_id g_LA)))
+
+(defrelation r3 ((?point_id GEO) (?county_id GEO) (?taz GEO)) :<=>
+  (and 
+   (geoPartOf ?point_id ?taz)
+   (geoPartOf ?taz ?county_id)
+   (member-of ?county_id (setof g_LA))))
+
+(ask (subset-of r2 r1))
+;;; THIS SHOULD ALSO RETURN TRUE, BUT WE ARE NOT QUITE SMART ENOUGH TO
+;;; INFER THE EQUALITY CONSTRAINT FROM THE SINGLETON SET - MAYBE LATER:
+(ask (subset-of r3 r1))
+
+;;; OCT-13-2005 EQUALITY REASONING BUG
+
+(clear-module "TEST")
+
+(deffunction f (?x ?y))
+(defconcept a)
+(defconcept b)
+(defconcept c (?x) :<=> (and (a ?x) (b ?x)))
+
+(assert (a (f x)))
+(assert (b (f y)))
+(assert (= (f x) (f y)))
+
+(retrieve all (c ?x))
+;;; THIS SHOULD RETRIEVE THE SAME NUMBER OF ANSWERS AS THE PREVIOUS
+;;; QUERY:
+(retrieve all (c ?x))
+
+;;; SKOLEMS IN ASSERTED DESCRIPTIVE PROPOSITIONS
+
+(clear-module "TEST")
+
+(defrelation r (?x ?y))
+(defrelation s (?x ?y))
+(defrelation t (?x ?y))
+
+(assert (=> (r ?x ?y) (exists ?z (s ?x ?z))))
+(assert (=> (s ?x ?z) (forall ?e (=> (t ?e ?z) (t ?z ?e)))))
+(assert (r a b))
+
+;;; THIS WILL GENERATE A SKOLEM WHICH WILL BECOME PART OF A FORALL
+;;; PROPOSITION; THIS SHOULD NOT CREATE ANY ERRORS OR WARNINGS:
+(run-forward-rules "TEST")
+
+(retrieve all (s ?x ?y))
+
+;;; TESTS A BUG IN LOGICAL-TYPE WITH CONSTANTS THAT ARE STELLA CLASSES
+
+(clear-module "TEST")
+
+(defrelation r (?x (?y string)))
+(defconcept c (?self) :=> (range-type r ?self string))
+
+;;; THIS SHOULD NOT GENERATE ANY ERRORS OR WARNINGS:
+(process-definitions)
+
+;;; NEW BUG IN FORARD INFERENCE WITH PSYASE AND NEW FIXES:
+;;; THE PROBLEM IS THAT WE ARE NOW INVERTING THE PREDICATE
+;;; ASSERTION, SINCE DURING INHERITANCE WE ARE PICKING UP
+;;; AN EXISTING PROPOSITION WITH FIND-SIMILAR-PROPOSITION
+;;; WHICH LATER ON WITH OUR IMPROVED NORMALIZATION GETS
+;;; INVERTED WHICH IS BAD...
+;;; ALSO, ONCE WE FIX THIS, THESE RIDICULOUS RULES ALSO NEED
+;;; TO GET ELIMINATED...
+
+(clear-module "TEST")
+
+(deffunction predicate (?self ?value))
+
+(deffunction myarity (?self (?value integer)))
+
+(assert
+  (forall (?v7134 ?v)
+    (=>> (= (myarity ?v7134) ?v)
+         (or (not (= ?v7134 Phychsim6_Instance_10020))
+             (integer ?v)))))
+
+(assert (myarity Phychsim6_Instance_10020 2))
+(assert (predicate Phychsim6_Instance_1 Phychsim6_Instance_10020))
+
+(run-forward-rules TEST :force)
+
+;;; NORMALIZATION TEST CASES:
+
+(clear-module "TEST")
+
+(conceive (and))
+(conceive (or))
+(conceive (not))
+
+(conceive (and (relation relation)))
+(conceive (or (relation relation)))
+
+(defrelation r1 ((?x relation) (?y relation)))
+(defrelation r2 (?x ?y) :<=> (r1 ?y ?x))
+(defrelation r3 (?x ?y) :<=> (and (r1 ?y ?x) (= ?x ?y)))
+
+(process-definitions)
+
+(print-rules r1)
+(print-rules r2)
+(print-rules r3)
+
+;;; THIS SHOULD NOT PICK UP `r1':
+(conceive
+ (kappa (?x ?y)
+   (and (r1 ?x ?y) (= ?x ?y))))
+
+;;; THIS SHOULD:
+(conceive
+ (kappa (?x  ?y)
+   (and (r1 ?x ?y))))
+
+;;; THIS SHOULD:
+(conceive
+ (kappa ((?x relation) (?y relation))
+   (and (r1 ?x ?y))))
+
+;;; THIS SHOULD NOT PICK UP `not-r1':
+(conceive
+ (kappa (?x ?y)
+   (and (not (r1 ?x ?y)) (= ?x ?y))))
+
+;;; THIS SHOULD:
+(conceive
+ (kappa (?x  ?y)
+   (and (not (r1 ?x ?y)))))
+
+;;; THIS SHOULD:
+(conceive
+ (kappa ((?x relation) (?y relation))
+   (and (not (r1 ?x ?y)))))
+
+;;; FORWARD INFERENCE BUG:
+
+(clear-module "TEST")
+
+(defrelation r1 (?x ?y))
+(defrelation r2 (?x ?y))
+
+(assert (=>> (and (= ?x ?y)
+                  (r1 ?x ?y))
+             (r2 ?x ?y)))
+
+(assert (r1 a b))
+
+;;; THIS SHOULD NOT CONTAIN `(r2 a a)':
+(all-facts-of a)
+
+;;; FUNCTION SINGLE-VALUEDNESS ISSUE WHEN WE COULD RETRIEVE
+;;; A SECOND VALUE THAT IS EQUATABLE TO AN ASSERTED ONE:
+
+(clear-module "TEST")
+
+(deffunction father (?x ?y))
+(defrelation parent (?x ?y))
+(defrelation male (?x))
+
+(assert
+  (=> (and (parent ?c ?p)
+           (male ?p))
+      (father ?c ?p)))
+
+(assert (father fred (father joe)))
+(assert (parent fred fritz))
+(assert (male fritz))
+
+;;; SHOULD GET FRITZ BUT DOESN'T BECAUSE WE STOP AT THE ASSERTED VALUE:
+(retrieve all (father fred ?f))
+
+;;; GETS FRITZ BECAUSE WE DON'T SHORTCUT, SINCE NOT ALL KEY ARGS ARE BOUND:
+(retrieve all (father ?c ?f))
+
+;;; SAME AS ABOVE BUT SWITCH ASSERTED INDIVIDUALS:
+
+(clear-module "TEST")
+
+(deffunction father (?x ?y))
+(defrelation parent (?x ?y))
+(defrelation male (?x))
+
+(assert
+  (=> (and (parent ?c ?p)
+           (male ?p))
+      (father ?c ?p)))
+
+(assert (father fred fritz))
+(assert (parent fred (father joe)))
+(assert (male (father joe)))
+
+;;; SAME ISSUE, JUST THE OTHER WAY ROUND:
+(retrieve all (father fred ?f))
+(retrieve all (father ?c ?f))
+
+;;; BUG WHERE WE BROKE ON CALLING `ARGUMENT-BOUND-TO'
+;;; ON AN INTERNAL VARIABLE THAT DIDN'T HAVE AN OFFSET:
+
+(clear-module "TEST")
+
+(defrelation v1 (?student ?number ?year))
+(defrelation v2 (?student ?dept ?course))
+
+(ask (subset-of (kappa (?s ?d)
+                  (exists (?n ?y ?c)
+                    (and (v1 ?s ?n ?y)
+                         (v2 ?s ?d ?c)
+                         (>= ?y 1995))))
+                (kappa (?s ?d)
+                  (exists (?n ?y ?c)
+                    (and (v1 ?s ?n ?y)
+                         (v2 ?s ?d ?c)
+                         (>= ?y 1990))))))
+
+;;; INCORRECT NORMALIZATION OF FUNCTION-INDUCED EXISTENTIALS
+;;; KNOWN BUG (SEE `invert-proposition'):
+
+(clear-module "TEST")
+
+(defrelation happy (?x))
+(defrelation poor (?x))
+(deffunction boss (?x ?y))
+
+(assert (=>> (poor ?x) (not (happy ?x))))
+
+;;; THIS RETURNS FALSE AS IT SHOULD:
+(ask (=> (poor fred)
+         (happy fred))
+     :inference-level :refutation)
+
+;;; THIS FAILS DUE TO INCORRECT NORMALIZATION:
+(ask (=> (poor (boss fred))
+         (happy (boss fred)))
+     :inference-level :refutation)
+
+;;; THIS IS HOW IT SHOULD NORMALIZE BUT POWERLOOM'S NORMALIZATION
+;;; OF FUNCTION-INDUCED EXISTENTIALS SCREWS US UP REGARDLESS:
+
+(ask (=> (exists (?b)
+           (and (= (boss fred) ?b)
+                (poor ?b)))
+         (exists (?b)
+           (and (= (boss fred) ?b)
+                (happy ?b))))
+     :inference-level :refutation)
+
+;;; "PROVING" THE IMPLICATION VIA EXPLICIT ASSERTION DOES DO THE RIGHT THING:
+(assert (exists (?b)
+          (and (= (boss fred) ?b)
+               (poor ?b))))
+;;; RETURNS FALSE AS IT SHOULD:
+(ask (exists (?b)
+           (and (= (boss fred) ?b)
+                (happy ?b)))
+     :inference-level :refutation)
+
+;;; DUPLICATE RULE DETECTION DEFICIENCY, SINCE WE ARE CURRENTLY ONLY
+;;; SUCCEEDING IF THE QUANTIFIED VARIABLES IN THE TWO RULES LINE UP.
+;;; TO FIX THIS WE HAVE TO DO SOMETHING MORE LIKE UNIFICATION AND ALSO
+;;; ALLOW BACKTRACKING, SINCE ESTABLISHING A BINDING MIGHT MAKE US
+;;; FAIL LATER - IN THE WORST CASE WE ARE DOING SUBGRAPH ISOMORPHISM HERE:
+
+(clear-module "TEST")
+
+(assert
+  (forall (?x ?y)
+    (=> (and (relation ?x)
+             (relation ?y))
+        (bound-variables ?x ?y))))
+
+;;; THIS SHOULD RETURN THE PREVIOUS RULE BUT DOESN'T:
+
+(assert
+  (forall (?t ?s)
+    (=> (and (relation ?s)
+             (relation ?t))
+        (bound-variables ?s ?t))))
+
+;;; IMPROVED HOLDS SPECIALIST:
+
+(clear-module "TEST")
+
+(defrelation r (?x ?y))
+(defrelation s (?x ?y))
+
+(assert (r a b))
+(assert (s a c))
+
+(retrieve all (holds ?r a ?x))
+(retrieve all (holds ?r a b))
+(retrieve all (holds ?r a c))
+
+;;; SHALLOW DISPROOF OF FUNCTION PROPOSITIONS AND SINGLE-VALUED RELATIONS
+
+(clear-module "TEST")
+
+(deffunction f (?x ?y))
+(defrelation r (?x ?y))
+
+(assert (f a b))
+(assert (not (f c d)))
+
+(assert (r a b))
+(assert (not (r c d)))
+
+(ask (f a b))
+(ask (not (f a b)))
+(ask (f a c))
+(ask (not (f a c)))
+(ask (f c d))
+(ask (not (f c d)))
+(ask (f c e))
+(ask (not (f c e)))
+
+(ask (r a b))
+(ask (not (r a b)))
+(ask (r a c))
+(ask (not (r a c)))
+(ask (r c d))
+(ask (not (r c d)))
+(ask (r c e))
+(ask (not (r c e)))
+
+(assert (single-valued r))
+
+(ask (r a b))
+(ask (not (r a b)))
+(ask (r a c))
+(ask (not (r a c)))
+(ask (r c d))
+(ask (not (r c d)))
+(ask (r c e))
+(ask (not (r c e)))

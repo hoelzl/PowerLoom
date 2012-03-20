@@ -1,0 +1,2058 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: rule-induction.ste,v 1.11 2006/05/11 07:05:34 hans Exp
+
+;;; Rule induction code.  
+
+;;; There are several variants to the rule induction algorithm.  The
+;;; variant is a top-down or bottom-up rule induction strategy.  This
+;;; is decided using the *Rule-Induction-Strategy* variable.  
+
+;;; The second variant concerns whether propositional signatures are
+;;; used to build the initial rule structure.  This should be a much
+;;; more efficient way to build rules, since it reduces the number of
+;;; calls to PowerLoom's query mechanism.  This feature can be set by
+;;; setting *Induce-Rules-From-Signatures* to be true.
+
+;;; If signatures are used, you can choose three different ways that
+;;; rules can be built from the signatures.  Rules can be built top
+;;; down, bottom up, or from a decision tree.  This is set using the
+;;; *Signature-Strategy* variable.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(defglobal *Rule-Induction-Strategy* KEYWORD :TOP-DOWN) ;; or :BOTTOM-UP
+
+;; :BOTTOM-UP, :TOP-DOWN, or :DECISION-TREE
+;; How do we learn from the signatures?
+(defglobal *Signature-Strategy* KEYWORD :TOP-DOWN)
+
+(defun set-signature-strategy ((k keyword))
+  :command? true
+  (setq *Signature-Strategy* k))
+
+(defglobal *Enable-User-Thing* BOOLEAN TRUE)
+(defglobal *Optimize-Induced-Queries* BOOLEAN TRUE)
+(defglobal *Simplify-Rule-Antecedent?* BOOLEAN FALSE 
+  :documentation "Flag to control whether we try to simplify the rule antecedent.
+This should be set to FALSE if we expect the user to edit the rule and
+TRUE if we want to have final rules as general as possible."
+  :public? TRUE)
+
+(defglobal *trace-id3* BOOLEAN false)
+(defglobal *trace-foil* BOOLEAN false)
+
+(defglobal *Induce-Rules-From-Signatures* BOOLEAN TRUE)
+
+(defun set-signature-rules ((b boolean))
+  :command? true
+  (setq *Induce-Rules-From-Signatures* b))
+
+(defglobal *NUM-LGGS* INTEGER 2000) ;; number of clauses to smash in bottom up
+
+(defglobal *Enforce-Linked-Variables* BOOLEAN FALSE)
+
+(defglobal *LOG-INDUCED-RULES* BOOLEAN FALSE) ;; verbose printing
+
+(defglobal *Allow-Recursive-Decision-Nodes* BOOLEAN true) 
+
+(defglobal *Log-Decision-Rule-Construction* BOOLEAN false)
+
+(defglobal LOG_2 FLOAT 0.6931472)
+
+(defun set-rule-induction-strategy ((k keyword))
+  :command? true
+  (setq *rule-induction-strategy* k))
+
+(defun set-recursive-decision-nodes ((b boolean))
+  :command? true
+  (setq *Allow-Recursive-Decision-Nodes* b))
+
+(defclass DECISION-TREE (standard-object)
+  :slots
+  ((feature :type SYMBOL)  ;; I have to keep this because STELLA does not
+                           ;; create integer hash tables for C++
+   (feature-index :type INTEGER)  
+   (proposition :type PROPOSITION)
+   (truth-value :type BOOLEAN)
+   (concept :type SYMBOL)
+   (true-branch :type DECISION-TREE)
+   (false-branch :type DECISION-TREE))
+  :print-form (print-decision-tree self stream)) 
+
+(defglobal *Induced-Decision-Rules* (LIST of CONS) NULL)
+(defglobal *Induced-Rule-Counter* INTEGER 0)
+
+(defglobal *Candidate-Clauses* (VECTOR of CONS) NULL)
+
+;; Rule induction code
+
+(defun induce-inference-rules ((relation-name SYMBOL)
+			      (class-name SYMBOL))
+  :command? TRUE :evaluate-arguments? FALSE
+  ;; builds a rule to infer relation-name over instances of
+  ;; class-name.  Currently, relation-name must be a unary relation.
+  ;; All instances of class-name in the current module are used as
+  ;; training examples.
+  (setq relation-name (permanentify relation-name))
+  (clear-cases)
+  (clear-training-examples)
+  (setq *Induced-Decision-Rules* (new (LIST of CONS)))
+  (setq class-name (permanentify class-name))
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(relation (surrogate-value-inverse (get-description relation-name)))
+	(ilist (listify (all-class-instances class)))
+	(num (length ilist))
+	;; (start-time (get-ticktock))
+	(instances (new (VECTOR of LOGIC-OBJECT) :array-size num)))
+    (foreach instance in ilist
+	as i in (interval 0 NULL) do
+	  (setf (nth instances i) instance))
+
+    (case *Rule-Induction-Strategy*
+      (:TOP-DOWN
+       (setq *Enable-User-Thing* true)
+       (when (not *Allow-Recursive-Decision-Nodes*)
+	 (insert-new *Taboo-Operators* relation)) 
+       ;; build giant "match rule"
+       (generate-classification-rule instances relation-name class-name TRUE)
+       ;; Get candidate clauses
+       (let ((clauses (lookup *Case-Antecedent-Table*
+			      (concatenate (symbol-name class-name) 
+					   "-match"))))
+	 (setq *Candidate-Clauses* (new (VECTOR of CONS) 
+					:array-size (length clauses)))
+	 (foreach clause in clauses 
+	     as i in (interval 0 NULL) do
+	       (setf (nth *Candidate-Clauses* i) clause)))
+       (print "Generating Training Examples" EOL)
+       ;; create training example for each instance
+       (generate-classification-training-examples instances relation 
+				*Induce-Rules-From-Signatures*)
+       (setq *Optimize-Induced-Queries* TRUE)
+       (print "Generating Decision Rules" EOL)
+       (top-down-rule-induction *training-examples*))
+      (:BOTTOM-UP
+       (setq *Enable-User-Thing* false)
+       (generate-training-examples instances relation)
+       (setq *Optimize-Induced-Queries* TRUE)
+       (bottom-up-rule-induction *training-examples* *simplify-rule-antecedent?*)))
+    ;;    (print "Time: " (ticktock-difference start-time (get-ticktock)) EOL)))
+    ))
+       
+(defun modular-induce-inference-rules ((relation-name SYMBOL)
+				      (class-name SYMBOL)
+				      (modules (list of MODULE)))
+  ;; just like induce-inference-rules except it is module-aware.  In
+  ;; other words it gets its training examples from each module in the 
+  ;; modules parameter.
+  (clear-training-examples)
+  (clear-cases)
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(relation (surrogate-value-inverse (get-description relation-name)))
+	(ilist (new (list of OBJECT)))
+	(home *module*)
+	(fail-unbound *Fail-Unbound-Clauses?*)
+	(num (length ilist))
+	(instance-vec (new (VECTOR of (VECTOR of LOGIC-OBJECT)) 
+			:array-size (length modules)))
+	(instances (VECTOR of LOGIC-OBJECT) NULL))
+
+    (setq *Fail-Unbound-Clauses?* TRUE)
+    (when (not *Allow-Recursive-Decision-Nodes*)
+      (insert-new *Taboo-Operators* relation))
+    (case *Rule-Induction-Strategy*
+      (:TOP-DOWN
+       (print "Building Classification Rule" EOL)
+       (setq *Enable-User-Thing* TRUE)
+       (foreach module in modules 
+	   as j in (interval 0 NULL) do
+	   (change-module module)
+	   (setq ilist (listify (all-class-instances class)))
+	   (setq num (length ilist))
+	   (setq instances (new (VECTOR of LOGIC-OBJECT) :array-size num))
+	   (foreach instance in ilist
+	       as i in (interval 0 NULL) do
+		 (setf (nth instances i) instance))
+	   (setf (nth instance-vec j) instances)
+	   ;; Build classification rule
+	   (generate-classification-rule instances relation-name class-name 
+					 FALSE))
+       (change-module home)
+       (build-classification-rule relation-name class-name)
+       ;; Get candidate clauses
+       (let ((clauses (lookup *Case-Antecedent-Table*
+			      (concatenate (symbol-name class-name) 
+					   "-match"))))
+	 (setq *Candidate-Clauses* (new (VECTOR of CONS) 
+					:array-size (length clauses)))
+	 (foreach clause in clauses 
+	     as i in (interval 0 NULL) do
+	       (setf (nth *Candidate-Clauses* i) clause)))
+       (print "Generating Training Examples" EOL)
+       (foreach module in modules 
+	   as vec in instance-vec do
+	     (change-module module)
+	     (generate-classification-training-examples vec relation true))
+       (print "Generating Inference Rules" EOL)
+       (top-down-rule-induction *training-examples*)
+       (setq *Fail-Unbound-Clauses?* fail-unbound))
+      (:BOTTOM-UP
+       (setq *Enable-User-Thing* false)
+       (foreach module in modules 
+	   as vec in instance-vec do
+	     (ignore vec)
+	     (change-module module)
+	     (generate-training-examples instances relation))
+       (setq *Optimize-Induced-Queries* TRUE)
+       (bottom-up-rule-induction *training-examples* *simplify-rule-antecedent?*)))))
+
+;; Code for bottom up rule induction ala GOLEM
+
+(defun bottom-up-rule-induction ((examples (LIST of TRAINING-EXAMPLE))
+                                 (simplify-rule? BOOLEAN))
+  :command? TRUE 
+  (let ((positive (new (LIST of TRAINING-EXAMPLE)))
+	(negative (new (LIST of TRAINING-EXAMPLE)))
+        (all-positive LIST NULL)
+        (all-negative LIST NULL)
+	(rules (new (LIST of (CONS of CONS))))
+	(concept (concept (first examples)))
+	(rule nil))
+    
+    ;; divide up the examples in to positive and negative
+    (foreach example in examples do
+	  (if (cast (output example) BOOLEAN-WRAPPER)
+	      (push positive example)  ;; uncovered positives
+	    (push negative example)))
+    ;; Hold onto these, since the positive list gets
+    ;; destructively modified during learning.
+    (setq all-positive (copy positive))
+    (setq all-negative (copy negative))
+    
+    ;; collect assertion structure and store in positive examples
+    (collect-facts-in-examples positive)
+    (foreach example in positive do
+	(setf (facts example)
+	  (substitute-cons-tree (facts example) (quote ?Y) (name example))))
+
+    (print "Starting rule induction with " (length positive) " positive and "
+	   (length negative) " negative examples" EOL)
+    
+    (while (not (empty? positive))
+      (setq rule (learn-one-rule-bottom-up positive negative))
+      (cond ((empty? rule)
+	     (print "Quiting with " (length positive) " examples uncovered" EOL)
+	     (break))
+            ((and simplify-rule? (non-empty? all-negative))
+             (setq rule (simplify-antecedent rule (quote (?y)) 
+                                             all-positive all-negative)))
+            (otherwise NULL))
+      (push rules (bquote (=> (and && (copy-cons-tree rule))
+                              (& concept ?Y)))))
+
+    (print EOL "PowerLoom has induced the following rules" EOL EOL)
+    
+    (when (defined? rules)
+      (foreach rule in rules do
+	    (print rule EOL))
+      (setq *Induced-Decision-Rules* rules))))
+
+
+(defun (learn-one-rule-bottom-up (CONS of CONS))
+    ((positive (LIST of TRAINING-EXAMPLE))
+     (negative (LIST of TRAINING-EXAMPLE)))
+  ;; This function follows the based GOLEM algorithm for learning a
+  ;; single rule.  It essentially grabs positive examples at random
+  ;; and finds the least general generalization (lgg) between them.
+  ;; It then checks to see if this lgg covers any negative examples.
+  ;; If it does, it is thrown out.  If it doesn't it is tested to see
+  ;; how many positive examples are covered.  The lgg with the highest
+  ;; number of positive examples covered is chosen.
+  (let ((lgg (CONS of CONS) nil)
+	(rule nil)
+	(score 0)
+	(num-positive (length positive))
+	(index1 0)
+	(index2 0)
+	(facts1 nil)
+	(facts2 nil)
+	(max 0)
+	(cover 0)
+	(num-lggs (* (length positive) 5))
+	(best-lgg nil))
+    
+    (print "Learning rule bottom up over " (length positive) " positives" EOL)
+    (setq max 0)
+    (setq best-lgg nil)
+    (when (eql? (length positive) 1)
+      (setq rule (facts (first positive)))
+      (pop positive)
+      (return rule))
+
+    (while (and (non-empty? positive) (or (> max 0) (nil? rule)))
+      (setq cover (+ max cover))
+      (setq max 0)
+      (print "   Current rule covers " cover " positive examples" EOL)
+      (print "           rule is " rule EOL)
+      (when (not (nil? rule))
+	(remove-covered-examples rule positive))
+      ;; Why 5?  Is this arbitrary?  Should it be a special/global variable?
+      (setq num-lggs (* (length positive) 5))
+      (foreach i in (interval 1 num-lggs) 
+	  do (ignore i)
+	     (setq index1 (random (length positive)))
+	     (setq facts1 (facts (nth positive index1)))
+	     (if (nil? rule)
+	       (progn
+		 (setq index2 (random (length positive)))
+		 (while (eql? index1 index2)
+		   (setq index2 (random (length positive))))
+		 (setq facts2 (facts (nth positive index2))))
+	       (setq facts2 rule))
+	     (setq lgg (least-general-generalization facts1 facts2))
+             (when (not (rule-covers-any-example? lgg negative))
+	       (setq score (num-examples-covered lgg positive))
+               ;; Try simplifications to see if they get the same results.
+        ;       (setq lgg
+        ;             (simplify-antecedent lgg (quote (?y)) positive negative))
+	       (when (> score max)
+		 (print "   Best covers " score " positives" EOL)
+		 (setq best-lgg lgg)
+                 ;; Was EQL?, but that was fragile in the face of
+                 ;; some unexplained problems with remove-covered-examples
+                 ;; when the number didn't change exactly as expected.
+		 (when (>= (+ cover score) num-positive)
+		   (remove-covered-examples lgg positive)
+		   (return (remove-redundant-clauses lgg)))
+		 (setq max score))))
+      (setq rule best-lgg))
+    (return (remove-redundant-clauses rule))))
+
+(defun (contains-output-variable? BOOLEAN) ((clause CONS) (output-variables (CONS of SYMBOL)))
+  (foreach term in clause
+           do (typecase term
+                (SYMBOL
+                 (when (member? output-variables term)
+                   (return TRUE)))
+                (CONS
+                 (when (contains-output-variable? term output-variables)
+                   (return TRUE)))
+                (otherwise NULL)))
+  (return false))
+
+(defun (simplify-antecedent (CONS of CONS)) ((antecedent (CONS of CONS)) 
+                                             (output-variables (CONS of SYMBOL))
+                                             (positive (LIST of TRAINING-EXAMPLE))
+                                             (negative (LIST of TRAINING-EXAMPLE)))
+  ;; Right now, just try to simplify the antecedent while making sure the
+  ;; simplifications don't allow any additional negative matches in.
+  ;; Brute force approach of dropping each clause in turn and keeping
+  ;; only those clauses that are needed for correct operation.
+  (let ((new-antecedent (CONS of CONS) nil)
+        (candidate CONS nil)
+        (discarded-potential-generators CONS nil)
+        (covered-examples 0)
+        (previous-covered-examples 0)
+        (score (num-examples-covered antecedent positive)))
+    (while (non-empty? antecedent)
+      (setq candidate (popq antecedent))
+      (if (rule-covers-any-example? (append new-antecedent antecedent) negative)
+        (pushq new-antecedent candidate)
+        (progn
+          (print "Removing clause " candidate EOL)
+          (when (contains-output-variable? candidate output-variables)
+            (pushq discarded-potential-generators candidate)))))
+
+    ;; Now make sure we didn't drop a necessary candidate generator:
+    (setq covered-examples (num-examples-covered new-antecedent positive))
+    (while (and (non-empty? discarded-potential-generators)
+                (< covered-examples score))
+      (setq candidate (popq discarded-potential-generators))
+      (setq previous-covered-examples covered-examples)
+      (setq covered-examples 
+            (num-examples-covered (cons candidate new-antecedent) positive))
+      (when (> covered-examples previous-covered-examples)
+        (print "Reinserting clause " candidate EOL)
+        (pushq new-antecedent candidate)))
+    (return new-antecedent)))
+        
+
+
+(defspecial *Bottom-Up-Variable-Counter* INTEGER -1)
+
+(defun (least-general-generalization CONS) ((clause1 (CONS of CONS))
+					    (clause2 (CONS of CONS)))
+  ;; returns the least general generalization under theta-subsumption
+  ;; between two sets of clauses.
+  (let ((matches (new (LIST of CONS)))
+	(probe nil)
+	(operator SYMBOL NULL)
+	(bindings (new (LIST of CONS)))
+	(new-clause nil)
+	(vars1 (get-variables-from-cons-propositions (cons-list clause1)))
+	(vars2 (get-variables-from-cons-propositions (cons-list clause2)))
+	(not? BOOLEAN FALSE)
+	(var SYMBOL NULL)
+	(result nil))
+
+    ;; substitute temp variable names for the variables
+    (foreach var in vars1 
+	as i in (interval 0 NULL) 
+	where (not (eql? var (quote ?Y))) do
+	  (setq clause1 (substitute-cons-tree clause1 var
+				(intern-symbol
+				 (concatenate "?A" (stringify i))))))
+    (foreach var in vars2 
+	as i in (interval 0 NULL) 
+	where (not (eql? var (quote ?Y))) do
+	  (setq clause2 (substitute-cons-tree clause1 var
+				(intern-symbol
+				 (concatenate "?B" (stringify i))))))
+    
+    
+    (setq *Bottom-Up-Variable-Counter* 0)
+    (foreach clause in (copy-cons-tree clause1) do
+       (if (eql? (first clause) (quote NOT))
+	   (progn
+	     (setq not? true)
+	     (setq probe (second clause)))
+	 (progn
+	   (setq not? false)
+	   (setq probe clause)))
+       (setq operator (first probe))
+       (setq matches (new (LIST of CONS)))
+       ;; find matching clause in clause2
+       (foreach potential-match in (copy-cons-tree clause2) do
+	   (when (and not? 
+		      (eql? (first potential-match) (quote NOT))
+		      (eql? (first (CAST (second potential-match) CONS)) 
+			    operator))
+	     (push matches (second potential-match)))
+	   (when (and (not not?) (eql? (first potential-match) operator))
+	     (push matches potential-match)))
+
+       (when (not (empty? matches))
+	 (foreach match in matches do
+	   (case operator
+	     ((> < >= =<) ;;  Need to special case inequalities
+	      (setq new-clause (generalize-inequality probe match bindings)))
+	     (otherwise
+	      (setq new-clause (bquote (& operator)))	       
+	      (foreach arg1 in (rest probe)
+		  as arg2 in (rest match) do
+		  (if (not (equal-cons-trees? arg1 arg2))
+		   (progn
+		     ;; substitute a variable
+		     (setq var ;; check if current variable exists
+		       (lookup-variable-in-bindings arg1 arg2 bindings))
+		     (when (null? var) ;; generate new variable
+		       (setq var 
+			 (intern-symbol  
+			  (concatenate "?X" 
+				    (stringify *Bottom-Up-Variable-Counter*))))
+		       (when (not (either-numbers? arg1 arg2))
+			 (push bindings (cons-list arg1 arg2 var)))
+		       (++ *Bottom-Up-Variable-Counter*))
+		     (setq new-clause (cons var new-clause)))
+		   (setq new-clause (cons arg1 new-clause))))
+	    (setq new-clause (reverse new-clause))))
+	    (when not? ;; need to negate not clauses
+	      (setq new-clause (bquote (not & new-clause))))
+	   (setq result (cons new-clause result)))))
+    (return (remove-redundant-clauses (reverse result)))))
+
+
+(defun (generalize-inequality CONS) ((probe CONS) (match CONS) 
+				     (bindings (LIST of CONS))) 
+  ;; special purpose code for generalizing two propositions with
+  ;; inequalities.
+  (let ((operator (first probe))
+	(new-clause (cons-list operator))
+	(var SYMBOL NULL))
+
+    (foreach arg1 in (rest probe)
+      as arg2 in (rest match) do
+	(if (not (equal-cons-trees? arg1 arg2))
+	    (if (both-numbers? arg1 arg2)
+		(case operator
+		  ((> >=) (setq new-clause (cons (min arg1 arg2) new-clause)))
+		  ((< =<) (setq new-clause (cons (max arg1 arg2) new-clause)))
+		  (otherwise (print "Bug in generalize-inequality." EOL)))
+	      ;; substitute a variable
+	      (progn
+		(setq var ;; check if current variable exists
+		  (lookup-variable-in-bindings arg1 arg2 bindings))
+		(when (null? var) ;; generate new variable
+		  (setq var 
+		    (intern-symbol  
+		     (concatenate "?X" 
+				  (stringify *Bottom-Up-Variable-Counter*))))
+		  (when (not (either-numbers? arg1 arg2))
+		    (push bindings (cons-list arg1 arg2 var)))
+		  (++ *Bottom-Up-Variable-Counter*))
+		(setq new-clause (cons var new-clause))))
+	  (setq new-clause (cons arg1 new-clause))))
+    (return (reverse new-clause))))
+
+(defun (both-numbers? BOOLEAN) ((t1 OBJECT) (t2 OBJECT))
+  (if (and (isa? t1 @NUMBER-WRAPPER)
+	   (isa? t2 @NUMBER-WRAPPER))
+      (return true)
+    (return false)))
+
+(defun (either-numbers? BOOLEAN) ((t1 OBJECT) (t2 OBJECT))
+  (if (or (isa? t1 @NUMBER-WRAPPER)
+	   (isa? t2 @NUMBER-WRAPPER))
+      (return true)
+    (return false)))
+		
+	      
+
+;;STELLA(27): (eval 
+;; (least-general-generalization
+;;  (bquote ((uncle X Y) (sib X Z) (parent Z Y) (male X)))
+;;  (bquote ((uncle X Y) (married X Z) (sib Z W) (parent W Y) (male X)))))
+;;{{UNCLE X Y} {SIB ?X0 ?X1} {PARENT ?X1 Y} {MALE X}}
+;;STELLA(28): 
+
+;(eval 
+; (least-general-generalization
+;  (bquote ((uncle john deb) 
+;	   (sib john ron) 
+;	   (sib john dave)
+;	   (parent ron deb)
+;	   (parent ron ben) 
+;	   (male john)
+;	   (male dave)
+;	   (female deb)))
+;  (bquote ((uncle bill jay)
+;	   (sib bill bruce)
+;	   (parent bruce jay)
+;	   (parent bruce rach)
+;	   (male bill)
+;	   (male jay)))))
+
+
+(defun (remove-redundant-clauses (CONS of CONS)) ((clauses (CONS of CONS)))
+  (let ((result nil)
+	(true-table (new (HASH-TABLE of SYMBOL (LIST of CONS))))
+	(not-table (new (HASH-TABLE of SYMBOL (LIST of CONS))))
+	(entries (LIST of CONS) NULL)
+	(shared-variables (new (LIST of SYMBOL)))
+	(known-variables (new (LIST of SYMBOL)))
+	(operator SYMBOL NULL)
+	(subsumed? false)
+	(operators (new (LIST of SYMBOL))))
+    ;; This function looks through a set of clauses and tries to remove
+    ;; redundancies.  Perhaps there is a better way to do this?
+    
+    ;; fill out tables and get shared variables
+    (foreach clause in (copy-cons-tree clauses) do
+       (if (eql? (first clause) (quote not))
+	   (progn 
+	     (setq operator (first (cast (second clause) CONS)))
+	     (insert-new operators operator)  ;; list of hash keys
+	     (setq entries (lookup not-table operator))
+	     (when (null? entries)
+	       (setq entries (new (LIST of CONS))))
+	     (push entries (second clause))
+	     (insert-at not-table operator entries))
+	 (progn
+	   (setq operator (first clause))
+	   (insert-new operators operator)  ;; list of hash keys
+	   (setq entries (lookup true-table operator))
+	   (when (null? entries)
+	     (setq entries (new (LIST of CONS))))
+	   (push entries clause)
+	   (insert-at true-table operator entries)))
+       (foreach v in (get-variables-from-cons-propositions (cons-list clause))
+	   do (if (member? known-variables v)
+		  (insert-new shared-variables v)
+		(push known-variables v))))
+    
+    (foreach operator in operators do
+       (setq entries (lookup true-table operator))
+       (when (defined? entries)  
+         (foreach clause1 in entries do
+	    (setq subsumed? false)
+	    (foreach clause2 in entries 
+	      where (not (eql? clause1 clause2)) do
+	      (setq subsumed? true)
+	      (foreach arg1 in (rest clause1)
+		  as arg2 in (rest clause2) do
+		  (when (and (not (equal-cons-trees? arg1 arg2))
+			     (or (and (symbol? arg1)
+				      (member? shared-variables arg1))
+				 (cons? arg1)))
+		    (setq subsumed? false)
+		    (break)))
+	      (when subsumed? 
+		(break)))
+	   (when (not subsumed?)
+	     (setq result (cons clause1 result)))))
+       (setq entries (lookup not-table operator))
+       (when (defined? entries)
+        (foreach clause1 in entries do
+	    (setq subsumed? false)
+	    (foreach clause2 in entries 
+	      where (not (eql? clause1 clause2)) do
+	      (setq subsumed? true)
+	      (foreach arg1 in (rest clause1)
+		  as arg2 in (rest clause2) do
+	          (when (and (not (equal-cons-trees? arg1 arg2))
+			     (or (and (symbol? arg1)
+				      (member? shared-variables arg1))
+				 (cons? arg1)))
+		    (setq subsumed? false)
+		    (break)))
+	      (when subsumed? 
+		(break)))
+	      (when (not subsumed?)
+		(setq result (cons (bquote (not & clause1)) result))))))
+    (return result)))
+
+
+#|
+;; More efficient, but not as precise:
+(defun (remove-redundant-clauses (CONS of CONS)) ((clauses (CONS of CONS)))
+  (let ((result nil)
+	(true-table (new (HASH-TABLE of SYMBOL (LIST of CONS))))
+	(not-table (new (HASH-TABLE of SYMBOL (LIST of CONS))))
+	(entries (LIST of CONS) NULL)
+	(shared-variables (new (LIST of SYMBOL)))
+	(known-variables (new (LIST of SYMBOL)))
+	(operator SYMBOL NULL)
+	(subsumed? false)
+	(operators (new (LIST of SYMBOL))))
+    ;; This function looks through a set of clauses and tries to remove
+    ;; redundancies.  Perhaps there is a better way to do this?
+    
+    ;; fill out tables and get shared variables
+    (foreach clause in clauses ; (copy-cons-tree clauses)
+      do (if (eql? (first clause) (quote not))
+	   (progn 
+	     (setq operator (first (cast (second clause) CONS)))
+	     (insert-new operators operator)  ;; list of hash keys
+	     (setq entries (lookup not-table operator))
+	     (when (null? entries)
+	       (setq entries (new (LIST of CONS))))
+	     (push entries (second clause))
+	     (insert-at not-table operator entries))
+	   (progn
+	     (setq operator (first clause))
+	     (insert-new operators operator)  ;; list of hash keys
+	     (setq entries (lookup true-table operator))
+	     (when (null? entries)
+	       (setq entries (new (LIST of CONS))))
+	     (push entries clause)
+	     (insert-at true-table operator entries)))
+         (foreach v in (get-variables-from-cons-propositions (cons-list clause))
+	   do (if (member? known-variables v)
+                (insert-new shared-variables v)
+		(push known-variables v))))
+    
+    (let ((clause1 CONS NIL))
+      (foreach operator in operators 
+        do (setq entries (lookup true-table operator))
+           (when (defined? entries)
+             (while (non-empty? entries)
+               (setq clause1 (pop entries))
+               (setq subsumed? false)
+               (foreach clause2 in entries 
+                 where (not (eql? clause1 clause2)) do
+                   (setq subsumed? true)
+                 (foreach arg1 in (rest clause1)
+                   as arg2 in (rest clause2) do
+                   (when (and (not (equal-cons-trees? arg1 arg2))
+                              (or (and (symbol? arg1)
+                                       (member? shared-variables arg1))
+                                  (cons? arg1)))
+                       (setq subsumed? false)
+                     (break)))
+                 (when subsumed? 
+                     (break)))
+               (when (not subsumed?)
+                   (pushq result clause1))))
+           (setq entries (lookup not-table operator))
+           (when (defined? entries)
+             (while (non-empty? entries)
+               (setq clause1 (pop entries))
+               (setq subsumed? false)
+               (foreach clause2 in entries 
+                 where (not (eql? clause1 clause2)) do
+                 (setq subsumed? true)
+                 (foreach arg1 in (rest clause1)
+                   as arg2 in (rest clause2) do
+                   (when (and (not (equal-cons-trees? arg1 arg2))
+                              (or (and (symbol? arg1)
+                                       (member? shared-variables arg1))
+                                  (cons? arg1)))
+                     (setq subsumed? false)
+                     (break)))
+                 (when subsumed? 
+                   (break)))
+               (when (not subsumed?)
+                 (pushq result (bquote (not & clause1))))))))
+    (return result)))
+|#
+
+(defun (lookup-variable-in-bindings OBJECT) ((obj1 OBJECT) (obj2 OBJECT)
+						 (bindings (LIST of CONS)))
+  ;; this function helps lgg by checking to see if variables have already
+  ;; been generated for a particular binding set.
+  (foreach bind in bindings do
+	(when (and (equal-cons-trees? (first bind) obj1)
+		   (equal-cons-trees? (second bind) obj2))
+	  (return (third bind))))
+  
+  (when (and (cons? obj1) (cons? obj2))
+    (let ((answer nil)
+	  (bind OBJECT NULL))
+      (foreach arg1 in (cast obj1 CONS)
+	  as arg2 in (cast obj2 CONS) do
+	    (if (eql? arg1 arg2)
+		(setq answer (cons arg1 answer))
+	      (progn
+		(setq bind (lookup-variable-in-bindings arg1 arg2 bindings))
+		(when (null? bind)
+		  (return NULL))
+		(setq answer (cons bind answer)))))
+      (return (reverse answer)))) ;; should probably enter this in the table
+	
+  (return NULL))
+
+
+
+(defun (learn-one-rule-bottom-up-from-signatures (CONS of CONS))
+    ((positive (LIST of TRAINING-EXAMPLE))
+     (negative (LIST of TRAINING-EXAMPLE))
+     (covered (LIST of TRAINING-EXAMPLE))
+     (cons-props (VECTOR of CONS)))
+  ;; This function learns a rule bottom up from the propositional
+  ;; signatures.  See learn-one-rule-bottom-up for an explanation of
+  ;; the algorithm.  The only difference here is that we aren't
+  ;; querying PowerLoom, but rather are looking at the precomputed
+  ;; signatures to determine whether a clause is satisfied by an
+  ;; instance or not.
+  (let ((temp-positive (copy positive))
+	(max 0)
+	(cover 0)
+	(index1 0)
+	(index2 0)
+	(vec-size (length (input (first negative))))
+	(indices (LIST of INTEGER-WRAPPER) NULL)
+	(best-indices (new (LIST of INTEGER-WRAPPER)))
+	(lgg (VECTOR of INTEGER-WRAPPER) NULL)
+	(sig1 VECTOR NULL)
+	(sig2 VECTOR NULL)
+	(stop false)
+	(result nil)
+	(score 0)
+	(num-lggs 0))
+    
+    (while (or (> max 0) (null? lgg))
+      (setq cover (+ cover max))
+      (print "   Current rule covers " cover " positive examples" EOL)
+      (when (defined? lgg)
+	(foreach example in 
+	      (remove-signature-covered-examples best-indices temp-positive)
+	    do (push covered example)))
+      (setq num-lggs (* (length temp-positive) 1))
+      (setq max 0)
+      (foreach i in (interval 1 num-lggs)
+	  do (ignore i)
+	     (setq index1 (random (length temp-positive)))
+	     (setq sig1 (input (nth temp-positive index1)))
+	     (if (null? lgg) ;; if this is first time through
+	       (progn
+		 (setq index2 (random (length temp-positive)))
+		 (while (eql? index1 index2)
+		   (setq index2 (random (length temp-positive))))
+		 (setq sig2 (input (nth temp-positive index2))))
+	       (setq sig2 lgg))
+	     (setq indices (intersect-signatures sig1 sig2))
+	     (when (not (signature-indices-cover-any-example? indices negative))
+	       (setq score (num-signature-indices-covered indices temp-positive))
+	       (when (> score max)
+		 (print "    New best: " score " examples" EOL)
+		 (setq best-indices indices)
+		 (setq max score))))
+      (setq lgg (new (VECTOR of INTEGER-WRAPPER) :array-size vec-size))
+      (foreach i in (interval 0 (1- vec-size))
+	  do (setf (nth lgg i) 2))
+      (foreach index in best-indices
+	  do (if (> index 0)
+	       (setf (nth lgg (1- index)) 1)
+	       (setf (nth lgg (1- (- index))) 0))))
+    
+    ;;    (print "   Pruning rule from " (length best-indices) " clauses" EOL)
+    (while stop
+      (setq stop true)
+      (foreach index in (copy best-indices)
+	  do (when (not (signature-indices-cover-any-example?
+			 (remove (copy best-indices) index) negative))
+	       (print "     Removing clause" EOL)
+	       (setq best-indices (remove best-indices index))
+	       (setq stop false)
+	       (break))))
+    ;;    (print "   Result " (length best-indices) " clauses" EOL)
+			     
+    ;; return cons rule from best-indices
+    (foreach index in best-indices
+	do (if (> index 0)
+	     (setq result (cons (nth cons-props (1- index)) result))
+	     (setq result
+	       (cons (bquote (fail & (nth cons-props (1- (- index))))) result))))
+    (return result)))
+	  
+
+(defun (intersect-signatures (LIST of INTEGER-WRAPPER)) ((sig1 VECTOR) 
+							 (sig2 VECTOR))
+  ;; simple intersection over binary vectors.  This forms the least
+  ;; general generalization for the propositional version of GOLEM.
+  (let ((result (new (LIST of INTEGER-WRAPPER))))
+    (foreach i in (interval 0 (1- (length sig1))) do
+	  (when (and (eql? (nth sig1 i) one-wrapper)
+		     (eql? (nth sig2 i) one-wrapper))
+	    (push result (+ i 1)))
+	  (when (and (eql? (nth sig1 i) zero-wrapper)
+		     (eql? (nth sig2 i) zero-wrapper))
+	    (push result (- (+ i 1)))))
+    (return result)))
+
+(defun (remove-signature-covered-examples (LIST of TRAINING-EXAMPLE))
+	((indices (LIST of INTEGER-WRAPPER))
+	 (examples (LIST of TRAINING-EXAMPLE)))
+  (let ((removed (new (LIST of TRAINING-EXAMPLE))))
+    (foreach example in (copy examples) 
+      where (signature-indices-cover-example? indices example) do
+	  (push removed example)
+	  (setq examples (remove examples example)))
+    (return removed)))
+
+(defun (num-signature-indices-covered INTEGER)  
+    ((indices (LIST of INTEGER-WRAPPER))
+     (examples (LIST of TRAINING-EXAMPLE)))
+  ;; counts the number of examples a particular set of signature
+  ;; indices covers.
+  (let ((count 0))
+    (foreach example in examples
+	where (signature-indices-cover-example? indices example) do
+	  (++ count))
+    (return count)))
+
+(defun (signature-indices-cover-any-example? BOOLEAN) 
+    ((indices (LIST of INTEGER-WRAPPER))
+     (examples (LIST of TRAINING-EXAMPLE)))
+  (foreach example in examples do
+	(when (signature-indices-cover-example? indices example)
+	  (return true)))
+  (return false))
+   
+(defun (signature-indices-cover-example? BOOLEAN) 
+    ((indices (LIST of INTEGER-WRAPPER))
+     (example TRAINING-EXAMPLE))
+  (let ((actual 0))
+    (foreach index in indices do 
+      (setq actual (1- (abs (wrapper-value index))))
+      (if (> index 0)
+	  (when (eql? (nth (input example) actual) zero-wrapper)
+	    (return false))
+	(when (eql? (nth (input example) actual) one-wrapper)
+	  (return false)))))
+  (return true))
+	  
+   
+;; Code for top-down rule-induction ala FOIL
+
+(defun top-down-rule-induction ((examples (list of training-example)))
+  ;; a top-down covering algorithm to build a set of rules
+  :command? TRUE 
+  (let ((positive (new (LIST of TRAINING-EXAMPLE)))
+	(all-positives (new (LIST of TRAINING-EXAMPLE)))
+	(negative (new (LIST of TRAINING-EXAMPLE)))
+	(uncovered (LIST of TRAINING-EXAMPLE) NULL)
+	(covered (new (LIST of TRAINING-EXAMPLE)))
+	(antecedent nil)
+	(linked-antecedents (LIST of CONS) NULL)
+	(concept (concept (first examples)))
+        (num-rules 0)
+	(loop-check 0)
+	(signatures? *Induce-Rules-From-Signatures*)
+	(cons-props (VECTOR of CONS) null)
+	(props (new (list of PROPOSITION)))
+	(proposition-vector (vector of proposition) NULL))
+    (setq *INDUCED-DECISION-RULES* (new (LIST of CONS)))
+
+    ;; get the relevant relations from the antecedent of the 
+    ;; classification rule.
+    (when (defined? (module (first *training-examples*)))
+      (change-module (module (first *training-examples*))))
+    (setq props
+      (get-classification-relations (query (first *training-examples*))))
+    (setq cons-props (new (VECTOR of CONS) :array-size (length props)))
+    
+    (setq proposition-vector (new (vector of proposition) 
+				  :array-size (length props)))
+    (foreach i in (interval 0 (1- (length props)))
+	as prop in props do
+       (setf (nth proposition-vector i) prop)
+       ;; create cons version of propositions
+       (setf (nth cons-props i) (proposition-to-cons prop)))
+
+    ;; divide up the examples in to positive and negative
+    (foreach example in examples do
+	  (if (cast (output example) BOOLEAN-WRAPPER)
+	      (progn 
+		(push positive example)  ;; uncovered positives
+		(push all-positives example)) ;; all of the positives
+	    (push negative example)))
+    
+    (print "Starting rule induction with " (length positive) " positive and "
+	   (length negative) " negative examples" EOL)
+    
+    ;; Keep building rules until all positives are covered or 
+    ;; you can't cover any more positives
+    (while (not (empty? positive))
+      (print EOL (length positive) " positive examples left to be covered" EOL)
+      (setq covered (new (list of training-example)))
+      ;; learn a single rule that covers as many positive examples as
+      ;; possible without covering any negative examples.  The rule
+      ;; is returned in the form of a list of indexes into the 
+      ;; proposition vector
+      (setq linked-antecedents (list nil))
+      (when *Induce-Rules-From-Signatures* ;; get initial rule from signatures
+	(case *Signature-Strategy*
+	  (:BOTTOM-UP
+	   (setq antecedent (learn-one-rule-bottom-up-from-signatures
+			     positive negative covered cons-props))
+	   (setq linked-antecedents
+	     (link-variables-in-induced-rule antecedent covered cons-props)))
+
+;;	   (push linked-antecedents antecedent))
+	  (:DECISION-TREE
+	   (setq uncovered (new (LIST of TRAINING-EXAMPLE)))
+	   (foreach example in positive do
+		 (push uncovered example))
+	   (foreach example in negative do
+		 (push uncovered example))
+	   (foreach tree-rule in 
+		 (get-rules-from-tree (query (first uncovered))
+				      (induce-decision-tree uncovered))
+	       where (cast (first tree-rule) BOOLEAN-WRAPPER)
+	       collect (rest tree-rule) into linked-antecedents)
+	   (setq linked-antecedents (remove linked-antecedents nil)))
+	     
+	  (:TOP-DOWN
+	   (setq antecedent (learn-one-rule-top-down-from-signatures
+			     positive negative covered cons-props))
+	   ;; Next, we need to link all free variables to ?Y.  This will
+	   ;; actually create many possible antecedents
+	   (setq linked-antecedents 
+	     (link-variables-in-induced-rule antecedent covered cons-props)))))
+      
+      (foreach ant in linked-antecedents do
+	 (setq covered (get-covered-examples ant negative))
+         (when (or (< (length covered) 10)
+		   (< (length covered) (length positive))
+		   (nil? ant))
+	  (when (> (length covered) 0) ;; need to specialize rule
+	   (setq ant (specialize-rule ant *Candidate-Clauses*
+				      positive covered))
+	   (setq loop-check 0)
+	   (while (and (not (nil? ant)) 
+		       (rule-covers-any-example? ant negative))
+	     ;; keep going if negs slipped by.  This happens because
+	     ;; of PowerLoom's query optimizer.
+	     (++ loop-check)
+	     (when (eql? loop-check 4)
+	       (setq ant nil)
+	       (setq covered negative)
+	       (break))
+	     (setq ant (specialize-rule ant *Candidate-Clauses*
+					positive covered)))
+	   (when (not (nil? ant))
+	     (setq covered NULL)))
+	 (when (or (null? covered)  ;; if no negs covered, proceed
+		   (empty? covered))
+	   (setq covered (get-covered-examples ant positive))
+	   ;; remove the covered examples from the positive examples
+	   (foreach example in covered do
+		 (setq positive (remove positive example)))
+	   (when (= (length covered) 0)
+	     (print "No Positives Covered by" ant EOL))
+	   (when (> (length covered) 0)
+	     (push *Induced-Decision-Rules* ;; add rule to list
+		   (bquote (=> (and && (reverse (copy-cons-tree ant))) 
+			       (& concept ?Y))))
+	     (print "Adding rule to cover " 
+		    (length covered) " examples" EOL)))))
+		     
+      (if (= (length *Induced-Decision-Rules*) num-rules)
+	  (progn
+	    (when (not *Induce-Rules-From-Signatures*)
+	      (print "Stopping with " (length positive) 
+		     " examples uncovered" EOL)
+	      (break))	  
+	    (print (length positive) 
+		   " examples uncovered, switching to full query-based induction" EOL)
+	    (setq *Induce-Rules-From-Signatures* FALSE))
+	(setq *Induce-Rules-From-Signatures* signatures?))
+      (setq num-rules (length *Induced-Decision-Rules*)))
+
+    (setq *Induce-Rules-From-Signatures* signatures?)
+    (print EOL "PowerLoom has induced the following rules" EOL EOL)
+    (foreach rule in *Induced-Decision-Rules* do
+	  (print rule EOL))))
+
+
+(defun (build-antecedent-from-rule-index (CONS of CONS)) 
+    ((props (VECTOR of CONS)) (rule-index (LIST of INTEGER-WRAPPER)))
+  ;; translates a rule from a set of indices into the propositional
+  ;; signatures.
+  (let ((antecedent nil)
+	(cons-prop nil))
+    ;; follow indexes to build the antecedent
+    (foreach index in rule-index do
+	(if (< index 0) ;; indexes less than 0 indicate negated props
+	    (setq cons-prop 
+	       (bquote (fail & (nth props (1- (abs (wrapper-value index)))))))
+	   (setq cons-prop (nth props 			    
+				(1- (abs (wrapper-value index))))))
+	(setq antecedent (cons cons-prop antecedent)))
+    (return antecedent)))
+
+
+(defun (learn-one-rule-top-down-from-signatures (CONS of CONS))
+    ((positive (LIST of TRAINING-EXAMPLE))
+     (negative (LIST of TRAINING-EXAMPLE))
+     (covered_pos (LIST of TRAINING-EXAMPLE))
+     (cons-props (VECTOR of CONS)))
+  ;; Starts with an empty rule and uses a greedy strategy to add
+  ;; antecedents to a rule until all negative examples are excluded.
+  ;; This is the standard FOIL rule induction strategy.
+  (let ((current_utility 0.0)
+	(rule (new (LIST of INTEGER-WRAPPER))) ;; just store the prop indexes
+	(gain 0.0)
+	(max_gain 0.0)
+	(used_features (new (LIST of INTEGER-WRAPPER)))
+	(num_features 0)
+	(vars (new (LIST of SYMBOL)))
+	(variable-table (VECTOR of (LIST of SYMBOL)) NULL)
+	(feature_index 0)
+	(covered_neg (new (LIST of TRAINING-EXAMPLE))))
+
+    (print "Learning rule top down from signatures over " (length positive) 
+	   " positives" EOL)
+    
+    (when (empty? positive)
+      (return nil))  ;; nothing to do here if there are no + examples
+    
+    (setq num_features (length (input (first positive))))
+    
+    (setq variable-table
+      (new (VECTOR of (LIST of SYMBOL)) :array-size (1+ num_features)))
+    (foreach i in (interval 1 num_features) do
+       (setf (nth variable-table i) 
+	 (get-variables-from-cons-propositions 
+	  (cons-list (nth cons-props (1- i))))))
+    (push vars (quote ?Y))
+    
+    (foreach example in negative
+	collect example into covered_neg)
+    (foreach example in positive
+	collect example into covered_pos)
+    
+    (while (not (empty? covered_neg))
+      (setq current_utility 
+	(foil-utility (length covered_pos) (length covered_neg)))
+      (setq max_gain 0.0)
+      ;; Evaluate the gain of each feature and determine the best one
+      (foreach i in (interval 1 num_features)
+	  where (not (member? used_features i)) do
+	    (if (and *Enforce-Linked-Variables*
+		     (not (exists ele in (nth variable-table i)
+			      where (member? vars ele))))
+		(setq gain -9999.0)
+	     (setq gain (foil-gain i current_utility covered_pos covered_neg)))
+	  (when *Trace-FOIL*
+	    (print "Foil gain on feature " i": " gain EOL))
+	  (when (> gain max_gain)
+	    (setq feature_index i)
+	    (setq max_gain gain))
+	    ;; Now test negation
+	    (if (and *Enforce-Linked-Variables*
+		     (not (exists ele in (nth variable-table i)
+			      where (member? vars ele))))
+		(setq gain -9999.0)
+	      (setq gain (foil-gain (- i) current_utility covered_pos covered_neg)))
+	  (when *Trace-FOIL*
+	    (print "Foil gain on feature " i": " gain EOL))
+	  (when (> gain max_gain)
+	    (setq feature_index (- i))
+	    (setq max_gain gain)))
+      ;; If you can't improve and you still have covered negatives,
+      ;; then you are done.  Fail this rule.
+      (when (= max_gain 0.0) 
+	(setq covered_pos (new (LIST of TRAINING-EXAMPLE)))
+	(print "   Darn, nothing we can do here, returning nil." EOL)
+	(return nil))
+      (when *Trace-Foil*
+	(print "** Choosing feature " (nth cons-props (abs (1- feature_index))) EOL))
+
+      ;; add variables to variable list
+      (when *Enforce-Linked-Variables*
+	(foreach var in (nth variable-table (abs feature_index))
+	    where (not (member? vars var)) do
+	      (push vars var)))
+      
+      ;; update the covered and uncovered examples
+      (update-covered-examples feature_index covered_pos covered_neg)
+      (push used_features (abs feature_index))
+      (push rule feature_index))
+;;      (print "   Returning indexes: " rule EOL)
+;;      (print " *** Covers: " EOL)
+;    (foreach ex1 in covered_pos do
+;	  (foreach ex2 in *training-examples*
+;	      as k in (interval 0 NULL) do
+;		(when (eql? ex1 ex2)
+					;		  (print "Example " k " " (query ex1) EOL))))
+    (print "   Returning with " (length covered_pos) " positives and "
+	   (length covered_neg) " negatives covered" EOL)
+    (return (build-antecedent-from-rule-index cons-props rule))))
+
+(defun update-example-matches ((examples (LIST of TRAINING-EXAMPLE))
+                               (index INTEGER)
+                               (match-value INTEGER-WRAPPER))
+  ;; Destructively updates `examples' to include only those whose `index'-th
+  ;; input value matches `match-value'
+  (let ((temp NIL))
+    (foreach example in examples
+             do (cond ((<= (length (input example)) index)
+                       (warn "Bad training example, not enough features.  Needs " (1+ index)
+                             EOL (query example)))
+                      ((eql? (nth (input example) index) match-value)
+                       (pushq temp example))))
+    (setf (the-cons-list examples) temp)))
+
+
+(defun update-covered-examples ((feature_index INTEGER)
+				(covered_pos (LIST OF TRAINING-EXAMPLE))
+				(covered_neg (LIST OF TRAINING-EXAMPLE)))
+  ;; Using the given feature index, update all of the covered positive
+  ;; and negative examples.  Really, you are just trying to figure out
+  ;; which examples you no longer cover.  Hopefully, you lose more
+  ;; negative than positive examples.
+
+  (let ((match-value (choose (> feature_index 0) zero-wrapper one-wrapper)) 
+        (index INTEGER (1- (abs feature_index))))
+
+    (update-example-matches covered_pos index match-value)
+    (update-example-matches covered_neg index match-value)))
+			
+
+(defun (count-example-matches INTEGER) ((examples (LIST of TRAINING-EXAMPLE))
+                                        (index INTEGER)
+                                        (match-value INTEGER-WRAPPER))
+  (let ((n 0))
+    (foreach example in examples
+             do (cond ((<= (length (input example)) index)
+                       (warn "Bad training example, not enough features.  Needs " (1+ index)
+                             EOL (query example)))
+                      ((eql? (nth (input example) index) match-value)
+                       (++ n))))
+    (return n)))
+
+
+(defun (foil-gain FLOAT)  ((feature-index INTEGER)
+			   (utility FLOAT)
+			   (covered-pos (LIST of TRAINING-EXAMPLE))
+			   (covered-neg (LIST of TRAINING-EXAMPLE)))
+  ;; if feature-index is less than 0, then test the negation
+  (let ((match-value (choose (< feature-index 0) zero-wrapper one-wrapper))
+
+	(index INTEGER (1- (abs feature-index)))
+        ;; count covered and uncovered examples with given feature
+        (p (count-example-matches covered-pos index match-value))
+	(n (count-example-matches covered-neg index match-value)))
+    (return (* p (- (foil-utility p n) utility)))))
+    
+
+(defun (foil-utility FLOAT) ((p INTEGER) (n INTEGER))
+  (when (= p 0)
+    (return 0))
+  (return (/ (log (/ p (+ p n))) LOG_2)))
+
+(defun (learn-one-rule-top-down (CONS of CONS))
+    ((propositions (VECTOR of CONS))
+     (positive (list of training-example))
+     (negative (list of training-example)))
+  (return (specialize-rule nil propositions positive negative)))
+
+(defun (specialize-rule (CONS of CONS))
+    ((rule (CONS of CONS))
+     (propositions (VECTOR of CONS))
+     (positive (list of training-example))
+     (negative (list of training-example)))
+  
+  ;; specialize rule will add new antecedent clauses to a rule
+  ;; until no negative examples are covered.  
+  (print "Specializing "  EOL)
+  (let ((candidates (new (LIST of INTEGER-WRAPPER)))
+	(covered-negs (new (LIST of training-example)))
+	(covered-pos (new (LIST of training-example)))
+	(current_utility 0.0)
+	(feature-index 0)
+	(new-clause nil)
+	(vars (get-variables-from-cons-propositions rule))
+	(variable-table (VECTOR of (LIST of SYMBOL)) NULL)
+	(gain 0.0)
+	(max 0.0))
+    
+    ;; find positive and negatives that are covered by this rule
+    (foreach example in negative 
+	where (rule-covers-example? rule example) do
+	  (push covered-negs example))
+    (foreach example in positive
+	where (rule-covers-example? rule example) do
+	 (push covered-pos example))
+    
+    (when (empty? covered-negs)           ;; quick check to see if we need to 
+      (print " No covered negatives" EOL) ;; specialize
+      (return rule))         
+    
+    (when (not (member? vars (quote ?Y)))
+      (push vars (quote ?Y)))
+    
+    (setq variable-table
+     (new (VECTOR of (LIST of SYMBOL)) :array-size (1+ (length propositions))))
+    (foreach i in (interval 1 (length propositions)) do
+       (setf (nth variable-table i) 
+	 (get-variables-from-cons-propositions 
+	  (cons-list (nth propositions (1- i))))))
+    
+    (foreach i in (interval 1 (length propositions)) do
+	  (push candidates i)  ;; collect indices into propositions
+	  (push candidates (- i)))
+    
+    ;; put clauses in current rule on the used list
+    (foreach clause in rule do     
+	(foreach prop in propositions 
+	    as i in (interval 1 NULL) do
+	    (when (equal-cons-trees? prop clause)
+	      (setq candidates (remove candidates i))
+	      (break))
+	    ;; test negation
+	    (when (equal-cons-trees? (bquote (fail & prop)) clause)
+	      (setq candidates (remove candidates (- i)))
+	      (break))))
+
+    (while (not (empty? covered-negs))
+      ;; go through all possible antecedents
+      (print "   Covers " (length covered-negs) " negs, and " (length covered-pos) " pos" EOL)
+      (setq current_utility 
+	(foil-utility (length covered-pos) (length covered-negs)))
+      (setq max 0.0)
+      ;; Evaluate the gain of each feature and determine the best one
+      (foreach i in (copy candidates)
+	 where (exists ele in (nth variable-table (abs (wrapper-value i)))
+		   where (member? vars ele)) do  ;; have to share a variable
+	 (if (> i 0)
+	     (setq gain 
+	       (query-foil-gain 
+		(cons (nth propositions (- i 1)) rule)
+		current_utility covered-pos covered-negs))
+	   (setq gain 
+	     (query-foil-gain 
+	      (cons (bquote (fail & (nth propositions (- (- i) 1)))) rule)
+	      current_utility covered-pos covered-negs)))
+	 (when (> gain max)
+	   (print "    Current: " (nth propositions (- (abs (wrapper-value i)) 1))": " gain)
+	   (if (< i 0) (print " Negated" EOL) (print EOL))
+	   (setq feature-index i)
+	   (setq max gain)))
+      
+      ;; If you can't improve and you still have covered negatives,
+      ;; then you are done.  Fail this rule.
+      (when (= max 0.0)
+	(print "   No features provide any gain" EOL)
+	(print "   Can't separate " EOL)
+	(foreach pos in covered-pos do
+	      (print "     " (name pos) EOL))
+	(print "   From " EOL)
+	(foreach neg in covered-negs do
+	      (print "     " (name neg) EOL))
+	(return nil))
+      
+      (foreach var in (nth variable-table (abs feature-index))
+	  where (not (member? vars var)) do
+	    (push vars var))
+      
+      (setq candidates (remove candidates feature-index))
+      (setq new-clause 
+	(copy-cons-tree (nth propositions (1- (abs feature-index)))))
+      (when (< feature-index 0)
+	(setq new-clause (bquote (fail & new-clause))))
+;;      (when *Trace-Foil*
+      (print "   Adding clause " new-clause EOL)
+      (setq rule (cons new-clause rule))
+      (remove-excluded-examples rule covered-pos covered-negs))
+;;    (print "Induced rule covers " (length covered-pos) " examples" EOL)
+;;    (when (and (empty? covered-negs)
+;;	       (rule-covers-any-example? rule negative))
+;;      (print "***PROBLEM:  Our covered negatives are exhausted but we still cover negatives" EOL))
+    (return rule)))
+
+
+(defun remove-excluded-examples ((rule (CONS of CONS))
+				 (covered-pos (LIST of TRAINING-EXAMPLE))
+				 (covered-neg (LIST of TRAINING-EXAMPLE)))
+  ;; remove examples not covered by the rule
+    (foreach example in (copy covered-neg)
+	where (not (rule-covers-example? rule example)) do	
+;;	  (print "     Removing " (query example) EOL)
+	  (setq covered-neg (remove covered-neg example)))
+     
+    (foreach example in (copy covered-pos)
+	where (not (rule-covers-example? rule example)) do	
+	  (setq covered-pos (remove covered-pos example))))
+
+
+(defun (query-foil-gain FLOAT) ((rule (CONS of CONS))
+				(utility FLOAT)
+				(covered-pos (LIST of TRAINING-EXAMPLE))
+				(covered-neg (LIST of TRAINING-EXAMPLE)))
+  ;; This function uses PowerLoom's query machinery to determine which
+  ;; examples are covered or uncovered.
+  (let ((p 0)
+	(n 0)
+	(result 0.0))
+
+    (foreach example in covered-neg 
+	where (rule-covers-example? rule example) do
+	  (++ n))
+    
+    (foreach example in covered-pos 
+	where (rule-covers-example? rule example) do
+	  (++ p))
+
+    (when (and (eql? p 0) (eql? n 0))
+      (return 0.0))
+    (setq result (* p (- (foil-utility p n) utility)))
+    (when (< result 0.000001)
+      (setq result 0.0))
+    (return result)))
+
+
+(defun query-and-update-covered-examples 
+    ((rule (CONS of CONS))
+     (uncovered (LIST of TRAINING-EXAMPLE))
+     (covered (LIST of TRAINING-EXAMPLE)))
+  ;; uses PowerLoom to decide which uncovered examples are now covered
+  (foreach example in (copy uncovered)
+      where (rule-covers-example? rule example) 
+      collect example into covered))
+
+(defun remove-covered-examples ((rule (CONS of CONS))
+				(uncovered (LIST of TRAINING-EXAMPLE)))
+    (foreach example in (copy uncovered)
+	where (rule-covers-example? rule example) do
+	  (setq uncovered (remove uncovered example))))
+
+(defun (num-examples-covered INTEGER) ((rule (CONS of CONS))
+				       (examples (LIST of TRAINING-EXAMPLE)))
+  (let ((count 0))
+    (foreach example in examples do
+	  (when (rule-covers-example? rule example) 
+	    (++ count)))
+    (return count)))
+
+(defun (get-covered-examples (LIST of TRAINING-EXAMPLE))
+    ((rule (CONS of CONS))
+     (uncovered (LIST of TRAINING-EXAMPLE)))
+  (let ((covered (new (LIST of TRAINING-EXAMPLE))))
+    ;; uses PowerLoom to decide which uncovered examples are now covered
+    (foreach example in uncovered
+	where (rule-covers-example? rule example) 
+	collect example into covered)
+    (return covered)))
+
+(defun (rule-covers-any-example? BOOLEAN) 
+    ((rule (CONS of CONS))
+     (examples (LIST of TRAINING-EXAMPLE)))
+  (foreach example in examples do
+     (when (rule-covers-example? rule example)
+	(return true)))
+  (return false))
+
+(defun (rule-covers-example? BOOLEAN) ((reverse-rule (CONS of CONS))
+				       (example TRAINING-EXAMPLE))
+  ;; runs PowerLoom to determine if the rule covers or excludes the
+  ;; given trainign example
+  (when (nil? reverse-rule)
+    (return true))
+  ;; rule is actually in reverse order so we need to reverse it.
+
+  (let ((query QUERY-ITERATOR NULL)
+	(rule (reverse (copy-cons-tree reverse-rule)))
+	(vars (remove (get-variables-from-cons-propositions rule) 
+		      (quote ?Y)))
+        ; (extra-clauses nil)
+	(cons-query nil)
+	(types nil))
+    (when (defined? (module example))
+      (change-module (module example)))
+    (setq cons-query 
+      (cons (quote and)
+	    (substitute-cons-tree rule (name example) (quote ?Y))))
+    (when (not (empty? vars))
+      (foreach var in vars do
+	 ;; X variables are my variables and are of type user-thing
+	 ;; V variables are system generated thing variables
+	 (if (and *Enable-User-Thing*
+		  (eql? (nth (symbol-name var) 1) #\X))
+	   (setq types (cons (bquote (& var USER-THING)) 
+				     types))
+	   (setq types (cons var types))))
+      (setq cons-query (bquote (exists & types & cons-query))))
+    
+    (if *OPTIMIZE-INDUCED-QUERIES*
+	(setq query (make-query nil cons-query nil (bquote (:timeout 300))))
+      (setq query (make-query nil cons-query nil 
+			      (bquote (:timeout 300 :dont-optimize? true)))))
+    (return (true-truth-value? (call-ask query)))))
+    
+(defun (link-variables-in-induced-rule (LIST of (CONS of CONS)))
+	((rule (CONS of CONS))
+	 (examples (list of training-example))
+	 (cons-props (VECTOR of CONS)))
+  ;; This function adds clauses to link all variables to the root variable
+  (let ((vars (LIST of SYMBOL) NULL)
+	(temp-rule CONS nil)
+	(var symbol NULL)
+	(unlinked (LIST of SYMBOL) NULL)
+	(linked (LIST of SYMBOL) NULL)
+	(new-rules (new (list of CONS)))
+	;; (concept (concept (first *training-examples*)))
+	)
+    
+       ;; make sure all variable are linked to ?Y
+    (setq vars (get-variables-from-cons-propositions rule))
+;;    (print "Need to link variables " vars " from rule " EOL "  " rule EOL)
+    (foreach example in examples do
+       ;; foreach example generate its link to the variables
+       (when (null? (input example))
+	 (setf (input example) (create-input-signature (query example))))
+;;       (print "Testing " (query example) EOL)
+       (setq temp-rule (copy-cons-tree rule))
+       ;; foreach variable in the rule, find the first proposition
+       ;; that uses it that is evaluated true for the example.  This
+       ;; proposition is the one that "generated" a binding for that
+       ;; variable
+       (setq unlinked (new (LIST of SYMBOL)))
+       (setq linked (new (LIST of SYMBOL)))
+       (foreach var in vars collect var into unlinked)
+       (setq unlinked (remove unlinked (quote ?Y)))
+       (push linked (quote ?Y))
+       (while (not (empty? unlinked))
+           (setq var (pop unlinked))
+	   (foreach prop in cons-props
+	       as i in (interval 0 NULL) do
+	       (when (member? prop var) 
+	          (when (exists ele in temp-rule where
+			      (equal-cons-trees? ele prop))
+;;		    (print prop " already exists in rule" EOL)
+		    (push linked var)
+		    (break)) ;; already have a link in rule
+		  (when (eql? (nth (input example) i) one-wrapper) 
+		    (setq temp-rule 
+		      (concatenate temp-rule 
+				   (cons-list (copy-cons-tree prop))))
+		    (foreach new-var in (rest prop)
+			where (and (not (eql? new-var var))
+				   (symbol? new-var)
+				   (not (member? linked new-var))) do
+			  (push unlinked new-var))
+		    (push linked var)
+		    (break)))))
+
+       (when (not (exists ele in new-rules where
+			(equal-cons-trees? ele temp-rule)))
+;;	 (print "Adding " temp-rule EOL)
+	 (push new-rules temp-rule)))
+    (foreach it on new-rules do
+	  (setf (value it) (reverse (cast (value it) CONS))))
+    (return new-rules)))
+;;    (foreach rule in new-rules do
+;;	  (push *Induced-Decision-Rules* 
+;;		(bquote (=> (and && rule) (& concept ?Y)))))))
+
+;;    (print EOL "PowerLoom has induced the following rules" EOL EOL)
+;;    (foreach rule in *Induced-Decision-Rules* do
+;;	(print rule EOL))))
+
+
+;;; Learning curve stuff
+
+
+(defun (evaluate-rule-induction (VECTOR of FLOAT-WRAPPER))
+    ((relation-name SYMBOL)
+     (class-name SYMBOL)
+     (num-trials INTEGER)
+     (curve-splits INTEGER))  ;; for generating curves, use 1 for single point
+  :command? TRUE :evaluate-arguments? FALSE
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(relation (surrogate-value-inverse (get-description relation-name)))
+	(ilist (listify (all-class-instances class)))
+	(num (length ilist))
+	(num-train (/ (* 1 num) 2))
+	(current-split num-train)
+	(training-instances (VECTOR of LOGIC-OBJECT) NULL)
+	(instances (new (VECTOR of LOGIC-OBJECT) :array-size num))
+	(result 0.0)
+	(results (new (VECTOR of FLOAT-WRAPPER) :array-size curve-splits)))
+
+    (foreach instance in ilist
+	as i in (interval 0 NULL) do
+	  (setf (nth instances i) instance))
+
+    (foreach i in (interval 0 (1- curve-splits)) do
+	  (setf (nth results i) 0.0))
+    
+    ;; For each curve split run a number of trials where we create the
+    ;; match criteria, training, and testing examples and run and test
+    ;; the learning algorithm.
+    (foreach split in (interval 0 (1- curve-splits)) do
+       (setq current-split (* num-train (/ (1+ split) curve-splits)))
+       (foreach i in (interval 0 (1- num-trials)) do
+	  (shuffle-vector instances)
+	  (Print "Starting Trial " (1+ i) " of split " (1+ split) " with " current-split " examples" EOL)
+	  (clear-training-examples)
+	  (clear-cases)
+          (setq training-instances (new (VECTOR of LOGIC-OBJECT) 
+					:array-size current-split))
+	  (foreach j in (interval 0 (1- current-split)) do
+		(setf (nth training-instances j) (nth instances j)))
+
+	  (case *Rule-Induction-Strategy*
+	    (:TOP-DOWN
+	     (setq *Enable-User-Thing* true)
+	     (print "  Creating Match Criteria" EOL)
+	     (generate-classification-rule 
+	      training-instances relation-name class-name TRUE)
+	     (set-candidate-clauses class-name)
+	     (print "  Generating Training Examples" EOL)
+	     (generate-classification-training-examples instances 
+							relation true)
+	     (setq *Optimize-Induced-Queries* TRUE))
+	    (:BOTTOM-UP
+	     (setq *Enable-User-Thing* false)
+	     (generate-training-examples instances relation)
+	     (setq *Optimize-Induced-Queries* TRUE)))
+	    
+	  (setq *training-examples* (reverse *training-examples*))
+	  (let ((train-set (new (LIST of TRAINING-EXAMPLE)))
+		(test-set (new (LIST of TRAINING-EXAMPLE))))
+	    (foreach example in *training-examples*
+		as j in (interval 0 NULL) do
+		  (when (< j current-split)
+		    (push train-set example))
+		  (when (>= j num-train)
+		    (push test-set example)))
+	    (setq result (train-and-test-rule-induction train-set test-set))
+	    (setf (nth results split) (+ (nth results split) result))
+	    (print EOL "  Result: " result EOL))))
+    
+    (foreach i in (interval 0 (1- curve-splits)) do
+	  (setf (nth results i) (/ (nth results i) num-trials)))
+    (return results)))
+		    
+
+
+(defun (train-and-test-rule-induction FLOAT)
+	((train-set (LIST of TRAINING-EXAMPLE))
+	 (test-set (LIST of TRAINING-EXAMPLE)))
+  (let ((home-module MODULE *context*)
+	(test-module MODULE (find-or-create-module 
+		      (concatenate (module-full-name (cast *context*
+							   MODULE))
+				   "INDUCED-RULES")))
+	(result 0.0))
+    (change-module test-module)
+    (clear-context test-module)
+    (case *Rule-Induction-Strategy*
+      (:TOP-DOWN
+       (top-down-rule-induction train-set))
+      (:BOTTOM-UP
+       (bottom-up-rule-induction train-set  *simplify-rule-antecedent?*)))
+    (assert-induced-rules)
+    (setq result (test-theory-over-examples test-set))
+    (change-module home-module)
+    (return result)))
+
+
+
+;; Code for inducing rules using a decision tree
+
+(defun induce-decision-rules ((relation-name SYMBOL)
+			      (class-name SYMBOL))
+  :command? TRUE :evaluate-arguments? FALSE
+  (setq relation-name (permanentify relation-name))
+  (clear-cases)
+  (clear-training-examples)
+  (setq *Induced-Decision-Rules* (new (LIST of CONS)))
+  (setq class-name (permanentify class-name))
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(relation (surrogate-value-inverse (get-description relation-name)))
+	(ilist (listify (all-class-instances class)))
+	(num (length ilist))
+	(tree DECISION-TREE NULL)
+	(instances (new (VECTOR of LOGIC-OBJECT) :array-size num)))
+    (foreach instance in ilist
+	as i in (interval 0 NULL) do
+	  (setf (nth instances i) instance))
+
+    ;; Build classification rule
+    (when (not *Allow-Recursive-Decision-Nodes*)
+      (insert-new *Taboo-Operators* relation))
+    (generate-classification-rule instances relation-name class-name TRUE)
+    (print "Generating Training Examples" EOL)
+    (generate-classification-training-examples instances relation true)
+    (print "Generating Decision Rules" EOL)
+    (setq tree (induce-decision-tree *training-examples*))
+    (setf (concept tree) relation-name)
+    (get-rules-from-tree (query (first *training-examples*)) tree)))
+
+(defun modular-induce-decision-rules ((relation-name SYMBOL)
+				      (class-name SYMBOL)
+				      (modules (list of MODULE)))
+  ;; just like induce-decision-rules except it is module-aware.  In
+  ;; other words it gets its training examples from each module in the 
+  ;; modules parameter.
+  (setq relation-name (permanentify relation-name))
+  (setq class-name (permanentify class-name))
+  (clear-training-examples)
+  (clear-cases)
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(relation (surrogate-value-inverse (get-description relation-name)))
+	(ilist (new (list of OBJECT)))
+	(tree decision-tree null)
+	(home *module*)
+	(num (length ilist))
+	(instance-vec (new (VECTOR of (VECTOR of LOGIC-OBJECT)) 
+			:array-size (length modules)))
+	(instances (VECTOR of LOGIC-OBJECT) NULL))
+
+    (when (not *Allow-Recursive-Decision-Nodes*)
+      (insert-new *Taboo-Operators* relation))
+    (print "Building Classification Rule" EOL)
+    (foreach module in modules 
+	as j in (interval 0 NULL) do
+       (change-module module)
+       (setq ilist (listify (all-class-instances class)))
+       (setq num (length ilist))
+       (setq instances (new (VECTOR of LOGIC-OBJECT) :array-size num))
+       (foreach instance in ilist
+	   as i in (interval 0 NULL) do
+	     (setf (nth instances i) instance))
+       (setf (nth instance-vec j) instances)
+       ;; Build classification rule
+       (generate-classification-rule instances relation-name class-name FALSE))
+    (change-module home)
+    (build-classification-rule relation-name class-name)
+
+    (print "Generating Training Examples" EOL)
+    (foreach module in modules 
+	as vec in instance-vec do
+	  (change-module module)
+	  (generate-classification-training-examples vec relation true))
+    (print "Inducing Decision Tree" EOL)
+    (setq tree (induce-decision-tree *training-examples*))
+    (setf (concept tree) relation-name)
+    (when (defined? (module (first *training-examples*)))
+      (change-module (module (first *training-examples*))))))
+;;    (build-decision-rules tree 
+;;			  (get-classification-relations 
+;;			   (query (first *training-examples*))))))
+
+
+(defun (ask-decision-tree BOOLEAN) ((tree DECISION-TREE)
+				    (query CONS))
+  ;; Uses a decision tree to answer a query.  
+  (let ((signature (create-input-signature query)))
+    (return (traverse-decision-tree tree signature))))
+
+(defun (traverse-decision-tree BOOLEAN) ((tree DECISION-TREE)
+					 (features (VECTOR of INTEGER-WRAPPER)))
+  (when (null? (feature tree))
+    (return (truth-value tree)))
+  (if (eql? (nth features (feature-index tree)) one-wrapper)
+      (return (traverse-decision-tree (true-branch tree) features))
+    (return (traverse-decision-tree (false-branch tree) features))))
+	
+(defun (induce-decision-tree DECISION-TREE) 
+    ((examples (LIST of TRAINING-EXAMPLE)))
+  :command? TRUE 
+  (let ((features (new (list of SYMBOL)))
+	(feature SYMBOL NULL)
+	(tree DECISION-TREE NULL)
+	(props (new (list of PROPOSITION)))
+	(proposition-table (new (Hash-Table of SYMBOL PROPOSITION))))
+    (print "  Inducing decision tree" EOL)
+    (when (defined? (module (first examples)))
+      (change-module (module (first examples))))
+    (setq props
+      (get-classification-relations (query (first examples))))
+    (foreach i in (interval 0 (1- (length props))) 
+	do (setq feature (concatenate "A" (stringify i)))
+	  (insert-at proposition-table feature (nth props i))
+	collect feature into features)
+    (setq tree (build-decision-tree examples features nil))
+    (add-propositions-to-decision-tree tree proposition-table)
+    (return tree)))
+
+(defun add-propositions-to-decision-tree ((tree DECISION-TREE)
+					  (table (HASH-TABLE of SYMBOL PROPOSITION)))
+  (when (null? (feature tree))
+      (return))
+  (setf (proposition tree) (lookup table (feature tree)))
+  (add-propositions-to-decision-tree (true-branch tree) table)
+  (add-propositions-to-decision-tree (false-branch tree) table))
+    
+(defun (build-decision-tree object) ((examples (list of TRAINING-EXAMPLE))
+				     (features (list of SYMBOL))
+				     (feature-stack (CONS of symbol)))
+  ;; This function produces a decision tree for the given set of
+  ;; examples by choosing one of the given features as the root of
+  ;; the tree and recursively making trees for each of the
+  ;; resulting categories. 
+  (let ((p 0)
+	(n 0)
+	(current-entropy 0.0)
+	(new-entropy 0.0)
+	(tree (new decision-tree))
+	(min-new-entropy 1.0)
+	(feature-index 0)
+	(split-feature SYMBOL NULL))
+
+    ;; First check how you've split your data
+    (foreach example in examples do
+	  (if (cast (output example) BOOLEAN-WRAPPER)
+	      (++ p)
+	    (++ n)))
+    (if (> p n)
+	(setf (truth-value tree) true)
+      (setf (truth-value tree) false))
+    ;; If we have a homogeneous mixture, return the tree
+    (when (or (= p 0) (= n 0))
+	(return tree))
+    
+    (setq current-entropy (entropy p n))
+    ;; find feature which maximizes information gain
+    (foreach feature in features 
+	as i in (interval 0 NULL) 
+	where (not (member? feature-stack feature)) do
+       (setq new-entropy (expected-entropy i examples))
+       (when (< new-entropy min-new-entropy)
+	 (when *Trace-ID3*
+	   (print "Info gain for feature " feature ": " 
+		  (- current-entropy new-entropy) EOL))
+	 (setq min-new-entropy new-entropy)
+	 (setq feature-index i)
+	 (setq split-feature feature)))
+    (when *Trace-ID3*
+      (print "Splitting on feature " split-feature EOL))
+
+    ;; if we have not found a split feature in a heterogenous
+    ;; mixture, then there is noise. Just return the tree which will
+    ;; default to the truth of the largest population.
+    (when (null? split-feature)
+      (return tree))
+
+    ;; Separate examples based on their value for this feature
+    (let ((left-examples (new (list of TRAINING-EXAMPLE)))
+	  (right-examples (new (list of TRAINING-EXAMPLE))))
+      (foreach example in examples do
+	  (if (eql? (nth (input example) feature-index) one-wrapper) 
+	      (push left-examples example)
+	    (push right-examples example)))
+      (setf (feature tree) split-feature)
+      (setf (feature-index tree) feature-index)
+      (setf (true-branch tree) 
+	(build-decision-tree left-examples features 
+			     (cons split-feature feature-stack)))
+      (setf (false-branch tree) 
+	(build-decision-tree right-examples features
+			     (cons split-feature feature-stack))))
+    (return tree)))
+
+
+(defun (expected-entropy FLOAT)  ((feature-index INTEGER) 
+				  (examples (list of training-example)))
+;; Compute the expected entropy of the partitions created by splitting 
+;; on the given feature. This is simply a weighted sum of the entropy
+;; for each partition.
+  (let ((E 0.0)
+	(num-examples (length examples))
+	(p 0)
+	(n 0))
+    ;; calculate entropy of positive branch
+    (foreach example in examples do
+       (when (eql? (nth (input example) feature-index) one-wrapper)
+	 (if (cast (output example) BOOLEAN-WRAPPER)
+	     (++ p)
+	   (++ n))))
+    (setq E (* (/ (+ p n) num-examples) (entropy p n)))
+    ;; calculate entropy of negative branch
+    (setq p 0)
+    (setq n 0)
+    (foreach example in examples do
+       (when (eql? (nth (input example) feature-index) zero-wrapper)
+	 (if (cast (output example) BOOLEAN-WRAPPER)
+	     (++ p)
+	   (++ n))))
+    (setq E (+ E (* (/ (+ p n) num-examples) (entropy p n))))
+    (return E)))
+    
+
+(defun (entropy FLOAT) ((p INTEGER) (n INTEGER))
+  ;; Compute the entropy given p + instances and n - instances
+  (when (and (= p 0) (= n 0))
+    (return 0.0))
+  (let ((sum (+ p n))
+	(pos-impurity 0.0)
+	(pos-perc (/ p sum))
+	(neg-impurity 0.0)
+	(neg-perc (/ n sum)))
+    (if (= p 0)
+	(setq pos-impurity 0)
+      (setq pos-impurity (- (* pos-perc (/ (log pos-perc) (log 2))))))
+    (if (= n 0)
+	(setq neg-impurity 0)
+      (setq neg-impurity (- (* neg-perc (/ (log neg-perc) (log 2))))))
+    (return (+ pos-impurity neg-impurity))))
+
+
+(defun print-decision-tree ((tree decision-tree) (stream NATIVE-OUTPUT-STREAM))
+  (help-print-decision-tree tree 0 stream))
+
+(defun help-print-decision-tree ((tree DECISION-TREE) (level INTEGER) (stream NATIVE-OUTPUT-STREAM))
+  (when (null? (feature tree))
+    (if (truth-value tree)
+	(print-stream stream "True" EOL)
+      (print-stream stream "False" EOL))
+    (return))
+  (print-stream stream EOL)
+  (foreach i in (interval 1 level)
+      do (ignore i)
+	 (print-stream stream "|   "))
+  (print-stream stream (proposition tree) " = 1: ")
+  (help-print-decision-tree (true-branch tree) (+ level 1) stream)
+  (foreach i in (interval 1 level)
+      do (ignore i)
+	 (print-stream stream  "|   "))
+  (print-stream stream (proposition tree) " = 0: ")  
+  (help-print-decision-tree (false-branch tree) (+ level 1) stream))
+
+;;
+;; Code for extracting rules from decision tree
+;;
+
+(defun (get-rules-from-tree (LIST of CONS)) ((query CONS) (tree DECISION-TREE))
+  (print "  Extracting rules from decision tree" EOL)
+  (return (build-rules-from-tree tree (get-classification-relations query))))
+
+(defun (build-rules-from-tree (LIST of CONS))
+    ((tree decision-tree) (props (list of proposition)))
+   ;; TODO:  Have this call link-variables-in-induced-rule
+  (let ((rules (new (LIST of CONS)))
+	(cons-props (CONS of CONS) nil))
+    
+    (foreach prop in props
+	collect (proposition-to-cons prop) into cons-props)
+    (setq *Induced-Decision-Rules* (new (LIST of CONS)))
+    (extract-paths-from-tree tree nil rules)
+    (return rules)))
+
+
+(defun extract-paths-from-tree
+    ((tree decision-tree)
+     (antecedent-stack (CONS OF CONS))
+     (antecedent (LIST OF CONS)))
+  ;; traverses a tree and returns all paths to the leaves
+  (when (null? (feature tree))
+    (push antecedent (cons (truth-value tree) antecedent-stack))
+    (return))
+  (let ((prop (proposition-to-cons (proposition tree))))
+    (extract-paths-from-tree 
+     (true-branch tree) (cons prop antecedent-stack) antecedent)
+    (extract-paths-from-tree 
+     (false-branch tree) (cons (bquote (fail & prop)) 
+			       antecedent-stack) antecedent)))
+
+
+(defun sort-examples-by-tree 
+    ((tree decision-tree)
+     (examples (LIST of TRAINING-EXAMPLE))
+     (sorted-examples (LIST of (LIST of TRAINING-EXAMPLE))))
+  ;; traverses a tree and sorts 
+  (when (null? (feature tree))
+    (push sorted-examples examples)
+    (return))
+  (let ((true-examples (new (LIST of TRAINING-EXAMPLE)))
+	(false-examples (new (LIST of TRAINING-EXAMPLE))))
+    
+    (foreach example in examples do
+       (if (eql? (nth (input example) (feature-index tree)) one-wrapper)
+	   (push true-examples example)
+	 (push false-examples example)))
+    
+    (sort-examples-by-tree
+     (true-branch tree) true-examples sorted-examples)
+    (sort-examples-by-tree
+     (false-branch tree) false-examples sorted-examples)))
+
+
+(defun assert-induced-rules ()
+  :command? TRUE
+  (let ((command nil)
+	(name SYMBOL NULL)
+	(vars (LIST of SYMBOL) NULL)
+	(types nil))
+    (foreach rule in *Induced-Decision-Rules* do
+	(setq name (intern-symbol 
+		    (concatenate "Induced-Rule-" 
+				 (stringify *Induced-Rule-Counter*))))
+	(setq vars (get-variables-from-cons-propositions rule))
+	(setq types nil)
+	(if *Enable-User-Thing*
+	    (foreach var in vars
+		collect (bquote (& var USER-THING)) into types)
+	  (foreach var in vars collect var into types))
+		
+	(++ *Induced-Rule-Counter*)
+	(setq command
+	  (bquote (defrule & name (forall & types & (copy-cons-tree rule)))))
+	
+	(if *LOG-INDUCED-RULES* 
+	  (print command EOL EOL)
+	  (print "Asserting " name EOL))
+	(evaluate-logic-command command false))))
+
+(defun set-candidate-clauses ((class-name SYMBOL))
+    ;; Set candidate clauses from original match rule
+    (let ((clauses (lookup *Case-Antecedent-Table*
+			   (concatenate (symbol-name class-name) 
+					"-match"))))
+      (setq *Candidate-Clauses* (new (VECTOR of CONS) 
+				     :array-size (length clauses)))
+      (foreach clause in clauses 
+	  as k in (interval 0 NULL) do
+	    (setf (nth *Candidate-Clauses* k) clause))))
+
+
+(defun (get-variables-from-proposition-list (LIST of SYMBOL))
+    ((props (LIST of PROPOSITION)))
+  (let ((the-list (new (LIST of SYMBOL)))
+	(variable SYMBOL NULL))
+    (foreach prop in props do
+       (case (kind prop)
+	 ((:OR :NOT :AND)
+	  (foreach var in (get-variables-from-proposition-list 
+			   (cast (listify (arguments prop))
+				 (list of proposition))) do
+		(insert-new the-list var)))
+	 (otherwise
+	  (foreach arg in (arguments prop) do
+	     (typecase arg
+	       (PATTERN-VARIABLE (setq variable (skolem-name arg)))
+	       (SYMBOL (setq variable arg))
+	       (SURROGATE (setq variable (intern-symbol (symbol-name arg))))
+	       ((FLOAT-WRAPPER INTEGER-WRAPPER STRING)
+		(setq variable NULL))
+	       (PROPOSITION
+		(print "Dave, you've got a proposition" EOL))
+	       (LOGIC-OBJECT (setq variable (object-name arg))))
+	     (when (defined? variable)
+	     (insert-new the-list variable))))))
+    (return the-list)))
+
+
+(defun (get-variables-from-cons-propositions (LIST of SYMBOL))
+    ((props (CONS of CONS)))
+  (return 
+    (help-get-variables-from-cons-propositions props
+					       (new (LIST of SYMBOL)))))
+
+(defun (help-get-variables-from-cons-propositions (LIST of SYMBOL))
+    ((ele PARSE-TREE)
+     (the-list (LIST of SYMBOL)))
+  (typecase ele
+    (CONS
+     (foreach arg in ele do
+	(help-get-variables-from-cons-propositions arg the-list)))
+    (SYMBOL
+     (when (eql? (nth (symbol-name ele) 0) #\?)
+	     (insert-new the-list ele)))
+    (otherwise nil))
+  (return the-list))
+  
+			  
+(defun (get-propositions-from-decision-tree (LIST of PROPOSITION))
+    ((tree DECISION-TREE)) 
+  (when (null? (feature tree))
+    (return (new (LIST of PROPOSITION))))
+  (let ((the-list
+	 (concatenate 
+	   (get-propositions-from-decision-tree (true-branch tree))
+	   (get-propositions-from-decision-tree (false-branch tree)))))
+    (push the-list (proposition tree))
+    (return the-list)))
+
+
+
+    

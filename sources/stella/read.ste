@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: read.ste,v 1.56 2003/09/05 00:45:08 tar Exp
+;;; Version: read.ste,v 1.67 2006/05/11 07:06:22 hans Exp
 
 ;;; Stream tokenizers and the Stella reader.  
 
@@ -595,7 +595,7 @@
       :cpp "buffer[position] = ch"
       :java "buffer[position] = (byte)ch")))
 
-(defun (byte-array-read-sequence INTEGER)
+(defun (native-byte-array-read-sequence INTEGER)
     ((buffer TOKENIZER-BYTE-ARRAY) (stream NATIVE-INPUT-STREAM)
      (start INTEGER) (end INTEGER))
   ;; Read from `stream' filling `buffer' between `start' and `end' (depending
@@ -617,8 +617,54 @@
          catch (java.io.IOException e) {n = 0;}")
     (return (+ n start))))
 
+(defun (tokenizer-byte-array-read-sequence INTEGER)
+    ((buffer TOKENIZER-BYTE-ARRAY) (stream INPUT-STREAM)
+     (start INTEGER) (end INTEGER))
+  ;; Transfer a sequence of bytes from the tokenizer buffer associated with `stream'
+  ;; into `buffer'.
+  (let ((state (tokenizer-state stream))
+        (cursor (cursor state))
+        (internal-end (end state))
+        (internal-size (buffer-size state))
+        (echoStream (echo-stream stream)))
+    ;; First fill buffer if necessary:
+    (when (= cursor internal-end)
+      (when (read-into-tokenizer-buffer stream state -1)
+        (return 0))
+      (setq cursor (cursor state))
+      (setq internal-end (end state))
+      (when (= cursor internal-size)
+        (setq cursor 0)))
+    ;; Copy over items
+    (let ((read-size (min (- end start) (- internal-end cursor)))
+          (original-start start)
+          (internal-buffer (buffer state)))
+      (foreach i in (interval 1 read-size)
+        do (ignore i)
+           (setf (byte-array-nth buffer start)
+                 (byte-array-nth internal-buffer cursor))
+           (++ start)
+           (++ cursor))
+      (when (defined? echoStream)
+        (byte-array-write-sequence buffer echoStream original-start end))
+    (setf (cursor state) cursor)
+    (return read-size))))
+
+(defun (byte-array-read-sequence INTEGER)
+    ((buffer TOKENIZER-BYTE-ARRAY) (stream INPUT-STREAM)
+     (start INTEGER) (end INTEGER))
+  :public? TRUE
+  :documentation "Read from `stream' filling `buffer' between `start' and `end' (depending
+on how many characters are available).
+Return the actual end pointer to the input read into `buffer'.  EOF is
+indicated by the return value being equal to start."
+  ;; This implements the Common-Lisp `read-sequence' semantics.
+  (if (defined? (tokenizer-state stream))
+    (return (tokenizer-byte-array-read-sequence buffer stream start end))
+    (return (native-byte-array-read-sequence buffer stream start end))))
+
 ;; SHOULD THIS GO SOMEWHERE ELSE?
-(defun byte-array-write-sequence
+(defun native-byte-array-write-sequence
     ((buffer TOKENIZER-BYTE-ARRAY) (stream NATIVE-OUTPUT-STREAM)
      (start INTEGER) (end INTEGER))
   ;; Write from `buffer' to `stream', using data in the buffer starting at position
@@ -632,6 +678,15 @@
         :java
         "try {stream.write(buffer, start, end - start);}
          catch (java.lang.Exception e) {}"))
+
+(defun byte-array-write-sequence
+    ((buffer TOKENIZER-BYTE-ARRAY) (stream NATIVE-OUTPUT-STREAM)
+     (start INTEGER) (end INTEGER))
+  :public? TRUE
+  :documentation "Write from `buffer' to `stream', using data in the buffer starting at position
+`start' stopping just before `end'."
+  ;; This implements the Common-Lisp `write-sequence' semantics.
+  (native-byte-array-write-sequence buffer stream start end))
 
 (defglobal *tokenizer-initial-buffer-size* INTEGER 2048)
 
@@ -710,24 +765,27 @@
       ;; We can't use `read-sequence' and have to use `read-character' or
       ;;    `read-line' instead, but we have to make sure it reads from the
       ;;    native stream:
-      (setf (tokenizer-state stream) NULL)
-      (case (buffering-scheme stream)
-        (:LINE
-  ;;;;; THIS WON'T WORK FOR FILES/STREAMS THAT TRAVELED ACROSS PLATFORMS
-  ;;;;; WE WOULD NEED TO WRITE A NATIVE READ-LINE THAT CAN HANDLE ALL THREE
-  ;;;;; EOL SEQUENCES AND POSSIBLY RETURNS A CODE INDICATING WHICH ONE IT
-  ;;;;; ENCOUNTERED.
-         (mv-setq (inputLine eof?) (read-line stream))
-         (when (null? inputLine)
-           (setq inputLine ""))
-         ;; WILL THIS WORK FOR DIFFERENT LINE BREAK CHARACTER SEQUENCES?
-         (setq inputLine (string-concatenate inputLine EOL-STRING)))
-        (:CHARACTER
-         (mv-setq (inputChar eof?) (read-character stream))
-         (if eof?
-             (setq inputLine "")
-           (setq inputLine (character-to-string inputChar)))))
-      (setf (tokenizer-state stream) state)
+      (unwind-protect 
+        (progn 
+          (setf (tokenizer-state stream) NULL)
+          (case (buffering-scheme stream)
+            (:LINE
+             ;;;;; THIS WON'T WORK FOR FILES/STREAMS THAT TRAVELED ACROSS PLATFORMS
+             ;;;;; WE WOULD NEED TO WRITE A NATIVE READ-LINE THAT CAN HANDLE ALL THREE
+             ;;;;; EOL SEQUENCES AND POSSIBLY RETURNS A CODE INDICATING WHICH ONE IT
+             ;;;;; ENCOUNTERED.
+             (setq inputLine (native-read-line stream))
+             (when (null? inputLine)
+               (setq inputLine "")
+               (setq eof? TRUE))
+             ;; WILL THIS WORK FOR DIFFERENT LINE BREAK CHARACTER SEQUENCES?
+             (setq inputLine (string-concatenate inputLine EOL-STRING)))
+            (:CHARACTER
+             (mv-setq (inputChar eof?) (read-character stream))
+             (if eof?
+               (setq inputLine "")
+               (setq inputLine (character-to-string inputChar))))))
+        (setf (tokenizer-state stream) state))
       (setq requiredSpace (length inputLine)))
     
     (ensure-tokenizer-buffer-size state currentTokenStart requiredSpace)
@@ -764,7 +822,7 @@
             (otherwise
              ;; For reading from files we use a double-buffer scheme that on
              ;;   average  uses two calls to `read-sequence' to fill the `buffer':
-             (setq end (byte-array-read-sequence buffer nativeStream start end))))
+             (setq end (native-byte-array-read-sequence buffer nativeStream start end))))
       (setf (end state) end)
       ;; Return TRUE on EOF:
       (return (or eof? (= start end))))))
@@ -810,7 +868,7 @@
       (error "Unread character " char " does not match last character read"))
     (setf (cursor state) cursor)))
 
-(defun (read-line-from-tokenizer-buffer STRING BOOLEAN) ((stream INPUT-STREAM))
+(defun (read-line-from-tokenizer-buffer STRING) ((stream INPUT-STREAM))
   ;; Read one line from the tokenizer buffer associated with `stream'.
   ;; THIS IS INEFFICIENT, SINCE IT USES `read-character-from-tokenizer-buffer'
   ;;    AND OUTPUT TO A STRING STREAM (WHICH COULD BE AVOIDED BY COPYING FROM
@@ -848,7 +906,7 @@
         (setq line (the-string buffer))
         (break))
       (print-stream buffer ch))
-    (return line eof?)))
+    (return line)))
 
 
   ;;
@@ -867,8 +925,47 @@
           (buffer-size :type INTEGER :initially *tokenizer-initial-buffer-size*)
           (cursor :type INTEGER :initially *tokenizer-initial-buffer-size*)
           (end :type INTEGER :initially *tokenizer-initial-buffer-size*)
+
+          ;; Tokenizer table state information.  The first two slots are
+          ;; the cached values.  For most operations with only a single table
+          ;; associated with the stream, only those slots will be used.  For
+          ;; the cases where multiple tokenizers are used on a stream, the
+          ;; state-dictionary slot will store the information of the additional
+          ;; tables.  It will only be created if more than one table is used
+          ;; with the tokenizer.  It is then created on demand in `get-tokenizer-state'
           (state :type INTEGER :initially 1)
+          (table :type TOKENIZER-TABLE)
+          (state-dictionary :type (DICTIONARY OF TOKENIZER-TABLE INTEGER-WRAPPER))
+
+          ;; Used as a manual recycle list for TOKENIZER-TOKENs
           (token-list :type TOKENIZER-TOKEN)))
+
+(defmethod (get-saved-state INTEGER) ((state-object TOKENIZER-STREAM-STATE)
+                                      (table TOKENIZER-TABLE))
+  ;; Manages the retrieval of table-specific saved state for a particular
+  ;; tokenizer state.   The state-dictionary is created only if the stream
+  ;;
+  ;;      First time called.
+  (cond ((null? (table state-object))
+         (setf (table state-object) table)
+         (return (state state-object)))
+	;; Current cache hits:
+        ((eql? (table state-object) table)
+         (return (state state-object)))
+	;; A different table is used.  If it was used before, we get
+	;; the old saved value.  Otherwise we reset it to the start state.
+	;; ALTERNATE STRATEGY:  Always set it to the start state on change?
+	;; If we do that, we can then eliminate the state dictionary altogether.
+        (otherwise
+         (when (null? (state-dictionary state-object))
+           (setf (state-dictionary state-object) (new KEY-VALUE-LIST)))
+         (insert-at (state-dictionary state-object)
+                    (table state-object)
+                    (state state-object))
+         (let ((saved-state (lookup (state-dictionary state-object) table)))
+           (if (defined? saved-state)
+             (return saved-state)
+             (return 1))))))		; Start state is default value.
 
 ;; Indicates the type of the input stream for the curren invocation of
 ;;    `with-tokenizer' (allows us to distinguish between regular
@@ -924,7 +1021,7 @@
                                   (tokenizer-state tok_inputStream_)))
                          (tok_buffer_ (buffer tok_streamState_))
                          (tok_size_ (buffer-size tok_streamState_))
-                         (tok_state_ (state tok_streamState_))
+                         (tok_state_ (get-saved-state tok_streamState_ tok_table_))
                          (tok_nextState_ tok_state_)
                          (tok_cursor_ (cursor tok_streamState_))
                          (tok_end_ (end tok_streamState_))
@@ -1082,6 +1179,7 @@
        ;;    which is why we make it user controllable (it is done by default
        ;;    with every call to `get-next-token').
        (setf (cursor tok_streamState_) tok_cursor_)
+       (setf (table tok_streamState_) tok_table_)
        (setf (state tok_streamState_) tok_state_)))))
              
 (defmacro get-next-token (&body (options CONS))
@@ -1763,9 +1861,15 @@ according to a particular tokenization `table'."
                 (setq cursor (1- size))
               (break)))
           (when (even? nofEscapes)
-            (setq separatorPosition (- separatorPosition tokenStart))
             (when fullyEscaped?
-              (-- separatorPosition))
+              (-- separatorPosition)
+              (when (< separatorPosition 0)
+                (setq separatorPosition (+ separatorPosition size)))
+              (when (not (eql? (byte-array-nth buffer separatorPosition)
+                               MODULE-SEPARATOR-CHARACTER))
+                ;; we must have a surrogte, e.g.: MOD/@|Foo|
+                (-- separatorPosition)))
+            (setq separatorPosition (- separatorPosition tokenStart))
             (if (< separatorPosition 0)
                 (return (+ separatorPosition size))
               (return separatorPosition))))
@@ -1996,6 +2100,161 @@ according to a particular tokenization `table'."
           (return NULL)
         (return tokenList)))))
 
+;;; Specialized symbol tokenizer for strings (for efficiency).
+;;; IMPORTANT: If `tokenize-s-expression's handling of symbols
+;;; changes, this function most likely needs to be changed too.
+
+(defun (parse-stella-name STRING STRING KEYWORD)
+    ((name STRING) (enableCaseConversion? BOOLEAN))
+  :documentation
+  "Parse the printed representation `name' of a STELLA symbol, surrogate or
+keyword and return its symbol name, module name and type (which is either
+:SYMBOL, :SURROGATE or :KEYWORD).  `name' can be qualified and must use the
+exact same syntax and escape characters that would be used if it were to be
+read by `read-s-expression-from-string' (or `unstringify').  If
+`enableCaseConversion?' is TRUE, the returned symbol name will be upcased if
+the current module is case-insensitive; otherwise, it will be returned as is.
+Raises a read exception if `name' does not represent a symbol.
+This function is available primarily for efficiency, since it is about
+10-15 times faster than `unstringify'."
+  :public? TRUE
+  (let ((symbolName STRING NULL)
+        (moduleName STRING NULL)
+        (symbolType KEYWORD NULL)
+        (separatorPos 0)
+        (upcase? (and enableCaseConversion?
+                      (not (case-sensitive? *module*))))
+        (result GENERALIZED-SYMBOL NULL))
+    (with-stella-tokenizer name
+      (get-next-stella-token FALSE)
+      (when (end-of-tokens?)
+        (return NULL NULL NULL))
+      (case (get-stella-token-type)
+        (:SYMBOL
+         (case (get-token-type)
+           (:SYMBOL
+            (setq symbolName (get-token-text upcase?)))
+           (:QUALIFIED-SYMBOL
+            (setq separatorPos (get-qualified-symbol-separator-position))
+            (setq symbolName (get-token-text upcase? (1+ separatorPos)))
+            (setq moduleName
+              (choose (= separatorPos 0)
+                      "ROOT-MODULE"
+                      (get-token-text TRUE 0 separatorPos))))
+           (:FULLY-ESCAPED-SYMBOL
+            (setq symbolName
+              (unescape-token-string (get-token-text FALSE 1) #\\ FALSE)))
+           (:QUALIFIED-FULLY-ESCAPED-SYMBOL
+            (setq separatorPos
+              (get-qualified-symbol-separator-position :FULLY-ESCAPED))
+            (setq symbolName
+              (unescape-token-string
+               (get-token-text FALSE (+ separatorPos 2)) #\\ FALSE))
+            (setq moduleName
+              (choose (= separatorPos 0)
+                      "ROOT-MODULE"
+                      (get-token-text TRUE 0 separatorPos))))
+           (:ESCAPED-SYMBOL
+            (setq symbolName
+              (unescape-token-string (get-token-text) #\\ upcase?)))
+           (:QUALIFIED-ESCAPED-SYMBOL
+            (setq separatorPos
+              (get-qualified-symbol-separator-position :ESCAPED))
+            (setq symbolName
+              (unescape-token-string
+               (get-token-text FALSE (1+ separatorPos)) #\\ upcase?))
+            (setq moduleName
+              (choose (= separatorPos 0)
+                      "ROOT-MODULE"
+                      (get-token-text TRUE 0 separatorPos))))
+           (:CL-SYMBOL
+            (setq symbolName (get-token-text TRUE 3))
+            (setq moduleName "/COMMON-LISP"))))
+        (:SURROGATE
+         (case (get-token-type)
+           (:SURROGATE
+            (setq symbolName (get-token-text upcase? 1)))
+           (:QUALIFIED-SURROGATE
+            (setq separatorPos (get-qualified-symbol-separator-position))
+            (setq symbolName (get-token-text upcase? (+ separatorPos 2)))
+            (setq moduleName
+              (choose (= separatorPos 0)
+                      "ROOT-MODULE"
+                      (get-token-text TRUE 0 separatorPos))))
+           (:FULLY-ESCAPED-SURROGATE
+            (setq symbolName
+              (unescape-token-string (get-token-text FALSE 2) #\\ FALSE)))
+           (:QUALIFIED-FULLY-ESCAPED-SURROGATE
+            (setq separatorPos
+              (get-qualified-symbol-separator-position :FULLY-ESCAPED))
+            (setq symbolName
+              (unescape-token-string
+               (get-token-text FALSE (+ separatorPos 3)) #\\ FALSE))
+            (setq moduleName
+              (choose (= separatorPos 0)
+                      "ROOT-MODULE"
+                      (get-token-text TRUE 0 separatorPos))))
+           (:ESCAPED-SURROGATE
+            (setq symbolName
+              (unescape-token-string (get-token-text FALSE 1) #\\ upcase?)))
+           (:QUALIFIED-ESCAPED-SURROGATE
+            (setq separatorPos
+              (get-qualified-symbol-separator-position :ESCAPED))
+            (setq symbolName
+              (unescape-token-string
+               (get-token-text FALSE (+ separatorPos 2)) #\\ upcase?))
+            (setq moduleName
+              (choose (= separatorPos 0)
+                      "ROOT-MODULE"
+                      (get-token-text TRUE 0 separatorPos))))))
+        (:KEYWORD
+         (case (get-token-type)
+           (:KEYWORD
+            (setq symbolName  (get-token-text TRUE 1)))
+           (:FULLY-ESCAPED-KEYWORD
+            (setq symbolName
+              (unescape-token-string (get-token-text FALSE 2) #\\ FALSE)))
+           (:ESCAPED-KEYWORD
+            (setq symbolName
+              (unescape-token-string (get-token-text FALSE 1) #\\ TRUE)))))
+        (:ERROR
+         (signal-read-error "Illegal read syntax: " (get-token-text)))
+        (otherwise
+         (signal-read-error "Illegal symbol syntax: " (get-token-text)
+                            " in state " (get-token-type))))
+      (setq symbolType (get-stella-token-type))
+      (get-next-stella-token FALSE)
+      (if (or (end-of-tokens?)
+              (eql? (get-token-type) :CLOSE-FULLY-ESCAPED-NAME))
+          (return symbolName moduleName symbolType)
+        (signal-read-error "Garbage found after " (symbol-name result))))))
+
+(defun (qualified-stella-name? BOOLEAN) ((name STRING))
+  :documentation
+  "Return TRUE if `name' is a symbol or surrogate qualified with a module
+pathname or a module pathname ending with a `/'.  Assumes that `name'
+is the printed representation of a STELLA symbol (potentially containing
+escape characters)."
+  :public? TRUE
+  (with-stella-tokenizer name
+    (get-next-stella-token FALSE)
+    (when (end-of-tokens?)
+      (return FALSE))
+    (case (get-token-type)
+      ((:QUALIFIED-SYMBOL
+        :QUALIFIED-FULLY-ESCAPED-SYMBOL
+        :QUALIFIED-ESCAPED-SYMBOL
+        :QUALIFIED-SURROGATE
+        :QUALIFIED-FULLY-ESCAPED-SURROGATE
+        :QUALIFIED-ESCAPED-SURROGATE)
+       (return TRUE))
+      (:QUALIFIED-NAME
+       ;; exclude the unqualified division symbol:
+       (return (not (eql? name "/"))))
+      (otherwise
+       (return FALSE)))))
+
+
 ;;; Performance:
 ;;; - Without interning symbols we are quite a bit faster than the Lisp reader
 ;;;   (8.5 vs 13.2 seconds on the 4MB krk.ste file with 20000 symbols and
@@ -2040,7 +2299,8 @@ according to a particular tokenization `table'."
                                (get-stella-module moduleName FALSE)
                                *module*)))
            (cond ((null? module)
-                  (signal-read-error "Module " moduleName " does not exist"))
+                  (signal-read-error "Module " moduleName " does not exist;"
+                                     " current token=" name))
                  ((eql? tokenType :SURROGATE)
                   (setq parsedToken
                     (intern-surrogate-in-module name module FALSE)))
@@ -2250,13 +2510,15 @@ return the result."
     (setf (cursor state) length)
     (setf (end state) length)
     (setf (state state) 1)
+    (setf (table state) null)
+    (setf (state-dictionary state) null)
     (setf (token-list state) (new STELLA-TOKEN))
     (setf (tokenizer-state stream) state)
     (return stream)))
 
-(defun (read-line STRING BOOLEAN) ((inputStream INPUT-STREAM))
-  :documentation "Read one line from `inputStream' and return the result.
-Return `true' as the second value on EOF."
+(defun (native-read-line STRING) ((inputStream INPUT-STREAM))
+  :documentation "Read one line from `inputStream' using the native language
+readline algorithm and return the result.  On EOF return `null'"
   :public? TRUE
   (when (defined? (tokenizer-state inputStream))
     (return (read-line-from-tokenizer-buffer inputStream)))
@@ -2281,7 +2543,172 @@ Return `true' as the second value on EOF."
     (when (and (defined? echoStream)
                (defined? input))
       (print-stream echoStream input EOL))
-    (return input (null? input))))
+    (return input)))
+
+(defglobal *read-line-tokenizer-table-definition* CONS
+  (bquote ((:start * (#\linefeed) :initial-linefeed
+                   * (#\return) :initial-return
+                   :eof :eof
+                   * :otherwise :line)
+           (:initial-linefeed :include :linefeed)
+           (:initial-return :include :return)
+           (:return  * (#\linefeed) :linefeed
+                     * (#\return) :initial-return
+                     :eof :eof
+                     * :otherwise :line)
+           (:linefeed :eof :eof
+                      * (#\linefeed) :initial-linefeed
+                      * (#\return) :initial-return
+                      * :otherwise :line)
+           (:line * (#\linefeed) :linefeed
+		  * (#\return) :return
+                  * :eof :eof
+                  :otherwise :line
+                  )
+           (:error :include :start)))
+  :public? FALSE)
+
+;; NEW READLINE TOKENIZER TABLE.  But this one has problems when
+;; used on an interactive stream like STANDARD-INPUT.  It will not
+;; return on a single CR terminator, because it is still looking
+;; to see if there will be a following LF terminator or not.
+;; It should therefore only be used by the read-line2 code, which
+;; should in turn not be used on terminal or network streams.
+
+(defglobal *read-line2-tokenizer-table-definition* CONS
+  (bquote ((:start * (#\linefeed) :linefeed
+                   * (#\return) :return
+                   :eof :eof
+                   * :otherwise :line)
+           (:line  * (#\linefeed) :linefeed
+                   * (#\return) :return
+                   * :eof :eof
+                   :otherwise :line)
+           (:return  * :eof :eof
+                     (#\linefeed) :return-linefeed
+                     * (#\return) :return
+                     * :otherwise :line)
+           (:linefeed :eof :eof
+                      * (#\linefeed) :linefeed
+                      * (#\return) :return
+                      * :otherwise :line)
+           (:return-linefeed
+                      * :eof :eof
+                      * (#\linefeed) :linefeed
+                      * (#\return) :return
+                      * :otherwise :line)
+           (:error :include :start)))
+  :public? FALSE)
+
+(defglobal *read-line-tokenizer-table* TOKENIZER-TABLE NULL
+  :public? FALSE)
+(defglobal *read-line2-tokenizer-table* TOKENIZER-TABLE NULL
+  :public? FALSE)
+
+(startup-time-progn :final
+   (setq *read-line-tokenizer-table* 
+         (parse-tokenizer-definition *read-line-tokenizer-table-definition*))
+   (setq *read-line2-tokenizer-table* 
+         (parse-tokenizer-definition *read-line2-tokenizer-table-definition*)))
+
+(defun (read-line STRING) ((stream INPUT-STREAM))
+  :public? TRUE
+  :documentation "Read one line from `stream' and return the result.
+This differs from `native-read-line' in that it is not platform-dependent.
+It recognizes any of the three common line ending formats: CR, LF, CR-LF
+in any combination.  It is not as fast as `native-read-line', however."
+  (when (eql? stream STANDARD-INPUT)
+    ;; `read-line' doesn't seem to do quite the right thing on interactive
+    ;; streams for PowerLoom's `demo' command, this works around that but
+    ;; might fail in cases somebody redirects the stream to a file:
+    (return (native-read-line stream)))
+  (with-tokenizer *read-line-tokenizer-table* stream
+    (loop
+      (get-next-token FALSE)
+      (when (end-of-tokens?)
+        (save-tokenizer-stream-state)
+        (return NULL))
+      (case (get-token-type)
+        (:LINE
+         (save-tokenizer-stream-state)
+         (return (get-token-text)))
+        ((:RETURN :LINEFEED))
+        ((:INITIAL-LINEFEED :INITIAL-RETURN)
+         (save-tokenizer-stream-state)
+         (return ""))
+        (:ERROR
+         (save-tokenizer-stream-state)
+         (signal-read-error "Illegal read syntax: " (get-token-text)))))))
+
+#|
+;; This is a read-line routine that uses the read-line2 tokenizer table.
+;; Unfortunately it doesn't work reliably on interactive (terminal) or
+;; network streams that use only a CR as a terminator.
+(defun (read-line STRING) ((stream INPUT-STREAM))
+  :public? TRUE
+  :documentation "Read one line from `stream' and return the result.
+This differs from `native-read-line' in that it is not platform-dependent.
+It recognizes any of the three common line ending formats: CR, LF, CR-LF
+in any combination.  It is not as fast as `native-read-line', however."
+  (let ((line ""))
+    (with-tokenizer *read-line-tokenizer-table* stream
+      (loop
+        (get-next-token FALSE)
+        (when (end-of-tokens?)
+          (save-tokenizer-stream-state)
+          (if (eql? line "")
+            (return NULL)
+            (return line)))
+        (case (get-token-type)
+          (:LINE
+           (setq line (get-token-text)))
+          (:LINEFEED
+           (save-tokenizer-stream-state)
+           (return line))
+          (:RETURN-LINEFEED
+           (save-tokenizer-stream-state)
+           (return line))
+          (:RETURN
+           (save-tokenizer-stream-state)
+           (return line))
+          (:ERROR
+           (save-tokenizer-stream-state)
+           (signal-read-error "Illegal read syntax: " (get-token-text))))))))
+|#
+
+(defun (read-line2 STRING KEYWORD) ((stream INPUT-STREAM))
+  :PUBLIC? TRUE
+  :documentation "Read one line from `stream' and return the result and
+a keyword that indicates the terminator for that line ending:
+`:CR' `:LF' `:CRLF' or `:EOF'.   This is not platform-dependent
+and differs from `read-line' by returning a second value.  It
+may hang when used on interactive streams such as terminal or
+network streams with only CR line endings.  It should only be
+used on file or string input streams."
+  (let ((line ""))
+    (with-tokenizer *read-line-tokenizer-table* stream
+      (loop
+        (get-next-token FALSE)
+        (when (end-of-tokens?)
+          (save-tokenizer-stream-state)
+          (if (eql? line "")
+            (return NULL :EOF)
+            (return line :EOF)))
+        (case (get-token-type)
+          (:LINE
+           (setq line (get-token-text)))
+          (:LINEFEED
+           (save-tokenizer-stream-state)
+           (return line :LF))
+          (:RETURN-LINEFEED
+           (save-tokenizer-stream-state)
+           (return line :CRLF))
+          (:RETURN
+           (save-tokenizer-stream-state)
+           (return line :CR))
+          (:ERROR
+           (save-tokenizer-stream-state)
+           (signal-read-error "Illegal read syntax: " (get-token-text))))))))
 
 (defun (read-character CHARACTER BOOLEAN) ((inputStream INPUT-STREAM))
   :documentation "Read one character from `inputStream' and return the result.
@@ -2399,6 +2826,19 @@ the input is read.  See also special variable `*USER-QUERY-ACTION*'."
 	     (otherwise NULL)))
 	 (print "Type `y' for yes or `n' for no." EOL))))))
 
+(defmethod (stream-to-string STRING) ((from INPUT-STREAM))
+  :public? TRUE
+  :documentation "Read all of the input from `stream' and return it as a string."
+  (let ((to (new OUTPUT-STRING-STREAM))
+        (buffer (make-tokenizer-byte-array *tokenizer-initial-buffer-size*))
+        (bytes-read 0))
+    (loop 
+      (setq bytes-read (byte-array-read-sequence buffer from
+                                                 0 *tokenizer-initial-buffer-size*))
+      (if (> bytes-read 0)
+        (byte-array-write-sequence buffer to 0 bytes-read)
+        (break)))
+    (return (the-string to))))
 
   ;;
 ;;;;;; Testing/Benchmarking

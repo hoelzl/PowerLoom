@@ -1,0 +1,456 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: http.ste,v 1.6 2006/05/11 02:24:08 hans Exp
+
+(in-package "STELLA")
+
+(in-module "UTILITIES")
+
+(defclass HTTP-EXCEPTION (READ-EXCEPTION)
+  :public-slots ((error-code :type INTEGER)))
+
+(defun (handle-http-header-first-line STRING INTEGER STRING) 
+    ((line STRING) (fields (DICTIONARY OF STRING-WRAPPER STRING-WRAPPER)))
+  :public? TRUE
+  :documentation "Handles the first line of an http header.  
+Returns version, response code, response message.  The first
+line is inserted into `fields' fields with the empty string key \"\"
+This is a low-level utility routine that can be used to build custom
+message parsing code."
+  (let ((space1 (position line #\Space 0))
+	(space2 (choose (null? space1) 
+			NULL-INTEGER
+			(position line #\Space (+ space1 1)))))
+    (when (null? space2)
+      (error "Malformed header line: " line))
+    (insert-at fields "" line)
+    (return (subsequence line 0 space1)
+	    (string-to-integer (subsequence line (+ space1 1) space2))
+	    (subsequence line (+ space2 1) NULL)) ))
+
+(defun handle-http-header-other-line
+    ((line STRING) (fields (DICTIONARY OF STRING-WRAPPER STRING-WRAPPER)))
+  :public? TRUE
+  :documentation "Handles header lines other than the first one.
+Each such line is inserted into `fields' as keyword value pairs.
+This is a low-level utility routine that can be used to build custom
+message parsing code."
+  ;; Handles the other lines.  Inserts header into fields.
+  (let ((colon-position (position line #\: 0)))
+    (if (null? colon-position)
+      (error "Bad header seen: " line)
+      (insert-at fields
+		 (subsequence line 0 colon-position)
+		 (subsequence line (+ colon-position 2) NULL)))))
+
+
+(defun (decompose-internet-url STRING STRING STRING STRING STRING STRING STRING) ((url STRING))
+  :public? TRUE
+  :documentation "Takes an internet style URL and returns the components of
+that URL as specified below.  Missing elements return the empty string \"\".
+  PROTOCOL USERNAME:PASSWORD DOMAIN PORT PATH QUERY FRAGMENT
+
+  o Protocol.  The access protocol.
+
+       Those schemes which refer to internet protocols mostly have a
+       common syntax for the rest of the object name. This starts with a
+       double slash '//' to indicate its presence, and continues until
+       the following slash '/':
+
+  o An optional user name, if required (as it is with a few FTP servers).
+    The password, if present, follows the user name, separated from it by a colon;
+    the user name and optional password are followed by a commercial at sign '@'. 
+  o The internet domain name of the host
+  o The port number, if it is not the default number for the protocol,
+    is given in decimal notation after a colon.
+  o Path The path is a hierarchical representation of a particular path. It may 
+    define details of how the client should communicate with the server, including
+    information to be passed transparently to the server without any processing by
+    the client.
+    The path is interpreted in a manner dependent on the scheme being used.
+    Generally, the reserved slash '/' character (ASCII 2F hex) denotes a level in a
+    hierarchical structure, the higher level part to the left of the slash.
+  o Query is the part of the hierarchical information following a '?' character.
+  o Fragment is the part of the hierarchical information following a '#' character.
+
+References:  http://www.gbiv.com/protocols/uri/rfc/rfc3986.html
+"
+  (let ((field-start 0)
+        (field-end (string-search url #\: 0))
+        (protocol STRING "")
+        (user-information STRING "")
+        (domain-name STRING "")
+        (port-number STRING "")
+        (path STRING "")
+        (query STRING "")
+        (fragment STRING ""))
+    (when (defined? field-end)
+      (setq protocol (subsequence url 0 field-end))
+      (if (= field-end (string-search url "://" field-end))
+        (++ field-end 3)                          ; Skip over ://  SHOULD CHECK for //!
+        (++ field-end 1))
+      (setq field-start field-end)
+      (setq field-end (position url #\/ field-start))
+      (setq domain-name (subsequence url field-start field-end))
+      (setq field-start field-end))
+
+    (setq field-end (position url #\? field-start))
+    (if (defined? field-end)
+      (progn 
+        (setq path (subsequence url field-start field-end))
+        (setq field-start (+ field-end 1))
+        (setq field-end (position url #\# field-start))
+        (if (defined? field-end)
+          (progn 
+            (setq query (subsequence url field-start field-end))
+            (setq field-start (+ field-end 1))
+            (setq fragment (subsequence url field-start NULL)))
+          (setq query (subsequence url field-start NULL))))
+      (progn
+        (setq field-end (position url #\# field-start))
+        (if (defined? field-end)
+          (progn 
+            (setq path (subsequence url field-start field-end))
+            (setq field-start (+ field-end 1))
+            (setq fragment (subsequence url field-start NULL)))
+          (setq path (subsequence url field-start NULL)))))
+
+    ;; Check for optional user information:
+    (setq field-end (position domain-name #\@ 0))
+    (when (defined? field-end)
+      (setq user-information (subsequence domain-name 0 field-end))
+      (setq domain-name (subsequence domain-name (+ field-end 1) NULL)))
+
+    ;; Check for optional port information:
+    (setq field-start (position domain-name #\: 0))
+    (when (defined? field-start)
+      (setq port-number (subsequence domain-name (+ field-start 1) NULL))
+      (setq domain-name (subsequence domain-name 0 field-start)))
+
+    (return protocol user-information domain-name port-number path query fragment)))
+
+
+#|
+;; New Version
+;;; The new version does not perform quite as well as the older version.
+;;; The problem is that the new read-line code uses tokenizer buffers,
+;;; and thus permanently associate a tokenizer buffer with the input
+;;; stream.  This in turn makes READ-SEQUENCE (used, for example in getting
+;;; an HTTP page into a string) run about half as fast and greatly increase
+;;; the consing for subsequent processing.
+;;;
+;;;  On MCL retrieving the Loom home page from www.isi.edu, the difference is
+;;;     New:  0.239s  and 172,336 bytes
+;;;     Old:  0.079s  and  53,304 bytes
+;;;
+;;; Might as well keep the old version, since it works.
+
+(defun (read-http-header INTEGER STRING STRING)
+    ((stream INPUT-STREAM) (fields (DICTIONARY OF STRING-WRAPPER STRING-WRAPPER)))
+  :public? TRUE
+  :documentation "Reads the HTTP header from `stream', parses the header fields
+and stores the results in `fields'.  The first line of the response will be
+stored in `fields' with the empty string \"\" as the key.  Other values will
+have the header name as the key.  The first return value is the response code
+of the HTTP request.  A response of 200 indicates success.  Other common
+responses are 404 (page not found).  The second return value is the message
+associated with the code.  The third return value is the version information.
+If the stream ends before a valid header is read, then `null' is returned for
+all values."
+
+  (mv-bind (version-string response-code response-message)
+           (handle-http-header-first-line (read-line stream) fields)
+    (foreach line in (lines stream)
+      do (if (eql? line "")
+           (break)                   ; End of header
+           (handle-http-header-other-line line fields)))
+    (return response-code response-message version-string)))
+|#
+
+;; Old version:
+
+(defun (read-http-header INTEGER STRING STRING)
+    ((stream INPUT-STREAM) (fields (DICTIONARY OF STRING-WRAPPER STRING-WRAPPER)))
+  :public? TRUE
+  :documentation "Reads the HTTP header from `stream', parses the header fields
+and stores the results in `fields'.  The first line of the response will be
+stored in `fields' with the empty string \"\" as the key.  Other values will
+have the header name as the key.  The first return value is the response code
+of the HTTP request.  A response of 200 indicates success.  Other common
+responses are 404 (page not found).  The second return value is the message
+associated with the code.  The third return value is the version information.
+If the stream ends before a valid header is read, then `null' is returned for
+all values."
+  (let ((buffer (make-raw-mutable-string 1024))
+	(first-line? TRUE)
+	(response-code INTEGER NULL)
+	(response-message STRING NULL)
+	(version-string STRING NULL)
+	(ch CHARACTER NULL)
+	(index 0)
+	(eof? FALSE)
+	(return? FALSE))
+    (mv-setq (ch eof?) (read-character stream))
+    (while (not eof?)
+      (case ch
+	(#\Return
+	 (if return?
+	   (progn 
+	     ;(warn "Two return characters in a row")
+	     (break))
+	   (setq return? TRUE)))
+	(#\Linefeed
+	 (unless return? 
+	   ;(warn "Linefeed seen without preceding return")
+	   )
+	 (cond ((= index 0)		; Blank line ends header
+		(break))
+	       (first-line?		; this is the header line
+		(mv-setq (version-string response-code response-message)
+		  (handle-http-header-first-line (subsequence buffer 0 index) fields))
+		(setq first-line? FALSE))
+	       (otherwise
+		(handle-http-header-other-line (subsequence buffer 0 index) fields)))
+	 (setq return? FALSE)
+	 (setq index 0))
+	(otherwise
+	 (when return?			; For robustness, no CR-LF
+	   ;(warn "Return not followed by linefeed")
+	   (cond ((= index 0)		; Blank line ends header
+		  (break))
+		 (first-line?		; this is the header line
+		  (mv-setq (version-string response-code response-message)
+		    (handle-http-header-first-line (subsequence buffer 0 index) fields))
+		  (setq first-line? FALSE))
+		 (otherwise
+		  (handle-http-header-other-line (subsequence buffer 0 index) fields))))
+	 (setf (nth buffer index) ch)
+	 (++ index)
+	 (setq return? FALSE)))
+      (mv-setq (ch eof?) (read-character stream)))
+    (return response-code response-message version-string) ))
+
+
+(defun write-http-request ((stream OUTPUT-STREAM) (method STRING) (host STRING) (url-path STRING)
+                           (headers DICTIONARY) (content STRING))
+  :public? TRUE
+  :documentation "Send `content' as an HTTP 1.0 request on `stream' using `method'.
+The request is sent to `url-path' at `host'.  The `stream' must be a TCP-stream
+that is connected to `host' at the appropriate port."
+  (print-stream stream method " " url-path " HTTP/1.0" #\Return #\Linefeed)
+  (when (defined? host)
+    (when (null? headers) (setq headers (new PROPERTY-LIST)))
+    (insert-at headers "Host" host))
+  (when (defined? content)
+    (when (null? headers) (setq headers (new PROPERTY-LIST)))
+    (insert-at headers "Content-Length" (integer-to-string (length content))))
+  (when (defined? headers)
+    (foreach (key value) in headers
+      do (print-stream stream (unwrap-string key) ": " (unwrap-string value)
+                       #\Return #\Linefeed)))
+  (print-stream stream #\Return #\Linefeed)
+  (when (defined? content)
+    (print-stream stream content))
+  (flush-output stream))
+
+(defun write-post-request ((stream OUTPUT-STREAM) (host STRING) (url-path STRING) 
+                           (headers DICTIONARY) (content STRING))
+  (write-http-request stream "POST" host url-path headers content))
+
+(defun (post-data STRING)
+    ((host STRING) (port INTEGER) (url-path STRING) (headers DICTIONARY) (content STRING))
+  :public? TRUE
+  :documentation "Posts `content' as data to `url-path' on `host' and `port'.
+The port value for standard http servers is 80.  Returns the body of the
+reply message as a string, if successful.  Otherwise an HTTP-EXCEPTION is
+signaled."
+  (let ((return-headers (new KEY-VALUE-LIST)))
+    (special ((*printreadably?* FALSE))
+      (with-network-stream (in out host port)
+	 ;; Send request
+	 (write-post-request out host url-path headers content)
+	 ;; Read and parse reply
+	 (mv-bind (return-Code return-Message version)
+		  (read-http-header in return-headers)
+		  (ignore version)
+;              (print "Headers:" EOL)
+;              (foreach (key val) in return-headers
+;                do (print key "=" val eol))
+;; This should really handle all of the 200-series return codes
+;; without an error, but right now we only handle simple success.
+	  (if (= return-Code 200)	; HTTP SUCCESS
+	      (return (stream-to-string in))
+	      (let ((ex (new HTTP-EXCEPTION :message return-message
+			                     :error-code return-code)))
+                  (print "code = " return-code "    message = " return-message "    version = " version)
+                  (signal-exception ex))
+;                (signal-exception (new HTTP-EXCEPTION :message return-message
+;                                       :error-code return-code))
+                ))) )))
+
+(defun (get-web-page STRING)
+       ((host STRING) (port INTEGER) (url-path STRING) (return-headers DICTIONARY))
+  :public? TRUE
+  :documentation "Gets the webpage describe by path `url-path' on `host' and `port'.
+The port value for standard http servers is 80.  If successful, 
+returns the body of the web message as a string.  The headers
+from the reply message will be set in `return-headers' if not
+`null'.  If an error occurs an HTTP-EXCEPTION is signaled."
+  (when (null? return-headers) (setq return-headers (new KEY-VALUE-LIST)))
+  (special ((*printreadably?* FALSE))
+    (with-network-stream (in out host port)
+      ;; Send request
+      (write-http-request out "GET" host url-path NULL NULL)
+      ;; Read and parse reply
+      (mv-bind (return-Code return-Message version)
+               (read-http-header in return-headers)
+        (ignore version)
+        ;              (print "Headers:" EOL)
+        ;              (foreach (key val) in return-headers
+        ;                do (print key "=" val eol))
+        ;; This should really handle all of the 200-series return codes
+        ;; without an error, but right now we only handle simple success.
+        (if (= return-Code 200)	; HTTP SUCCESS
+          (return (stream-to-string in))
+          (let ((ex (new HTTP-EXCEPTION :message return-message
+                         :error-code return-code)))
+            (print "code = " return-code "    message = " return-message "    version = " version)
+            (signal-exception ex))
+          ;                (signal-exception (new HTTP-EXCEPTION :message return-message
+          ;                                       :error-code return-code))
+          ))) ))
+
+(defun (build-full-url-hierarchical-part STRING) ((path STRING) (query STRING) (fragment STRING))
+  (if (empty? query)
+    (if (empty? fragment)
+      (return path)
+      (return (concatenate path "#" fragment)))
+    (if (empty? fragment)
+      (return (concatenate path "?" query))
+      (return (concatenate path "?" query "#" fragment)))))
+
+(defun (url-path-to-filename STRING) ((path STRING))
+  ;; Transform a URL path into a valid filename path.
+  (let ((separator (directory-separator)))
+    (if (eql? separator #\/)
+      (return (unescape-url-string path))
+      (progn 
+        (setq path (unescape-url-string (substitute path separator #\/)))
+        (when (and (eql? (operating-system) :MAC)
+                   (eql? (nth path 0) separator))
+          (setq path (subsequence path 1 NULL)))
+        (return path)))))
+
+(defun (open-url-stream INPUT-STREAM) ((url STRING))
+  :public? TRUE
+  :documentation "Opens an input stream to `url'.
+Currently only http: with no user name or password and file: urls on the local
+host with absolute pathnames are supported."
+  (mv-bind (protocol user-info host port path query fragment)
+           (decompose-internet-url url)
+    (cond ((string-eql? protocol "http")
+           (cond ((non-empty? user-info)
+                  (signal BAD-ARGUMENT-EXCEPTION
+                   "Only URL without user information are supported: " url))
+                 (otherwise
+                  (let ((in INPUT-STREAM NULL)
+                        (out OUTPUT-STREAM NULL)
+                        (return-headers (new KEY-VALUE-LIST)))
+	            (mv-setq (in out) 
+                             (open-network-stream host (choose (non-empty? port)
+                                                               (string-to-integer port)
+                                                               80)))
+                    ;; Send request
+                    (write-http-request out "GET" host
+                                        (build-full-url-hierarchical-part path query fragment)
+                                        NULL NULL)
+                    ;; Read and parse reply
+                    (mv-bind (return-Code return-Message version)
+                             (read-http-header in return-headers)
+                      (ignore version)
+                      ;              (print "Headers:" EOL)
+                      ;              (foreach (key val) in return-headers
+                      ;                do (print key "=" val eol))
+                      ;; This should really handle all of the 200-series return codes
+                      ;; without an error, but right now we only handle simple success.
+                      (if (= return-Code 200)	; HTTP SUCCESS
+                        (return in)
+                        (let ((ex (new HTTP-EXCEPTION :message return-message
+                                       :error-code return-code)))
+                          (print "code = " return-code "    message = " return-message "    version = " version)
+                          (when (defined? in)
+                            (free in))
+                          (when (defined? out)
+                            (free out))
+                          (signal-exception ex))))))))
+          ((string-eql? protocol "file")
+           (cond ((non-empty? user-info)
+                  (signal BAD-ARGUMENT-EXCEPTION
+                   "Only URL without user information are supported: " url))
+                 ((or (empty? host)
+                      (string-eql? host "localhost"))
+                  (return (new FILE-INPUT-STREAM :filename (url-path-to-filename path))))
+                 (otherwise
+                  (signal BAD-ARGUMENT-EXCEPTION
+                   "Only file URLs on the local host are supported: " url))))
+          (otherwise
+           (signal BAD-ARGUMENT-EXCEPTION
+                   "Only http and file URLs are supported: " url)))))
+
+
+(defmacro with-input-url ((binding CONS) &body (body CONS))
+  :public? TRUE
+  :documentation "Sets up an unwind-protected form which opens a URL for
+input and closes it afterwards.  The stream for reading is bound to the
+variable provided in the macro form.
+Syntax is `(WITH-INPUT-URL (var url) body+)'."
+  (let ((var SYMBOL (first binding)))
+    (return
+      (bquote 
+       (let ((& var INPUT-STREAM NULL))
+	 (unwind-protect
+	     (progn 
+	       (setq & var (open-url-stream & (second binding)))
+	       && body)
+	   (when (defined? & var)
+	     (free & var))))))))

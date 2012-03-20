@@ -1,0 +1,1126 @@
+; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: whynot.ste,v 1.16 2006/05/11 07:05:39 hans Exp
+
+;;; Support for generating WhyNot explanations
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+;;; TO DO:
+
+;;; - Problem: right now we can get explanations that are simply a subset
+;;;   of a previous one with some inferences replaced by simply UNKNOWN -
+;;;   these should be filtered out! - SHOULD BE FIXED NOW.
+;;; - implement new scoring mechanisms/alternatives:
+;;;   - make scores more complex objects and use methods on them to do
+;;;     different things for different situations
+;;;   + cutoff via max. number of unknowns
+;;;   - cutoff via unknown/known percentage
+;;; - new post-processing opportunity: if we have something like it is
+;;;   unknown whether we have 1.25 red units in the coa, we (1) shouldn't
+;;;   discard the information if that doesn't match the required value, and
+;;;   (2) we might want to present what's the actual value to the user to
+;;;   illustrate why the inference failed.  This is an interesting case
+;;;   where cutting off due to falsity can actually be overly restrictive.
+
+
+(defclass WHYNOT-PARTIAL-MATCH (INCREMENTAL-PARTIAL-MATCH)
+  :documentation
+  "Variant of :BASIC partial match strategy to support WHYNOT queries."
+  :slots ((unknown-goal-cutoff :type INTEGER :initially NULL)))
+
+(defclass WHYNOT-DEEP-PARTIAL-MATCH (WHYNOT-PARTIAL-MATCH)
+  :documentation
+  "Variant of WhyNot partial match geared towards deep proofs.")
+
+(defun (whynot-partial-match-mode? BOOLEAN) ()
+  ;; Return TRUE if a query is computing WhyNot partial matches.
+  :globally-inline? TRUE
+  (return (and (partial-match-mode?)
+               (isa? (partial-match-strategy *queryIterator*)
+                     @WHYNOT-PARTIAL-MATCH))))
+
+(defmethod (create-partial-match-frame WHYNOT-PARTIAL-MATCH)
+    ((self WHYNOT-PARTIAL-MATCH) (frame CONTROL-FRAME) (kind KEYWORD))
+  (return (new WHYNOT-PARTIAL-MATCH :control-frame frame :kind kind)))
+
+(defmethod (create-partial-match-frame WHYNOT-DEEP-PARTIAL-MATCH)
+    ((self WHYNOT-DEEP-PARTIAL-MATCH) (frame CONTROL-FRAME) (kind KEYWORD))
+  (return (new WHYNOT-DEEP-PARTIAL-MATCH :control-frame frame :kind kind)))
+
+(defmethod set-dynamic-cutoff ((self WHYNOT-PARTIAL-MATCH))
+  ;; Set the dynamic cutoff for the partial goal represented by `self'.
+  (let ((cutoff (compute-dynamic-cutoff self)))
+    (when (defined? cutoff)
+      (when (or (< cutoff -100)
+                (> cutoff +100))
+        (warn "*** fishy dynamic cutoff=" cutoff " computed, resetting to 0.0")
+        (setq cutoff 0.0))
+      (setf (dynamic-cutoff self) cutoff))
+    (setf (unknown-goal-cutoff self) (compute-unknown-goal-cutoff self))))
+
+(defmethod (compute-unknown-goal-cutoff INTEGER) ((self WHYNOT-PARTIAL-MATCH))
+  ;; Compute the maximum number of allowable unknowns in the proof of
+  ;;    the goal represented by `self'.
+  ;; This score comes from the parent's cutoff and the siblings' scores.
+  ;; EXTRACTED FROM `set-' METHOD, SO WE CAN USE IT IN THE GOAL TRACE.
+  (let ((parent WHYNOT-PARTIAL-MATCH (parent self))
+        (parentCutoff INTEGER NULL)
+        (cutoff INTEGER NULL))
+    (when (defined? parent)
+      (setq parentCutoff (unknown-goal-cutoff parent))
+      (when (null? parentCutoff)
+        (return NULL))
+      (case (kind parent)
+        (:AND
+         (let ((parentFrame (control-frame parent))
+               (siblingUnknowns 0))
+           (foreach i in (interval 0 (1- (argument-cursor parentFrame)))
+               do (++ siblingUnknowns
+                      (number-of-failed-subgoals
+                       (cast
+                        (partial-match-frame
+                         (nth (arguments parentFrame) i))
+                        WHYNOT-PARTIAL-MATCH))))
+           (setq cutoff (max (- parentCutoff siblingUnknowns) 0))))
+        (otherwise
+         (setq cutoff parentCutoff))))
+    (return cutoff)))
+
+(defmethod (number-of-failed-subgoals INTEGER) ((self WHYNOT-PARTIAL-MATCH))
+  ;; Return the number of failed subgoals in `self's proof.
+ ;;;; EXPERIMENT - NEEDS TO LOOK AT DUPLICATE GOALS
+ ;;;; TO REALLY DO WHAT'S REQUIRED HERE:
+  (let ((proof (justification (control-frame self))))
+    (return
+      (memoize (proof)
+               :max-values 500
+               (compute-number-of-failed-subgoals proof)))))
+
+(defun (compute-number-of-failed-subgoals INTEGER) ((proof JUSTIFICATION))
+  ;; Compute the number of failed subgoals in `self's proof and return it.
+  (let ((list LIST NULL))
+    (when (defined? proof)
+      (setq list (new LIST))
+      (collect-failed-goals proof list)
+      (return (length list)))
+    (return 0)))
+
+(defmethod (cutoff-partial-match? BOOLEAN) ((self WHYNOT-PARTIAL-MATCH)
+                                            (trace? BOOLEAN))
+  ;; Assume the goal represented by `self' just completed.
+  ;; Return TRUE if the goal's computed score fails to clear the minimally
+  ;;    required cutoff score for `self'.
+  (let ((score (positive-score self))
+        (scoreCutoff (dynamic-cutoff self))
+        (unknownGoalCutoff (unknown-goal-cutoff self))
+        (cutoff? FALSE))
+    (cond ((or (null? score)       ;; shouldn't happen
+               (null? scoreCutoff) ;; can happen with frames that timeout, etc.
+               (= scoreCutoff 0.0))
+           (setq cutoff? FALSE))
+          ((< scoreCutoff 0.0)
+           (setq cutoff? (> score scoreCutoff)))
+          (otherwise
+           (setq cutoff? (< score scoreCutoff))))
+    ;; this is wrong (wrong interpretation of `*minimum-score-cutoff*), it
+    ;; is left in here as a reminder so we won't try to enable it again:
+    ;(unless cutoff?
+    ;  (setq cutoff? (<= (abs score) *minimum-score-cutoff*)))
+    (when (and (not cutoff?)
+               (defined? unknownGoalCutoff))
+      (setq cutoff? (> (number-of-failed-subgoals self) unknownGoalCutoff))
+      (when (and cutoff? trace?)
+        (print "*** Cutting off search, more than "
+               unknownGoalCutoff " failed subgoal(s)" EOL)))
+    (return cutoff?)))
+
+(defun (auxiliary-equivalence-proposition? BOOLEAN) ((proposition PROPOSITION))
+  ;; Return true if `proposition' is an auxiliary equivalence to handle a
+  ;;    a constant in the consequent of a rule.
+  (return
+    (and (eql? (kind proposition) :EQUIVALENT)
+         (exists arg in (arguments proposition)
+           where (and (variable? arg)
+                      (defined?
+                        (variable-value (cast arg PATTERN-VARIABLE))))))))
+
+(defmethod (proposition-weight FLOAT) ((self WHYNOT-PARTIAL-MATCH)
+                                       (proposition PROPOSITION))
+  ;; Compute the weight of `proposition' relative to its controlling
+  ;;    partial match frame `self'.
+  (cond ((null? proposition)
+         ;; can happen in depth cutoff cases:
+         (return 1.0))
+        ((eql? (kind proposition) :ISA)
+         ;; devalue type propositions:
+         (return 0.25))
+        ((and (eql? (kind proposition) :NOT)
+              (eql? (kind (cast (first (arguments proposition)) PROPOSITION))
+                    :EQUIVALENT))
+         ;; in-equivalences should almost always be true, so they don't mean much:
+         (return 0.1))
+        ((auxiliary-equivalence-proposition? proposition)
+         (return 0.0))
+        ((defined? (weight proposition))
+         (return (weight proposition)))
+        ((defined? (truth-value proposition))
+         (return (positive-score (truth-value proposition))))
+        (otherwise
+         (return 1.0))))
+
+(defglobal *min-clock-ticks-per-whynot-antecedent* INTEGER 5)
+(defslot CONTROL-FRAME real-allotted-clock-ticks :type INTEGER)
+
+(defmethod (continue-partial-AND-proof KEYWORD) ((self WHYNOT-PARTIAL-MATCH)
+                                                 (frame CONTROL-FRAME)
+                                                 (lastMove KEYWORD))
+  ;; Control partial AND proofs in WhyNot partial match mode.
+  ;; Similar to the :BASIC version, but uses a timout handling similar to
+  ;;    what we do for antecedent proofs to makes sure we don't spend all
+  ;;    time in one conjunct.  For example, we might spend all time in
+  ;;    generating a couple of bindings for the first conjunct for which
+  ;;    all subsequent conjuncts will fail.  But if we ignore the first
+  ;;    conjunct, we might get a better overall score!  The time management
+  ;;    here tries to avoid getting stuck.
+  (let ((forbiddenVars NIL))
+    (case lastMove
+      (:DOWN
+       (set-dynamic-cutoff self)
+       (when (defined? (allotted-clock-ticks frame))
+         (setf (real-allotted-clock-ticks frame)
+           (allotted-clock-ticks frame))))
+      ((:UP-TRUE :UP-FAIL)
+       (let ((success? (eql? lastMove :UP-TRUE))
+             (andProposition (proposition frame))
+             (conjunctFrame (result frame))
+             (conjunct (proposition conjunctFrame))
+             (score (positive-score (partial-match-frame conjunctFrame)))
+             (weight (proposition-weight self conjunct)))
+         (setq lastMove :UP-TRUE) ;; we succeed by default
+         (push-AND-partial-match-score self score weight)
+         (cond
+          ((cutoff-partial-match? (partial-match-frame conjunctFrame)
+                                  (trace-keyword? :GOAL-TREE))
+           ;; we didn't get the minimum score required:
+           (setq lastMove :UP-FAIL))
+          ((and (false-truth-value? (truth-value conjunctFrame))
+                (strict-truth-value? (truth-value conjunctFrame)))
+           ;; we have a strict falsity, always fail - is this too drastic?:
+           (setq lastMove :UP-FAIL))
+          ((and (variable-type? conjunct)
+                (not success?))
+           ;; if we miss a variable type in an AND we always fail:
+           (setq lastMove :UP-FAIL))
+          (otherwise
+           (when (= (argument-cursor frame)
+                    (1- (length (arguments andProposition))))
+             ;; all conjuncts evaluated; compute/propagate final score:
+             (setq score (compute-AND-score self))
+             (if (or (<= score *minimum-score-cutoff*)
+                     (and (not (all-arguments-bound? andProposition))
+                          (not (allow-unbound-variables? self))))
+                 (setq lastMove :UP-FAIL)
+               (set-frame-partial-truth self NULL score NULL FALSE))))))))
+    ;; if we are failing, clean up the down frame, since trying to find
+    ;;    another solution on the current conjunct won't help:
+    (when (eql? lastMove :UP-FAIL)
+      (setf (down frame) NULL))
+    (let ((result (continue-and-proof frame lastMove)))
+      (case result
+        (:MOVE-DOWN
+         ;; Pop partial match scores and weights until the number of weights
+         ;;    agrees with the cursor position (in case we backtracked):
+         (foreach i in (interval (argument-cursor frame)
+                                 (1- (length (argument-scores self))))
+             do (ignore i)
+		(pop-AND-partial-match-score self))
+         ;; skip clauses that are too unconstrained - we do this after the
+         ;;    call to `continue-and-proof' to potentially skip the first
+         ;;    clause as well as take advantage of clause re-optimization:
+         (when (skip-AND-clause? self frame forbiddenVars)
+           (setq result (continue-partial-AND-proof self frame :UP-FAIL)))
+
+         ;;; FIGURE OUT HOW TO DO THIS RIGHT (SEEMS TO DO THE TRICK FOR NOW):
+         ;;; Allocate 1/nth of the remaining time for the current conjunct
+         ;;;    (the problem is, that conjuncts that come later really need
+         ;;;    more time, since they might need to generate a full extension
+         ;;;    for each binding a previous conjunct generates, so, how to do
+         ;;;    this right in the presence of backtracking is still a mystery).
+         ;;; We don't need to reset, since that will happen upon the next
+         ;;;    down move into the AND-frame:
+         (when (and (defined? (allotted-clock-ticks frame))
+                    (eql? result :MOVE-DOWN))
+           (setf (allotted-clock-ticks frame)
+             (/ (- (real-allotted-clock-ticks frame)
+                   (- (current-clock-ticks *queryIterator*)
+                      (starting-clock-ticks frame)))
+                (length (arguments frame))))))
+        (:FAILURE
+         ;; the AND failed completely, compute result score by looking at the
+         ;;    truth value to honor cases where we got a false result, i.e.,
+         ;;    we can either get 0.0 or -1.0 but no partial scores:
+         (set-frame-partial-truth self (truth-value frame) NULL NULL FALSE))
+        (otherwise NULL))
+      (return result))))
+
+(defun (number-of-remaining-antecedents INTEGER) ((iterator ITERATOR))
+  ;; Return the number of untried antecedents remaining in the antecedents
+  ;;    iterator `iterator' (exploits knowledge of the internals of
+  ;;    `allocate-antecedents-iterator').
+  (typecase iterator
+    (CONS-ITERATOR
+     (if (first-iteration? iterator)
+         (return (length (cons-iterator-cursor iterator)))
+       (return (1- (length (cons-iterator-cursor iterator))))))
+    (otherwise
+     (error "Don't know how to handle antecedents iterator of type "
+            (primary-type iterator)))))
+
+(defmethod (chaining-depth-degradation FLOAT) ((self WHYNOT-PARTIAL-MATCH))
+  ;; Return a degradation factor relative to the rule chaining depth
+  ;;    of `frame' to devalue long-winded partial proofs.
+  (let ((frame (control-frame self))
+        (degradationFactor 0.75)
+        (degradation 1.0))
+    (setq frame (up frame)) ;; don't count the first chain link
+    (while (defined? frame)
+      (when (defined? (antecedents-rule frame))
+        (setq degradation (* degradation degradationFactor)))
+      (setq frame (up frame)))
+    (return degradation)))
+
+(defmethod (chaining-depth-degradation FLOAT) ((self WHYNOT-DEEP-PARTIAL-MATCH))
+  ;; In deep mode we don't use a degradation factor.
+  (return 1.0))
+
+(defmethod (continue-partial-antecedents-proof KEYWORD)
+    ((self WHYNOT-PARTIAL-MATCH) (lastMove KEYWORD))
+  ;; Control partial :ANTECEDENTS strategy proofs in WHYNOT partial match mode.
+  ;; Major difference to :BASIC match mode is timeout handling to spend an
+  ;;    equal amount of time on each rule to give each of them a chance.
+  (let ((frame (control-frame self))
+        (iterator (iterator frame))
+        (goal (extract-subgoal-of-frame frame))
+        (score PARTIAL-MATCH-SCORE NULL)
+        (result KEYWORD NULL)
+        (allottedClockTicks (allotted-clock-ticks frame))
+        (currentClockTicks (current-clock-ticks *queryIterator*)))
+    (case lastMove
+      (:DOWN
+       (set-dynamic-cutoff self)
+       (when (null? iterator)
+         ;; first time around - allocate the iterator here, so we can manage
+         ;;    resources spent on each rule:
+         (setq iterator
+           (allocate-antecedents-iterator
+            (extract-subgoal-description-of-frame frame)
+            (find-external-arguments-for-subgoal frame)
+            (reverse-polarity? frame)))
+         (when (null? iterator)
+           (setq iterator (allocate-iterator NIL)))
+         (setf (iterator frame) iterator))
+       (when (defined? allottedClockTicks)
+         ;; when we move back down into this frame, the newly allotted ticks
+         ;;    will be all we have left to play with:
+         (setf (real-allotted-clock-ticks frame) allottedClockTicks)))
+      ((:UP-TRUE :UP-FAIL)
+       (setq score (positive-score (partial-match-frame (result frame))))
+       (when (or (and (reverse-polarity? frame)
+                      (> score 0.0))
+                 (and (not (reverse-polarity? frame))
+                      (< score 0.0)))
+         ;; return unknown in case we found negative evidence:
+         (setq score 0.0)
+         (setq lastMove :UP-FAIL))
+       (when (< (abs score) 1.0)
+         (setq score (* score (chaining-depth-degradation self))))
+       (setq score
+         (* score (proposition-weight self (antecedents-rule frame))))
+       (set-frame-partial-truth self NULL score NULL FALSE)
+       (when (or (eql? lastMove :UP-FAIL)
+                 (and (not (all-arguments-bound? goal))
+                      (not (allow-unbound-variables? self)))
+                 (cutoff-partial-match? self (trace-keyword? :GOAL-TREE)))
+         (set-frame-partial-truth self UNKNOWN-TRUTH-VALUE 0.0 NULL TRUE)
+         (setq lastMove :UP-FAIL))))
+    ;; if we are failing, clean up the down frame:
+    (when (and (eql? lastMove :UP-FAIL)
+               (defined? (down frame)))
+      (setf (down frame) NULL))
+    (unless (or (eql? lastMove :UP-TRUE)
+                (null? allottedClockTicks))
+      ;; we'll try the next available rule, manage its allotted resources by
+      ;;    temporarily resetting `frame's timeout which will be inherited
+      ;;    by the subgoal frame of the next rule that gets tried.  We don't
+      ;;    don't need to reset, since that will happen on the next down move:
+      (setf (allotted-clock-ticks frame)
+        (/ (- (real-allotted-clock-ticks frame)
+              (- currentClockTicks (starting-clock-ticks frame)))
+           (max (number-of-remaining-antecedents iterator) 1)))
+      (when (and (< (allotted-clock-ticks frame)
+                    *min-clock-ticks-per-whynot-antecedent*)
+                 (> (number-of-remaining-antecedents iterator) 0))
+        ;; don't bother trying, we don't have enough time left:
+        (trace-if :GOAL-TREE "*** Timeout - not enough time to subgoal" EOL)
+        (setf (iterator frame) (allocate-iterator NIL))))
+    (setq result (continue-antecedents-proof frame lastMove))
+    (when (and (eql? lastMove :UP-TRUE)
+               (null? (truth-value frame)))
+      ;; indicate that we did already compute a truth value:
+      (setf (truth-value frame) UNKNOWN-TRUTH-VALUE))
+    (return result)))
+
+(defmethod (max-unconstrained-fanout FLOAT) ((self WHYNOT-PARTIAL-MATCH))
+  ;; Return the maximum fanout cost of a goal for a WhyNot proof (as
+  ;;    computed by the dynamic optimizer) above which we simply skip it.
+  (return 25.0))
+
+(defmethod (max-unconstrained-fanout FLOAT) ((self WHYNOT-DEEP-PARTIAL-MATCH))
+  ;; Return the maximum fanout cost of a goal for a deep WhyNot proof (as
+  ;;    computed by the dynamic optimizer) above which we simply skip it.
+  (return 1000000.0))
+
+(defmethod (skip-AND-clause? BOOLEAN)
+    ((self WHYNOT-PARTIAL-MATCH)
+     (frame CONTROL-FRAME)
+     (forbiddenVars (CONS OF PATTERN-VARIABLE)))
+  ;; Return true if the current conjunct is either too unconstrained or has
+  ;;    an unbound variable mentioned in `forbiddenVars', and simulate its
+  ;;    failure by generating appropriate result frames and justifications.
+  (let ((forbiddenVars? (non-empty? forbiddenVars))
+        (conjunct PROPOSITION
+                  (nth (arguments (proposition frame))
+                       (argument-cursor frame))))
+    (when (or (and forbiddenVars?
+                   ;; If unbound vars were left by a function call, skip
+                   ;;    all propositions that refer to that variable:
+                   (exists var in (get-unbound-variables conjunct)
+                       where (member? forbiddenVars var)))
+              ;; Skip over open propositions that would fanout too much (we
+              ;;    just called this in the AND optimizer - no big deal):
+              (> (dynamically-estimate-goal-fanout conjunct)
+                 (max-unconstrained-fanout self)))
+      ;; create failure result data structures:
+      (let ((result (create-down-frame frame conjunct)))
+        (set-frame-truth-value result UNKNOWN-TRUTH-VALUE)
+        (when (null? (partial-match-frame result))
+          (create-and-link-partial-match-frame result NULL))
+        (set-frame-partial-truth
+         (partial-match-frame result) UNKNOWN-TRUTH-VALUE 0.0 NULL TRUE)
+        (record-goal-justification
+         result (new PRIMITIVE-STRATEGY
+                     :inference-rule :SKIPPED-CONJUNCT
+                     :strategy :FAILURE))
+        (setf (state result) :POPPED) ;; IMPORTANT!!
+        (setf (nth (arguments frame) (argument-cursor frame)) result)
+        (setf (result frame) result)
+        (when (trace-keyword? :GOAL-TREE)
+          (print "*** Skipping clause " conjunct EOL))
+        (return TRUE)))
+    (return FALSE)))
+
+(defmethod initialize-partial-match-strategy ((self WHYNOT-PARTIAL-MATCH)
+                                              (query QUERY-ITERATOR))
+  ;; Initialize the partial match strategy `self' of `query'.
+  ;; This method can be specialized by different strategies.
+  (let ((minimumScore FLOAT-WRAPPER
+                      (lookup (options query) :MINIMUM-SCORE))
+        (maxUnknowns INTEGER-WRAPPER
+                     (lookup (options query) :MAXIMUM-UNKNOWNS))
+        (epsilon 0.001))
+    (setf (partial-match-strategy query) self)
+    (setf (dynamic-cutoff self)
+      (choose (defined? minimumScore) minimumScore epsilon))
+    (setf (latest-positive-score query) 0.0)
+    (when (defined? maxUnknowns)
+      (setf (unknown-goal-cutoff self) maxUnknowns))))
+
+(defslot CONTROL-FRAME all-justifications :type (LIST OF JUSTIFICATION))
+
+(defmethod (compute-partial-truth FLOAT) ((self WHYNOT-PARTIAL-MATCH)
+                                          (query QUERY-ITERATOR))
+  ;; Compute the partial truth of `query' using the :WHYNOT partial match mode.
+  ;; Unless a minimum score is explicitly specified, we are looking for
+  ;;    explanations with score >= 0.3.
+  ;; This version attempts to not go for strictly increasing scores, since
+  ;;    it might make us miss good second guesses if we pick up a high scoring
+  ;;    explanation early.  It tries to find the best top-N proofs (currently,
+  ;;    N is hardcoded as 10) and maximizes with the score of the worst proof
+  ;;    in that class once at least N proofs have been found.
+  ;; We avoid generating many similar explanations that only differ
+  ;;    in a single binding but use the same line of reasoning by
+  ;;    detecting such equivalent proofs and collapsing them into one.
+  (let ((baseFrame (base-control-frame query))
+	(partialMatchFrame (partial-match-strategy query))
+        (minimumScore FLOAT-WRAPPER (lookup (options query) :MINIMUM-SCORE))
+        (maximizeScore?
+         (not (eql? (lookup (options query) :MAXIMIZE-SCORE?) FALSE-WRAPPER)))
+        (topNproofs 10)
+        (proofClasses (new (LIST OF WHYNOT-PROOF-CLASS)))
+        (initialInferenceLevel (current-inference-level)))
+    (when (null? partialMatchFrame)
+      (setq partialMatchFrame self)
+      (setf (partial-match-strategy query) self))
+    (setf (dynamic-cutoff partialMatchFrame)
+      (choose (defined? minimumScore) minimumScore 0.3))
+    (special ((*queryIterator* query)
+              (*generate-all-proofs?* TRUE)
+              (*record-justifications?* TRUE)
+              (*inferenceLevel* initialInferenceLevel)
+              (*reversePolarity?* FALSE))
+      (loop
+	;(emit-thinking-dot :PARTIAL-MATCH)
+	(unless (next? query)
+          (break))
+        (setq *inferenceLevel* initialInferenceLevel) ;; reset for next round
+        ;; If we couldn't get the minimally required score, terminate:
+        (when (cutoff-partial-match? partialMatchFrame FALSE)
+          (break))
+        (when (= (length (insert-whynot-proof
+                          proofClasses (justification baseFrame)))
+                 *similar-whynot-proof-cutoff*)
+          (cutoff-similar-whynot-proofs query))
+        ;; once we have at least `topNproofs' set the cutoff slightly above
+        ;;    the score of the worst of the `topNproofs':
+        (when (>= (length proofClasses) topNproofs)
+          (sort proofClasses (the-code :function better-whynot-proof-class?))
+          (setf (dynamic-cutoff partialMatchFrame) 
+            (+ (positive-score
+                (representative (nth proofClasses (1- topNproofs)))) 0.01)))
+        (when (or (not maximizeScore?)
+                  (not (unknown-truth-value? (truth-value baseFrame))))
+          (break))))
+    ;; Sort and attach justifications found - higher scoring
+    ;;    justifications come earlier in the list:
+    (post-process-whynot-proof-classes proofClasses)
+    (setf (all-justifications baseFrame) (new LIST))
+    (foreach class in proofClasses
+        collect (representative class) into (all-justifications baseFrame))
+    (setf (justification baseFrame) (first (all-justifications baseFrame)))
+    (return (choose (defined? (justification baseFrame))
+                    (positive-score (justification baseFrame))
+                    0.0))))
+
+(defun (better-whynot-proof? BOOLEAN) ((proof1 JUSTIFICATION)
+                                       (proof2 JUSTIFICATION))
+  ;; Return TRUE if `proof1' represents a better WhyNot justification
+  ;;    than `proof2'.  Conceivably, we could look at more than just
+  ;;    the scores.
+  (return (> (positive-score proof1) (positive-score proof2))))
+
+(defun (compute-proof-deviation INTEGER)
+    ((proof1 JUSTIFICATION)
+     (proof2 JUSTIFICATION)
+     (maxDeviations INTEGER)
+     (deviations (KEY-VALUE-LIST OF JUSTIFICATION JUSTIFICATION)))
+  ;; Compares `proof1' and `proof2' and computes their number of deviating
+  ;;    subproofs.   If they have more than `maxDeviations' or are
+  ;;    not structurally equivalent NULL is returned.
+  ;; Deviating pairs of subproofs are collected in `deviations' (currently
+  ;;    this only collects pattern records, since propositions with
+  ;;    differing constants in them are not considered equivalent).
+  (when (null? deviations)
+    (setq deviations (new KEY-VALUE-LIST)))
+  (let ((foundDeviations 0)
+        (subDeviations 0))
+    (when (and (eql? (inference-rule proof1) (inference-rule proof2))
+               (eql? (inference-strategy proof1) (inference-strategy proof2))
+               (eql? (truth-value proof1) (truth-value proof2))
+               (eql? (reverse-polarity? proof1) (reverse-polarity? proof2))
+               (eql? (positive-score proof1) (positive-score proof2))
+               (eql? (negative-score proof1) (negative-score proof2))
+               (equivalent-propositions?
+                (proposition proof1) (proposition proof2) NULL))
+      ;; the two justifications are practically identical, actually, this might
+      ;;    be too strong of a test - relax later:
+      (when (eql? (inference-rule proof1) :PATTERN)
+        ;; we know that the propositions are equivalent, so they have to have
+        ;;    the same arity and should have the same variable names:
+        (foreach (var1 value1) in (substitution proof1)
+            as (var2 value2) in (substitution proof2)
+              do (unless (eql? var1 var2)
+                 (clear deviations)
+                 (return NULL))
+               (unless (eql? value1 value2)
+                 (++ foundDeviations))
+               (when (> foundDeviations maxDeviations)
+                 (clear deviations)
+                 (return NULL)))
+        (when (> foundDeviations 0)
+          (insert-at deviations proof1 proof2)))
+      (foreach ant1 in (antecedents proof1)
+          as ant2 in (antecedents proof2)
+          do (setq subDeviations
+               (compute-proof-deviation
+                ant1 ant2
+                (- maxDeviations foundDeviations)
+                deviations))
+             (when (null? subDeviations)
+               (clear deviations)
+               (return NULL))
+             (++ foundDeviations subDeviations))
+      (return foundDeviations))
+  (return NULL)))
+
+(defclass WHYNOT-PROOF-CLASS (SET)
+  :documentation "Set of equivalent WhyNot proofs that differ in at most one
+variable binding all on the same `deviating-variable'."
+  :parameters ((any-value :type JUSTIFICATION))
+  :slots ((representative :type JUSTIFICATION)
+          ;; the pattern of `representative' binding `deviating-variable':
+          (deviating-pattern :type JUSTIFICATION)
+          ;; the variable on whose binding we deviate:
+          (deviating-variable :type PATTERN-VARIABLE)
+          (deviating-instances :type LIST :initially (new LIST))))
+
+(defspecial *max-whynot-proof-class-deviations* INTEGER 1)
+
+(defun (insert-whynot-proof-to-class? BOOLEAN) ((class WHYNOT-PROOF-CLASS)
+                                                (proof JUSTIFICATION))
+  ;; Insert `proof' into `class' if it is structurally equivalent to the
+  ;;    proofs in that class and differs in at most one variable binding.
+  ;; Return true if `proof' was successfully added.
+  (when (empty? class)
+    (pushf (the-cons-list class) proof)
+    (setf (representative class) proof)
+    (return TRUE))
+  (let ((deviations
+         (new (KEY-VALUE-LIST OF JUSTIFICATION JUSTIFICATION)))
+        (foundDeviations
+         (compute-proof-deviation proof (representative class)
+			    *max-whynot-proof-class-deviations* deviations)))
+    (when (defined? foundDeviations)
+      (foreach (newDev repDev) in deviations
+          do (when (= foundDeviations 0)
+               ;; we found an identical proof:
+               (return TRUE))
+             (when (null? (deviating-pattern class))
+               ;; only 1 proof in the class so far:
+               (setf (deviating-pattern class) repDev))
+             ;; test for deviation on proper variable:
+             (foreach (newVar newValue) in (substitution newDev)
+                 as (repVar repValue) in (substitution
+                                          (deviating-pattern class))
+                 where (not (eql? newValue repValue))
+                 do (ignore repVar)
+		    (cond ((null? (deviating-variable class))
+                           (setf (deviating-variable class) newVar)
+                           (insert (deviating-instances class) repValue))
+                          ((not (eql? newVar (deviating-variable class)))
+                           ;; deviation on wrong variable:
+                           (return FALSE))
+                          ((member? (deviating-instances class) newValue)
+                           ;; same deviation as some other proof:
+                           (return TRUE)))
+                    (insert (deviating-instances class) newValue))
+             (pushf (the-cons-list class) proof)
+             ;; we only allowed 1 deviation:
+             (return TRUE)))
+    (return FALSE)))
+
+(defun (insert-whynot-proof WHYNOT-PROOF-CLASS)
+    ((classes (LIST OF WHYNOT-PROOF-CLASS)) (proof JUSTIFICATION))
+  ;; Insert `proof' into one of `classes' or open a new class for it.
+  ;; Return the class to which `proof' was added.
+  (foreach class in classes
+      where (insert-whynot-proof-to-class? class proof)
+      do (return class))
+  (push classes (new WHYNOT-PROOF-CLASS))
+  (insert-whynot-proof-to-class? (first classes) proof)
+  (return (first classes)))
+
+(defun (better-whynot-proof-class? BOOLEAN) ((class1 WHYNOT-PROOF-CLASS)
+                                             (class2 WHYNOT-PROOF-CLASS))
+  ;; Return TRUE if the proofs in `class1' represents a better WhyNot
+  ;;    justification than those in `class2'.
+  (return (better-whynot-proof? (representative class1)
+                                (representative class2))))
+
+;;; TRICKY: We have to make this a THING (not a SET) to have control over
+;;;    how it prints in the KIF pretty printer.
+;;; TO DO: We might also have to set `surrogate-value-inverse' properly
+;;;    to make `generate' do the right thing.  The inital value below is a start.
+(defclass ALTERNATIVE-BINDINGS-SET (THING)
+  :documentation
+  "Represents a set of alternative bindings collected for the pattern
+variable `(the-variable self)'."
+  :slots ((the-variable :type PATTERN-VARIABLE)
+          (bindings :type SET :initially (new SET))
+          (surrogate-value-inverse :initially @ALTERNATIVE-BINDINGS-SET))
+  :print-form (print-stream stream
+                            (string-downcase
+                             (get-skolem-print-name (the-variable self)))))
+
+(defun (alternative-bindings-set? BOOLEAN) ((thing OBJECT))
+  ;; Return true if `thing' represents a set of binding alternatives.
+  :globally-inline? TRUE
+  (return (and (defined? thing)
+               (isa? thing @ALTERNATIVE-BINDINGS-SET))))
+
+(defun (alternative-bindings SET) ((bindingsSet ALTERNATIVE-BINDINGS-SET))
+  ;; Return the set of alternative bindings represented by `bindingsSet'.
+  :globally-inline? TRUE
+  (return (bindings bindingsSet)))
+
+(defun post-process-whynot-proof-classes
+    ((classes (LIST OF WHYNOT-PROOF-CLASS)))
+  (sort classes (the-code :function better-whynot-proof-class?))
+  ;; Annotate a class of similar proofs with a pseudo variable binding
+  ;;    indicating a collection of matches:
+  (foreach class in classes
+      where (> (length class) 1)
+      do (let ((substitution (substitution (deviating-pattern class)))
+               (variable (deviating-variable class))
+               (bindings (new ALTERNATIVE-BINDINGS-SET
+                              :the-variable variable)))
+           (foreach instance in (deviating-instances class)
+               do (insert (bindings bindings) instance))
+           (insert-at substitution variable bindings))))
+
+(defglobal *similar-whynot-proof-cutoff* INTEGER 3)
+
+(defun cutoff-similar-whynot-proofs ((query QUERY-ITERATOR))
+  ;; Cutoff the currently active/continuable goal of `query' to avoid
+  ;;    generating more bindings that will lead to structurally similar
+  ;;    proofs.
+  (let ((continuationFrame (base-control-frame query)))
+    (while (defined? (down continuationFrame))
+      (setq continuationFrame (down continuationFrame)))
+    (when (defined? (iterator continuationFrame))
+      (setf (iterator continuationFrame) (allocate-iterator NIL))
+      (when (trace-keyword? :GOAL-TREE)
+        (special ((*printInFrame* continuationFrame)
+                  (*printMode* :REALISTIC)
+                  (*printLogicalFormStream* STANDARD-OUTPUT)
+                  (*queryIterator* query))
+          (print "*** cutting off similar WhyNot proofs at goal=")
+          (print-unformatted-logical-form
+           (proposition continuationFrame) STANDARD-OUTPUT)
+          (print EOL))))))
+
+
+  ;;
+;;;;;; Debugging retrieval queries
+  ;;
+
+(defmethod (retrieve-partial-solutions QUERY-ITERATOR)
+    ((self WHYNOT-PARTIAL-MATCH) (query QUERY-ITERATOR))
+  ;; Retrieve partial solutions for `query' using WhyNot partial match mode.
+  (let ((baseFrame (base-control-frame query))
+        (partialMatchFrame (partial-match-strategy query))
+        (minimumScore FLOAT-WRAPPER (lookup-query-option query :MINIMUM-SCORE))
+        (maximizeScore? (not (eql? (lookup-query-option query :MAXIMIZE-SCORE?)
+                                   FALSE-WRAPPER)))
+        (howMany (lookup-how-many-solutions query))
+        (topN 10) ;; make this settable?
+        (topNPartialproofs topN)
+        (haveEnoughPartialProofs? FALSE)
+        (currentSolution NIL)
+        (currentProof JUSTIFICATION NULL)
+        (strictProofs (new (LIST OF JUSTIFICATION)))
+        (partialProofClasses (new (LIST OF WHYNOT-PROOF-CLASS)))
+        (initialInferenceLevel (current-inference-level)))
+    (when (null? partialMatchFrame)
+      (setq partialMatchFrame self)
+      (setf (partial-match-strategy query) self))
+    (setf (dynamic-cutoff partialMatchFrame)
+      (choose (defined? minimumScore) minimumScore 0.3))
+    (special ((*queryIterator* query)
+              (*generate-all-proofs?* TRUE)
+              (*record-justifications?* TRUE)
+              (*inferenceLevel* initialInferenceLevel)
+              (*reversePolarity?* FALSE))
+      (loop
+	;(emit-thinking-dot :PARTIAL-MATCH)
+        ;; fool duplicate solutions checking, since we need to do this in here:
+        (clear (solutions query))
+	(when (or (= (length strictProofs) howMany)
+                  (not (next? query)))
+          (break))
+        (setq *inferenceLevel* initialInferenceLevel) ;; reset for next round
+        ;; If we couldn't get the minimally required score, terminate:
+        (when (cutoff-partial-match? partialMatchFrame FALSE)
+          (break))
+        (setq currentSolution (consify (value query)))
+        (setq currentProof (justification baseFrame))
+        (cond ((not (exists proof in strictProofs
+                        where (equal? (retrieval-proof-solution proof query)
+                                      currentSolution)))
+               ;; we have a solution for which no strict proof exists yet:
+               (when (not (unknown-truth-value? (truth-value baseFrame)))
+                 ;; it is a strict solution, record it:
+                 (push strictProofs currentProof)
+                 (continue)))
+              (otherwise
+               ;; we have a new (maybe partial) proof for a solution that
+               ;;    already has a strict proof - skip it:
+               (continue)))
+        (when (= (length
+                  (insert-whynot-proof partialProofClasses currentProof))
+                 *similar-whynot-proof-cutoff*)
+            (cutoff-similar-whynot-proofs query))
+        ;; once we have at least `topNPartialproofs' partial proofs set cutoff
+        ;;    slightly above the score of the worst of the `topNPartialproofs':
+        (setq topNPartialproofs
+          ;; determine size of the window based on how many many solutions
+          ;;    were sought and how many strict ones we have so far (this is a
+          ;;    bit strange, since we can force the generation of more partial
+          ;;    solutions by supplying a large number than by asking for all):
+          (choose (null? howMany)
+                  topN
+                  (max topN (- howMany (length strictProofs)))))
+        (when (or haveEnoughPartialProofs?
+                  (>= (length partialProofClasses) topNPartialproofs))
+          (setq haveEnoughPartialProofs? TRUE)
+          (sort partialProofClasses
+                (the-code :function better-whynot-proof-class?))
+          (setf (dynamic-cutoff partialMatchFrame) 
+            (+ (positive-score
+                (representative
+                 (nth partialProofClasses (1- topNPartialproofs)))) 0.01)))
+        (when (not maximizeScore?)
+          (break))))
+    (setf (all-justifications baseFrame) (reverse strictProofs))
+    (unless (= (length strictProofs) howMany)
+      ;; we didn't find enough strict solution (or all were required):
+      ;; Sort and attach partial proofs found - higher scoring
+      ;;    justifications come earlier in the list:
+      (post-process-whynot-proof-classes partialProofClasses)
+      (foreach class in partialProofClasses
+          as i in (interval 1 topNPartialproofs)
+          collect (representative class) into (all-justifications baseFrame)))
+    (setf (justification baseFrame) (first (all-justifications baseFrame)))
+    ;; rebuild the appropriate solutions vector:
+    (clear (solutions query))
+    (foreach proof in (all-justifications baseFrame)
+        do (let ((solution
+                  (new QUERY-SOLUTION
+                       :bindings
+                       (coerce-to-vector (retrieval-proof-solution proof query))
+                       :match-score (positive-score proof)
+                       :justification proof)))
+             (insert-at (solutions query) (bindings solution) solution)))
+    (return query)))
+
+(defun (retrieval-proof-solution CONS) ((proof JUSTIFICATION)
+                                        (query QUERY-ITERATOR))
+  ;; `proof' is the top-level pattern justification of a retrieval `query'.
+  ;; Return the query variable bindings generated by this proof as a list.
+  (let ((solution NIL)
+        (substitution (substitution proof)))
+    (foreach extVar in (external-variables query)
+        do (foreach (var value) in substitution
+               ;; TRICKY: the variable objects are not `eq?', so we test names:
+               where (eql? (variable-name var) (variable-name extVar))
+               do (pushq solution value)
+                  (break)))
+    (return (reverse solution))))
+
+
+  ;;
+;;;;;; Top level `whynot':
+  ;;
+
+(defun collect-failed-goals
+    ((proof JUSTIFICATION) (failures (LIST OF JUSTIFICATION)))
+  ;; Scan `proof' and collect all completely failed goals into `failures'.
+  ;; This is smart about failed antecedents that reference a ``class''
+  ;;    variable with multiple alteranative bindings.  In this case, any
+  ;;    additional constraints about the variable are also collected,
+  ;;    since for any particular binding all of them have to be true.
+  (when (eql? (inference-rule proof) :AND-INTRODUCTION)
+    (let ((variables (new (LIST OF PATTERN-VARIABLE))))
+      (foreach antecedent in (antecedents proof)
+          where (failed-goal-justification? antecedent)
+          do (foreach arg in (arguments (proposition antecedent))
+                 where (alternative-bindings-set?
+                        (justification-argument-bound-to arg antecedent))
+                 do (insert-new variables arg)))
+      (when (non-empty? variables)
+        (foreach antecedent in (antecedents proof)
+            do (if (or (failed-goal-justification? antecedent)
+                       (exists arg in (arguments (proposition antecedent))
+                           where (member? variables arg)))
+                   (insert failures antecedent)
+                 (collect-failed-goals antecedent failures)))
+        (return))))
+  (if (failed-goal-justification? proof)
+      (insert-new failures proof)
+    (foreach antecedent in (antecedents proof)
+        do (collect-failed-goals antecedent failures))))
+
+(defun (derive-justified-partial-query QUERY-ITERATOR) ((query QUERY-ITERATOR))
+  (when (and (defined? (partial-match-strategy query))
+             (defined? (justification (base-control-frame query))))
+    (return query))
+  (let ((partialQuery
+         (create-query-iterator
+          (description (pattern-record (base-control-frame query)))
+          (bindings (value query))))
+        (recordJustifications? (record-justifications?))
+        ;(traceSubgoals? (trace-keyword? :GOAL-TREE))
+	)
+    (insert-at (options partialQuery) :MATCH-MODE :WHYNOT)
+    (set-powerloom-feature :justifications)
+    (call-ask-partial partialQuery)
+    (unless recordJustifications?
+      (unset-powerloom-feature :justifications))
+    (return partialQuery)))
+
+(defun whynot (&rest (args OBJECT))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (mv-bind (label style maxDepth summary?)
+      (parse-why-arguments (coerce-&rest-to-cons args))
+    (explain-whynot label style maxDepth summary? STANDARD-OUTPUT) ))
+
+(defun explain-whynot ((label STRING) (style KEYWORD)
+                       (maxDepth INTEGER) (summary? BOOLEAN)
+		       (stream OUTPUT-STREAM))
+  :documentation "Programmer's interface to the WHYNOT function."
+  :public? TRUE
+  (when (null? label)
+    (setq *most-recent-explanation-mapping* (new EXPLANATION-MAPPING)))
+  (exception-case
+      (let ((mappings (CONS OF EXPLANATION-MAPPING) NIL))
+        (foreach justification in (get-whynot-justifications
+                                   *most-recent-query*
+                                   label
+                                   *most-recent-explanation-mapping*)
+            as i in (interval 1 NULL)
+            do (when (null? label)
+                 (let ((info (register-justification
+                              (visible-justification justification)
+                              *most-recent-explanation-mapping*)))
+                   (setf (label info) (integer-to-string i))
+                   (setf (depth info) 1)))
+               (print-stream stream EOL "Explanation #" i " score="
+                             (positive-score justification) ":" EOL EOL)
+               (print-whynot-justification
+                justification stream maxDepth style summary?)
+               (when (null? label)
+                 (pushq mappings *most-recent-explanation-mapping*)
+                 (setq *most-recent-explanation-mapping*
+                   (new EXPLANATION-MAPPING))))
+        (when (non-empty? mappings)
+          (setq *most-recent-explanation-mapping* (new EXPLANATION-MAPPING))
+          (foreach mapping in mappings
+              do (foreach (k v) in mapping
+                     do (insert-at *most-recent-explanation-mapping* k v)))))
+    (EXPLAIN-EXCEPTION (ee)
+      (print-stream STANDARD-OUTPUT (exception-message ee)))))
+
+(defun print-whynot-justification ((justification JUSTIFICATION)
+                                   (stream OUTPUT-STREAM)
+                                   (maxDepth INTEGER)
+                                   (style KEYWORD)
+                                   (summary? BOOLEAN))
+  :documentation "Print a WHYNOT `justification' to `stream' according to
+`maxDepth' and `style'.  Print a summary only if `summary?' is TRUE."
+  :public? TRUE
+  (special ((*explanation-style* (choose (defined? style) style :BRIEF)))
+    (cond ((null? justification)
+           (when (defined? *most-recent-query*)
+             (pretty-print-logical-form
+              (proposition
+               (description
+                (current-pattern-record *most-recent-query*)))
+              stream)
+             (print-stream
+              stream EOL
+              "  " (lookup-explanation-phrase :not-asserted NIL NULL)
+              " and " EOL
+              "  " (lookup-explanation-phrase :no-rules NIL NULL) "." EOL)))
+          (summary?
+           (let ((failures (new (LIST OF JUSTIFICATION))))
+             (collect-failed-goals justification failures)
+             (print-stream stream "The query failed, because" EOL)
+             (foreach failure in failures
+                 as i in (interval 1 NULL)
+                 do (if (= i 1)
+                        (print-stream stream "    ")
+                      (print-stream stream "and "))
+                    (print-justification-proposition failure stream 4)
+                    (print-stream stream EOL))
+             (print-stream stream "failed." EOL EOL)))
+          (otherwise
+           (print-explanation
+            justification
+            stream
+            *most-recent-explanation-mapping*
+            maxDepth
+            *explanation-audience*)))))
+
+(defun (get-whynot-justifications (LIST OF JUSTIFICATION))
+    ((query QUERY-ITERATOR) (label STRING) (mapping EXPLANATION-MAPPING))
+  :documentation "Programmer's interface to WHYNOT function.  Derive
+justifications why `query' failed, or, if `label' was supplied as non-NULL,
+lookup its justification relative to `mapping' and return the result."
+  (let ((justifications LIST NULL))
+    (when (null? query)
+      (setq query *most-recent-query*))
+    (when (null? mapping)
+      (setq mapping *most-recent-explanation-mapping*))
+    (when (null? query)
+      (signal EXPLAIN-NO-QUERY-EXCEPTION "There is nothing to explain."))
+    (when (and (not (defined? (partial-match-strategy query)))
+               (not (exhausted? query)))
+      (signal EXPLAIN-QUERY-TRUE-EXCEPTION "The query did not fail."))
+    (setq query (derive-justified-partial-query query))
+    (setq justifications (all-justifications (base-control-frame query)))
+    (when (defined? label)
+      (when (defined? mapping)
+	(setq justifications
+	  (list (lookup-justification mapping label))))
+      (when (null? (first justifications))
+	(signal EXPLAIN-NO-SUCH-LABEL-EXCEPTION
+		"Label " label " does not exists in the current explanation")))
+    (return justifications)))
+
+
+#|
+;; WhyNot explanation rendering games:
+
+;; Scheme 1:
+
+1  Douglas Lenat speaks the German language.
+is true to some part because an if-then rule applies
+since 1.1  ! If some intelligent agent Y is a child of 
+             some intelligent agent X and X speaks some natural 
+             language, then Y speaks the natural language.
+and 1.2  ! X (such as Kurt Godel, Steve DeVoy, etc.) speaks the German language.
+and 1.3  ? Douglas Lenat(Y) is a child of X.
+
+1   Anthrax Bacillus lethally infects animal.
+is true to some part because an if-then rule applies
+since 1.1 ! If some collection ORG-TYPE lethally infects some type of
+            organism HOST-TYPE, a collection ORG-SUBTYPE is a kind of ORG-TYPE,
+            and a type of organism HOST-SUBTYPE is a kind of HOST-TYPE, then
+            ORG-SUBTYPE lethally infects HOST-SUBTYPE.
+and 1.2  ! Anthrax Bacillus(ORG-SUBTYPE) lethally infects mammal(HOST-TYPE).
+and 1.3  Anthrax(ORG-SUBTYPE) is a kind of anthrax(ORG-TYPE).
+and 1.4  ? An animal(HOST-SUBTYPE) is a kind of mammal(HOST-TYPE).
+
+1.3  Anthrax is a kind of anthrax.
+is true because of a successful subsumption test
+
+;; Scheme 2:
+
+You asked whether it is known that:
+   (1) Douglas Lenat speaks the German language
+   
+Reasons statement (1) might be true:
+   (1.1) KNOWN RULE: If some intelligent agent Y is a child of 
+         some intelligent agent X and X speaks some natural 
+         language Z, then Y speaks the natural language.
+   (1.2) INFERRED FACT: X (such as Kurt Godel, Steve DeVoy, etc.)
+         speaks the German language (the Z).
+   (1.3) UNKNOWN FACT: Douglas Lenat (the Y) is a child of X.
+Therefore, if it were known for some X that
+   [?]   X speaks the German language and Douglas Lenat is a child of X
+then the following would be known:
+   (1)   Douglas Lenat speaks the German language
+
+Reasons fact (1.2) was inferred:
+   (2.1) KNOWN RULE: If some intelligent agent X has Y as its native language.
+         then X speaks Y.
+   (2.2) KNOWN FACT: Kurt Godel (the X) has German (the Y) as his native
+         language.
+Therefore, the following was inferred:
+   (1.2) X (such as Kurt Godel, Steve DeVoy, etc.) speaks the German language.
+
+
+You asked whether it is known that:
+   (1) Anthrax Bacillus lethally infects animal.
+
+Reasons statement (1) might be true:
+   (1.1) KNOWN RULE: If some collection ORG-TYPE lethally infects some type of
+         organism HOST-TYPE, a collection ORG-SUBTYPE is a kind of ORG-TYPE,
+         and a type of organism HOST-SUBTYPE is a kind of HOST-TYPE, then
+         ORG-SUBTYPE lethally infects HOST-SUBTYPE.
+   (1.2) KNOWN FACT: Anthrax Bacillus (the ORG-TYPE) lethally infects
+         mammal (the HOST-TYPE).
+   (1.3) INFERRED FACT: Anthrax (the ORG-SUBTYPE) is a kind of
+         anthrax (the ORG-TYPE).
+   (1.4) UNKNOWN FACT: An animal (the HOST-SUBTYPE) is a kind of
+         mammal (the HOST-TYPE).
+Therefore, if it were known that
+   [?]   An animal is a kind of mammal.
+then the following would be known:
+   (1)   Anthrax Bacillus (the ORG-SUBTYPE) lethally infects
+         animal (the HOST-SUBTYPE).
+But note the following:
+   A mammal is a kind of animal
+which makes it unlikely that:
+   An animal is a kind of mammal.
+Maybe the question was asked about too general a class.
+
+Reason fact (1.3) was inferred:
+   A successful subsumption test.
+|#
+
+#|
+;;; Debugging/testing support
+
+(defun print-whynot-to-html-file ((file FILE-NAME))
+  (special ((*explanation-format* :HTML)
+            (*explanation-audience* :LAY)
+            ;(*logic-dialect* :KIF-ONTOSAURUS)
+            (*logic-dialect* :JAVA-GUI-HTML)
+            ;(*logic-dialect* :KIF)
+            )
+    (with-output-file (out file)
+      (explain-whynot NULL :BRIEF NULL FALSE out))))
+
+(defun print-why-to-html-file ((file FILE-NAME))
+  (special ((*explanation-format* :HTML)
+            (*explanation-audience* :LAY)
+            (*logic-dialect* :KIF-ONTOSAURUS)
+            ;(*logic-dialect* :KIF)
+            )
+    (with-output-file (out file)
+      (explain-why NULL :BRIEF NULL out))))
+|#

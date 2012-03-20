@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: PrintStringStream.java,v 1.5 2003/04/18 21:16:08 hans Exp
+// Version: PrintStringStream.java,v 1.7 2006/05/11 07:06:48 hans Exp
 
 // Native Print String Stream
 //

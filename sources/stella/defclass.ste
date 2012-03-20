@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: defclass.ste,v 1.81 2003/04/18 21:14:46 hans Exp
+;;; Version: defclass.ste,v 1.88 2006/05/11 07:05:57 hans Exp
 
 ;;; Support for defining STELLA classes.
 
@@ -53,6 +53,8 @@
 ;;;;;; 'yield-define-stella-class'
   ;;
 
+;;; This function should not be called directly from other code, as it
+;;; skips the step for getting proper NULL values for arrays.
 (defun (type-to-null-value-tree OBJECT) ((type TYPE))
   ;; Return a parse tree for the null value corresponding to the type 'type'.
   (let ((class (type-to-class type)))
@@ -66,15 +68,23 @@
           (return (transientify-form nullValue)))))
     (return (bquote NULL))))
 
-(defun (type-to-walked-null-value-tree OBJECT) ((type TYPE))
+;; cl-array-null
+(defun (type-to-walked-null-value-tree OBJECT) ((typespec TYPE-SPEC) (type TYPE))
   ;; Just like `type-to-null-value-tree' but also walks the result
   ;;    before it gets returned.  This is sometimes necessary for
   ;;    more complex NULL values, e.g., if they are defined via
   ;;    `verbatim' clauses.
   (let ((nullValue (type-to-null-value-tree type)))
-    (if (eql? nullValue (bquote NULL))
-        (return nullValue)
-      (return (walk-expression-tree nullValue type (quote NULL) FALSE)))))
+    (unless (eql? nullValue (bquote NULL))
+      (setq nullValue (walk-expression-tree nullValue type (quote NULL) FALSE)))
+    (if (array-type-specifier? typespec)
+	(return
+	  ;;; TO DO: FIGURE OUT WHAT THIS NEEDS TO BE!
+	  (walk-expression-tree (bquote (verbatim :common-lisp
+						  & (lisp-null-array-symbol-string (array-type-rank typespec))
+						  :otherwise & nullValue))
+				type (quote NULL) FALSE))
+	(return nullValue))))
   
 (defun (yield-cons-list-from-sequence CONS) ((sequence SEQUENCE))
   ;; Return a newly-formed cons-list containing the values in
@@ -200,6 +210,15 @@ a Stella class object."
         (not (space-saver-slot-allocation? slot))
         (not (redundant-slot? slot)))))
 
+(defun (parameter-slot? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if `slot' represents a class parameter.
+  (let ((owner (slot-owner slot)))
+    (return
+      (and (abstract? slot)
+           (defined? owner)
+           (defined? (type-class owner))
+           (member? (parameters (type-class owner)) (slot-name slot))))))
+
 (defun (native-method? BOOLEAN) ((slot METHOD-SLOT))
   ;; Return TRUE if 'slot' will be implemented by a
   ;;    native method in the target language.
@@ -321,6 +340,26 @@ a Stella class object."
                                  nativeSlotHome))
              do (setq candidate superClass))
     (return candidate)))
+
+(defun (slot-name-conflict? BOOLEAN) ((slot SLOT) (class CLASS))
+  ;; Assume `slot' is a native storage or method slot visible on `class'.
+  ;; Return `true' if there is another slot with the same symbol name
+  ;;    defined on this class or any superclass.  In that case, it will
+  ;;    not be possible to have both defined in languages like C++ or Java.
+  ;; This is a bit expensive, but we don't try this test unless it seems likely
+  ;;    that there is a conflict.
+  (let ((name (slot-name slot))
+        (name-string (symbol-name name)))
+    (foreach siblingSlot in (class-local-slots class)
+      where (and (not (eql? (slot-name siblingSlot) name))
+                 (string-eql? (symbol-name (slot-name siblingSlot)) name-string))
+      do (return TRUE))
+    (foreach superClass in (class-all-super-classes class)
+      do (foreach superSlot in (class-local-slots superClass)
+           where (and (not (eql? (slot-name superSlot) name))
+                      (string-eql? (symbol-name (slot-name superSlot)) name-string))
+           do (return TRUE)))
+    (return FALSE)))
 
 (defun (method-contains-unknown-type? BOOLEAN) ((method METHOD-SLOT))
   ;; Test if a method contains an unknown type in its signature.
@@ -486,8 +525,10 @@ a Stella class object."
 (defun (yield-constructor-name SYMBOL) ((class CLASS))
   ;; Return the name of the constructor function for the class named
   ;;    'className'.
-  (return (intern-derived-symbol
-           (class-type class) (concatenate "NEW-" (class-name class)))))
+  (let ((base-name (class-name class))
+        (prefix (choose (all-upper-case-string? base-name) "NEW-" "new-")))
+    (return (intern-derived-symbol (class-type class) 
+                                   (concatenate prefix base-name)))))
 
 (defun (yield-creation-trees CONS) ((class CLASS))
   ;; Return a list of trees that create an instance of 'class'.
@@ -727,17 +768,18 @@ a Stella class object."
         (:NULL-VALUE-ONLY
          (when (or requiredSlot?
                    (not (equal-cons-trees?
-                         (type-to-null-value-tree (type slot))
+                         (type-to-walked-null-value-tree (type-specifier slot) (type slot))
                          initialValueExpression)))
            (setq initialValueExpression NULL)))
         (:INITIAL-VALUE-ONLY
          (when (or requiredSlot?
                    (equal-cons-trees?
-                    (type-to-null-value-tree (type slot))
+                    (type-to-walked-null-value-tree (type-specifier slot) (type slot))
                     initialValueExpression))
            (setq initialValueExpression NULL)))
         (:FORCE-NULL-VALUE
-         (setq initialValueExpression (type-to-null-value-tree (type slot))))
+         (setq initialValueExpression 
+	       (type-to-walked-null-value-tree (type-specifier slot) (type slot))))
         (:ANY-INITIAL-VALUE
          (when requiredSlot?
            (setq initialValueExpression NULL))))
@@ -1070,9 +1112,10 @@ a Stella class object."
 
 (defun (yield-initializer-name SYMBOL) ((class CLASS))
   ;; Return the name of the initializer function for 'class'.
-  (return (intern-derived-symbol
-           (class-type class)
-           (concatenate "initialize-" (class-name class)))) )
+  (let ((base-name (class-name class))
+        (prefix (choose (all-upper-case-string? base-name) "INITIALIZE-" "initialize-")))
+    (return (intern-derived-symbol (class-type class) 
+                                   (concatenate prefix base-name))) ))
 
 (defun (yield-initializer-definition CONS) ((class CLASS))
   ;; Return the definition of an initializer definition for 'class'.
@@ -1420,7 +1463,7 @@ some free list.  Depending on program behavior, this table can get quite large!"
   (let ((defaultForm (system-default-value slot)))
     (return (and (defined? defaultForm)
                  (not (equal-cons-trees?
-                       (type-to-null-value-tree (type slot))
+                       (type-to-walked-null-value-tree (type-specifier slot) (type slot))
                        defaultForm))))))
 
 (defun (system-defined-slot-reader? BOOLEAN) ((slot STORAGE-SLOT))
@@ -1459,15 +1502,8 @@ some free list.  Depending on program behavior, this table can get quite large!"
   (return
     (intern-derived-symbol
      (slot-name slot)
-     (concatenate
-       "*HARDWIRED-"
-       (concatenate
-         (symbol-name (slot-name slot))
-         (concatenate
-           "-ON-"
-           (concatenate
-             (symbol-name (slot-owner slot))
-             "*")))))))
+     (concatenate "*HARDWIRED-" (symbol-name (slot-name slot)) "-ON-"
+                  (symbol-name (slot-owner slot)) "*"))))
 
 (defun (yield-hardwired-slot-reader-body CONS CONS) ((slot STORAGE-SLOT))
   ;; Yield a reader body for a hardwired 'slot'.
@@ -1646,52 +1682,6 @@ some free list.  Depending on program behavior, this table can get quite large!"
                  (defined? (type-class type))
                  (subtype-of? (type slot) @LITERAL))) ))
 
-#|
-;; This code has been obsoleted by the slot accessor function scheme:
-(defun (yield-wrapped-slot-reader-name SYMBOL) ((slotName SYMBOL))
-  ;; Return the name of the wrapped read-slot method for the slot
-  ;;    named 'slotName'.
-  (return (intern-derived-symbol
-           slotName
-           (concatenate "WRAPPED-" (symbol-name slotName)))) )
-                                        
-(defun (yield-wrapped-slot-reader-tree CONS)
-    ((slot STORAGE-SLOT) (class CLASS))
-  ;; Return a tree defining a method that that reads the literal
-  ;;    slot 'slot' on 'class' and wraps stored literals.
-  (let ((className (type-to-symbol (class-type class)))
-        (methodName (yield-wrapped-slot-reader-name (slot-name slot)))
-        (wrappedType (type-to-wrapped-type (type slot))))
-    (return
-      (bquote
-       (DEFMETHOD (& methodName & wrappedType) ((self & className))
-         :auxiliary? TRUE
-         (let ((bareValue (& (slot-name slot) self)))
-           (return (choose (defined? bareValue)
-                           (& (choose (eq? (slot-base-type slot)
-                                           @BOOLEAN)
-                                      (quote wrap-boolean)
-                                      (quote wrap-literal))
-                              bareValue)
-                           NULL))))))))
-
-(defun (yield-wrapped-slot-writer-tree CONS)
-    ((slot STORAGE-SLOT) (class CLASS))
-  ;; Return a method object plus body for a method that writes into the
-  ;;    literal 'slot' and unwraps wrapped literals before they get stored.
-  (let ((className (type-to-symbol (class-type class)))
-        (methodName (yield-setter-method-name
-                     (yield-wrapped-slot-reader-name (slot-name slot))))
-        (wrappedType (type-to-wrapped-type (type slot))))
-    (return
-      (bquote
-       (DEFMETHOD (& methodName & wrappedType)
-           ((self & className) (value & wrappedType))
-         :auxiliary? TRUE
-         (let ((bareValue & (type slot) (wrapper-value value)))
-           (setf (& (slot-name slot) self) bareValue)
-           (return value)))))))
-|#
 
 (defun (generically-accessible-type? BOOLEAN) ((type TYPE))
   (return (or (subtype-of? type @OBJECT)
@@ -1721,12 +1711,11 @@ some free list.  Depending on program behavior, this table can get quite large!"
 
 (defun (yield-generic-slot-accessor-name SYMBOL) ((class CLASS))
   ;; Return the name of the generic accessor for slots on 'class'.
-  (return
-    (intern-derived-symbol
-     (class-type class)
-     (concatenate
-       "ACCESS-"
-       (concatenate (symbol-name (class-type class)) "-SLOT-VALUE")))))
+  (let ((base-name (symbol-name (class-type class)))
+        (prefix (choose (all-upper-case-string? base-name) "ACCESS-" "access-"))
+        (suffix (choose (all-upper-case-string? base-name) "-SLOT-VALUE" "-Slot-Value")))
+    (return (intern-derived-symbol (class-type class)
+                                   (concatenate prefix base-name suffix)))))
 
 (defun (yield-generic-slot-accessor-definition CONS) ((class CLASS))
   ;; Return the definition of the generic accessor for slots on 'class'.
@@ -1874,12 +1863,13 @@ some free list.  Depending on program behavior, this table can get quite large!"
     (return result)))
 
 (defun (yield-mixin-slot-reader-name SYMBOL) ((slot STORAGE-SLOT))
-  (return
-    (intern-derived-symbol
-     (slot-name slot)
-     (concatenate
-       (symbol-name (slot-name slot))
-       (concatenate "-ON-" (symbol-name (slot-owner slot)))))))
+  (let ((pre-name (symbol-name (slot-name slot)))
+        (post-name (symbol-name (slot-owner slot)))
+        (infix (choose (and (all-upper-case-string? pre-name)
+                            (all-upper-case-string? post-name))
+                       "-ON-" "-On-")))
+    (return (intern-derived-symbol (slot-name slot)
+                                   (concatenate pre-name infix post-name))) ))
 
 (defun (yield-mixin-slot-writer-name SYMBOL) ((slot STORAGE-SLOT))
   (return (yield-setter-method-name (yield-mixin-slot-reader-name slot))))
@@ -1917,10 +1907,9 @@ some free list.  Depending on program behavior, this table can get quite large!"
 
 (defun (yield-native-slot-reader-name SYMBOL) ((slot STORAGE-SLOT))
   ;; Return the name for the native slot reader method of 'slot'.
-  (return
-    (intern-derived-symbol
-     (slot-name slot)
-     (concatenate (symbol-name (slot-name slot)) "-NATIVE-VALUE"))))
+  (let ((base-name (symbol-name (slot-name slot)))
+        (suffix (choose (all-upper-case-string? base-name) "-NATIVE-VALUE" "-Native-Value")))
+    (return (intern-derived-symbol (slot-name slot) (concatenate base-name suffix))) ))
 
 (defun (yield-native-slot-writer-name SYMBOL) ((slot STORAGE-SLOT))
   ;; Return the name for the native slot writer method of 'slot'.

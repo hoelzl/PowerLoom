@@ -1,30 +1,46 @@
 ;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;                                                                          ;
-;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 2000-2003              ;
-;  University of Southern California, Information Sciences Institute       ;
-;  4676 Admiralty Way                                                      ;
-;  Marina Del Rey, California 90292                                        ;
-;                                                                          ;
-;  This software was developed under the terms and conditions of Contract  ;
-;  No. N00014-94-C-0245 between the Defense Advanced Research Projects     ;
-;  Agency and the University of Southern California, Information Sciences  ; 
-;  Institute.  Use and distribution of this software is further subject    ;
-;  to the provisions of that contract and any other agreements developed   ;
-;  between the user of the software and the University of Southern         ;
-;  California, Information Sciences Institute.  It is supplied "AS IS",    ;
-;  without any warranties of any kind.  It is furnished only on the basis  ;
-;  that any party who receives it indemnifies and holds harmless the       ;
-;  parties who furnish and originate it against any claims, demands, or    ;
-;  liabilities connected with using it, furnishing it to others or         ;
-;  providing it to a third party.  THIS NOTICE MUST NOT BE REMOVED FROM    ;
-;  THE SOFTWARE, AND IN THE EVENT THAT THE SOFTWARE IS DIVIDED, IT SHOULD  ;
-;  BE ATTACHED TO EVERY PART.                                              ;
-;                                                                          ;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;; Version: pli.ste,v 1.29 2003/10/29 02:43:02 hans Exp
+
+;;; Version: pli.ste,v 1.48 2006/05/11 07:05:28 hans Exp
 
 ;;; Application Program Interface (API) for PowerLoom
 
@@ -57,6 +73,20 @@ is called more than once, every call after the first one is a no-op."
     (when (not *powerloom-initialized?*)
       ;; this will set `*powerloom-initialized?*' to true:
       (startup-logic-system))))
+
+(defun reset-powerloom ()
+  :documentation "Reset PowerLoom to its initial state.
+CAUTION: This will destroy all loaded knowledge bases and might break other
+loaded STELLA systems if they do reference PowerLoom symbols in their code."
+  :public? TRUE
+  (with-process-lock *powerloom-lock*
+    (logic/reset-powerloom)))
+
+(defun clear-caches ()
+  :documentation "Clear all query and memoization caches."
+  :public? TRUE
+  (with-process-lock *powerloom-lock*
+    (logic/clear-caches)))
 
 
   ;;
@@ -114,7 +144,7 @@ elements are available, `false' otherwise."
 
 (defmethod (length INTEGER) ((self PL-ITERATOR))
   :public? TRUE
-  :documentation "Number of items in `self'."
+  :documentation "Number of items remaining in `self'.  Non destructive."
   (return (length (cursor self))))
 
 (defglobal EMPTY-PL-ITERATOR PL-ITERATOR (new PL-ITERATOR :cursor NIL)
@@ -261,20 +291,63 @@ elements are available, `false' otherwise."
               collect term into result)
      (return result))))
 
+
+(defun (legal-operator? BOOLEAN) ((operator SYMBOL))
+  :public? FALSE
+  (return (or (member? *kif-sentence-operators* operator)
+              (member? *kif-term-operators* operator)
+              (member? (quote (<=>> <<=> <<=>> <~> <~>> <<~> <<~>>
+                                    about <<= =>> <~ ~> <<~ ~>>))
+                       operator))))
+
+
   ;;
 ;;;;;; Names to instances and back
   ;;
+
+
+
+(defun (get-keyword KEYWORD) ((name STRING))
+  :public? TRUE
+  :documentation "Returns the Stella KEYWORD `name' if it exists.  Case sensitive."
+  (return (lookup-keyword name)))
+
+(defun (get-symbol SYMBOL) ((name STRING) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation "Returns the Stella SYMBOL `name' visible in `module' if it
+exists.  `name' is ALWAYS treated case sensitively."
+  (with-logic-environment module environment
+    (return (lookup-symbol name))
+    #|  potentially case-insensitive version:
+    ;; Additional doc string text:
+    ;; "`name may be treated non case sensitively if `module' is not case sensitive."
+    (let ((sym (lookup-symbol name)))
+      (if (defined? sym)
+        (return sym)
+        (if (case-sensitive? *module*)
+          (return (lookup-symbol (string-upcase name)))
+          (return NULL))))
+     |#
+    ))
+
+(defun (get-operator SYMBOL) ((name STRING))
+  :public? TRUE
+  :documentation "Returns the logical operator object (a Stella SYMBOL) for `name'.
+If no such operator exists then a `no-such-object' exception is thrown."
+  (unless (all-upper-case-string? name)
+    (setq name (string-upcase name)))
+  (let ((operator (lookup-symbol-in-module name *logic-module* false)))
+    (if (and (defined? operator) (legal-operator? operator))
+      (return operator)
+      (signal NO-SUCH-OBJECT-EXCEPTION "No operator named " name)
+     )))
 
 (defun (get-object OBJECT) ((name STRING) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation "Look for an object named `name' that is local to
 or visible from the module `module'."
-  (let ((currentModule (either module *module*)))
-    (unless (or (case-sensitive? currentModule)
-		(all-upper-case-string? name))
-      (setq name (string-upcase name))))
   (with-logic-environment module environment
-			  (return (LOGIC/get-instance name))))
+    (return (LOGIC/get-instance (intern-stella-name name)))))
 
 (defun (s-get-object OBJECT) ((name STRING) (module-name STRING) (environment ENVIRONMENT))
   :public? TRUE
@@ -289,12 +362,8 @@ with the name `module-name', then a Stella `no-such-context-exception' is thrown
   :public? TRUE
   :documentation "Return a class/concept named `name' that is local to
 or visible from the module `module'."
-  (let ((currentModule (either module *module*)))
-    (unless (or (case-sensitive? currentModule)
-		(all-upper-case-string? name))
-      (setq name (string-upcase name))))
   (with-logic-environment module environment
-			  (return (LOGIC/get-class name))))
+    (return (LOGIC/get-class (intern-stella-name name)))))
 
 (defun (s-get-concept LOGIC-OBJECT) ((name STRING) (module-name STRING) (environment ENVIRONMENT))
   :public? TRUE
@@ -309,12 +378,8 @@ with the name `module-name', then a Stella `no-such-context-exception' is thrown
   :public? TRUE
   :documentation "Return a concept or relation named `name' that is local to
 or visible from the module `module'."
-  (let ((currentModule (either module *module*)))
-    (unless (or (case-sensitive? currentModule)
-		(all-upper-case-string? name))
-      (setq name (string-upcase name))))
   (with-logic-environment module environment
-			  (return (LOGIC/get-relation name))))
+    (return (LOGIC/get-relation (intern-stella-name name)))))
 
 (defun (s-get-relation LOGIC-OBJECT) ((name STRING) (module-name STRING) (environment ENVIRONMENT))
   :public? TRUE
@@ -325,10 +390,43 @@ with the name `module-name', then a Stella `no-such-context-exception' is thrown
   (return 
     (get-relation name (safely-get-module module-name environment) environment)))
 
+
+;;;;
+;;;;  GET-NAME series.
+;;;;  GET-NAME is always fully qualified.
+;;;;  GET-SHORT-NAME is never qualified.
+;;;;  GET-NAME-IN-MODULE gets the name needed to find the object as seen from the module.
+;;;;
+
 ;; TO DO:  WHAT ABOUT SKOLEMS? -- Nothing, they are unnamed objects.
-(defun (get-name STRING) ((obj OBJECT))
+(defun (get-name-in-module STRING) ((obj OBJECT) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
-  :documentation "Return the name of `obj', if it has one.  Otherwise return `null'."
+  :documentation "Return the name, qualified as necessary, so that `obj' can be found from
+`module'.  If there is no name for the object return `null'."
+  (with-logic-environment module environment
+    (typecase obj
+      (SKOLEM
+       (return NULL))
+      (LOGIC-OBJECT
+       (return (stringify (object-name obj))))
+      (GENERALIZED-SYMBOL
+       (return (stringify obj)))
+      (MODULE
+       (return (module-full-name obj)))
+      (CONTEXT
+       (return (context-name obj)))
+      (/PL-KERNEL-KB/COMPUTED-PROCEDURE
+       (return (stringify (surrogate-value-inverse obj))))
+      (otherwise 
+       (return NULL)))))
+
+(defun (get-name STRING) ((obj OBJECT))
+  :documentation "Return the fully qualified name of `obj', if it has one.  Otherwise return `null'."
+  (return (get-name-in-module obj *root-module* NULL)))
+
+(defun (get-short-name STRING) ((obj OBJECT))
+  :public? TRUE
+  :documentation "Return the short name of `obj', if it has one.  Otherwise return `null'."
   (typecase obj
     (SKOLEM
      (return NULL))
@@ -345,6 +443,8 @@ with the name `module-name', then a Stella `no-such-context-exception' is thrown
      (return (symbol-name (surrogate-value-inverse obj))))
     (otherwise 
      (return NULL))))
+
+
 
 (defun (object-to-string STRING) ((self OBJECT))
   :public? TRUE
@@ -367,7 +467,8 @@ with the name `module-name', then a Stella `no-such-context-exception' is thrown
 (defun (object-to-integer INTEGER) ((self OBJECT))
   :public? TRUE
   :documentation
-  "Coerce `self' to an integer, or throw a Stella Exception if the coersion is not feasible."
+  "Coerce `self' to an integer, or throw a Stella Exception if the coersion is not feasible.
+Floating point values will be coerced by rounding."
   (typecase self
     (SKOLEM 
      (let ((value (value-of self)))
@@ -479,22 +580,26 @@ Currently `type' only has an effect on the interpretation of literal types."
   ;;
 
 #|
-(get-nth-string (retrieve "(?y)" "(age Fred ?y)" *module* NULL) 1)
+;; syntax games - these are not all valid examples:
+(get-nth-string (retrieve "(?y)" "(age Fred ?y)" *module* NULL) 1 *module* NULL)
 v.
-(get-nth-string (retrieve "(age ?x ?y)" "(= ?x Fred)" *module* NULL) 2)
+(get-nth-string (retrieve "(age ?x ?y)" "(= ?x Fred)" *module* NULL) 2)*module* NULL
 v.
-(get-nth-string (retrieve "(age Fred ?y)" "TRUE" *module* NULL) 2)
+(get-nth-string (retrieve "(age Fred ?y)" "TRUE" *module* NULL) 2 *module* NULL)
 v.
-(get-nth-string (parametric-retrieve "(age ?x ?y)" "TRUE" (list "Fred" NULL) *module* NULL) 2)
+(get-nth-string (parametric-retrieve "(age ?x ?y)" "TRUE" (list "Fred" NULL) *module* NULL)
+                2 *module* NULL)
 v.
-(get-nth-string (parametric-retrieve "(?x ?y)" "(age ?x ?y)" (list "Fred" NULL) *module* NULL) 2)
+(get-nth-string (parametric-retrieve "(?x ?y)" "(age ?x ?y)" (list "Fred" NULL) *module* NULL)
+                2 *module* NULL)
 v.
-(get-nth-string (s-get-proposition "(age Fred null)" *module* NULL) 2)
+(get-nth-string (s-get-proposition "(age Fred null)" *module* NULL) 2 *module* NULL)
 v.
-(get-nth-string (s-get-propositions "(age Fred null)" *module* NULL) 2)
+(get-nth-string (s-get-propositions "(age Fred null)" *module* NULL) 2 *module* NULL)
 v.
 (get-nth-string (get-binary-proposition
-                 (get-relation "age") (get-object "Fred") NULL *module* NULL) 2)
+                 (get-relation "age") (get-object "Fred") NULL *module* NULL)
+                2 *module* NULL)
 |#
 
 (defun (help-get-true-extension-members (CONS OF PROPOSITION)) 
@@ -841,9 +946,13 @@ Non-reflexive."
 Include instances of subconcepts of `concept'.  Depending on `concept',
 the return values could be (wrapped) literals."
   (with-logic-environment module environment
-    (return 
-     (list-to-pl-iterator 
-      (remove-deleted-members (asserted-collection-members concept FALSE))))))
+    (if (and (defined? environment)
+             (eql? (level environment) "ASSERTION"))
+      (return 
+       (list-to-pl-iterator 
+        (remove-deleted-members (asserted-collection-members concept FALSE))))
+      (return
+       (retrieve (bquote (all ?x (& (object-name concept) ?x))) module environment)))))
 
 (defun (s-get-concept-instances PL-ITERATOR)
        ((concept-name STRING) (module-name STRING) (environment ENVIRONMENT))
@@ -868,9 +977,18 @@ If no module can be found with the name `module-name', then a Stella
 Exclude instances of subconcepts of `concept'.  Depending on `concept',
 the return values could be (wrapped) literals."
   (with-logic-environment module environment
-    (return 
-     (list-to-pl-iterator 
-      (asserted-collection-members concept TRUE)))))
+    (if (and (defined? environment)
+             (eql? (level environment) "ASSERTION"))
+      (return 
+       (list-to-pl-iterator 
+        (remove-deleted-members (asserted-collection-members concept TRUE))))
+      (return
+       (retrieve (bquote (all ?x (/LOGIC/AND (& (object-name concept) ?x)
+                                             (/LOGIC/FAIL
+                                              (LOGIC/EXISTS (?y)
+                                                (/LOGIC/AND (PROPER-SUBRELATION & (object-name concept) ?Y)
+                                                            (?Y ?X)))))))
+                 module environment)))))
 
 (defun (s-get-direct-concept-instances PL-ITERATOR)
        ((concept-name STRING) (module-name STRING) (environment ENVIRONMENT))
@@ -957,7 +1075,7 @@ has an attribute matching `value' for the binary relation `relation', i.e.,
    (let ((derivableTypes NIL))
      (foreach prop in (all-true-dependent-propositions object NULL FALSE)
               where (eql? (kind prop) :ISA)
-              do (pushq derivableTypes (get-nth-value prop 0)))
+              do (pushq derivableTypes (get-nth-value prop 0 module environment)))
      (return (cons-to-pl-iterator (most-specific-named-descriptions derivableTypes))))))
 
 (defun (get-relation-extension (PL-ITERATOR OF PROPOSITION))
@@ -966,7 +1084,8 @@ has an attribute matching `value' for the binary relation `relation', i.e.,
 Include propositions that satisfy subrelations of `relation'."
   (with-logic-environment module environment
     (return (cons-to-pl-iterator
-             (help-get-true-extension-members relation TRUE)))))
+             (help-get-true-extension-members
+              relation (not (= environment ASSERTION-ENV)))))))
 
 (defun (s-get-relation-extension (PL-ITERATOR OF PROPOSITION))
        ((relation-name STRING) (module MODULE) (environment ENVIRONMENT))
@@ -974,7 +1093,7 @@ Include propositions that satisfy subrelations of `relation'."
   :documentation "Return propositions that satisfy the relation named
 `relation-name'.  Include propositions that satisfy subrelations of the relation."
   (let ((relation (safely-get-relation relation-name module environment)))
-    (if (all-defined? relation)
+    (if (defined? relation)
       (return (get-relation-extension relation module environment))
       (return EMPTY-PL-ITERATOR))))
 
@@ -1000,11 +1119,12 @@ Include propositions that satisfy subrelations of `relation'."
   :documentation "Return the module in which `object' was created."
   (return (home-module object)))
 
-(defun (get-modules (PL-ITERATOR OF MODULE)) ()
+(defun (get-modules (PL-ITERATOR OF MODULE)) ((kb-modules-only? BOOLEAN))
   :public? TRUE
-  :documentation "Return all modules currently loaded into PowerLoom."
-  (let ((modules (collect m in (all-modules))))
-    (return (cons-to-pl-iterator modules))))
+  :documentation "Return all modules currently loaded into PowerLoom.  If `kb-modules-only?'
+is `true', then Stella modules that are used only for program code are
+not included in the list."
+  (return (cons-to-pl-iterator (list-modules kb-modules-only?))))
 
 (defun (create-module MODULE) ((name STRING) (parent MODULE) (case-sensitive? BOOLEAN))
   :public? TRUE
@@ -1109,32 +1229,70 @@ name will be all upper case (This latter feature may change!)"
   ;;
 
 
+(defun (create-keyword KEYWORD) ((name STRING))
+  :public? TRUE
+  :documentation "Returns the Stella keyword `name', creating it if
+necessary.  `name' is treated case-sensitively.  This should
+generally not be necessary to do."
+  (return (intern-rigid-symbol-wrt-module name *module* KEYWORD-SYM)))
+
+(defun (create-symbol SYMBOL) ((name STRING) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation "Returns the Stella symbol `name' visible in `module',
+creating it if necessary.  `name' is ALWAYS treated case-sensitively,
+even if `module' is case insensitive. This should generally not be
+necessary to do."
+  (with-logic-environment module environment
+    (return (intern-symbol-in-module name *module* FALSE))))
+
 (defun (create-object LOGIC-OBJECT) 
     ((name STRING) (concept LOGIC-OBJECT) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation "Create an object named `name' of type `concept' in the designated
-module.  Both `name' and `concept' can be `null'.  If `name' is `null' then an object
-will be created with a new, non-conflicting name based on the name of `concept', or
-system-generated if no concept is specified.  If `concept' is `null', then the object
-will be of type THING.
+module.  Both `name' and `concept' can be `null'.  If `name' is `null' then an
+object will be created with a new, non-conflicting name based on the name of
+`concept', or system-generated if no concept is specified.  If `concept' is
+`null', then the object will be of type THING.  It is an error to create an
+object with the same name as an existing object.
 
-Note that because names in modules that are not case-sensitive are canonicalized,
-the name of the returned object may not match `name' exactly.
+Note that the string can be a qualified name, in which case the object
+will be created in the module specified, but with a name as determined
+by the qualified name.  Vertical bars in the name string are interpreted
+as Stella escape characters.
+
+Note that because names in modules that are not case-sensitive are
+canonicalized, the name of the returned object may not match `name'
+exactly.
 
 Return the object."
   (with-logic-environment module environment
-    (let ((object LOGiC-OBJECT null))
+    (let ((object LOGiC-OBJECT null)
+          (name-symbol SYMBOL null)
+          (object-surrogate SURROGATE null))
       (cond ((defined? name)
-             (setq object (create-logic-instance (intern-surrogate name) NULL)))
+             (setq name-symbol (intern-stella-name name)))
             ((defined? concept)
-             (setq object (create-logic-instance 
-                           (intern-surrogate 
-                            (generate-unique-name (get-name concept) null null))
-                           NULL)))
+             ;; Use this temporarily to get the appropriate modules.
+             (setq name-symbol (get-short-name concept))
+             (setq name-symbol (intern-symbol-in-module 
+                                (generate-unique-name (symbol-name name-symbol)
+                                                      (home-context name-symbol)
+                                                      NULL)
+                                (home-context name-symbol)
+                                TRUE)))
             (otherwise
-             (setq object (create-logic-instance 
-                           (intern-surrogate (generate-unique-name "I-" null null))
-                           NULL))))
+             (setq name-symbol (intern-symbol-in-module 
+                                (generate-unique-name "I" null null)
+                                *module*
+                                TRUE))))
+      (setq object-surrogate (lookup-surrogate-in-module (symbol-name name-symbol)
+                                                         (home-context name-symbol)
+                                                         FALSE))
+      (when (null? object-surrogate)
+        (setq object-surrogate (intern-surrogate-in-module (symbol-name name-symbol)
+                                                           (home-context name-symbol)
+                                                           FALSE)))
+      (setq object (help-create-logic-instance object-surrogate NULL))
       (when (defined? concept)
         (if (defined? (assert-unary-proposition concept object module environment))
           (return object)
@@ -1179,7 +1337,7 @@ the name of the returned object may not match `name' exactly."
   (with-logic-environment module environment
     (return 
       (call-defconcept
-       (bquote (& (intern-symbol name)
+       (bquote (& (intern-stella-name name)
                   && (choose (defined? parent)
                              (bquote (:subset-of & (object-name parent)))
                              NIL)))))))
@@ -1224,7 +1382,7 @@ the name of the returned object may not match `name' exactly."
           collect (yield-system-defined-parameter-name i *module*)
           into args)
       (return
-	(call-defrelation (bquote (& (intern-symbol name) & args)))))))
+	(call-defrelation (bquote (& (intern-stella-name name) & args)))))))
 
 (defun (s-create-relation LOGIC-OBJECT) ((name STRING) (arity INTEGER) 
                                          (module-name STRING) (environment ENVIRONMENT))
@@ -1262,7 +1420,7 @@ the name of the returned object may not match `name' exactly."
           collect (yield-system-defined-parameter-name i *module*)
           into args)
       (return
-	(call-deffunction (bquote (& (intern-symbol name) & args)))))))
+	(call-deffunction (bquote (& (intern-stella-name name) & args)))))))
 
 (defun (s-create-function LOGIC-OBJECT) ((name STRING) (arity INTEGER) 
                                          (module-name STRING) (environment ENVIRONMENT))
@@ -1283,23 +1441,68 @@ the name of the returned object may not match `name' exactly."
                      (safely-get-module module-name environment)
                      environment)))
 
-(defun (create-enumerated-list LOGIC-OBJECT) ((members CONS))
+(defun register-specialist-function ((name STRING) (function-reference FUNCTION-CODE)
+                                     (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation
-  "Create a logical term that denotes a list containing `members'.
-Useful for passing lists as arguments to parameterized queries."
-  (return (create-logical-list (new LIST :the-cons-list members))))
+  "Register `name' as a function name in `module' which will invoke the
+native code procedure described by `function-reference.'  The `name'
+is a fully-qualified name which will be interpreted by the normal
+rules for reading names in PowerLoom.  The function must conform
+to the signature for specialist functions.
 
-(defun (create-enumerated-set LOGIC-OBJECT) ((members CONS))
+The exact form of `function-reference' depends on the underlying
+programming language.  The following type mappings are used:
+          C++:  
+  Common Lisp:  FUNCTION   (result of #' or (FUNCTION ...))
+         Java:  java.lang.reflect.Method"
+  (with-logic-environment module environment
+    (/logic/register-specialist-function name function-reference)))
+
+(defun s-register-specialist-function ((name STRING) (native-name STRING)
+                                       (module-name STRING) (environment ENVIRONMENT))
   :public? TRUE
   :documentation
-  "Create a logical term that denotes the enumerated set containing `members'."
-  (return (/logic/create-enumerated-set (new LIST :the-cons-list members))))
+  "Register `name' as a function name in the module named `module-name'.
+This function will the native code named `native-name'.  The `name'
+is a fully-qualified name which will be interpreted by the normal
+rules for reading names in PowerLoom.  The `native-name' will be
+processed in a manner that depends on the underlying programming
+language.  The following type mappings are used:
+          C++:  Not available.  Error signaled.
+  Common Lisp:  The native-name is read by READ-FROM-STRING and then
+                the SYMBOL-FUNCTION is taken.
+         Java:  A fully package-qualified name is required.  It is
+                looked up using the Reflection tools.
+The function found must conform to the signature for specialist functions."
+  (with-logic-environment (safely-get-module module-name environment) environment
+    (/logic/register-specialist-function-name name native-name)))
+
+
+(defun (create-enumerated-list LOGIC-OBJECT) 
+       ((members CONS) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation
+  "Create a logical term that denotes a list containing `members' in
+`module' using `environment'.  Useful for passing lists as arguments
+to parameterized queries."
+  (with-logic-environment module environment
+    (return (create-logical-list (new LIST :the-cons-list members)))))
+
+(defun (create-enumerated-set LOGIC-OBJECT) 
+       ((members CONS) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation
+  "Create a logical term that denotes the enumerated set containing `members'
+in `module' using `environment'."
+  (with-logic-environment module environment
+    (return (/logic/create-enumerated-set (new LIST :the-cons-list members)))))
 
 (defun destroy-object ((object LOGIC-OBJECT))
   :public? TRUE
   :documentation "Delete the object `object', retracting all facts attached to it."
-  (destroy-instance object))
+  (with-process-lock *powerloom-lock*
+    (destroy-instance object)))
 
 (defun s-destroy-object
  ((object-name STRING) (module-name STRING) (environment ENVIRONMENT))
@@ -1319,8 +1522,7 @@ If no module can be found with the name `module-name', then a Stella
     ((relation LOGIC-OBJECT) (arg OBJECT) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation "Assert that the proposition (`relation' `arg') is TRUE in `module'.  Return the asserted proposition."
-  (with-logic-environment 
-    module environment
+  (with-logic-environment module environment
     (if (class? relation)
       (return (assert-isa-proposition arg (surrogate-value-inverse relation)))
       (return (assert-property arg (surrogate-value-inverse relation))))))
@@ -1412,7 +1614,7 @@ Return an iterator of the propositions resulting from sentence."
   :documentation "Retract the truth of the proposition `proposition' in `module'.
 Return the retracted proposition."
   (with-logic-environment module environment
-    (update-proposition-truth-value proposition :RETRACT-TRUE)
+    (help-update-top-level-proposition proposition :RETRACT-TRUE)
     (return proposition)))
 
 (defun (s-retract-proposition (PL-ITERATOR OF PROPOSITION)) 
@@ -1431,7 +1633,7 @@ Return an iterator of the retracted propositions resulting from sentence."
       (setq propositions (s-conceive sentence module-name environment))
       (setq return-value (cons-to-pl-iterator (cursor propositions))) ; Preserve for return
       (foreach proposition in propositions
-	  do (update-proposition-truth-value proposition :RETRACT-TRUE))
+	  do (help-update-top-level-proposition proposition :RETRACT-TRUE))
       (return return-value))))
 
 (defun (conceive (PL-ITERATOR OF PROPOSITION))
@@ -1690,7 +1892,7 @@ value of `ifexists'.  Possible values are \"ASK\", \"REPLACE\", \"WARN\" and \"E
   REPLACE => Means overwrite without warning.
   WARN    => Means overwrite with a warning.
   ERROR   => Means don't overwrite, signal an error instead.
-  ASK     => Ask the user whether to overwrite or not.  If not overwritten, an
+  ASK     => Ask the user whether to overwrite or not.  If not overwritten, an 
              exception is thrown."
   (let ((exists? (stella/probe-file? filename)))
     (cond ((or (not exists?) (string-equal? ifexists "REPLACE"))
@@ -1698,13 +1900,14 @@ value of `ifexists'.  Possible values are \"ASK\", \"REPLACE\", \"WARN\" and \"E
 	  ((string-equal? ifexists "ASK")
 	   (unless (yes-or-no? (concatenate "File `" filename 
 					    "' already exists.  Overwrite it? (yes or no) "))
-	     (error "File " filename " already exists")))
+	     (ensure-file-does-not-exist filename "save-module")))
 	  ((string-equal? ifexists "WARN")
 	   (warn "File " filename " already exists, overwriting."))
 	  ((string-equal? ifexists "ERROR")
-	   (error "File " filename " already exists."))
+	   (ensure-file-does-not-exist filename "save-module"))
 	  (otherwise
-	   (error "Unrecognized ifexists option " ifexists)))
+           (signal BAD-ARGUMENT-EXCEPTION
+                   "Unrecognized ifexists option " ifexists)))
     (with-logic-environment module environment
       (with-output-file (stream filename)
 	(do-save-module *MODULE* stream))) ))
@@ -1748,7 +1951,9 @@ the proposition `prop'."
   :documentation "Return the number of columns in `obj', which must
 be of type proposition, cons, vector or PL-iterator.  For a proposition,
 the number includes both the predidate and arguments. For the PL-iterator
-case,the number of columns is for the current value of the iterator."
+case,the number of columns is for the current value of the iterator.
+
+For non sequence objects, the column count is zero."
   (when (null? obj)
     (return 0))
   (typecase obj
@@ -1759,15 +1964,21 @@ case,the number of columns is for the current value of the iterator."
     (CONS
      (return (length obj)))
     (VECTOR
-     (return (length obj)))))
+     (return (length obj)))
+    (otherwise 
+     (return 1))))
 
-(defun (get-nth-value OBJECT) ((sequence OBJECT) (n INTEGER))
+(defun (get-nth-value OBJECT) ((sequence OBJECT) (n INTEGER) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation "Return the value in the `nth' column of `sequence'.
-Counting starts at zero.  `sequence' must be of type proposition, cons,
-vector or PL-iterator.  A zero column number returns a proposition's 
-relational predicate.  For the PL-iterator case, the number of columns
-is for the current value of the iterator."
+Counting starts at zero.  Unless `n' is zero, `sequence' must be of type
+proposition, cons, vector or PL-iterator.  A zero column number returns
+a proposition's relational predicate.  For the PL-iterator case, the number
+of columns is for the current value of the iterator.
+
+As a special case, a column number of zero will also return `sequence' itself
+if it is not one of the types enumerated above.  This is done to allow the
+use of `get-nth-value' on PL-iterators with only a single return variable."
   (when (or (>= n (get-column-count sequence))
 	    (< n 0))
     (signal LOGIC-EXCEPTION "Column index " n " is out of range for " sequence))
@@ -1775,65 +1986,102 @@ is for the current value of the iterator."
     (PROPOSITION
      (if (eql? n 0)
        (return (get-predicate sequence))
-       (return (nth (arguments sequence) (1- n)))))
+       (let ((value (nth (arguments sequence) (1- n))))
+         (typecase value
+           (SKOLEM
+            (with-logic-environment module environment
+              (return (value-of value))))
+           (otherwise
+            (return value))))))
     (PL-ITERATOR
-     (return (get-nth-value (value sequence) n)))
+     (return (get-nth-value (value sequence) n module environment)))
     (CONS
      (return (nth sequence n)))
     (VECTOR
-     (return (nth sequence n)))))
+     (return (nth sequence n)))
+    (otherwise
+     (return sequence)) ))
 
-(defun (get-nth-string STRING) ((sequence OBJECT) (n INTEGER))
+(defun (get-nth-string STRING) ((sequence OBJECT) (n INTEGER) (module MODULE)(environment ENVIRONMENT))
   :public? TRUE
   :documentation "Return a string representation of the value in the `nth' column of
-`sequence'. Counting starts at zero.  `sequence' must be of type
+`sequence'. Counting starts at zero.   Unless `n' is zero, `sequence' must be of type
 proposition, cons, vector or PL-iterator.  A zero column number returns
 a proposition's relational predicate.  For the PL-iterator case, the
 the current value pointed to by the iterator is used.  This will always
 succeed, even if the `nth' value is not a string object.  In that case, a
-string reprensentation will be returned."
-  (return (object-to-string (get-nth-value sequence n))))
+string reprensentation will be returned.
 
-(defun (get-nth-integer INTEGER) ((sequence OBJECT) (n INTEGER))
+
+As a special case, a column number of zero will also return `sequence' itself
+as a string if it is not one of the types enumerated above.  This is done to 
+allow the use of `get-nth-string' on PL-iterators with only a single return variable."
+  (return (object-to-string (get-nth-value sequence n module environment))))
+
+(defun (get-nth-integer INTEGER) ((sequence OBJECT) (n INTEGER) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation  "Return an integer representation of the value in the `nth' column of
-`sequence'. Counting starts at zero.  `sequence' must be of type
+`sequence'. Counting starts at zero.   Unless `n' is zero, `sequence' must be of type
 proposition, cons, vector or PL-iterator.  A zero column number returns
 a proposition's relational predicate.  For the PL-iterator case, the
 the current value pointed to by the iterator is used.  If this is not
-an integer value, then NULL-INTEGER will be returned."
-  (return (object-to-integer (get-nth-value sequence n))))
+an integer value, then an exception will be thrown.
 
-(defun (get-nth-float FLOAT) ((sequence OBJECT) (n INTEGER))
+
+As a special case, a column number of zero will also return the integer
+value of `sequence' itself if it is not one of the types enumerated
+above.   This allows the use of `get-nth-integer' on PL-iterators with
+only a single return variable.  If  `sequence' cannot be turned into an
+integer, an exception will be thrown."
+  (return (object-to-integer (get-nth-value sequence n module environment))))
+
+(defun (get-nth-float FLOAT) ((sequence OBJECT) (n INTEGER) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation  "Return the floating point value in the `nth' column of
 `sequence'. Counting starts at zero.  `sequence' must be of type
 proposition, cons, vector or PL-iterator.  A zero column number returns
 a proposition's relational predicate.  For the PL-iterator case, the
 the current value pointed to by the iterator is used.  If this is not
-a floating point value, then NULL-FLOAT will be returned."
-  (return (object-to-float (get-nth-value sequence n))))
+a floating point value, then an exception will be thrown.
 
-(defun (get-nth-logic-object LOGIC-OBJECT) ((sequence OBJECT) (n INTEGER))
+
+As a special case, a column number of zero will also return the floating
+point value of `sequence' itself if it is not one of the types enumerated
+above.  This allows the use of `get-nth-float' on PL-iterators with only
+a single return variable.    If  `sequence' cannot be turned into a floating
+point value, an exception will be thrown."
+  (return (object-to-float (get-nth-value sequence n module environment))))
+
+(defun (get-nth-logic-object LOGIC-OBJECT) ((sequence OBJECT) (n INTEGER) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation
   "Return a logic object representation of the value in the `nth' column
-of `sequence'.  Counting starts at zero.  `sequence' must be of type
+of `sequence'.  Counting starts at zero.   Unless `n' is zero, `sequence' must be of type
 proposition, cons, vector or PL-iterator.  A zero column number returns
 a proposition's relational predicate.  For the PL-iterator case, the
 the current value pointed to by the iterator is used.  A zero column number
-returns the proposition's relational predicate."
-  (let ((value (get-nth-value sequence n)))
+returns the proposition's relational predicate.  If the return value is
+not a LOGIC-OBJECT, an exception is thrown.
+
+As a special case, a column number of zero will also return `sequence' itself
+if it is not one of the types enumerated above.  This is done to allow the
+use of `get-nth-value' on PL-iterators with only a single return variable.
+If `sequence' is not a LOGIC-OBJECT, an exception is thrown."
+  (let ((value (get-nth-value sequence n module environment)))
     (if (isa? value @LOGIC-OBJECT)
       (return value)
-      (return NULL))))
+      (signal STELLA-EXCEPTION "Can't coerce " value " to a LOGIC-OBJECT."))))
 
-(defun (get-enumerated-collection-members CONS) ((collection OBJECT))
+(defun (get-enumerated-collection-members CONS) ((collection OBJECT) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation
   "Returns the members of an enumerated collection.  This works on all types
 of collection, i.e., sets and lists"
-  (return (the-cons-list (asserted-collection-members collection TRUE))))
+  (with-logic-environment module environment
+    (let ((members (asserted-collection-members collection TRUE)))
+      (if (defined? members)
+        (return (the-cons-list members))
+        (return NULL)))))
 
 
   ;;
@@ -1939,6 +2187,11 @@ either absolutely or by default."
   :documentation "Tests whether `tv' is an unknown truth value."
   (return (unknown-truth-value? tv)))
 
+(defun (is-inconsistent BOOLEAN) ((tv TRUTH-VALUE))
+  :public? TRUE
+  :documentation "Tests whether `tv' is an inconsistent truth value."
+  (return (inconsistent-truth-value? tv)))
+
 (defun (is-strict BOOLEAN) ((tv TRUTH-VALUE))
   :public? TRUE
   :documentation "Tests whether `tv' is a strict (non-default) truth value."
@@ -1973,6 +2226,7 @@ as determined by PowerLoom.  It can be be tested via the functions `is-true',
 `is-false' and `is-unknown' (which see)."
   :public? TRUE
   (with-logic-environment module environment
+    (setq query (deobjectify-tree query))
     ;; Test for the case where `query' is the sentence and no ASK options are
     ;;    being given and add the required extra level of nesting:
     (when (symbol? (first query))
@@ -2038,6 +2292,7 @@ order does matter or should be different from its default, it can be forced
 by declaring the set of output variables."
   :public? TRUE
   (with-logic-environment module environment
+    (setq query (deobjectify-tree query))
     ;; NOTE: This works around the problem that query iterators would
     ;; otherwise be forced to completion by iterator-to-pl-iterator.
     ;; If that changes, then we can simplify this code.
@@ -2104,4 +2359,5 @@ If no module can be found with the name `module-name', then a STELLA
   (startup-stella-system)
   (print "Initializing PowerLoom..." EOL)
   (startup-logic-system)
+  (STELLA/change-module "PL-USER")
   (powerloom))

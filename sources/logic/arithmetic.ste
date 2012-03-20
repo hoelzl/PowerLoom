@@ -1,42 +1,58 @@
 ;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;                                                                          ;
-;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 1998-2003              ;
-;  University of Southern California, Information Sciences Institute       ;
-;  4676 Admiralty Way                                                      ;
-;  Marina Del Rey, California 90292                                        ;
-;                                                                          ;
-;  This software was developed under the terms and conditions of Contract  ;
-;  No. N00014-94-C-0245 between the Defense Advanced Research Projects     ;
-;  Agency and the University of Southern California, Information Sciences  ; 
-;  Institute.  Use and distribution of this software is further subject    ;
-;  to the provisions of that contract and any other agreements developed   ;
-;  between the user of the software and the University of Southern         ;
-;  California, Information Sciences Institute.  It is supplied "AS IS",    ;
-;  without any warranties of any kind.  It is furnished only on the basis  ;
-;  that any party who receives it indemnifies and holds harmless the       ;
-;  parties who furnish and originate it against any claims, demands, or    ;
-;  liabilities connected with using it, furnishing it to others or         ;
-;  providing it to a third party.  THIS NOTICE MUST NOT BE REMOVED FROM    ;
-;  THE SOFTWARE, AND IN THE EVENT THAT THE SOFTWARE IS DIVIDED, IT SHOULD  ;
-;  BE ATTACHED TO EVERY PART.                                              ;
-;                                                                          ;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: arithmetic.ste,v 1.32 2003/09/30 20:53:04 hans Exp
+;;; Version: arithmetic.ste,v 1.42 2006/05/11 07:05:05 hans Exp
 
 ;;; Evaluators perform computations (e.g., '+', '>') during constraint
 ;;;    propagation, and may side-effect, causing additional propagations.
 
-;;; TO DO:
-;;; - make this a standard LOGIC file and explicitly qualify specialists, etc.
-;;;   with PL-KERNEL.
-
 (in-package "STELLA")
 
 (in-module "PL-KERNEL")
+
+
+;;; TO DO:
+;;; - make this a standard LOGIC file and explicitly qualify specialists, etc.
+;;;   with PL-KERNEL.
 
 
   ;;
@@ -96,6 +112,26 @@
        (setq floatResult (stella/sqrt (wrapper-value x)))))
     (return (wrap-literal floatResult))))
 
+(defun (negate-computation NUMBER-WRAPPER) ((x NUMBER-WRAPPER))
+  :public? TRUE
+  (typecase x
+    (INTEGER-WRAPPER
+     (return (wrap-integer (/stella/- 0 (unwrap-integer x)))))
+    (FLOAT-WRAPPER
+     (return (wrap-float (/stella/- 0.0 (unwrap-float x)))))))
+
+(defun (abs-computation NUMBER-WRAPPER) ((x NUMBER-WRAPPER))
+  :public? TRUE
+  (typecase x
+    (INTEGER-WRAPPER
+     (if (/stella/< (unwrap-integer x) 0)
+       (return (wrap-integer (/stella/- 0 (unwrap-integer x))))
+       (return x)))
+    (FLOAT-WRAPPER
+     (if (/stella/< (unwrap-float x) 0.0)
+       (return (wrap-float (/stella/- 0.0 (unwrap-float x))))
+       (return x)))))
+
 (define-computed-constraint plus-constraint ((x1 NUMBER-WRAPPER)
 					     (x2 NUMBER-WRAPPER)
 					     (x3 NUMBER-WRAPPER))
@@ -133,6 +169,12 @@
   (setq value (times-computation x2 x3))
   (setq value (divide-computation x1 x3))
   (setq value (divide-computation x1 x2)))
+
+(define-computed-constraint negate-constraint ((x1 NUMBER-WRAPPER)
+					       (x2 NUMBER-WRAPPER))
+  (setq value (arithmetic-equal-test x1 (negate-computation x2)))
+  (setq value (negate-computation x2))
+  (setq value (negate-computation x1)))
 
 ;; Returns only the positive square root.
 ;;   Negative square roots come from square-root instead!
@@ -175,56 +217,48 @@
 ;;; This prevents its cached values from 'leaking' into other contexts,
 ;;;    where they might not be valid (due to the fact that the
 ;;;    caches are not truth-maintained under retraction).
+
+;;; The bounds of interval caches will be either NUMBER-WRAPPERs
+;;; or QUANTITY-LOGIC-WRAPPERs.  OBJECT is used because these classes
+;;; don't have any other common superconcept.
+
 (defclass INTERVAL-CACHE (THING)
   :public? TRUE
   :public-slots
   ((home-context :type CONTEXT)
    (interval-member :type LOGIC-OBJECT)
-   ))
-
-(defclass INTEGER-INTERVAL-CACHE (INTERVAL-CACHE)
-  :public? TRUE
-  :public-slots
-  ((lower-bound :type INTEGER)
-   (upper-bound :type INTEGER))
-  :print-form
-  (print-native-stream
-   stream "|IIcache-of: " (interval-member self)
-   " [" (choose (defined? (lower-bound self))
-                (integer-to-string (lower-bound self))
-                "?")
-   "," (choose (defined? (upper-bound self))
-               (integer-to-string (upper-bound self))
-               "?")
-   "]|"))
-
-(defclass FLOAT-INTERVAL-CACHE (INTERVAL-CACHE)
-  :public? TRUE
-  :public-slots
-  ((lower-bound :type FLOAT)
-   (upper-bound :type FLOAT)
+   (lower-bound :type OBJECT)
+   (upper-bound :type OBJECT)
    (strict-lower-bound? :type BOOLEAN)
    (strict-upper-bound? :type BOOLEAN))
   :print-form
-  (print-native-stream
-   stream "|FIcache-of: " (interval-member self) " "
-   (choose (strict-lower-bound? self) "(" "[")
-   (choose (defined? (lower-bound self))
-           (float-to-string (lower-bound self))
-           "?")
-   "," (choose (defined? (upper-bound self)) 
-               (float-to-string (upper-bound self))
-               "?")
-   (choose (strict-upper-bound? self) ")" "]")
-   "|"))
+  (progn 
+    (print-stream stream  "|cache-of: " (interval-member self) " ")
+    (print-interval stream (lower-bound self) (strict-lower-bound? self)
+                           (upper-bound self) (strict-upper-bound? self))
+    (print-stream stream "|")))
+
+(defun print-interval ((stream NATIVE-OUTPUT-STREAM) (lower OBJECT) (strict-lower? BOOLEAN)
+                                                     (upper OBJECT) (strict-upper? BOOLEAN))
+  (if strict-lower?
+    (print-stream stream "(")
+    (print-stream stream "["))
+  (if (defined? lower)
+      (print-stream stream lower)
+      (print-stream stream "?"))
+  (print-stream stream ",")
+  (if (defined? upper)
+    (print-stream stream upper)
+    (print-stream stream "?"))
+(if strict-upper?
+    (print-stream stream ")")
+    (print-stream stream "]")))
 
 (defun (create-interval-cache INTERVAL-CACHE)
-       ((intervalMember LOGIC-OBJECT) (integer? BOOLEAN))
+       ((intervalMember LOGIC-OBJECT))
   :public? TRUE
   ;; Create an INTERVAL-CACHE, and point it at 'intervalMember'.
-  (let ((intervalCache (choose integer? 
-                          (new INTEGER-INTERVAL-CACHE)
-                          (new FLOAT-INTERVAL-CACHE))))
+  (let ((intervalCache (new INTERVAL-CACHE)))
     (setf (interval-member intervalCache) intervalMember)
     (setf (home-context intervalCache) *context*)
     (assert-binary-value @INTERVAL-CACHE-OF intervalMember intervalCache)
@@ -234,55 +268,34 @@
   :public? TRUE
   ;; If 'self' has more than one dependent, return
   ;;    an INTERVAL-CACHE attached to it.
-  (let ((intervalCache OBJECT
-                       (access-binary-value self @INTERVAL-CACHE-OF)))
-    (if (and (defined? intervalCache)
-             (not (skolem? intervalCache))
-             (eql? (home-context (cast intervalCache INTERVAL-CACHE)) *context*))
-      (return intervalCache)
-      (return (create-interval-cache
-               self
-               ;; NEED BETTER TEST:
-               (or (test-isa? self @INTEGER)
-                   ;; Try to intuit the type of function output skolems that
-                   ;;    don't yet have an output type proposition associated:
-                   (and (function-output-skolem? self)
-                        (logical-subtype-of? (skolem-type (cast self SKOLEM))
-                                             @INTEGER))))))))
-
-(defun (coerce-interval-bound-to-integer INTEGER)
-       ((self OBJECT) (operator SURROGATE))
-  :public? TRUE
-  ;; Return an integer representing the closest integer to 'self' obeying
-  ;;    the inequality 'operator'.
-  (typecase self
-    (INTEGER (return (INTEGER.coerce-interval-bound-to-integer self operator)))
-    (FLOAT (return (FLOAT.coerce-interval-bound-to-integer self operator)))
-    (otherwise (return NULL))) )
-
-(defun (INTEGER.coerce-interval-bound-to-integer INTEGER)
-       ((self INTEGER-WRAPPER) (operator SURROGATE))
-  ;; Return an integer representing the closest integer to 'self' obeying
-  ;;    the inequality 'operator'.
-  (when (null? (wrapper-value self))
-    (return NULL))
-  (case operator
-    (@> (return (1+ (wrapper-value self))))
-    (@>= (return (wrapper-value self)))
-    (@< (return (1- (wrapper-value self))))
-    (@=< (return (wrapper-value self)))) )
-
-(defun (FLOAT.coerce-interval-bound-to-integer INTEGER)
-       ((self FLOAT-WRAPPER) (operator SURROGATE))
-  ;; Return an integer representing the closest integer to 'self' obeying
-  ;;    the inequality 'operator'.
-  (when (null? (wrapper-value self))
-    (return NULL))
-  (case operator
-    (@> (return (1+ (floor (wrapper-value self)))))
-    (@>= (return (ceiling (wrapper-value self))))
-    (@< (return (1- (ceiling (wrapper-value self)))))
-    (@=< (return (floor (wrapper-value self)))) ))
+  (let ((intervalCache (access-binary-value self @INTERVAL-CACHE-OF)))
+    (cond ((and (defined? intervalCache)
+                (not (skolem? intervalCache)))
+           (let ((thisCache INTERVAL-CACHE intervalCache)
+                 (copyCache INTERVAL-CACHE NULL)
+                 (proposition PROPOSITION NULL))
+             (when (eql? (home-context thisCache) *context*)
+               (return thisCache))
+             ;; we inherited one, allocate a copy in the current context so
+             ;; we can modify it there without affecting the parent context:
+             (setq copyCache
+               (new INTERVAL-CACHE
+                    :home-context *context*
+                    :interval-member self
+                    :lower-bound (lower-bound thisCache)
+                    :upper-bound (upper-bound thisCache)
+                    :strict-lower-bound? (strict-lower-bound? thisCache)
+                    :strict-upper-bound? (strict-upper-bound? thisCache)))
+             ;; don't call `assert-binary-value' here, since that would unconditionally
+             ;; clip and potentially generate a retraction warning; instead, call
+             ;; `equate-values' directly; first, lookup the interval proposition:
+             (setq proposition
+               (some p in (unfiltered-dependent-propositions self @INTERVAL-CACHE-OF)
+                   where (eql? (relationRef p) @INTERVAL-CACHE-OF)))
+             (equate-values (value-of (last-argument proposition)) copyCache)
+             (return copyCache)))
+          (otherwise
+           (return (create-interval-cache self))))))
 
 (defun signal-interval-clash ((interval INTERVAL-CACHE))
   ;; Signal a clash.
@@ -305,32 +318,60 @@
                                     (not (true? dep))))
            do (post-for-evaluation dep)) )
 
+(defmethod (integer-valued-member? BOOLEAN) ((interval INTERVAL-CACHE))
+  ;; Returns `true' if the member of interval is of type INTEGER.
+  ;; Currently only works with skolems.  Can this be expanded?
+  (let ((member (interval-member interval)))
+    (return (and (isa? member @SKOLEM)
+                 (subtype-of? (skolem-type (cast member SKOLEM)) @INTEGER)))))
+
+(defmethod (integer-lower-bound INTEGER-WRAPPER) ((interval INTERVAL-CACHE))
+  (let ((lb (lower-bound interval)))
+    (when (defined? lb)
+      (typecase lb
+        (INTEGER-WRAPPER
+         (if (strict-lower-bound? interval)
+           (return (1+ (unwrap-integer lb)))
+           (return lb)))
+        (FLOAT-WRAPPER
+         (if (strict-lower-bound? interval)
+           (if (integer-valued? (unwrap-float lb))
+             (return (1+ (floor (unwrap-float lb))))
+             (return (ceiling (unwrap-float lb))))
+           (return (ceiling (unwrap-float lb)))))
+        (otherwise
+         (return NULL))))
+    (return NULL)))
+
+(defmethod (integer-upper-bound INTEGER-WRAPPER) ((interval INTERVAL-CACHE))
+  (let ((ub (upper-bound interval)))
+    (when (defined? ub)
+      (typecase ub
+        (INTEGER-WRAPPER
+         (if (strict-upper-bound? interval)
+           (return (1- (unwrap-integer ub)))
+           (return ub)))
+        (FLOAT-WRAPPER
+         (if (strict-upper-bound? interval)
+           (if (integer-valued? (unwrap-float ub))
+             (return (1- (floor (unwrap-float ub))))
+             (return (floor (unwrap-float ub))))
+           (return (floor (unwrap-float ub)))))
+        (otherwise
+         (return NULL))))
+    (return NULL)))
+
+
+(defmethod evaluate-tighter-integer-interval ((interval INTERVAL-CACHE))
+  (let ((lb (integer-lower-bound interval))
+        (ub (integer-upper-bound interval)))
+    (when (and (defined? lb) 
+               (defined? ub)
+               (eql? lb ub))
+      (equate-values (interval-member interval) lb))))
+
+
 (defmethod evaluate-tighter-interval ((interval INTERVAL-CACHE))
-  ;; Dummy method.
-  NULL )
-
-(defmethod evaluate-tighter-interval ((interval INTEGER-INTERVAL-CACHE))
-  ;; Situation: A bound on 'interval' has become stricter.
-  ;; Test for equality of lower and upper bounds, binding the interval
-  ;;    member to the that value if equality occurs.
-  ;; Test for a clash.
-  ;; Call 'evaluate-proposition' on all inequalities attached to
-  ;;    the interval member.
-  (trace-if :PROPAGATE "TIGHTER BOUNDS ON: " (interval-member interval) EOL
-            "   LB: " (lower-bound interval) "   UB: " (upper-bound interval) EOL)
-  (evaluate-adjacent-inequalities (interval-member interval))
-  (when (or (null? (lower-bound interval))
-            (null? (upper-bound interval)))
-    (return))
-  ;; both bounds are defined.  See if they interact:
-  (cond
-   ((eql? (lower-bound interval) (upper-bound interval))
-    (equate-values (interval-member interval) 
-                   (lower-bound interval)))
-   ((stella/> (lower-bound interval) (upper-bound interval))
-    (signal-interval-clash interval))) )
-
-(defmethod evaluate-tighter-interval ((interval FLOAT-INTERVAL-CACHE))
   ;; Situation: A bound on 'interval' has become stricter.
   ;; Test for equality of lower and upper bounds, binding the interval
   ;;    member to the that value if equality occurs.
@@ -339,87 +380,70 @@
   ;;    the interval member.
   (when (and (defined? (lower-bound interval))
              (defined? (upper-bound interval)))
-    (cond
-     ((eql? (lower-bound interval) (upper-bound interval))
+    (if (eql? (lower-bound interval) (upper-bound interval))
       (if (or (strict-lower-bound? interval)
               (strict-upper-bound? interval))
         (signal-interval-clash interval)
-        (equate-values (interval-member interval) (lower-bound interval))))
-     ((stella/> (lower-bound interval) (upper-bound interval))
-      (signal-interval-clash interval))))
-  (evaluate-adjacent-inequalities (interval-member interval)) )
+        (equate-values (interval-member interval) (lower-bound interval)))
+      (exception-case 
+        (progn
+          (when (compare-interval-bounds? @> (lower-bound interval)
+                                          (upper-bound interval))
+            (signal-interval-clash interval))
+          (when (integer-valued-member? interval)
+            (evaluate-tighter-integer-interval interval)))
+       (INCOMPATIBLE-QUANTITY-EXCEPTION ()
+          (signal-interval-clash interval)))))
+  (evaluate-adjacent-inequalities (interval-member interval)))
    
 (defmethod propagate-inequality-to-interval-cache
            ((self INTERVAL-CACHE) (value OBJECT)
             (operator SURROGATE))
-  ;; Dummy
-  (ignore operator value)
-  NULL )
-
-(defmethod propagate-inequality-to-interval-cache
-           ((self INTEGER-INTERVAL-CACHE) (value OBJECT)
-            (operator SURROGATE)) 
-  ;; Apply the constraint that the member of 'self' is related to 
-  ;;    'value' by the inequality 'operator'.
-  (let ((integerValue (coerce-interval-bound-to-integer value operator)))
-    (when (null? integerValue)
-      (return))
-    (case operator    
-      ((@> @>=)
-       (when (or (null? (lower-bound self))
-                 (stella/> integerValue (lower-bound self)))
-         (setf (lower-bound self) integerValue)
-         (evaluate-tighter-interval self)))
-      ((@< @=<)
-       (when (or (null? (upper-bound self))
-                 (stella/< integerValue (upper-bound self)))
-         (setf (upper-bound self) integerValue)
-         (evaluate-tighter-interval self))))) )
-
-(defmethod propagate-inequality-to-interval-cache
-           ((self FLOAT-INTERVAL-CACHE) (value OBJECT)
-            (operator SURROGATE)) 
   ;; Apply the constraint that the member of 'self' is related to 
   ;;    'value' by the inequality 'operator'.  
-  (unless (isa? value @NUMBER-WRAPPER)
+  (when (null-literal-wrapper? value)
     (return))
-  (let ((floatValue FLOAT (cast value NUMBER-WRAPPER))
-        (tighterInterval? FALSE))
-    (when (null? floatValue)
-      (return))
-    (case operator    
-      (@>
-       (when (or (null? (lower-bound self))
-                 (stella/> floatValue (lower-bound self))
-                 ;; if the value is = to the bound but the bound was not
-                 ;;    strict we can now upgrade it to a strict bound:
-                 (and (= floatValue (lower-bound self))
-                      (not (strict-lower-bound? self))))
-         (setf (lower-bound self) floatValue)
-         (setf (strict-lower-bound? self) TRUE)
-         (setq tighterInterval? TRUE)))
-      (@>=
-       (when (or (null? (lower-bound self))
-                 (stella/> floatValue (lower-bound self)))
-         (setf (lower-bound self) floatValue)
-         (setf (strict-lower-bound? self) FALSE)
-         (setq tighterInterval? TRUE)))
-      (@<
-       (when (or (null? (upper-bound self))
-                 (stella/< floatValue (upper-bound self))
-                 ;; if the value is = to the bound but the bound was not
-                 ;;    strict we can now upgrade it to a strict bound:
-                 (and (= floatValue (upper-bound self))
-                      (not (strict-upper-bound? self))))
-         (setf (upper-bound self) floatValue)
-         (setf (strict-upper-bound? self) TRUE)
-         (setq tighterInterval? TRUE)))
-      (@=<
-       (when (or (null? (upper-bound self))
-                 (stella/< floatValue (upper-bound self)))
-         (setf (upper-bound self) floatValue)
-         (setf (strict-upper-bound? self) FALSE)
-         (setq tighterInterval? TRUE))))
+  (unless (or (isa? value @NUMBER-WRAPPER)
+              (isa? value @QUANTITY-LOGIC-WRAPPER))
+    (return))
+  (let ((tighterInterval? FALSE))
+    (exception-case
+     (case operator    
+       (@>
+        (when (or (null? (lower-bound self))
+                  (compare-interval-bounds? @> value (lower-bound self))
+                  ;; if the value is = to the bound but the bound was not
+                  ;;    strict we can now upgrade it to a strict bound:
+                  (and (eql? value (lower-bound self))
+                       (not (strict-lower-bound? self))))
+          (setf (lower-bound self) value)
+          (setf (strict-lower-bound? self) TRUE)
+          (setq tighterInterval? TRUE)))
+       (@>=
+        (when (or (null? (lower-bound self))
+                  (compare-interval-bounds? @> value (lower-bound self)))
+          (setf (lower-bound self) value)
+          (setf (strict-lower-bound? self) FALSE)
+          (setq tighterInterval? TRUE)))
+       (@<
+        (when (or (null? (upper-bound self))
+                  (compare-interval-bounds? @< value (upper-bound self))
+                  ;; if the value is = to the bound but the bound was not
+                  ;;    strict we can now upgrade it to a strict bound:
+                  (and (= value (upper-bound self))
+                       (not (strict-upper-bound? self))))
+          (setf (upper-bound self) value)
+          (setf (strict-upper-bound? self) TRUE)
+          (setq tighterInterval? TRUE)))
+       (@=<
+        (when (or (null? (upper-bound self))
+                  (compare-interval-bounds? @< value (upper-bound self)))
+          (setf (upper-bound self) value)
+          (setf (strict-upper-bound? self) FALSE)
+          (setq tighterInterval? TRUE))))
+     (INCOMPATIBLE-QUANTITY-EXCEPTION ()
+       ;; Should this signal something else instead?  Like a plain clash?
+       (signal-interval-clash self)))
     (when tighterInterval?
       (evaluate-tighter-interval self)) ))
 
@@ -456,16 +480,18 @@
       (access-interval-cache-bounds cache1 :LOWER-BOUND)
       (inverse-inequality-operator operator)))) )
 
-(defun (access-interval-bounds NUMBER-WRAPPER BOOLEAN) 
+(defun (access-interval-bounds OBJECT BOOLEAN) 
        ((x OBJECT) (lowerOrUpper KEYWORD))
   ;; Helping function for 'LESS-specialist'.
-  ;; 'x' is a NUMBER-WRAPPER or an object that might be attached to
-  ;;    an interval cache.
+  ;; 'x' is a NUMBER-WRAPPER, QUANTITY-LOGIC-WRAPPER, or an
+  ;;    object that might be attached to an interval cache.
   ;; Return a lower or upper bound on 'x', or the
   ;;    appropriate NULL-WRAPPER if there is none.
   ;; A TRUE second return value indicates a strict (open) bound.
   (typecase x
     (NUMBER-WRAPPER
+     (return x FALSE))
+    (QUANTITY-LOGIC-WRAPPER
      (return x FALSE))
     (otherwise
      (return
@@ -473,40 +499,70 @@
         (access-binary-value x @INTERVAL-CACHE-OF)
         lowerOrUpper)))))
 
-(defun (access-interval-cache-bounds NUMBER-WRAPPER BOOLEAN) 
+(defun (access-interval-cache-bounds OBJECT BOOLEAN) 
     ((intervalCache INTERVAL-CACHE) (lowerOrUpper KEYWORD))
   ;; Return the lower or upper bound of `intervalCache', or the
   ;;    appropriate NULL-WRAPPER if there is none.
   ;; A TRUE second return value indicates a strict (open) bound.
-  (when (null? intervalCache)
-    (return NULL NULL))
-  (typecase intervalCache
-    (INTEGER-INTERVAL-CACHE
-     (case lowerOrUpper
-       (:LOWER-BOUND (return (lower-bound intervalCache) FALSE))
-       (:UPPER-BOUND (return (upper-bound intervalCache) FALSE))))
-    (FLOAT-INTERVAL-CACHE
-     (case lowerOrUpper
+  (if (null? intervalCache)
+    (return NULL NULL)
+    (case lowerOrUpper
        (:LOWER-BOUND
         (return (lower-bound intervalCache)
                 (strict-lower-bound? intervalCache)))
        (:UPPER-BOUND
         (return (upper-bound intervalCache)
-                (strict-upper-bound? intervalCache)))))))
+                (strict-upper-bound? intervalCache))))))
 
 (defun (compare-interval-bounds? BOOLEAN)
-       ((relation SURROGATE) (x NUMBER-WRAPPER) (y NUMBER-WRAPPER))
+       ((relation SURROGATE) (x OBJECT) (y OBJECT))
   ;; Helping function for 'LESS-specialist'.
-  ;; Convert 'x' and 'y' to floats, and compare them.
-  (when (or (null-number? x)
-            (null-number? y))
+  ;; Compare `x' and `y' according to `relation'.
+  ;; If they are not comparable, then throw
+  ;; an INCOMPATIBLE-QUANTITY-EXCEPTION
+  (when (or (null-literal-wrapper? x)
+            (null-literal-wrapper? y))
     (return FALSE))
-  (case relation
-    (@=<
-     (return (stella/<= (number-wrapper-to-float x) (number-wrapper-to-float y))))
-    (@<
-     (return (stella/< (number-wrapper-to-float x) (number-wrapper-to-float y))))
-    (otherwise (error "Shouldn't get here!"))) )
+  (when (eql? relation @=)
+    (return (eql? x y)))
+  (typecase x
+    (NUMBER-WRAPPER
+     (typecase y
+       (NUMBER-WRAPPER
+        (let ((float-x (number-wrapper-to-float x))
+              (float-y (number-wrapper-to-float y)))
+          (case relation
+            (@=< (return (stella/<=   float-x float-y)))
+            (@<  (return (stella/<    float-x float-y)))
+            (@>= (return (stella/>=   float-x float-y)))
+            (@>  (return (stella/>    float-x float-y))))))
+       (QUANTITY-LOGIC-WRAPPER
+        (let ((quantity-y (wrapper-value y))
+              (quantity-x (coerce-to quantity-y x)))
+          (case relation
+            (@=< (return (less-equal?    quantity-x quantity-y)))
+            (@<  (return (less?          quantity-x quantity-y)))
+            (@>= (return (greater-equal? quantity-x quantity-y)))
+            (@>  (return (greater?       quantity-x quantity-y))))))
+          
+       ))
+    (QUANTITY-LOGIC-WRAPPER
+     (typecase y
+       (NUMBER-WRAPPER
+        (let ((quantity-x (wrapper-value x))
+              (quantity-y (coerce-to quantity-x y)))
+          (case relation
+            (@=< (return (less-equal?    quantity-x quantity-y)))
+            (@<  (return (less?          quantity-x quantity-y)))
+            (@>= (return (greater-equal? quantity-x quantity-y)))
+            (@>  (return (greater?       quantity-x quantity-y))))))
+       (QUANTITY-LOGIC-WRAPPER
+        (case relation
+          (@=< (return (less-equal?    (wrapper-value x) (wrapper-value y))))
+          (@<  (return (less?          (wrapper-value x) (wrapper-value y))))
+          (@>= (return (greater-equal? (wrapper-value x) (wrapper-value y))))
+          (@>  (return (greater?       (wrapper-value x) (wrapper-value y))))))))))
+
 
 (defun (null-number? BOOLEAN) ((self NUMBER-WRAPPER))
   :public? TRUE
@@ -516,24 +572,33 @@
   (typecase self
     ((INTEGER-WRAPPER FLOAT-WRAPPER) (return (null? (wrapper-value self))))) )
 
+(defun (null-literal-wrapper? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  ;; Return TRUE if 'self' is null.
+  (when (null? self)
+    (return TRUE))
+  (typecase self
+    ((INTEGER-WRAPPER FLOAT-WRAPPER QUANTITY-LOGIC-WRAPPER STRING-WRAPPER CHARACTER-WRAPPER)
+     (return (null? (wrapper-value self))))) )
 
-(defun (satisfies-interval-bounds? BOOLEAN) ((object OBJECT) (value NUMBER-WRAPPER))
+
+(defun (satisfies-interval-bounds? BOOLEAN) ((object OBJECT) (value OBJECT))
   ;; Returns TRUE if 'value' is within the bounds of any intervals associated
   ;;   with 'object'.
-  (let ((lb NUMBER-WRAPPER NULL)
+  (let ((lb OBJECT NULL)
         (strictLower? BOOLEAN NULL)
-	(ub NUMBER-WRAPPER NULL)
+	(ub OBJECT NULL)
         (strictUpper? BOOLEAN NULL)
 	(answer BOOLEAN TRUE))
     (mv-setq (lb strictLower?) (access-interval-bounds object :LOWER-BOUND))
     (mv-setq (ub strictUpper?) (access-interval-bounds object :UPPER-BOUND))
-    (when (null-number? value)
+    (when (null-literal-wrapper? value)
       (return FALSE))
-    (unless (null-number? lb)
+    (unless (null-literal-wrapper? lb)
       (if strictLower?
 	(setq answer (compare-interval-bounds? @< lb value))
 	(setq answer (compare-interval-bounds? @=< lb value))))
-    (unless (null-number? ub)
+    (unless (null-literal-wrapper? ub)
       (if strictUpper?
 	(setq answer (and answer
 			  (compare-interval-bounds? @< value ub)))
@@ -541,84 +606,89 @@
 			  (compare-interval-bounds? @=< value ub)))))
     (return answer) ))
 
-(defun (LESS-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
-  ;; The current goal is either a LESS-THAN or LESS-OR-EQUAL comparison.
-  ;; First see if a quick result can be found using interval caches,
-  ;;    and otherwise return FAILURE so that the backtracker can have
-  ;;    a shot at it.
-  (let ((proposition (proposition frame))
-        (relation (relationRef proposition))
-        (xArg (first (arguments proposition)))
-        (yArg (second (arguments proposition)))
-        (x (argument-bound-to xArg))
+
+
+(defun (LESS-specialist-helper KEYWORD) ((frame CONTROL-FRAME)
+                                         (relation SURROGATE)
+                                         (xArg OBJECT)
+                                         (yArg OBJECT))
+  ;; Helper for inequality-specialist.  Understands how to compute
+  ;; with < and =< relations.  Uses `frame' only to set the truth
+  ;; value.  All other operations are done using `relation', `xArg'
+  ;; and `yArg'.  The caller is responsible for making sure that
+  ;; the values are set appropriately for greater than or reverse
+  ;; polarity cases.
+  (let ((x (argument-bound-to xArg))
         (y (argument-bound-to yArg))
-	(xBound NUMBER-WRAPPER NULL)
+	(xBound OBJECT NULL)
         (strictX? BOOLEAN NULL)
-        (yBound NUMBER-WRAPPER NULL)
-        (strictY? BOOLEAN NULL))
-    (ignore lastMove)
-    (let ((success? FALSE))
-      (when (null? y)
-        (when (null? x)
-          (return :TERMINAL-FAILURE))
-        ;; x bound, y unbound:
-        (mv-setq (xBound strictX?) (access-interval-bounds x :UPPER-BOUND))
-        (case relation
-          (@< 
-           (when (and (not (null-number? xBound))
-                      (isa? xBound @INTEGER-WRAPPER))
-             ;; convert >= to >:
-             (setq xBound (1+ (cast xBound INTEGER-WRAPPER)))))
-          (otherwise NULL))
-        (when (not (null-number? xBound))
-          (setq success? (bind-variable-to-value? yArg xBound TRUE)))
-        (return (select-proof-result success? FALSE FALSE)))
+        (yBound OBJECT NULL)
+        (strictY? BOOLEAN NULL)
+        (success? FALSE))
+    
+    ;;; The following section is a BIG KLUDGE.  It should perhaps
+    ;;; be removed, since binding a single arbitrary value doesn't
+    ;;; really make sense.
+    (when (null? y)
       (when (null? x)
-        ;; y bound, x unbound:
-        (mv-setq (yBound strictY?) (access-interval-bounds y :LOWER-BOUND))
-        (case relation
-          (@< 
-           (when (and (not (null-number? yBound))
-                      (isa? yBound @INTEGER-WRAPPER))
-             ;; convert =< to <:
-             (setq yBound (1- (cast yBound INTEGER-WRAPPER)))))
-          (otherwise NULL))
-        (when (not (null-number? yBound))
-          (setq success? (bind-variable-to-value? xArg yBound TRUE)))
-        (return (select-proof-result success? FALSE FALSE))))
+        (return :TERMINAL-FAILURE))
+      ;; x bound, y unbound:
+      (mv-setq (xBound strictX?) (access-interval-bounds x :UPPER-BOUND))
+      ;; Here we arbitrarily pick one integer that satisfies the bounds.
+      ;; This may not be the best thing to do, but we keep it (for now)
+      ;; for backward compatibility.
+      (when (and (not (null-literal-wrapper? xBound))
+                 (or (eq? relation @=<)
+                     (isa? xBound @INTEGER-WRAPPER)))
+        (when (eq? relation @<)
+          (setq xBound (1+ (cast xBound INTEGER-WRAPPER))))
+        (setq success? (bind-variable-to-value? yArg xBound TRUE)))
+      (return (select-proof-result success? FALSE FALSE)))
+    (when (null? x)
+      ;; y bound, x unbound:
+      (mv-setq (yBound strictY?) (access-interval-bounds y :LOWER-BOUND))
+      (when (and (not (null-number? yBound))
+                 (or (eq? relation @=<)
+                     (isa? yBound @INTEGER-WRAPPER)))
+        (when (eq? relation @<)
+          (setq yBound (1- (cast yBound INTEGER-WRAPPER))))
+        (setq success? (bind-variable-to-value? xArg yBound TRUE)))
+      (return (select-proof-result success? FALSE FALSE)))
+
     ;; both x and y are bound:
-    (when *reversePolarity?*
-      (let ((tempNumber OBJECT x))
-        (setq x y)
-        (setq y tempNumber))
-      (case relation
-        (@< (setq relation @=<))
-        (@=< (setq relation @<))))
     (let ((success? BOOLEAN NULL))
       (mv-setq (xBound strictX?) (access-interval-bounds x :UPPER-BOUND))
       (mv-setq (yBound strictY?) (access-interval-bounds y :LOWER-BOUND))
-      (case relation
-        (@<
-         (setq success?
-               (or (and (or strictX? strictY?)
-                        (compare-interval-bounds? @=< xBound yBound))
-                   (compare-interval-bounds? @< xBound yBound))))
-        (@=<
-         (setq success? (compare-interval-bounds? relation xBound yBound))))
+      (exception-case 
+       (case relation
+         (@<
+          (setq success?
+                (or (and (or strictX? strictY?)
+                         (compare-interval-bounds? @=< xBound yBound))
+                    (compare-interval-bounds? @< xBound yBound))))
+         (@=<
+          (setq success? (compare-interval-bounds? relation xBound yBound))))
+       (INCOMPATIBLE-QUANTITY-EXCEPTION ()
+         (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+         (return :TERMINAL-FAILURE)))
       (when success?
 	(set-frame-truth-value frame TRUE-TRUTH-VALUE)
         (return :FINAL-SUCCESS))
       ;; Try a quick disproof, (> xLB yUB)
       (mv-setq (xBound strictX?) (access-interval-bounds x :LOWER-BOUND))
       (mv-setq (yBound strictY?) (access-interval-bounds y :UPPER-BOUND))
-      (case relation
-        (@=<
-         (setq success?
-               (or (and (or strictX? strictY?)
-                        (compare-interval-bounds? @=< yBound xBound))
-                   (compare-interval-bounds? @< yBound xBound))))
-        (@<
-         (setq success? (compare-interval-bounds? @=< yBound xBound))))
+      (exception-case 
+       (case relation
+         (@=<
+          (setq success?
+                (or (and (or strictX? strictY?)
+                         (compare-interval-bounds? @=< yBound xBound))
+                    (compare-interval-bounds? @< yBound xBound))))
+         (@<
+          (setq success? (compare-interval-bounds? @=< yBound xBound))))
+       (INCOMPATIBLE-QUANTITY-EXCEPTION ()
+         (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+         (return :TERMINAL-FAILURE)))
       (when success?
 	(set-frame-truth-value frame FALSE-TRUTH-VALUE)
         (return :TERMINAL-FAILURE)))
@@ -630,23 +700,59 @@
       ;; if 'compare-interval-bounds?' didn't do it, then it can't be done:
       (return :TERMINAL-FAILURE)) ))
 
-(defun (GREATER-specialist KEYWORD)
-       ((frame CONTROL-FRAME) (lastMove KEYWORD))
-  ;; The current goal is either a GREATER-THAN or GREATER-OR-EQUAL comparison.
-  ;; Convert to a LESS-xxx goal and reevaluate.
+
+(defun (INEQUALITY-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; The current goal is either a LESS-THAN or LESS-OR-EQUAL comparison.
+  ;; First see if a quick result can be found using interval caches,
+  ;;    and otherwise return FAILURE so that the backtracker can have
+  ;;    a shot at it.
+  (ignore lastMove)
   (let ((proposition (proposition frame))
-        (relation (relationRef proposition))
-        (arguments (arguments proposition)))
-    (case relation
-      (@>
-       (setf (relationRef proposition) @<))
-      (@>=
-       (setf (relationRef proposition) @=<)))
-    ;; swap arguments:
-    (let ((temp (nth arguments 0)))
-      (setf (nth arguments 0) (nth arguments 1))
-      (setf (nth arguments 1) temp))
-    (return (LESS-specialist frame lastMove)) ))
+        (relation (relationRef proposition)))
+    (if *reversePolarity?*
+      (special ((*reversePolarity?* FALSE))
+        (case relation
+          (@< (return 
+               (less-specialist-helper frame
+                                       @=< 
+                                       (second (arguments proposition))
+                                       (first (arguments proposition)))))
+          (@=< (return 
+                (less-specialist-helper frame
+                                        @< 
+                                        (second (arguments proposition))
+                                        (first (arguments proposition)))))
+          (@> (return 
+               (less-specialist-helper frame
+                                       @=< 
+                                       (first (arguments proposition))
+                                       (second (arguments proposition)))))
+          (@>= (return 
+               (less-specialist-helper frame
+                                       @< 
+                                       (first (arguments proposition))
+                                       (second (arguments proposition)))))))
+      (case relation
+        (@< (return 
+             (less-specialist-helper frame
+                                     @< 
+                                     (first (arguments proposition))
+                                     (second (arguments proposition)))))
+        (@=< (return 
+              (less-specialist-helper frame
+                                      @=<
+                                      (first (arguments proposition))
+                                      (second (arguments proposition)))))
+        (@> (return 
+             (less-specialist-helper frame
+                                     @< 
+                                     (second (arguments proposition))
+                                     (first (arguments proposition)))))
+        (@>= (return 
+              (less-specialist-helper frame
+                                      @=< 
+                                      (second (arguments proposition))
+                                      (first (arguments proposition))))))) ))
 
 (defun INEQUALITY-evaluator ((self PROPOSITION))
   ;; Find or create INTERVAL-CACHES for each non-literal
@@ -865,13 +971,15 @@
 		      (return :TERMINAL-FAILURE)))))
 	    ;; All arguments bound
 	    (otherwise
-	     (let ((match? (bind-argument-to-value? 
-			    subArg 
-			    (subsequence 
-			     (unwrap-string superArgValue)
-			     (wrapper-value (cast p1ArgValue INTEGER-WRAPPER))
-			     (wrapper-value (cast p2ArgValue INTEGER-WRAPPER)))
-			    TRUE)))
+	     (let ((super-string (unwrap-string superArgValue))
+                   (begin-index (unwrap-integer p1ArgValue))
+                   (end-index (unwrap-integer p2ArgValue))
+                   ;; Make sure the subsequence call won't fail with an error:
+                   (match? (and (/stella/<= end-index (/stella/length super-string))
+                                (bind-argument-to-value? 
+			         subArg 
+			         (subsequence super-string begin-index end-index)
+			         TRUE))))
 	       (set-frame-truth-value frame 
 				      (choose match? TRUE-TRUTH-VALUE FALSE-TRUTH-VALUE))
 	       (return (select-proof-result match? FALSE TRUE))))))

@@ -1,0 +1,376 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: generate.ste,v 1.19 2006/05/11 07:05:11 hans Exp
+
+;;; Routines that generate a source expression for a logic object
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+(defspecial *canonicalVariableNameMapping* KEY-VALUE-LIST NULL
+  :documentation "Maps variables to symbols in SYSTEM-DEFINED-ARGUMENT-NAMES.")
+
+(defspecial *canonicalVariableCounter* INTEGER NULL
+  :documentation "Number of the last canonically-mapped variable.")
+
+(defclass TERM-GENERATION-EXCEPTION (LOGIC-EXCEPTION)
+  :public? TRUE
+  :documentation "Signals an exception during term generation."
+  :public-slots
+  ((offending-term :type OBJECT :required? TRUE)))
+
+(defun (generate-expression OBJECT) 
+       ((self LOGIC-OBJECT) (canonicalizeVariableNames? BOOLEAN))
+  :public? TRUE
+  :documentation "Return an s-expression representing the source expression for 'self'."
+  (special
+   ((*canonicalVariableNameMapping* 
+     (only-if canonicalizeVariableNames? (new KEY-VALUE-LIST)))
+    (*canonicalVariableCounter* -1))
+   (return (generate-term self)) ))
+  
+(defun (generate-name-of-variable SYMBOL) ((self PATTERN-VARIABLE))
+  ;; Return either the name of 'variable' or its canonical name.
+  ;; Too many mapping tables, can this be simplified?
+  (when (defined? *skolemNameMappingTable*)
+    (setq self (first-defined (lookup *skolemNameMappingTable* self) self)))
+  (when (null? *canonicalVariableNameMapping*)
+    (return (skolem-name self)))
+  (let ((canonicalName (lookup *canonicalVariableNameMapping* self)))
+    (when (null? canonicalName)
+      (setq canonicalName (nth SYSTEM-DEFINED-ARGUMENT-NAMES
+                               (++ *canonicalVariableCounter*)))
+      (insert-at *canonicalVariableNameMapping* self canonicalName))
+    (return canonicalName) ))
+
+(defun (generate-one-variable OBJECT) ((self PATTERN-VARIABLE) (typed? BOOLEAN))
+  ;; Return either the name of 'self', or if 'typed?' a list of its
+  ;;    name and type.
+  (when (and (printing-justification?)
+             (defined? (justification-argument-bound-to self NULL)))
+    ;; substitute the binding instead of printing the variable:
+    (return (generate-term (justification-argument-bound-to self NULL))))
+  (let ((name (generate-name-of-variable self)))
+    (if (and typed?
+             (not (eql? (logical-type self) @THING)))
+      (return (bquote (& name & (symbolize (logical-type self)))))
+      (return name)) ))
+
+(defun (generate-variables CONS) ((vector VECTOR) (typed? BOOLEAN))
+  ;; Return a list of typed variables.
+  (let ((result NIL))
+    (foreach v in vector collect (generate-one-variable v typed?) into result)
+    (return result) ))
+
+;; THIS IS PROBABLY WRONG:  -rmm
+(defun (generate-stella-collection CONS) ((self COLLECTION))
+  ;; Return a definition of the enumeration 'self'.
+  (let ((collection NIL))
+    (foreach m in self
+             collect (generate-term m) into collection)
+    (return (bquote (& (choose (no-duplicates? self)
+                               (quote SETOF)
+                               (quote LISTOF))
+                       && collection))) ))
+
+(defun (generate-description OBJECT) ((self DESCRIPTION))
+  ;; Return source for a description.
+  (cond
+   ((named-description? self)
+    (return (internal-stella-operator-to-kif (description-name self))))
+   ((defined? (relative-complement self))
+    (return (bquote (not & (internal-stella-operator-to-kif
+                            (description-name (relative-complement self)))))))
+;; FIGURE OUT HOW THIS GETS REWRITTEN:
+#|   
+   ((xnumeration? self)
+    (let ((operator SYMBOL NULL)
+          (members NIL))
+      (cond
+       ((test-property? self PL-KERNEL/@ORDERED)
+        (setq operator (quote LISTOF)))
+       ((test-property? self PL-KERNEL/@DUPLICATE-FREE)
+        (setq operator (quote SETOF)))
+       (otherwise
+        (setq operator (quote BAGOF))))
+      (foreach m in (description-extension self)
+               collect (generate-term m) into members)
+      (return (bquote (& operator && members)))))
+|#
+   (otherwise
+      (return
+        (bquote (kappa & (generate-variables (io-variables self) TRUE)
+                  & (generate-description-proposition self FALSE)))))))
+
+(defun (generate-arguments CONS) ((arguments VECTOR))
+  ;; Generate source for a vector of arguments.
+  (let ((result NIL))
+    (foreach arg in arguments
+             collect (generate-term arg) into result)
+    (return result) ))
+
+(defun (generate-operator SYMBOL) ((self PROPOSITION))
+  ;; Return a symbol representing the KIF representation of the
+  ;;    operator of 'self'.  Logic borrowed from 'stringified-kif-operator'.
+  (let ((operator (operator self)))
+    (when (null? operator)
+      (return (quote NULL)))
+    (typecase operator
+      (SURROGATE
+       (let ((description (get-description operator))
+             (symbol (symbolize operator)))
+         (if (defined? description)
+           (return (internal-stella-operator-to-kif symbol))
+           (return symbol))))
+      (SYMBOL
+       (return operator))) ))
+  
+(defun (generate-proposition OBJECT) ((self PROPOSITION))
+  ;; Generate source for a proposition.
+    (case (kind self)
+      ((:PREDICATE :FUNCTION :ISA :AND :OR :NOT)
+       (let ((operator (generate-operator self)))
+         (return (bquote (& operator
+                            && (generate-arguments (arguments self)))))))
+      (:EQUIVALENT
+       (return (bquote (= && (generate-arguments (arguments self))))))
+      (:EXISTS
+       (return (bquote (exists
+                        & (generate-variables (io-variables self) FALSE)
+                        & (generate-proposition (nth (arguments self) 0))))))
+      (:FORALL
+        (let ((forward? (not (backward-only? self)))
+              (arrow (symbolize (choose-implication-operator self forward?))))
+          (return
+            (bquote
+             (forall & (generate-variables (io-variables self) FALSE)
+               (& arrow
+                  & (generate-proposition
+                     (nth (arguments self) (choose forward? 0 1)))
+                  & (generate-proposition
+                     (nth (arguments self) (choose forward? 1 0)))))))))
+      (:IMPLIES
+       (return (generate-IMPLIES-proposition self)))
+      (:FAIL
+       (return (bquote (FAIL && (generate-arguments (arguments self))))))
+      (:CONSTANT (return (generate-operator self)))) )
+
+(defun (generate-function-as-term CONS) ((self PROPOSITION))
+  ;; Return source for 'self' denoting a skolemized function.
+  (let ((arguments NIL))
+    (foreach arg in (but-last (arguments self))
+             collect (generate-term arg) into arguments)
+    (return (bquote (& (generate-operator self) && arguments))) ))
+
+(defun (generate-skolem OBJECT) ((self SKOLEM))
+  ;; Return source for the skolem term 'self'.
+  (cond
+   ((defined? (native-value-of self))
+    (return (generate-term (native-value-of self))))
+   ((and (defined? (defining-proposition self))
+         (null? (variable-value self)))
+       (return (generate-function-as-term (defining-proposition self))))
+   ((and (defined? (innermost-of self))
+         ;; guards against infinite loops with some Cyc function props -
+         ;;    there might be a more enlightened fix for this:
+         (not (eql? self (innermost-of self))))
+    (return (generate-term (innermost-of self))))
+   ((concept-prototype? self)
+    (return (bquote (PL-KERNEL/concept-prototype
+                     & (generate-term (concept-prototype-of self))))))
+   (otherwise
+    ;;; TO DO: what we should do in this case is generate something like this:
+    ;;;    (PL-KERNEL/skolem-constant & (skolem-name self) & (generate-uuid :random))
+    ;;; where the uuid gets linked to the constant so we'll generate identical
+    ;;; expressions for the same constant in different contexts.  This will make
+    ;;; sure that if it gets saved out different occurrences will refer to the same
+    ;;; thing yet they won't clash if loaded into a new KB instance due to the UUID.
+    ;;; So far skolems never get saved since they get only generated during inference,
+    ;;; and the only place where this hits us is with `find-exact-duplicate-description'
+    ;;; for rules that were instantiated with a skolem during forward inference.
+    (warn "Don't know how to generate skolem: " self EOL)
+    (return (quote UNIDENTIFIED-SKOLEM)))) )
+
+(defmethod (generate-specialized-term OBJECT) ((self LOGIC-THING))
+  :public? TRUE
+  :documentation "Method to generate a specialized term for `self'.  This is designed
+to allow for extension of the term generation code to cover other
+types of objects for the logic.  This particular method will signal
+an error unless there is a surrogate-value-inverse link set."
+  (if (defined? (surrogate-value-inverse self))
+       (return (surrogate-value-inverse self))
+       (signal-exception
+        (new TERM-GENERATION-EXCEPTION 
+             :message (concatenate "DON'T KNOW HOW TO GENERATE EXPRESSION FOR THE THING: "
+                                   (stringify self))
+             :offending-term self))) )
+
+(defun (generate-term OBJECT) ((self OBJECT))
+  ;; Return an s-expression for 'self'.
+  (when (null? self)
+    (return NULL))
+  (typecase self
+    (PROPOSITION (return (generate-proposition self)))
+    (LITERAL-WRAPPER (return self))
+    (DESCRIPTION (return (generate-description self)))
+    (PATTERN-VARIABLE (return (generate-one-variable self FALSE)))
+    (SKOLEM (return (generate-skolem self)))
+    (LOGIC-OBJECT
+     (if (defined? (surrogate-value-inverse self))
+       (return (symbolize (surrogate-value-inverse self)))
+       (return (quote Unnamed_Object))))
+    (SURROGATE (return (symbolize self)))
+    (KEYWORD (return self))
+    (COLLECTION (return (generate-stella-collection self)))
+    (LOGIC-THING
+     (return (generate-specialized-term self)))
+    (THING
+     (if (defined? (surrogate-value-inverse self))
+       (return (surrogate-value-inverse self))
+       (signal-exception
+        (new TERM-GENERATION-EXCEPTION 
+             :message (concatenate "DON'T KNOW HOW TO GENERATE EXPRESSION FOR THE THING: "
+                                   (stringify self))
+             :offending-term self))))
+    (otherwise
+     (warn "Illegal logical form: " self EOL)
+     (return (quote ILLEGAL-TERM)))) )
+
+(defun (generate-IMPLIES-proposition CONS) ((self PROPOSITION))
+  ;; Generate source for IMPLIES proposition.
+  (let ((tailArg (nth (arguments self) 0))
+        (headArg (nth (arguments self) 1)))
+    (if (and (isa? headArg @DESCRIPTION)
+             (isa? tailArg @DESCRIPTION))
+      (return
+        (generate-descriptions-as-rule headArg tailArg self FALSE))
+      (return (bquote (PL-KERNEL/subset-of
+                       && (generate-arguments (arguments self)))))) ))
+
+(defun (generate-description-proposition CONS) ((self DESCRIPTION)
+                                                (invert? BOOLEAN))
+  ;; Generate source for the descripton of `self' and properly handle
+  ;;    implicit existentials.
+  ;; If `invert?' generate the negated body proposition.
+  (let ((prop (generate-proposition (proposition self)))
+        (existentals
+         (choose (non-empty? (internal-variables self))
+                 (top-level-existential-variables self)
+                 NIL)))
+    (foreach var in existentals
+        as i in (interval 0 NULL)
+        do (setf (nth existentals i) (generate-one-variable var TRUE)))
+    (when (non-empty? existentals)
+      (setq prop (bquote (exists & existentals & prop))))
+    (if invert?
+        (return (bquote (PL-KERNEL/not & prop)))
+      (return prop))))
+
+(defun (generate-descriptions-as-rule CONS) ((head DESCRIPTION)
+                                             (tail DESCRIPTION)
+                                             (rule PROPOSITION)
+                                             (reversePolarity? BOOLEAN))
+  ;; Assume `head' and `tail' are the arguments to the IMPLIES proposition
+  ;;    `rule' and generate source in the form of a FORALL rule.
+  ;; The only reason they are supplied is to have a consitent argument
+  ;;    list with the KIF-OUT version of this function.
+  ;; If `reversePolarity?' is true generate a Modus Tollens version of `rule'.
+  ;; BUG: only works for IMPLIES rules, since it assumes that the io-variables
+  ;;    of `head' and `tail' correspond to each other by position.
+  (let ((forwardArrow?
+         (and (forward-only? rule)
+              (not reversePolarity?)))
+        (reverseArguments?
+         (or forwardArrow? reversePolarity?))
+        (arrow (symbolize (choose-implication-operator rule forwardArrow?)))
+        (mapHeadVariables? (named-description? head))
+        (headProp OBJECT NULL)
+        (tailProp OBJECT NULL)
+        (universals NIL))
+    (when reverseArguments?
+      (let ((temp head))
+        (setq head tail)
+        (setq tail temp))
+      (setq mapHeadVariables? (not mapHeadVariables?)))
+    (foreach var in (choose mapHeadVariables?
+                            (io-variables tail)
+                            (io-variables head))
+        collect (generate-one-variable var TRUE) into universals)
+    ;; Generate the head:
+    (special ((*skolemNameMappingTable*
+               (choose mapHeadVariables?
+                       (create-skolem-mapping-table
+                        (io-variables head)
+                        (io-variables tail))
+                       NULL)))
+      (setq headProp (generate-description-proposition head reversePolarity?)))
+    ;; Generate the tail:
+    (special ((*skolemNameMappingTable*
+               (choose (not mapHeadVariables?)
+                       (create-skolem-mapping-table
+                        (io-variables tail)
+                        (io-variables head))
+                       NULL)))
+      (setq tailProp (generate-description-proposition tail reversePolarity?)))
+    (return
+      (bquote
+       (PL-KERNEL/forall & universals
+         ;; we expect a backward arrow by default:
+         (& arrow & headProp & tailProp))))))
+
+(defun (deobjectify-tree OBJECT) ((self OBJECT))
+  :documentation "Return a copy of `self' where all logic objects are
+replaced by their `generated' parse-tree version.  This is useful to
+convert the result of a retrieval query into a regular parse tree."
+  :public? TRUE
+  (typecase self
+    (CONS
+     (let ((result NIL))
+       (foreach elt in self
+           collect (deobjectify-tree elt) into result)
+       (return result)))
+    ((PROPOSITION LOGIC-OBJECT COLLECTION THING)
+     (return (generate-term self)))
+    (otherwise
+     (return self))))

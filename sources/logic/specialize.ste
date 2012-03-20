@@ -1,0 +1,1264 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: specialize.ste,v 1.64 2006/05/10 22:37:17 hans Exp
+
+;;; Specialization (subsumption) Routines
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Subsumption Utility Functions
+  ;;
+
+;;; Note, that the parameter types of the proposition iterators below
+;;;    is OBJECT, since some specializations want to return arguments of
+;;;    propositions instead of the actual propositions.
+
+(defclass ABSTRACT-PROPOSITIONS-ITERATOR (ITERATOR)
+  :documentation "Iterator class that can generate sets of propositions matching
+its `selection-pattern'."
+  :parameters ((any-value :type OBJECT))
+  :slots
+  ((selection-pattern :type SELECTION-PATTERN)
+   (proposition-cursor :type (ITERATOR OF PROPOSITION))
+   (equivalents-stack :type CONS :initially NULL)))
+
+(defclass TRUE-PROPOSITIONS-ITERATOR (ABSTRACT-PROPOSITIONS-ITERATOR)
+  :documentation "Iterator class that can generate sets of true propositions
+matching its `selection-pattern'."
+  :parameters ((any-value :type OBJECT))
+  :slots
+  ((truth-value :type TRUTH-VALUE
+     :documentation "Truth-value of the most recently generated proposition (or
+projected argument thereof).  This truth value is not necessarily the strictest
+and might have involved defaults.")))
+
+(defclass SPECIALIZING-PROPOSITIONS-ITERATOR (TRUE-PROPOSITIONS-ITERATOR)
+  :documentation "Iterator class that can generate sets of true propositions
+matching its `selection-pattern' or a more specific pattern that substitutes
+one of the relations in `specializing-relations'."
+  :parameters ((any-value :type OBJECT))
+  :slots
+  ((specializing-relations :type (CONS OF CONS) :initially NULL)))
+
+(defun (propositions-iterator-truth-value TRUTH-VALUE)
+    ((self (ITERATOR OF PROPOSITION)))
+  ;; Generic reader for the `truth-value' slot of various proposition iterators.
+  (typecase self
+    ((TRUE-PROPOSITIONS-ITERATOR
+      DESCRIPTION-EXTENSION-ITERATOR)
+     (return (truth-value self)))
+    (otherwise
+     (return NULL))))
+
+(defun (next-equivalent-selection-pattern CONS)
+    ((self ABSTRACT-PROPOSITIONS-ITERATOR))
+  ;; If any of the key elements in `self's selection pattern has equivalents,
+  ;;    return the next equivalent pattern.
+  ;; Return NULL if no more equivalent patterns can be generated.
+  ;; IMPORTANT: This is assumed to be non-destructive on `selection-pattern'.
+  ;; NOTE:  The equivalents are USUALLY skolems, but could be collections.
+  ;; NOTE2: Currently, this works only for equivalents on the first key.
+  (let ((pattern (selection-pattern self))
+        (keyWithEquivalents LOGIC-OBJECT NULL)
+        (equivalentsStack (equivalents-stack self))
+        (newSkolem LOGIC-OBJECT NULL)
+        (equivalentSkolems CONS NULL))
+    ;; TO DO: THIS IS TOO SIMPLISTIC FOR MULTI-KEY SELECTION PATTERNS, IN WHICH
+    ;;    CASE WE WOULD NEED TO GENERATE A CROSS-PRODUCT OVER THE SET OF
+    ;;    COLUMNS THAT HAVE ELEMENTS WITH EQUIVALENTS - LATER.
+    (when (null? equivalentsStack)
+      ;; first time looking for equivalents:
+      (setq keyWithEquivalents
+        (find-selection-key-with-equivalents pattern))
+      (when (defined? keyWithEquivalents)
+        (setq equivalentSkolems (variable-value-inverse keyWithEquivalents))
+        (setq equivalentsStack (cons equivalentSkolems NIL))))
+    (when (null? equivalentsStack)
+      (setf (equivalents-stack self) NIL)
+      (return NULL))
+    (when (empty? equivalentsStack)
+      (return NULL))
+    (setq equivalentSkolems (first equivalentsStack))
+    (setq newSkolem (first equivalentSkolems))
+    (setf (first equivalentsStack) (rest equivalentSkolems))
+    ;; now fix up the remainder of the stack:
+    (when (nil? (first equivalentsStack))
+      ;; if that's the last entry on the top of the stack, pop it:
+      (setq equivalentsStack (rest equivalentsStack)))
+    ;; possibly push new stack entry:
+    (when (non-empty? (variable-value-inverse newSkolem))
+      (setq equivalentsStack
+        (cons (variable-value-inverse newSkolem)
+              equivalentsStack)))
+    (setf (equivalents-stack self) equivalentsStack)
+    (when (null? keyWithEquivalents)
+      (setq keyWithEquivalents
+        (find-selection-key-with-equivalents pattern)))
+    (return
+      (substitute-cons-tree
+       (copy-cons-tree pattern) newSkolem keyWithEquivalents))))
+
+(defun (proposition-truth-value TRUTH-VALUE) ((proposition PROPOSITION))
+  ;; Very specialized function called by iterators over propositions.
+  ;; Return the truth value of `proposition', or TRUE-TRUTH-VALUE if it is
+  ;;    a :FUNCTION proposition with a defined output value (mirrors
+  ;;    `true-proposition?').
+  (let ((truthValue (truth-value proposition)))
+    (if (defined? truthValue)
+        (return truthValue)
+      (if (and (not *reversePolarity?*)
+               ;; A function proposition is true only if one or more
+               ;;    facts have been asserted about its output skolem
+               ;;    (do we have to consider defaults here?):
+               (function-with-defined-value? proposition))
+          (return TRUE-TRUTH-VALUE)
+        (return NULL)))))
+
+(defun (true-proposition? BOOLEAN) ((proposition PROPOSITION))
+  ;; Very specialized function called by iterators over propositions.
+  ;; Return TRUE if 'proposition' that is 'true?', or is a :FUNCTION
+  ;;    proposition with a defined output value.
+  ;; If reverse polarity, check for 'false?' proposition.
+  :globally-inline? TRUE  :public? TRUE
+  (return
+    (and (not (deleted? proposition))
+         (choose *reversePolarity?*
+                 ;; BUG: THIS IS WRONG FOR PARTIALLY FALSE PROPOSITIONS!
+                 ;; NOTE: we intentionally don't use `proposition-truth-value'
+                 ;;   below, since `true?' and `false?' do the correct thing
+                 ;;   in strict and default inference mode.
+                 (false? proposition)
+                 (or (true? proposition)
+                     ;; A function proposition is true only if one or more
+                     ;;    facts have been asserted about its output skolem:
+                     (function-with-defined-value? proposition))))))
+
+(defun (TRUE-PROPOSITIONS-ITERATOR.next? BOOLEAN)
+    ((self TRUE-PROPOSITIONS-ITERATOR))
+  :public? TRUE
+  ;; Move to the next true proposition selected by the iterator's selection
+  ;;    pattern (function propositions with defined values  are returned even
+  ;;    when they aren't true).
+  ;; The complexity results from chasing of 'variable-value-inverse' links.
+  (let ((cursor (proposition-cursor self))
+        (proposition PROPOSITION NULL))
+    (when (null? cursor)
+      (return FALSE))
+    (loop
+      (cond ((next? cursor)
+             (setq proposition (value cursor)))
+            (otherwise
+             (let ((pattern (next-equivalent-selection-pattern self)))
+               (cond ((defined? pattern)
+                      (setq cursor
+                        (allocate-iterator (select-propositions pattern)))
+                      (setf (proposition-cursor self) cursor)
+                      (continue))
+                     (otherwise
+                      (setf (proposition-cursor self) NULL)
+                      (return FALSE))))))
+      (when (true-proposition? proposition)
+        (setf (slot-value self value) proposition)
+        (setf (truth-value self) (proposition-truth-value proposition))
+        (return TRUE)))))
+
+(defmethod (next? BOOLEAN) ((self TRUE-PROPOSITIONS-ITERATOR))
+  ;; See `TRUE-PROPOSITIONS-ITERATOR.next?'.
+  (return (TRUE-PROPOSITIONS-ITERATOR.next? self)))
+
+(defun (SPECIALIZING-PROPOSITIONS-ITERATOR.next? BOOLEAN)
+    ((self SPECIALIZING-PROPOSITIONS-ITERATOR))
+  ;; Move to the next true proposition selected by the iterator's selection
+  ;;    pattern.  If no more propositions can be found for the current relation,
+  ;;    modify the pattern with the next specializing relation until no more
+  ;;    specializing relations are available.
+  (let ((specializingRelations (specializing-relations self)))
+    (loop
+      (when (TRUE-PROPOSITIONS-ITERATOR.next? self)
+        (when (and (defined? specializingRelations)
+                   (non-empty? specializingRelations))
+          (setf (truth-value self)
+            (conjoin-truth-values (truth-value self)
+                                  (second (first specializingRelations)))))
+        (setf (specializing-relations self) specializingRelations)
+        (return TRUE))
+      (if (null? specializingRelations)
+          ;; first time around:
+          (case (pattern-kind (selection-pattern self))
+            (:RELATION
+             (let ((relationDescription
+                    (surrogate-to-description
+                     (first (pattern-arguments (selection-pattern self))))))
+               ;; guard against (as yet) undefined relations:
+               (if (defined? relationDescription)
+                   (setq specializingRelations
+                     (all-supported-named-subcollections
+                      relationDescription))
+                 (setq specializingRelations NIL))))
+            (otherwise
+             (error "Illegal selection pattern in " self)))
+        (setq specializingRelations (rest specializingRelations)))
+      (when (empty? specializingRelations)
+        (setf (slot-value self value) NULL)
+        (return FALSE))
+      ;; modify selection pattern with the next subrelation:
+      (setf (first (pattern-arguments (selection-pattern self)))
+        (surrogate-value-inverse
+         (cast (first (first specializingRelations)) NAMED-DESCRIPTION)))
+      (setf (proposition-cursor self)
+        (allocate-iterator (select-propositions (selection-pattern self))))
+      ;; reset equivalents stack, since we are running a new pattern:
+      (setf (equivalents-stack self) NULL))))
+
+(defmethod (next? BOOLEAN) ((self SPECIALIZING-PROPOSITIONS-ITERATOR))
+  ;; See `SPECIALIZING-PROPOSITIONS-ITERATOR.next?'.
+  (return (SPECIALIZING-PROPOSITIONS-ITERATOR.next? self)))
+
+(defconstant EMPTY-PROPOSITIONS-ITERATOR
+    (ITERATOR OF PROPOSITION) (new TRUE-PROPOSITIONS-ITERATOR)
+  :documentation "This iterator returns no values whenever its called.")
+
+(defun (empty-propositions-index? BOOLEAN)
+    ((index PROPOSITIONS-INDEX) (primaryKey OBJECT) (specialize? BOOLEAN))
+  ;; Return TRUE if we can be sure that `index' represents the empty set.
+  ;; Propositions in `index' all reference `primaryKey' which might have
+  ;;    equivalents we would need to check.
+  ;; `specialize?' indicates whether we also need to look at specializing
+  ;;    relations.
+  (when (and (not specialize?)
+             (or (eql? index NIL-PAGING-INDEX)
+                 (eql? index NIL-NON-PAGING-INDEX)))
+    (typecase primaryKey
+      (LOGIC-OBJECT
+       (when (empty? (variable-value-inverse primaryKey))
+         (return TRUE)))
+      (otherwise
+       (return TRUE))))
+  (return FALSE))
+
+;;; TO DO: CONSIDER DOING SOMETHING DIFFERENT IF `relation' IS A CLASS AND
+;;;    `specialize?' IS TRUE SIMILAR TO WHAT WE DO IN `test-isa?':
+(defun (all-true-dependent-propositions (ITERATOR OF PROPOSITION))
+    ((self OBJECT) (relation SURROGATE) (specialize? BOOLEAN))
+  ;; Return a generator for propositions that directly reference 'self'
+  ;;    that are marked as TRUE, UNLESS we have reverse
+  ;;    polarity, in which case we return propositions marked as FALSE.
+  ;; The iterator understands variable-value-inverse links.
+  (safety 1 (or (defined? relation)
+                (not specialize?))
+          "INTERNAL-ERROR: Expected defined relation argument")
+  (let ((pattern
+         (choose (defined? relation)
+                 (make-relation-pattern relation (value-of self))
+                 (make-dependent-propositions-pattern (value-of self))))
+        (index (select-propositions pattern))
+        (iterator TRUE-PROPOSITIONS-ITERATOR NULL))
+    ;; Avoid generating a new iterator if we can predict an empty result:
+    (when (empty-propositions-index? index self specialize?)
+      (return EMPTY-PROPOSITIONS-ITERATOR))
+    (setq iterator
+      (choose specialize?
+              (new SPECIALIZING-PROPOSITIONS-ITERATOR)
+              (new TRUE-PROPOSITIONS-ITERATOR)))
+    (setf (selection-pattern iterator) pattern)
+    (setf (proposition-cursor iterator) (allocate-iterator index))
+    (return iterator)))
+
+(defun (all-true-dependent-isa-propositions (ITERATOR OF PROPOSITION))
+    ((self OBJECT))
+  ;; Return a generator for isa propositions about 'self'
+  ;;    that are marked as TRUE, UNLESS we have reverse
+  ;;    polarity, in which case we return propositions marked as FALSE.
+  ;; The iterator understands variable-value-inverse links.
+  (let ((pattern (make-isa-pattern (value-of self)))
+        (index (select-propositions pattern)))
+    (if (empty-propositions-index? index self FALSE)
+        ;; Avoid generating a new iterator if we can predict an empty result:
+        (return EMPTY-PROPOSITIONS-ITERATOR)
+      (return
+        (new TRUE-PROPOSITIONS-ITERATOR
+             :selection-pattern pattern
+             :proposition-cursor (allocate-iterator index))))))
+
+
+  ;;
+;;;;;; Subsumption tests for atomic propositions
+  ;;
+
+(defun (arguments-unify-with-arguments? BOOLEAN)
+       ((subProposition PROPOSITION) (referenceProposition PROPOSITION))
+  ;; Return TRUE if the arguments in proposition 'subProposition' unify with
+  ;;    those in 'referenceProposition'.
+  ;; note: unbinding logic copied from 'bind-argument-to-value?'.
+  (let ((patternRecord (current-pattern-record *queryIterator*))
+        (ubStackOffset (top-unbinding-stack-offset 
+                        patternRecord))
+        (success? FALSE))
+    (setq success?
+      (and (forall superArg in (arguments referenceProposition)
+               as subArg in (arguments subProposition)
+               always (and
+                       ;; don't allow "partial" propositions here to make sure
+                       ;; we only pick them up if we really want to (see also
+                       ;; `partial-arguments-unify-with-arguments?'):
+                       (not (null-instance? subArg))
+                       (bind-argument-to-value?
+                        superArg (value-of subArg) FALSE)))
+           ;; kludge to fix BUG in STELLA:
+           (eql? (length (arguments referenceProposition))
+                 (length (arguments subProposition)))))
+    (when (not success?)
+      (unbind-variables-beginning-at patternRecord (1+ ubStackOffset)))
+    (return success?)) )
+
+(defun (arguments-equal-arguments? BOOLEAN)
+       ((subProposition PROPOSITION) (referenceProposition PROPOSITION))
+  ;; Return TRUE if the arguments in proposition 'subProposition' match
+  ;;    those in 'referenceProposition'.
+  ;; Like arguments-unify-with-arguments?', but optimized for the case
+  ;;    that 'referenceProposition' has no unbound variables.
+  (return
+   (and (forall superArg in (arguments referenceProposition)
+                as subArg in (arguments subProposition)
+                always
+                (eql? (value-of superArg) (value-of subArg)))
+        ;; kludge to fix BUG in STELLA:
+        (eql? (length (arguments referenceProposition))
+              (length (arguments subProposition))))) )
+
+(defun (arguments-match-arguments? BOOLEAN)
+       ((subProposition PROPOSITION) (referenceProposition PROPOSITION))
+  ;; Call 'arguments-unify-with-arguments?' if we are inside of a query, and
+  ;;    'arguments-equal-arguments?' otherwise.
+  (if (defined? *queryIterator*)
+    (return (arguments-unify-with-arguments? subProposition referenceProposition))
+    (return (arguments-equal-arguments? subProposition referenceProposition))) )
+
+(defun (prefix-arguments-equal-arguments? BOOLEAN)
+       ((subProposition PROPOSITION) (referenceProposition PROPOSITION))
+  ;; Return TRUE if the arguments in proposition 'referenceProposition' match
+  ;;    those in 'subProposition'.
+  ;; There may be fewer arguments in 'referenceProposition'.
+  (return
+   (and (forall superArg in (arguments referenceProposition)
+                as subArg in (arguments subProposition)
+                always
+                (eql? (value-of superArg) (value-of subArg))))) )
+
+;; TO DO: THIS COULD BE VERY EXPENSIVE IF A NULL backlinkedArgument HAPPENS
+;;    BECAUSE WE DON'T BACKLINK ON UNWRAPPED LITERALS.  WE END UP ITERATING
+;;    OVER AN ENTIRE EXTENSION, EVEN THOUGH THERE IS A BOUND ARGUMENT.
+;;    FIGURE OUT HOW TO WARN IF THIS IS HAPPENING:
+(defun (all-matching-propositions (ITERATOR OF PROPOSITION)) ((self PROPOSITION))
+  ;; Called by 'try-scan-propositions-proof'.
+  ;; Return an iterator that generates all true propositions that reference
+  ;;    some argument of 'self, and whose relation specializes '(operator self)'.
+  (mv-bind (backlinkedArgument noMatchingPropositions?)
+      (select-argument-with-backlinks self)
+    ;; since `select-argument-with-backlinks' cannot reliably tell us that
+    ;;    without running a more extensive test, this is obsolete:
+    (when noMatchingPropositions?
+      (return EMPTY-PROPOSITIONS-ITERATOR))
+    (when (null? backlinkedArgument)
+      ;; iterate over all propositions with the same or specializing predicate:
+      (when-cyc-kludges-enabled
+       ;; we didn't find a backlinked argument even though some argument was
+       ;;    bound (e.g., a propositional argument to a #$holdsIn).  If the
+       ;;    extension is too big, don't page in anything at all:
+       (when (and (exists arg in (arguments self)
+                      where (defined? (argument-bound-to arg)))
+                  (> (dynamically-estimate-extension-size
+                      (get-description (operator self)))
+                     500))
+         (return EMPTY-PROPOSITIONS-ITERATOR)))
+      (return (all-matching-extension-members self TRUE)))
+    (let ((patternArgs NIL)
+          (binding OBJECT NULL))
+      (foreach arg in (arguments self)
+          do (setq binding (argument-bound-to arg))
+             (when (and (defined? binding)
+                        (isa? binding @PROPOSITION)
+                        (not (all-arguments-bound? binding)))
+                 ;; we have a proposition arg with open variables, ignore it:
+                 (setq binding NULL))
+          collect (value-of binding) into patternArgs)
+      (if (empty? (rest patternArgs))
+          ;; single argument, don't worry about position:
+          (return
+            (all-true-dependent-propositions
+             backlinkedArgument (relationRef self) TRUE))
+        ;; Create a position-sensitive selection pattern (duplicates some of
+        ;;    the logic of `all-true-dependent-propositions'); assumes a smart
+        ;;    selection algorithm for multi-arg patterns that generates the
+        ;;    smallest set of intermediate results:
+        (let ((pattern
+               (make-selection-pattern
+                :RELATION NIL (cons (operator self) patternArgs))))
+          (return
+            (new SPECIALIZING-PROPOSITIONS-ITERATOR
+                 :selection-pattern pattern
+                 :proposition-cursor (allocate-iterator
+                                      (select-propositions pattern)))))))))
+
+(defun (all-propositions-matching-arguments (CONS OF PROPOSITION))
+       ((arguments CONS) (relation SURROGATE) (specialize? BOOLEAN))
+  ;; Return a cons-list of all true propositions with arguments
+  ;;    matching `arguments' and operator 'relation' (or any subrelation
+  ;;    if `specialize?' is true).
+  ;; Assumes that instances of `arguments' followed any `variable-value' or
+  ;;    'argument-bound-to' links already.
+  (safety 3 (forall arg in arguments always (not (isa? arg @PATTERN-VARIABLE)))
+          "INTERNAL ERROR: Unexpected pattern variable arguments.")
+  (let ((backlinkedInstance (select-instance-with-backlinks arguments relation)))
+    (when (null? backlinkedInstance)
+      (return NIL))
+    (return
+      (collect prop in (all-true-dependent-propositions
+                        backlinkedInstance relation specialize?)
+               where (forall a1 in arguments
+                         as i in (interval 0 NULL)
+                         always (eql? (value-of a1)
+                                      (value-of (nth (arguments prop) i))))))))
+
+(defun (all-defining-propositions (CONS OF PROPOSITION))
+    ((outputArgument OBJECT) (relation SURROGATE) (specialize? BOOLEAN))
+  ;; Return all true function propositions whose output argument is
+  ;;    equivalent to `outputArgument', and that are equal to or
+  ;;    `specialize?' `relation'.
+  ;; Different from other `all-...-propositions' functions, this one is
+  ;;    not sensitive to `*reversePolarity?*', since there are no false
+  ;;    function propositions.
+  (special ((*reversePolarity?* FALSE)) ;; shield to avoid accidents
+    (let ((result NIL)
+          (outputArgumentValue (value-of outputArgument)))
+      (foreach prop in (all-true-dependent-propositions
+                        outputArgumentValue relation specialize?)
+          where (and (eql? (kind prop) :FUNCTION) ;; redundant?
+                     (eql? (value-of (last-argument prop))
+                           outputArgumentValue))
+          collect prop into result)
+      (return result))))
+
+
+  ;;
+;;;;;; Routines to test the existence of specific propositions
+  ;;
+
+(defun (help-memoize-test-property? BOOLEAN) ((self OBJECT) (relation SURROGATE))
+  ;; Helper function for `test-property?' to facilitate memoization.
+  ;; Comment: The grungy optimization here saves 15% or so.  Barely worth it.
+  (special ((*reversePolarity?* FALSE)
+            (*context* (get-property-test-context)))
+   (if (and (isa? self @LOGIC-OBJECT)
+            (nil? (variable-value-inverse (cast self LOGIC-OBJECT))))
+     (return (exists p in (unfiltered-dependent-propositions self relation)
+                     where (and (eql? (relationRef p) relation)
+                                (true-proposition? p))))
+     (return 
+      (next? (all-true-dependent-propositions self relation FALSE)))) ))
+
+(defun (test-property? BOOLEAN) ((self OBJECT) (relation SURROGATE))
+  :public? TRUE
+  ;; Called to search for a attribute proposition asserting that 'self'
+  ;;    satisfies the property 'relation'.
+  ;; CAUTION: Flat inference -- does not search subrelations of 'relation'.
+  ;; CAUTION: Ignores *reversePolarity?*.
+  (return
+    (memoize (self relation *context*)
+             :timestamps :KB-UPDATE  :max-values 500
+             (help-memoize-test-property? self relation))))
+
+#|
+;;; NOTE: THIS CAUSES UNWANTED FINALIZATION DURING BOOTSTRAP, WHILE THE
+;;;    VERSION BELOW DOESN'T.  IT ALSO MIGHT BE SLOWER.  POTENTIALLY, WE
+;;;    SHOULD CHANGE `all-true-dependent-propositions' TO HAVE THIS BEHAVIOR
+;;;    AUTOMATICALLY.
+(defun (help-memoize-test-isa? BOOLEAN) ((member OBJECT) (type SURROGATE))
+  ;; Helper function for `test-isa?' to facilitate memoization.
+  (special ((*reversePolarity?* FALSE)
+            (*context* (get-property-test-context)))
+    (return 
+      (next? (all-true-dependent-propositions member type TRUE)))))
+|#
+
+(defun (help-memoize-test-isa? BOOLEAN) ((member OBJECT) (type SURROGATE))
+  ;; Helper function for `test-isa?' to facilitate memoization.
+  (special ((*reversePolarity?* FALSE)
+            (*context* (get-property-test-context)))
+    (return
+      ;; NOTE: `relationref-specializes-relationref?' is already memoized:
+      (exists prop in (all-true-dependent-isa-propositions member)
+        where (relationref-specializes-relationref? (operator prop) type)))))
+
+(defun (test-isa? BOOLEAN) ((member OBJECT) (type SURROGATE))
+  :public? TRUE
+  ;; Return TRUE if 'member' satisfies 'type', using only proposition lookup.
+  ;; CAUTION: Ignores *reversePolarity?*.
+  ;; Memoization improvement ideas:
+  ;; - memoize access of ISA propositions separately and make them depend
+  ;;   on a new :UPDATE-ISA-PROPOSITION timestamp to make the cache
+  ;;   less volatile (`relationref-specializes-relationref?' is already
+  ;;   memoized seperately).
+  ;; - memoize failures and successes in different tables and make them
+  ;;   depend on different time stamps (this would keep successful tests
+  ;;   less volatile - would have to think about defaults).
+  ;; - improve memoization facility to better take context information into
+  ;;   account - again to make cached information less volatile.  Currently,
+  ;;   we wipe out all cached info even if an update was in an unrelated
+  ;;   context.
+  (case type
+    (PL-KERNEL/@THING
+     ;; this is universally true, since that's how it is handled by
+     ;; various normalization routines throughout PowerLoom:
+     (return TRUE))
+    ((PL-KERNEL/@CLASS PL-KERNEL/@RELATION PL-KERNEL/@FUNCTION
+      PL-KERNEL/@COLLECTION PL-KERNEL/@SET)
+     ;; optimize for some often tested meta classes with a less volatile cache:
+     (return
+       (memoize (member type *context*)
+                :timestamps :META-KB-UPDATE :max-values 1000
+                (help-memoize-test-isa? member type))))
+    (otherwise
+     (return
+       (memoize (member type *context*)
+                :timestamps :KB-UPDATE :max-values 1000
+                (help-memoize-test-isa? member type))))))
+
+(defun (help-memoize-access-binary-value OBJECT)
+    ((self OBJECT) (relation SURROGATE))
+  ;; Helper function for `access-binary-value' to facilitate memoization.
+  (special ((*reversePolarity?* FALSE)
+            (*context* (get-property-test-context)))
+    (let ((result OBJECT NULL)
+          (iterator (all-true-dependent-propositions self relation FALSE))
+          (proposition PROPOSITION NULL))
+      (while (next? iterator)
+        (setq proposition (value iterator))
+        (when (eql? (nth (arguments proposition) 0) self)
+          (setq result (value-of (nth (arguments proposition) 1)))
+          (return result)))
+      (return NULL) )))
+
+(defun (access-binary-value OBJECT) ((self OBJECT) (relation SURROGATE))
+  :public? TRUE
+  ;; Access the relation 'relation' on the object 'self'.  If found,
+  ;;    return the value of the second argument.  If there are several
+  ;;    values, just the first is returned.
+  ;; CAUTION: Ignores *reversePolarity?*.
+  (return
+    (memoize (self relation *context*)
+             :timestamps :KB-UPDATE :max-values 1000
+             (help-memoize-access-binary-value self relation))))
+
+;; THIS MAY NOT BE USEFUL: -rmm
+(defun (test-collectionof-member-of? BOOLEAN) ((member OBJECT) (type SURROGATE))
+  ;; Return TRUE if 'member' belongs to a 'setof' or 'listof' collection, and
+  ;;    if that collection specializes 'type'.
+  ;; CAUTION: Ignores *reversePolarity?*.
+  ;; POSSIBLY 'test-collectionof-member-of?' SHOULD BE FOLDED INTO 'test-isa?'.
+  (special ((*reversePolarity?* FALSE)
+            (*context* (get-property-test-context)))
+   (foreach p in (all-true-dependent-propositions
+                  member PL-KERNEL/@COLLECTIONOF TRUE)
+       where (true-proposition? p)
+       do (let ((collection (last (arguments p))))
+            (when (and (not (eql? member collection))
+                       (collection-implies-collection? 
+                        collection (surrogate-to-description type)))
+              (return TRUE))))
+   (return FALSE) ))
+
+
+  ;;
+;;;;;; Iterators that follow IMPLIES links
+  ;;
+
+(defclass TRANSITIVE-CLOSURE-ITERATOR (ITERATOR)
+  :documentation "Iterator that visits all nodes reachable using an
+embedded adjacency function."
+  :slots
+  ((allocate-adjacency-iterator-function :type FUNCTION-CODE)
+   (filter? :type FUNCTION-CODE)
+   (adjacency-iterator-stack :type (CONS OF ITERATOR) :initially NIL)
+   (been-there-list :type CONS)
+   ))
+
+(defun (TRANSITIVE-CLOSURE-ITERATOR.next? BOOLEAN)
+    ((self TRANSITIVE-CLOSURE-ITERATOR))
+  ;; Return the next node in a transitive search.
+  (let ((node (slot-value self value))
+        (adjacencyIterator
+         ITERATOR
+         (funcall (allocate-adjacency-iterator-function self) node)))
+    (if (defined? adjacencyIterator)
+      (pushf (adjacency-iterator-stack self) adjacencyIterator)
+      (progn
+        (setq adjacencyIterator (first (adjacency-iterator-stack self)))
+        (when (null? adjacencyIterator)
+          (return FALSE))))
+    (loop
+      (while (not (next? adjacencyIterator))
+        ;; pop exhausted iterator from stack:
+        (setf (adjacency-iterator-stack self)
+              (rest (adjacency-iterator-stack self)))
+        (setq adjacencyIterator (first (adjacency-iterator-stack self)))
+        (when (null? adjacencyIterator)
+          (return FALSE)))
+      (setq node (slot-value adjacencyIterator value))
+  ;; PROBLEM: THE `alreadyVisited' TEST MIGHT FAIL FOR IDENTICAL BUT NOT
+  ;;    EQ DESCRIPTIONS COMING FROM SECONDARY STORAGE (WE MIGHT BRING IN
+  ;;    A RULE TWICE IF IT GOT PAGED OUT OF THE MEMO CACHE).  MAYBE THE
+  ;;    BEST WAY TO DEAL WITH THAT IS TO REMOVE ANY DUPLICATES IN A
+  ;;    POSTPROCESSING STEP THAT USES A MORE SOPHISTICATED EQUALITY TEST.
+      (when (and (not (member? (been-there-list self) node))
+                 (or (null? (filter? self))
+                     (funcall (filter? self) node)))
+        (pushf (been-there-list self) node)
+        (setf (slot-value self value) node)
+        (return TRUE))) ))
+
+(defmethod (next? BOOLEAN) ((self TRANSITIVE-CLOSURE-ITERATOR))
+  (return (TRANSITIVE-CLOSURE-ITERATOR.next? self)))
+
+(defun (allocate-transitive-closure-iterator ITERATOR)
+       ((startNode OBJECT) (allocateAdjacencyIterator FUNCTION-CODE)
+        (filterFunction FUNCTION-CODE))
+  :documentation "Return an iterator that generates the transitive
+closure of applying iterators generated by 'allocateAdjacencyIterator'
+to 'startNode'.  If 'filterFunction' is non-null, that function is applied
+as a filter to each node generated (nodes filtered out still generate
+descendants, but they don't get returned)."
+  :public? TRUE
+  ;; Note: To eliminate duplicates and guarantee termination, we need to collect
+  ;;    a list of all objects visited during the search.
+  (let ((iterator (new TRANSITIVE-CLOSURE-ITERATOR)))
+    (setf (slot-value iterator value) startNode)
+    (setf (been-there-list iterator) NIL)
+    (setf (allocate-adjacency-iterator-function iterator)
+          allocateAdjacencyIterator)
+    (setf (filter? iterator) filterFunction)
+    (return iterator) ))
+
+(defclass SUPPORTED-CLOSURE-ITERATOR (TRANSITIVE-CLOSURE-ITERATOR)
+  :documentation
+  "Iterator that visits all objects reachable via true link propositions
+generated by an embedded link proposition iterator.  Each new object reached
+is represented as an `(<object> <truth-value>)' pair, where <truth-value> is
+the cumulative truth value of the links followed from the start to reach it.
+The embedded `allocate-adjacency-iterator-function' needs to be able to take
+an `(<object> <truth-value>)' pair as an argument which is different than the
+requirement for TRANSITIVE-CLOSURE-ITERATOR's."
+  :parameters ((any-value :type OBJECT #| but really CONS |#))
+  :slots
+  ((adjacency-iterator-stack :type (CONS OF TRUE-PROPOSITIONS-ITERATOR))))
+
+(defun (allocate-supported-closure-iterator SUPPORTED-CLOSURE-ITERATOR)
+       ((startNode CONS) (allocateAdjacencyIterator FUNCTION-CODE)
+        (filterFunction FUNCTION-CODE))
+  :documentation "Similar to `allocate-transitive-closure-iterator' (which see),
+but return a SUPPORTED-CLOSURE-ITERATOR instead."
+  :public? TRUE
+  (let ((iterator (new SUPPORTED-CLOSURE-ITERATOR)))
+    (setf (slot-value iterator value) startNode)
+    (setf (been-there-list iterator) NIL)
+    (setf (allocate-adjacency-iterator-function iterator)
+          allocateAdjacencyIterator)
+    (setf (filter? iterator) filterFunction)
+    (return iterator) ))
+
+(defmethod (next? BOOLEAN) ((self SUPPORTED-CLOSURE-ITERATOR))
+  ;; Generate the next element of a supported closure represented as an
+  ;;    `(<object> <truth-value>)' pair.
+  (cond ((TRANSITIVE-CLOSURE-ITERATOR.next? self)
+         (setf (slot-value self value)
+           (cons (slot-value self value)
+                 (cons (truth-value (first (adjacency-iterator-stack self)))
+                       NIL)))
+         (return TRUE))
+        (otherwise
+         (return FALSE))))
+
+(defclass DIRECTLY-LINKED-OBJECTS-ITERATOR (TRUE-PROPOSITIONS-ITERATOR)
+  :parameters ((any-value :type OBJECT))
+  :slots ((inverse? :type BOOLEAN)
+          (root-truth-value :type TRUTH-VALUE :initially TRUE-TRUTH-VALUE)))
+
+(defmethod (next? BOOLEAN) ((self DIRECTLY-LINKED-OBJECTS-ITERATOR))
+  ;; Move to the next true binary proposition of the right kind
+  ;;    (this is already taken care of by the initial selection pattern).
+  ;; Return the value of the second argument (or vice versa if
+  ;;    `(inverse? self)' is true).
+  (let ((proposition PROPOSITION NULL))
+    ;; NOTE: we ignore reverse polarity here, since in that case we already
+    ;;    changed the link direction instead (i.e., `inverse?' is true):
+    (special ((*reversePolarity?* FALSE))
+      (when (TRUE-PROPOSITIONS-ITERATOR.next? self)
+        (setq proposition (slot-value self value))
+        (setf (slot-value self value)
+          (value-of
+           (choose (inverse? self)
+                   (nth (arguments proposition) 0)
+                   (nth (arguments proposition) 1))))
+        ;; conjoin with `root-truth-value' to allow truth value chaining
+        ;;    in transitive closure reasoning:
+        (setf (truth-value self)
+          (conjoin-truth-values (truth-value self) (root-truth-value self)))
+        (return TRUE))
+      (setf (slot-value self value) NULL)
+      (return FALSE))))
+
+(defun (all-directly-linked-objects ITERATOR)
+    ((self OBJECT) (relation SURROGATE) (inverse? BOOLEAN))
+  ;; Generate the set of objects linked directly to `self' by
+  ;;    TRUE two-argument `relation' propositions.
+  ;; If 'inverse?', flip arguments during comparisons and projections.
+  ;; Logic copied from `all-true-dependent-propositions'.
+  (let ((pattern
+         (choose inverse?
+                 (make-relation-pattern-2 relation NULL (value-of self))
+                 (make-relation-pattern-2 relation (value-of self) NULL)))
+        (index (select-propositions pattern)))
+    ;; Avoid generating a new iterator if we can predict an empty result:
+    (when (empty-propositions-index? index self FALSE)
+      (return EMPTY-PROPOSITIONS-ITERATOR))
+    (return
+      (new DIRECTLY-LINKED-OBJECTS-ITERATOR
+           :selection-pattern pattern
+           :proposition-cursor (allocate-iterator index)
+           :inverse? inverse?))))
+
+;;; Methods for generating the set of collections linked directly to
+;;;   'self' by an :IMPLIES proposition. These are designed
+;;;   for embedding within the transitive closure iterator.
+;;; Tricky: If *reversePolarity?* is TRUE, then each of them traverses
+;;;    links in the inverse direction from normal.
+
+(defun (all-direct-supercollections (ITERATOR OF LOGIC-OBJECT)) 
+       ((self LOGIC-OBJECT) (performFiltering? BOOLEAN))
+  ;; Return a generator of collections directly implied by 'self'.
+  ;; Tricky: If there is a cycle of equivalent collections, this needs rather
+  ;;    complex handling.
+  (when (isa? self @DESCRIPTION)
+    (derive-deferred-satellite-rules self))
+  (let ((directlyLinkedObjects 
+	 (all-directly-linked-objects
+          self PL-KERNEL-KB/@SUBSET-OF *reversePolarity?*)))
+    (when (not performFiltering?)
+      (return directlyLinkedObjects))
+    (let ((directSupers (CONS OF LOGIC-OBJECT) NIL)
+	  (equivalents (all-equivalent-collections self TRUE)))
+      (if (non-empty? (rest equivalents))
+	  (foreach e in equivalents
+	      do (foreach parent in (all-direct-supercollections e FALSE)
+		     where (and (not (member? equivalents parent))
+				(not (member? directSupers parent)))
+		     do (pushq directSupers parent)))
+	(setq directSupers (consify directlyLinkedObjects)))
+      (return (allocate-iterator (most-specific-collections directSupers))) )))
+
+(defun (all-direct-supercollections-with-equivalents (ITERATOR OF LOGIC-OBJECT))
+       ((self LOGIC-OBJECT))
+  ;; Helping function for 'all-supercollections'.
+  ;; Return all direct supers without filtering out equivalent collections.
+  (return (all-direct-supercollections self FALSE)) )
+
+(defun (all-direct-subcollections (ITERATOR OF LOGIC-OBJECT)) 
+       ((self LOGIC-OBJECT) (performFiltering? BOOLEAN))
+  ;; Return a generator of collections that directly imply 'self'.
+  ;; If reverse polarity, generate supercollections.
+  ;; Tricky: If there is a cycle of equivalent collections, this needs rather
+  ;;    complex handling.
+  (when (isa? self @DESCRIPTION)
+    (derive-deferred-satellite-rules self))
+  (let ((directlyLinkedObjects 
+	 (all-directly-linked-objects
+          self PL-KERNEL-KB/@SUBSET-OF (not *reversePolarity?*))))
+    (when (not performFiltering?)
+      (return directlyLinkedObjects))
+    (let ((directSubs (CONS OF LOGIC-OBJECT) NIL)
+	  (equivalents (all-equivalent-collections self TRUE)))
+      (if (non-empty? (rest equivalents))
+	  (foreach e in equivalents
+	      do (foreach child in (all-direct-subcollections e FALSE)
+		     where (and (not (member? equivalents child))
+				(not (member? directSubs child)))
+		     do (pushq directSubs child)))
+	(setq directSubs (consify directlyLinkedObjects)))
+      (return (allocate-iterator (most-general-collections directSubs))) )))
+
+(defun (all-direct-subcollections-with-equivalents (ITERATOR OF LOGIC-OBJECT))
+       ((self LOGIC-OBJECT))
+  ;; Helping function for 'all-subcollections'.
+  ;; Return all direct subs without filtering out equivalent collections.
+  (return (all-direct-subcollections self FALSE)) )
+
+(defun (all-supercollections (ITERATOR OF LOGIC-OBJECT)) ((self LOGIC-OBJECT))
+  ;; Generate the set of collections linked to 'self' by a chain of IMPLIES
+  ;;    links.
+  ;; Note: If *reversePolarity?* is TRUE, we generate all subcollections.
+  ;; OPTIMIZATION: CONSIDER ADDING FAST TEST FOR EMPTY RESULT.
+  (return
+    (clone-memoized-iterator
+     (memoize (self *context* *reversePolarity?*)
+              :timestamps :META-KB-UPDATE :max-values 1000
+              (new MEMOIZABLE-ITERATOR
+                   :base-iterator
+                   (allocate-transitive-closure-iterator
+                    self
+                    (the-code :FUNCTION
+                              all-direct-supercollections-with-equivalents)
+                    NULL))))))
+
+(defun (all-subcollections (ITERATOR OF LOGIC-OBJECT)) ((self LOGIC-OBJECT))
+  ;; Generate the set of collections linked to 'self' by a chain of inverse
+  ;;    IMPLIES links.
+  ;; Note: If *reversePolarity?* is TRUE, we generate all supercollections.
+  ;; OPTIMIZATION: CONSIDER ADDING FAST TEST FOR EMPTY RESULT.
+  (return (allocate-transitive-closure-iterator
+           self (the-code :FUNCTION all-direct-subcollections-with-equivalents) NULL)) )
+
+(defun (all-isa-collections (CONS OF LOGIC-OBJECT)) ((self OBJECT))
+  ;; Generate all descriptions related to 'self' via ISA or 'member'
+  ;;    propositions.
+  (let ((collections NIL))
+    (foreach p in (all-true-dependent-propositions self NULL FALSE)
+             where (eql? (kind p) :ISA)
+             do (pushq collections (get-description (relationRef p))))
+    (foreach p in (all-true-dependent-propositions 
+                   self PL-KERNEL/@MEMBER-OF FALSE)
+             do (pushq collections (nth (arguments p) 1)))
+    (return collections) ))
+
+(defun (all-supported-named-subcollections (CONS OF CONS))
+    ((self LOGIC-OBJECT))
+  ;; Return a list of all named subcollections of `self' where each subrelation
+  ;;    is associated with a truth value indicating the strength of the IMPLIES
+  ;;    link/s it subrelationship depends on.
+  ;; Needed by `SPECIALIZING-PROPOSITIONS-ITERATOR.next?' and
+  ;;    `DESCRIPTION-EXTENSION-ITERATOR.next?' to properly handle defaults.
+  (return
+    (memoize (self
+              ;; depending on whether defaults are considered,
+              ;;    we'll get different sets of subcollections:
+              (using-default-knowledge?)
+              *context*
+              *reversePolarity?*)
+             :timestamps :META-KB-UPDATE :max-values 1000
+             (help-all-supported-named-subcollections self))))
+
+(defun (all-directly-linked-subcollections TRUE-PROPOSITIONS-ITERATOR)
+    ((self OBJECT))
+  ;; Helper function for `all-supported-named-subcollections'.
+  ;; Return an iterator that generates all objects linked to `self' via one
+  ;;    IMPLIES link.  If `self' is a CONS, assumes the first element is
+  ;;    the actual object and the second the starting truth value (needed to
+  ;;    propagate truth values along transitivity chains).
+  (let ((object LOGIC-OBJECT NULL)
+        (truthValue TRUTH-VALUE NULL)
+        (iterator ITERATOR NULL))
+    (typecase self
+      (CONS
+       (setq object (first self))
+       (setq truthValue (second self)))
+      (LOGIC-OBJECT
+       (setq object self)))
+    (when (isa? object @DESCRIPTION)
+      (derive-deferred-satellite-rules object))
+    (setq iterator
+      (all-directly-linked-objects
+       object PL-KERNEL-KB/@SUBSET-OF (not *reversePolarity?*)))
+    (typecase iterator
+      (DIRECTLY-LINKED-OBJECTS-ITERATOR
+       (when (defined? truthValue)
+         (setf (root-truth-value iterator) truthValue))
+       (return iterator))
+      (otherwise
+       (return NULL)))))
+
+(defun (help-all-supported-named-subcollections (CONS OF CONS))
+    ((self LOGIC-OBJECT))
+  ;; Helper function for `all-supported-named-subcollections'.
+  (let ((subCollections NIL)
+        (closureIterator
+         (SUPPORTED-CLOSURE-ITERATOR OF CONS)
+         (allocate-supported-closure-iterator
+          (cons self (cons TRUE-TRUTH-VALUE NIL))
+          (the-code :FUNCTION all-directly-linked-subcollections)
+          NULL)))
+    (foreach sub in closureIterator
+        where (and (isa? (first sub) @NAMED-DESCRIPTION)
+                   (not (eql? (first sub) self)))
+        collect sub into subCollections)
+    (return subCollections)))
+
+
+  ;;
+;;;;;; 'all-clashing-propositions'
+  ;;
+
+(defun (value-clashes-with-skolem? BOOLEAN) ((skolem SKOLEM) (value OBJECT))
+  ;; Returns TRUE if 'value' is not compatible with known restrictions on 'skolem'.
+  ;; Essentially this tries a very quick & cheap clash check to see if unifying
+  ;; the skolem with value would be lead to a problem.
+  (let ((type (skolem-type skolem)))
+    (cond ((null? type)
+	   (return FALSE))
+	  ((not (check-type? value type TRUE))
+	   (return TRUE))
+	  ((and (literal-type? type) ;; guard for speed
+                (logical-subtype-of? type @NUMBER))
+	   ;; Check skolem bounds, if any:
+	   (return 
+	     (not (PL-KERNEL-KB/satisfies-interval-bounds?
+		   skolem (cast value NUMBER-WRAPPER)))))
+	  (otherwise (return FALSE))) ))
+
+(defun (clashes-with-FUNCTION-proposition? BOOLEAN)
+       ((nextProposition PROPOSITION) (referenceProposition PROPOSITION))
+  ;; Return TRUE if the predicate proposition 'nextProposition' clashes
+  ;;    with 'referenceProposition'.
+  (when (forall
+         superArg in (but-last (arguments referenceProposition))
+         as subArg in (but-last (arguments nextProposition))
+         always (eql? (argument-bound-to superArg) (value-of subArg)))
+    (let ((lastSuperValue (argument-bound-to (last (arguments referenceProposition))))
+          (lastSubValue (value-of (last (arguments nextProposition)))))
+      (when (and (defined? lastSuperValue)
+                 (defined? lastSubValue)
+                 #|
+              ;;;;; FEEBLE ATTEMPT TO HANDLE DEFAULT VALUE CLASHES,
+              ;;;;;    FIX ONCE WE KNOW HOW TO EQUATE VALUES BY DEFAULT:
+                 (or (not (skolem? lastSubValue))
+                     (non-empty?
+                      (conflicting-default-values (cast lastSubValue SKOLEM))))
+                 (or (not (skolem? lastSuperValue))
+                     (non-empty?
+                      (conflicting-default-values (cast lastSuperValue SKOLEM))))
+		      |#
+		 )
+	(if (isa? lastSubValue @SKOLEM)
+	  (if (isa? lastSuperValue @SKOLEM)
+	    ;; Both skolems
+	    (return FALSE)
+	    ;; Sub is skolem
+	    (return (value-clashes-with-skolem? lastSubValue lastSuperValue)) )
+	  (if (isa? lastSuperValue @SKOLEM)
+	    ;; Super is skolem
+	    (return (value-clashes-with-skolem? lastSuperValue lastSubValue))
+	    ;; Neither is skolem
+	    (return (not (eql? lastSuperValue lastSubValue))) )) )))
+  (return FALSE) )
+
+(defclass CLASHING-PROPOSITIONS-ITERATOR (TRUE-PROPOSITIONS-ITERATOR)
+  :parameters ((any-value :type PROPOSITION))
+  :slots ((reference-proposition :type PROPOSITION)))
+
+(defmethod (next? BOOLEAN) ((self CLASHING-PROPOSITIONS-ITERATOR))
+  ;; Move to the next true proposition that clashes with
+  ;;    `(reference-proposition self)'.
+  (let ((referenceProp (reference-proposition self)))
+    (while (TRUE-PROPOSITIONS-ITERATOR.next? self)
+      (when (clashes-with-FUNCTION-proposition?
+             (slot-value self value)
+             referenceProp)
+        (return TRUE)))
+    (setf (slot-value self value) NULL)
+    (return FALSE)))
+
+(defun (all-clashing-propositions (ITERATOR OF PROPOSITION)) ((self PROPOSITION))
+  ;; Scan for proposition with matching operator and input arguments
+  ;;    but different output argument (which signals a clash if `self'
+  ;;    is a function or single-valued proposition - note, that the
+  ;;    caller needs to check single-valuedness).
+  (let ((arguments (arguments self))
+        (lastArg (last arguments))
+        (backlinkedArg OBJECT NULL))
+    ;; tricky: temporarily set output argument to NULL so we won't
+    ;; accidentally pick it up as a key to look for clashing propositions
+    ;; (it might have 0 backlinks and look like a very good key to use)
+    ;; - this is not thread safe:
+    (setf (last arguments) NULL)
+    (setq backlinkedArg (select-argument-with-backlinks self))
+    (setf (last arguments) lastArg)
+    (when (null? backlinkedArg)
+      (return EMPTY-PROPOSITIONS-ITERATOR))
+    (let ((pattern
+           (make-relation-pattern (operator self) (value-of backlinkedArg)))
+          (index (select-propositions pattern)))
+      ;; Avoid generating a new iterator if we can predict an empty result:
+      (when (empty-propositions-index? index backlinkedArg FALSE)
+        (return EMPTY-PROPOSITIONS-ITERATOR))
+      (return
+        (new CLASHING-PROPOSITIONS-ITERATOR
+             :selection-pattern pattern
+             :proposition-cursor (allocate-iterator index)
+             :reference-proposition self)))))
+
+
+;-------------------------------------------------------------------
+  ;;
+;;;;;; Taxonomy implications and subsumption support -erm
+  ;;
+
+;; TODO: If the propositions is an ISA proposition, a description
+;;   attached to a class may already exist, in which case that should
+;;   be used.  Similarly, if a description is later attached to a class,
+;;   it should use the proposition that is passed in here -erm
+
+;;; Experimental: we have 2 taxonomies, one for implications only, and
+;;;   one for implications and subsumptions
+
+(defglobal *implication-subsumption-graph* TAXONOMY-GRAPH NULL)
+
+(defun (relations-with-descriptions (LIST OF RELATION)) ()
+  ;; Return all relations which contain a description.
+  ;; TO DO: MAKE THIS AN ITERATOR.
+  (let ((result (new LIST)))
+    (foreach class in (all-classes NULL FALSE)
+	     where (defined? (description class))
+	     collect class into result)
+    (foreach slot in (all-slots NULL FALSE)
+             where (defined? (description slot))
+             collect slot into result)
+    (return result) ))
+
+(defun build-subsumption-taxonomy-graph ()
+  ;; Create taxonomy-node graph based on subsumption relationships of 
+  ;;   classes with descriptions
+  ;; NOTE: Currently not used
+  (let ((relationsWithDescriptions (relations-with-descriptions)))
+    (foreach r in relationsWithDescriptions
+	     do
+	     (create-description-implication-subsumption-node 
+	      (description r) NULL))
+    (foreach r in relationsWithDescriptions
+	     do
+	     (foreach super in (direct-superrelations r)
+		      where (member? relationsWithDescriptions super)
+		      do
+		      (create-taxonomy-link 
+		       *implication-subsumption-graph*
+		       (find-description-implication-subsumption-node 
+			(description super))
+		       (find-description-implication-subsumption-node 
+			(description r)))))))
+    
+;;; IDEA: when creating a new subsumption link (e.g., a relation is
+;;;       added on the fly), incrementally update implication-subsumption
+;;;       taxonomy, even though relation-taxonomy is non-incrementaly recomputed
+  
+(defun clear-implication-subsumption-graph ()
+  ;; Wipe the taxonomy nodes from the descriptions represented
+  ;;   in *implication-subsumption-graph*
+  ;; not implemented yet
+  (foreach r in (relations-with-descriptions)
+	   do
+	   (setf (taxonomy-node (description r)) NULL)))
+
+(defun initialize-implication-subsumption-graph ()
+  (clear-implication-subsumption-graph)
+  (setq *implication-subsumption-graph* (new TAXONOMY-GRAPH))
+  ;; Copy relation-taxonomy-graph at this point, initialize description table
+  ;; IDEA: Maybe create descriptions for all relations at this point
+;  (build-subsumption-taxonomy-graph)
+  (finalize-taxonomy-graph *implication-subsumption-graph*)
+)
+
+(startup-time-progn :final
+ (initialize-implication-subsumption-graph))
+
+(defun (find-description-implication-subsumption-node TAXONOMY-NODE)
+    ((description DESCRIPTION))
+  ;; Find the taxonomy-node associated with `description', assuming 
+  ;;   one exists.
+  (return 
+    (taxonomy-node description)))
+
+(defun (create-description-implication-subsumption-node TAXONOMY-NODE)
+    ((description DESCRIPTION) (parentNode TAXONOMY-NODE))
+  ;; Create a new taxonomy-node associated with `description',
+  ;;   optionally linking it to a parent taxonomy node that
+  ;;   is known to be associated with an implied description.
+  (let ((node (create-taxonomy-node
+	       *implication-subsumption-graph* parentNode description
+               (null? parentNode))))
+    (link-taxonomy-nodes *implication-subsumption-graph* parentNode node)
+    (setf (taxonomy-node description) node)
+    (return node)))
+
+(defun (find-or-create-description-implication-subsumption-node TAXONOMY-NODE) 
+    ((description DESCRIPTION))
+  (let ((result (find-description-implication-subsumption-node description)))
+    (when (defined? result)
+      (return result))
+    (return (create-description-implication-subsumption-node
+	     description NULL))))
+
+(defun (create-description-for-stella-relation-and-ancestors DESCRIPTION) ((self RELATION))
+  ;; Create descriptions and taxonomy nodes (if they don't exist)
+  ;;   for 'self' and 'self's ancestors.
+  ;; Return the newly-created description.
+  ;; TEMPORARY FIX: ASK ERIC TO LOOK AT THIS
+  (when (null? self)
+    (return NULL))
+  (let ((description (get-description self))
+	(taxonomyNode 
+	 (find-or-create-description-implication-subsumption-node 
+	  description)))
+    (foreach 
+     super in (direct-superrelations self)
+     do
+     ;; Do some stuff here to ensure that we're creating
+     ;;   a tree link if one doesn't already exist.
+     (let ((superDescription
+            (create-description-for-stella-relation-and-ancestors super))
+           (superTaxonomyNode
+            (find-description-implication-subsumption-node superDescription)))
+       (create-taxonomy-link
+        *implication-subsumption-graph* superTaxonomyNode taxonomyNode)))
+     (return description) ))
+
+(defun add-taxonomy-implies-subsumes-link ((tailDescription DESCRIPTION)
+				           (headDescription DESCRIPTION))
+  ;; Add a link to the implies fast-isa taxonomy
+  ;; IDEA: if `create-and-intern-node' can be called directly with
+  ;;   `parentNode', we'll probably get better intervals, since
+  ;;   the taxonomy-node system knows about the dependence between
+  ;;   child and parent
+  ;; TEMPORARILY DISABLED UNTIL CYCLES WORK:
+;  (print "PRETEND TO ADD LINK " tailDescription "  " headDescription EOL)
+  (return)
+  #|
+  (let ((parentNode (find-or-create-description-implication-subsumption-node
+		     headDescription))
+	(childNode (find-description-implication-subsumption-node
+		    tailDescription)))
+    (if (defined? childNode)
+      (create-taxonomy-link
+       *implication-subsumption-graph* parentNode childNode)
+      (create-description-implication-subsumption-node
+       tailDescription parentNode))
+    ;; Create descriptions for ancestors for purposes of subsumption tests
+    (create-description-for-stella-relation-and-ancestors 
+     (native-relation headDescription))
+    (create-description-for-stella-relation-and-ancestors 
+    (native-relation headDescription)))
+    |#
+    )
+
+(defun drop-taxonomy-implies-subsumes-link ((tailDescription DESCRIPTION)
+				            (headDescription DESCRIPTION))
+  ;; Delete a link from the implies fast-isa taxonomy.
+  (ignore headDescription tailDescription)
+; (print "PRETEND TO DROP LINK " tailDescription "  " headDescription EOL) 
+; (print "'drop-taxonomy-implies-subsumes-link':  Write me, I am a dummy!" EOL)
+  (return) )
+
+(defun (taxonomy-implies-or-is-subsumed? BOOLEAN) ((premise RELATION)
+						   (conclusion RELATION))
+  ;; Return TRUE if `premise' implies `conclusion', or the relation
+  ;;   associated with `premise' is a subrelation of the relation associated 
+  ;;   with `conclusion'.
+  (let ((premiseDescription (description premise))
+	(conclusionDescription DESCRIPTION NULL))
+    (when (or (null? premiseDescription)
+	      (null? (find-description-implication-subsumption-node
+		      premiseDescription)))
+      (setq premiseDescription
+	(create-description-for-stella-relation-and-ancestors premise)))
+    (setq conclusionDescription (description conclusion))
+    (when (null? conclusionDescription)
+      (return FALSE))
+    (when (null? (find-description-implication-subsumption-node
+		  conclusionDescription))
+      ;; I'm not sure if we can assume that taxonomy-nodes are guaranteed
+      ;;   to be attached to conclusionDescription, but we assume it for now.
+      ;; NOTE: If descriptions are created by means other than implication
+      ;;   or subrelation tests, we might be in trouble.
+      (error "'taxonomy-implies-or-is-subsumed?' conclusionDescription should have taxonomy-node"))
+    (return
+      (taxonomy-subnode-of? 
+       (find-description-implication-subsumption-node premiseDescription)
+       (find-description-implication-subsumption-node conclusionDescription)))))
+
+
+#|
+
+Testing
+
+(defclass S (STANDARD-OBJECT))
+(defclass A (S))
+(defclass B (STANDARD-OBJECT))
+(defclass C (STANDARD-OBJECT))
+(defclass D (STANDARD-OBJECT))
+
+(assert (forall ?x (=> (B ?x) (A ?x))))
+
+(defglobal cs CLASS (type-class @S))
+(defglobal ca CLASS (type-class @A))
+(defglobal cb CLASS (type-class @B))
+(defglobal cc CLASS (type-class @C))
+(defglobal co CLASS (type-class @OBJECT))
+
+(taxonomy-implies-or-is-subsumed? cb ca)	; TRUE
+(taxonomy-implies-or-is-subsumed? cc ca)        ; FALSE
+(taxonomy-implies-or-is-subsumed? ca cs)	; TRUE
+(taxonomy-implies-or-is-subsumed? cc cs)	; FALSE
+(taxonomy-implies-or-is-subsumed? cc co)	; TRUE
+(taxonomy-implies-or-is-subsumed? cb cc)	; FALSE
+
+(leval (assert (forall ?x (=> (C ?x) (B ?x)))))
+
+(taxonomy-implies-or-is-subsumed? cc ca)        ; TRUE
+(taxonomy-implies-or-is-subsumed? cc cs)        ; TRUE
+
+|#
+
+;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;  End additions -erm
+;;;;;;;;;;;;;;;;;;;;;
+

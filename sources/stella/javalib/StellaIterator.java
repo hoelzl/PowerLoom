@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: StellaIterator.java,v 1.6 2003/04/18 21:16:10 hans Exp
+// Version: StellaIterator.java,v 1.9 2006/05/11 07:06:50 hans Exp
 
 package edu.isi.stella.javalib;
 
@@ -68,7 +68,7 @@ public class StellaIterator implements java.util.Iterator {
 
   /** Tests if more elements are available.
    *
-   * @returns true if at least one more element is available.
+   * @return true if at least one more element is available.
    */
   public boolean hasNext () {
     return moreP;
@@ -76,7 +76,7 @@ public class StellaIterator implements java.util.Iterator {
 
   /** Returns the next Stella_Object provided by the encapsulated Iterator.
    *
-   * @returns the next Stella_Object provided by the iterator.
+   * @return the next Stella_Object provided by the iterator.
    */
   public Object next () {
     if (moreP) {

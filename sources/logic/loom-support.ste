@@ -1,0 +1,850 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: loom-support.ste,v 1.14 2006/05/11 07:05:20 hans Exp
+
+;;; A STELLLA/PowerLoom API that mimics Loom functionality.
+
+(in-package "STELLA")
+
+(in-module "LOOM-API")
+
+
+(verbatim :common-lisp
+          "(CL:defpackage \"LOOM-API\" 
+            (:use)
+            (:import-from \"COMMON-LISP\" CL:print-object)
+            (:export #:loom-role
+                     #:loom-role-of
+                     #:relation-of-loom-role
+                     #:clear-user-contexts
+                     #:generate-source-expression
+                     #:collection-members
+                     #:get-instance-name
+                     #:get-partitions
+                     #:disjoint-relations?
+                     #:covering?
+                     #:stringified-source
+                     #:get-role-names-and-values
+                     #:get-loom-roles
+                     #:get-value-restriction
+                     #:get-max-cardinality
+                     #:get-min-cardinality
+                     #:get-range
+                     #:get-domain
+                     #:compute-conjunction-relation
+                     #:most-specific-relations
+                     #:subrelation?
+                     #:get-class-instances
+                     #:get-role-value
+                     #:remove-role-value
+                     #:add-role-value
+                     #:instance-of?
+                     #:delete-instance
+                     #:create-instance
+                     #:get-equivalent-names
+                     #:instance?
+                     #:context-of-instance
+                     #:get-child-contexts
+                     #:get-parent-contexts
+                     #:get-xcontext
+                     ))"
+          :otherwise NULL)
+
+
+  ;;
+;;;;;; Utility function
+  ;;
+
+(defun (safe-surrogatify SURROGATE) ((surrogateRef OBJECT))
+  ;; Return a surrogate for 'surrogateRef' if its a symbol, surrogate,
+  ;;    or a string.
+  (when (null? surrogateRef)
+    (return NULL))
+  (typecase surrogateRef
+    (STRING (return (string-to-surrogate surrogateRef)))
+    (SURROGATE (return surrogateRef))
+    (SYMBOL (return (symbol-to-surrogate surrogateRef)))
+    (otherwise (return NULL))) )
+
+
+  ;;
+;;;;;; Loom roles
+  ;;
+
+(defclass LOOM-ROLE (THING)
+  :documentation "")
+
+(defrelation loom-role-of 
+  ((?c PL-KERNEL/CLASS) (?r PL-KERNEL/RELATION) (?role LOOM-ROLE))
+  :documentation ""
+  :axioms (single-valued loom-role-of))
+
+(defun (find-or-create-loom-role LOOM-ROLE) 
+       ((instanceRef OBJECT) (relationRef OBJECT) (create? BOOLEAN))
+  :documentation "Return a LOOM-ROLE instance if 'instanceRef' has
+a Loom role named 'relationRef'.  If 'create?', create a role
+instance if one doesn't already exist."
+  (let ((instance (get-instance instanceRef))
+        (relation (get-relation relationRef))
+        (role LOOM-ROLE NULL))
+    (when (or (null? instance)
+              (null? relation))
+      (return NULL))
+    (setq role (first (apply-retrieve (?i ?r ?role) (loom-role-of ?i ?r ?role)
+                                   (instance relation NULL))))
+    (when (or (defined? role)
+              (not create?))
+      (return role))
+    (setq role (create-logic-instance NULL @LOOM-ROLE))
+    (assert-tuple @loom-role-of (cons-list instance relation role))
+    (return role) ))
+
+(defun (get-loom-roles (CONS OF LOOM-ROLE)) 
+       ((instanceRef OBJECT) (inferRoles? BOOLEAN))
+  :documentation "Return a list of LOOM-ROLEs on 'instanceRef'.  If
+'inferRoles', create roles on the fly corresponding to
+frame predicate or domain propositions inherited by 'instance'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef)))
+    (when (null? instance)
+      (return NULL))
+    (when inferRoles?
+      ;; retrieving induced roles has the side-effect of asserting
+      ;;    them on 'instance':
+      (get-relation-induced-roles instance))
+    (return
+     (apply-retrieve (?i ?role) 
+                  (exists ?r (loom-role-of ?i ?r ?role))
+                  (instance NULL))) ))
+  
+(defun (get-relation-induced-roles (CONS OF LOOM-ROLE)) ((instanceRef OBJECT))
+  ;; Return a list of Loom roles created according to the
+  ;;    rules of Loom semantics:
+  ;;    (1) If a restriction on 'instanceRef' references a relation
+  ;;        R, then R induces a role (unless its a MAX=0 restrictoin).
+  ;;    (2) If 'instanceRef' is of type C and R has domain D and
+  ;;        '(subset-of C D)' holds, then R induces a role.
+  (let ((instance (get-instance instanceRef))
+;        (framePredicates (all-class-instances @FRAME-PREDICATE))
+        (relations NIL)
+        (roles NIL))
+    (when (null? instance)
+      (return NULL))
+    ;; TWO QUESTIONS:
+    ;;  (2) DOES THE 'instance-of' WORK (NOT YET IMPLEMENTED)?
+    ;;  (3) DOES THE 'or' CAUSE GENERATION OF ALL '?r's, I.E., UNACCEPTABLE
+    ;;      PERFORMANCE?
+    ;; PERFOMANCE QUESTION:  THIS BACKCHAINS ON FRAME PREDICATES.
+    ;;    CAN WE CUT IT OFF (WOULD MAKING IT SHALLOW DISABLE THE
+    ;;    HOLDS SPECIALIST? MAYBE NOT):
+    ;; SEMANTIC BUG: THE MAX-ZERO SHOULD FILTER BOTH HALVES OF THE 'OR:
+    (setq relations
+          (apply-retrieve 
+           (?r ?i) (or (exists (?fr ?v)
+                               (and (Frame-Predicate ?fr)
+                                    (holds ?fr ?r ?i ?v)
+                                    (not (and (= ?fr range-max-cardinality)
+                                              (= ?v 0)))))
+                       (exists (?c)
+                               (and (instance-of ?i ?c)
+                                    (domain ?r ?c))))
+           (NULL instance)))
+;; THIS IS THE DIRECT LOOK-UP APPROACH, BUT ITS LESS COMPLETE: -rmm
+;    (foreach 
+;     fr in framePredicates
+;     do
+;     (foreach p in (all-true-dependent-propositions
+;                    instance fr FALSE)
+;              where
+;              (and (eql? (nth (arguments p) 1) instance)
+;                   (not (and (member?
+;                              (quote (@RANGE-MAX-CARDINALITY @RANGE-CARDINALITY))
+;                              (relationRef p))
+;                             (zero? (cast (nth (arguments p) 2) INTEGER-WRAPPER)))))
+;              do (pushq relations (nth (arguments p) 0))))
+;    (foreach d in (all-types instance)
+;             do
+;             (foreach p in (all-true-dependent-propositions
+;                            d @DOMAIN FALSE)
+;                      do (pushq relations (nth (arguments p) 0))))
+    (foreach r in relations
+             do
+             (pushq roles (find-or-create-loom-role
+                           instance r TRUE)))
+    (return roles) ))
+
+(defun (relation-of-loom-role NAMED-DESCRIPTION) ((role LOOM-ROLE))
+  :documentation "Return the relation for the Loom role 'role'."
+  (return (first (apply-retrieve (?r ?role)
+                              (exists ?i (loom-role-of ?i ?r ?role))
+                              (NULL role)))) )
+
+(defun (get-role-names-and-values CONS) ((instanceRef OBJECT))
+  :documentation "Return a list of lists, with each sublist containing
+a relation (role) name (a symbol) followed by one or more fillers of
+that role on 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (table (new KEY-VALUE-LIST)))
+    (when (null? instance)
+      (return NULL))
+    (foreach p in (cast
+                   (concatenate
+                    (all-true-dependent-propositions 
+                     instance NULL TRUE)
+                    (all-true-dependent-propositions 
+                     instance NULL TRUE))
+                   (ITERATOR OF PROPOSITION))
+		  ;; LENGTH is a PL-KERNEL-KB deffunction:
+             where (and (eql? (/stella/length (arguments p)) 2)
+                        (eql? (nth (arguments p) 0) instance))
+             do
+             (let ((relation (surrogate-to-symbol (relationRef p)))
+                   (filler (value-of (nth (arguments p) 1))))
+               (when (defined? filler)
+                 (let ((bucket CONS (lookup table relation)))
+                   (if (null? bucket)
+                     (insert-at table relation (cons-list filler))
+                     (insert-at table relation (cons filler bucket)))))))
+    (let ((result NIL))
+      (foreach (key value) in table
+               do 
+               (pushq result (bquote (& key && (cast value CONS)))))
+      (return result)) ))
+
+
+  ;;
+;;;;;; contexts
+  ;;
+
+(defun (get-xcontext MODULE) ((contextRef OBJECT))
+  :documentation "Return the module referenced by 'contextRef'."
+  (return (get-module contextRef)) )
+
+(defun (get-parent-contexts (CONS OF MODULE)) ((moduleRef OBJECT))
+  :documentation "Return a list of parent modules of 'moduleRef'."
+  (let ((module (get-module moduleRef)))
+    (if (null? module)
+      (return NULL)
+      (return (consify (parent-modules module)))) ))
+
+(defun (get-child-contexts (CONS OF MODULE)) ((moduleRef OBJECT))
+  :documentation "Return a list of child modules of 'moduleRef'."
+  (let ((module (get-module moduleRef))
+        (children (CONS OF MODULE) NIL))
+    (when (null? module)
+      (return NULL))
+    (foreach cxt in (child-contexts module)
+             where (isa? cxt @MODULE)
+             do (pushq children cxt))
+    (return children) ))
+
+(defun (context-of-instance MODULE) ((instanceRef OBJECT))
+  :documentation "Return the home context (a module) of 'instanceRef',
+or NULL if it is not context sensitive."
+  (let ((instance (get-instance instanceRef)))
+    (when (null? instance)
+      (return NULL))
+    (typecase instance
+      (LOGIC-OBJECT (return (home-context instance)))
+      (otherwise (return NULL))) ))
+
+(defun clear-user-contexts ()
+  :documentation "Destroy the contents of all non-system-defined modules."
+  (foreach mdl in (all-modules)
+           where (and (clearable? mdl)
+                      (not (member? (cons-list *pl-kernel-module*) mdl)))
+           do
+;; FOR SOME REASON THIS DOESN'T WORK:
+           (print "Clearing: " mdl EOL)
+           (call-clear-module mdl)) )
+
+#|
+;; everything:   ??
+;;   concepts:   (apply-retrieve (?x) (class ?x) (NULL))
+;;  relations:   (apply-retrieve (?x) (?? ?x) (NULL))
+;;  instances:   (apply-retrieve (?x) (?? ?x) (NULL))
+|#
+
+(defun (list-context CONS) ((context MODULE) (values KEYWORD))
+  (within-context context
+    (case values
+      (:all
+       (return (consify (all-named-terms context false))))
+      (:concepts
+       (return (apply-retrieve (?x) (class ?x) (NULL))))
+      (:relations
+       (return (apply-retrieve (?x) 
+                               (and (relation ?x) (fail (class ?x)))
+                               (NULL))))
+      (:instances
+       (return (consify (all-instances context false)))))))
+
+
+  ;;
+;;;;;; find-xxx, and xxx?
+  ;;
+
+(defun (relation-arity INTEGER) ((relationRef OBJECT))
+  :documentation "Return the arity of the relation 'relationRef'."
+  :public? TRUE
+  (let ((relation (get-relation relationRef)))
+    (if (defined? relation)
+      (typecase relation
+        (DESCRIPTION (return (LOGIC/arity relation)))
+        (LOGIC-OBJECT (return (get-slot-value relation PL-KERNEL/@ARITY))))
+      (return NULL)) ))
+
+(defun (find-class LOGIC-OBJECT)
+       ((instanceRef OBJECT) (module MODULE) (local? BOOLEAN))
+  :documentation "Return the nearest class with name 'instanceRef' in
+the module 'module'.  If 'local?' is FALSE, also search modules inherited
+by 'module'.  'instanceRef' can be a string, symbol, or surrogate."
+  :public? TRUE
+  (let ((instance 
+         (coerce-to-instance-in-module instanceRef module local? NULL)))
+    (if (class? instance)
+      (return instance)
+      (return NULL)) ))
+
+(defun (find-relation LOGIC-OBJECT)
+       ((instanceRef OBJECT) (module MODULE) (local? BOOLEAN))
+  :documentation "Return the nearest relation with name 'instanceRef' in
+the module 'module'.  If 'local?' is FALSE, also search modules inherited
+by 'module'.  'instanceRef' can be a string, symbol, or surrogate."
+  :public? TRUE
+  (let ((instance 
+         (coerce-to-instance-in-module instanceRef module local? NULL)))
+    (if (relation? instance)
+      (return instance)
+      (return NULL)) ))
+
+(defun (get-instance-surrogate SURROGATE) ((instanceRef OBJECT))
+  :documentation "Return the surrogate pointing to the instance referenced by
+'instanceRef'."
+  :public? TRUE
+  (cond
+   ((null? instanceRef) (return NULL))
+   ((isa? instanceRef @SURROGATE)
+    (if (null? (surrogate-value (cast instanceRef SURROGATE)))
+      (return NULL)
+      (return (cast instanceRef SURROGATE))))
+   (otherwise
+    (let ((instance (get-instance instanceRef)))
+      (when (null? instance)
+        (return NULL))
+      (typecase instance
+        ((LOGIC-OBJECT THING)
+         (if (defined? instance)
+           (return (surrogate-value-inverse instance))
+           (return NULL))))))) )
+
+(defun (get-instance-name SYMBOL) ((instanceRef OBJECT))
+  :documentation "Return the name (a symbol) of the instance referenced by
+'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef)))
+    (typecase instance
+      ((LOGIC-OBJECT THING)
+       (when (and (defined? instance)
+                  (defined? (surrogate-value-inverse instance)))
+         (return (surrogate-to-symbol (surrogate-value-inverse instance))))))
+    (return NULL) ))
+
+(defun (get-equivalent-names (CONS OF SYMBOL)) ((relationRef OBJECT))
+  :documentation "Return a list containing the name of 'relationRef'
+plus the names of any equivalent relations."
+  (let ((relation (get-relation relationRef))
+        (equivalentNames NIL))
+    (when (null? relation)
+      (return NULL))
+    (foreach e in (all-equivalent-collections relation TRUE)
+             where (named-description? e)
+             collect (description-name (cast e DESCRIPTION))
+             into equivalentNames)
+    (return equivalentNames) ))
+
+(defun (instance? BOOLEAN) ((objectRef OBJECT))
+  :documentation "Return TRUE if 'objectRef' is an instance or the
+name of an instance."
+  :public? TRUE
+  (special ((*suppressNonLogicObjectWarning?* TRUE))
+    (return (defined? (get-instance objectRef)))) )
+
+(defun (individual? BOOLEAN) ((object OBJECT))
+  :documentation "Return TRUE if 'objectRef' is an instance or the
+name of an instance, and does not denote a relation, class, or set."
+  :public? TRUE
+  (special ((*suppressNonLogicObjectWarning?* TRUE))
+    (let ((instance (get-instance object)))
+      (return (and (defined? instance)
+		   (not (collection? instance)))) )))
+
+(defun (named? BOOLEAN) ((instanceRef OBJECT))
+  :documentation "Return TRUE if the object returned by 'instanceRef'
+is matched with a logical constant."
+  :public? TRUE
+  (return (defined? (get-instance-name instanceRef))) )
+
+(defun (create-instance OBJECT) ((instanceRef OBJECT) (classRef OBJECT))
+  :documentation "Create an instance named 'instanceRef'
+of type 'classRef'."
+  (let ((classType (get-instance-surrogate classRef))
+        (surrogate (safe-surrogatify instanceRef)))
+    (if (and (class? classType)
+             (or (null? instanceRef)
+                 (defined? surrogate)))
+      (return (create-logic-instance surrogate classType))
+      ;; 'instanceRef' can't be coerced to a surrogate:
+      (return NULL)) ))
+
+(defun (find-or-create-instance LOGIC-OBJECT)
+       ((instanceRef OBJECT) (classRef OBJECT))
+  :documentation "Find an existing instance refenced by 'instanceRef'
+of type 'classRef', or create one of type 'classRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (classType (get-instance-surrogate classRef)))
+    (cond
+     ((defined? instance)
+      (if (or (null? classRef)
+              (instance-of? instance classType))
+        (return instance)
+        (return NULL)))
+     (otherwise
+      (return (create-instance instanceRef classRef)))) ))
+
+(defun (instance-of? BOOLEAN) ((instanceRef OBJECT) (classRef OBJECT))
+  :documentation "Return TRUE if the instance referenced by 'instanceRef'
+belongs to the class referenced by 'classRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (classType (get-instance-surrogate classRef)))
+    (return (and (defined? instance)
+                 (defined? classType)
+                 (test-type-on-instance? instance classType))) ))
+
+(defun add-type ((instanceRef OBJECT) (classRef OBJECT))
+  :documentation "Assert that the instance referenced by 'instanceRef'
+is an instance of the class referenced by 'classRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (classType (get-instance-surrogate classRef)))
+    (when (and (defined? instance)
+               (class? classType))
+      (update-isa-proposition instance classType :ASSERT-TRUE)) ))
+
+(defun remove-type ((instanceRef OBJECT) (classRef OBJECT))
+  :documentation "Retract that the instance referenced by 'instanceRef'
+is an instance of the class referenced by 'classRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (classType (get-instance-surrogate classRef)))
+    (when (and (defined? instance)
+               (class? classType))
+      (update-isa-proposition instance classType :RETRACT-TRUE)) ))
+
+(defun (get-types (CONS OF DESCRIPTION)) 
+       ((instanceRef OBJECT) (directOrAsserted KEYWORD))
+  :documentation "Return a list of classes that instance belongs to."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (result NIL))
+    (when (null? instance)
+      (return NULL))
+    (case directOrAsserted
+      (:DIRECT
+       (foreach d in (all-direct-types instance)
+           do (pushq result d)))
+      (:ASSERTED
+       (foreach d in (all-asserted-types instance)
+           do (pushq result d)))
+      (otherwise
+       (foreach d in (all-types instance)
+           do (pushq result d))))
+    (return result) ))
+
+(defun update-role-value ((instanceRef OBJECT) (relationRef OBJECT)
+                     (valueRef OBJECT) (assert? BOOLEAN))
+  :documentation "Assert the tuple '(relationRef instanceRef valueRef)',
+or retract if 'assert?' is FALSE."
+  (let ((instance (get-instance instanceRef))
+        (relation (get-relation relationRef))
+        (value (get-instance valueRef)))
+    (when (and (defined? instance)
+               (defined? relation)
+               (eql? (relation-arity relation) 2)
+               (defined? value))
+      (update-tuple 
+       (get-instance-surrogate relation)
+       (cons-list instance value)
+       (choose assert? :ASSERT-TRUE :RETRACT-TRUE))) ))
+
+(defun add-role-value ((instanceRef OBJECT) (relationRef OBJECT) (valueRef OBJECT))
+  :documentation "Assert the tuple '(relationRef instanceRef valueRef)'."
+  :public? TRUE
+  (update-role-value instanceRef relationRef valueRef TRUE) )
+
+(defun remove-role-value ((instanceRef OBJECT) (relationRef OBJECT) (valueRef OBJECT))
+  :documentation "Retract the tuple '(relationRef instanceRef valueRef)'."
+  :public? TRUE
+  (update-role-value instanceRef relationRef valueRef FALSE) )
+
+(defun (get-role-value OBJECT) ((instanceRef OBJECT) (relationRef OBJECT))
+  :documentation "Return a value for the binary relation 'relationRef'
+applied to 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (relation (get-relation relationRef)))
+    (if (and (defined? instance)
+             (defined? relation)
+             (eql? (relation-arity relation) 2))
+      (return (get-slot-value instance (get-instance-surrogate relation)))
+      (return NULL)) ))
+
+;; OOPS: FIGURE OUT WHAT INFERENCE WORLD TO BE IN HERE, AND EVERYWHERE
+;;    ELSE:
+(defun (get-role-values CONS) 
+       ((instanceRef OBJECT) (relationRef OBJECT))
+  :documentation "Return a list of values for the binary relation 'relationRef'
+applied to 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (relation (get-relation relationRef)))
+    (if (and (defined? instance)
+             (defined? relation)
+             (eql? (relation-arity relation) 2))
+      (return (all-slot-values instance (get-instance-surrogate relation)))
+      (return NULL)) ))
+
+(defun (get-role-default-values CONS) 
+       ((instanceRef OBJECT) (relationRef OBJECT))
+  :documentation "Return a list of default values for the binary relation
+'relationRef' applied to 'instanceRef'."
+  :public? TRUE
+  (let ((defaultValues CONS NULL))
+    (within-context (get-inference-cache *module* :DEFAULT)
+     (setq defaultValues (get-role-values instanceRef relationRef)))
+    ;; TO DO: REWRITE THIS:
+    (within-context (get-inference-cache *module* :STRICT)
+     (foreach v in (get-role-values instanceRef relationRef)
+              do
+              (setq defaultValues (remove defaultValues v))))
+    (return defaultValues) ))
+
+(defun (get-class-instances CONS) ((classRef OBJECT) (direct? BOOLEAN))
+  :documentation "Return a list of instances belonging to the class 'classRef'."
+  :public? TRUE
+  (let ((classType (get-instance-surrogate classRef)))
+    (if (class? classType)
+	(if direct?
+	    (let ((instances (all-class-instances classType))
+		  (directInstances NIL)
+		  (directSubs (all-direct-subrelations (get-instance classRef) TRUE))
+		  (instance-of-sub? BOOLEAN FALSE))
+	      (foreach i in instances
+		  do (setq instance-of-sub? FALSE)
+		     (foreach s in directSubs
+			 do (when (instance-of? i s)
+			      (setq instance-of-sub? TRUE)
+			      (break)))
+		     (unless instance-of-sub?
+		       (pushq directInstances i)))
+	      (return directInstances))
+	    (return (all-class-instances classType)))
+      (return NIL)) ))
+
+(defun (subrelation? BOOLEAN) ((subrelationRef OBJECT) (superrelationRef OBJECT))
+  :documentation "Return TRUE if 'subrelationRef' specializes 'superrelationRef'.
+Side-effect: Upclassify 'subrelationRef'."
+  :public? TRUE
+  (let ((subrelation (get-relation subrelationRef))
+        (subrelationType (only-if (defined? subrelation)
+                                  (surrogate-value-inverse subrelation)))
+        (superrelationType (get-instance-surrogate superrelationRef)))
+    (if (and (relation? subrelationType)
+             (relation? superrelationType))
+      (progn
+        (find-direct-supers-and-subs subrelation TRUE)
+        (return (test-subrelation? subrelationType superrelationType)))
+      (return FALSE)) ))
+
+(defun (get-superrelations (CONS OF LOGIC-OBJECT))
+       ((relationRef OBJECT) (direct? BOOLEAN))
+  :documentation "Return a list of relations that generalize 'relationRef'.
+Does not include relations equivalent to 'relationRef'."
+  :public? TRUE
+  (finalize-objects)
+  (let ((relation (get-instance relationRef))
+        (result NIL))
+    (when (relation? relation)
+      (if direct?
+        (foreach super in (all-direct-superrelations relation TRUE)
+                 do (pushq result super))
+        (foreach super in (all-superrelations relation TRUE)
+                 do (pushq result super))))
+    (return result) ))
+
+(defun (get-subrelations (CONS OF LOGIC-OBJECT))
+       ((relationRef OBJECT) (direct? BOOLEAN))
+  :documentation "Return a list of relations that specialize 'relationRef'.
+Does not include relations equivalent to 'relationRef'."
+  :public? TRUE
+  (finalize-objects)
+  (let ((relation (get-instance relationRef))
+        (result NIL))
+    (when (relation? relation)
+      (if direct?
+        (foreach sub in (all-direct-subrelations relation TRUE)
+                 do (pushq result sub))
+        (foreach sub in (all-subrelations relation TRUE)
+                 do (pushq result sub))))
+    (return result) ))
+
+(defun (most-specific-relations (CONS OF LOGIC-OBJECT))
+       ((relationRefs CONS) (classifyFirst? BOOLEAN))
+  :documentation "Return a list of the most specific among the
+relations in 'relationRefs'.  If 'classifyFirst?', insure that
+all relations are classified before filtering for most-specific."
+  :public? TRUE
+  (let ((relations (CONS OF DESCRIPTION) NIL))
+    (foreach r in relationRefs
+             collect (get-relation r) into relations)
+    (setq relations (remove-duplicates relations))
+    (when (empty? (rest relations))
+      (return relations))
+    (when classifyFirst?
+      ;; mildly clever: we classify only those descriptions whose last
+      ;;    date of upclassification is older than the youngest
+      ;;    introduction age found in 'relations':
+      (special
+       ((*classificationSession* (get-classification-session :DESCRIPTION)))
+       (within-world (get-classification-world)       
+        (let ((youngestRelation (first relations)))
+          (foreach r in (rest relations)
+                   where (/stella/> (introduction-timestamp r)
+				    (introduction-timestamp youngestRelation))
+                   do (setq youngestRelation r))
+          (foreach r in relations
+                   where (not (upclassified-later-than? r youngestRelation))
+                   do (upclassify-one-description r))
+          ;; need to compute this INSIDE of the 'within' world context:
+          (return (most-specific-named-collections relations))))))
+    (return (most-specific-named-collections relations))))
+
+(defun (compute-conjunction-relation DESCRIPTION)
+       ((relationRefs (CONS OF NAMED-DESCRIPTION)))
+  :documentation "Return a relation representing the conjunction
+of relations in 'relationRefs'."
+  :public? TRUE
+  (let ((relations (CONS OF DESCRIPTION) NIL)
+        (conjunctionDescription LOGIC-OBJECT NULL))
+    (foreach r in relationRefs
+             collect (get-relation r) into relations)
+    (setq relations (remove-duplicates relations))
+    (when (empty? (rest relations))
+      (return (first relations)))
+    ;; synthesize description from other descriptions:
+    (let ((clauses NIL)
+          (variables NIL))
+      (foreach v in SYSTEM-DEFINED-ARGUMENT-NAMES
+               as i on (interval 1 (relation-arity (first relations)))
+               collect v into variables)
+      (foreach r in relations
+               do 
+               (if (named? r)
+                 (pushq clauses (bquote (& (surrogate-to-symbol
+                                            (surrogate-value-inverse r))
+                                           && (copy-cons-list variables))))
+                 (pushq clauses (third 
+                                 (cast (generate-expression r TRUE) CONS)))))
+      (setq conjunctionDescription
+            (conceive-term 
+             (bquote (kappa (& variables) (and && clauses))))))
+    (mv-bind (supers subs equivalents)
+             (find-direct-supers-and-subs conjunctionDescription TRUE)
+             (ignore supers subs)
+             (if (non-empty? equivalents)
+               (return (first equivalents))
+               (return conjunctionDescription))) ))
+
+#|
+(defconcept AA (?x))
+(defconcept BB (?x))
+(eval (compute-conjunction-relation (cons-list @AA @BB)))
+|#
+
+(defun (get-domain NAMED-DESCRIPTION) ((relationRef OBJECT))
+  :documentation "Return the domain of the binary relation 'relationRef'."
+  (let ((relation (get-relation relationRef)))
+    (when (null? relation)
+      (return NULL))
+    (return (first (apply-retrieve (?d ?r) (domain ?r ?d)
+                        (NULL relation)))) ))
+
+(defun (get-range NAMED-DESCRIPTION) ((relationRef OBJECT))
+  :documentation "Return the range of the binary relation 'relationRef'."
+  (let ((relation (get-relation relationRef)))
+    (when (null? relation)
+      (return NULL))
+    (return (first (apply-retrieve (?d ?r) (range ?r ?d)
+                        (NULL relation)))) ))
+
+(defun (get-min-cardinality INTEGER) ((instanceRef OBJECT) (relationRef OBJECT))
+  :documentation "Infer a minimum cardinality for the set of fillers of
+the range of relation 'relationRef' applied to 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (relationSurrogate (get-instance-surrogate relationRef)))
+    (return (get-slot-minimum-cardinality instance relationSurrogate)) ))
+
+(defun (get-max-cardinality INTEGER) ((instanceRef OBJECT) (relationRef OBJECT))
+  :documentation "Infer a maximum cardinality for the set of fillers of
+the range of relation 'relationRef' applied to 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (relationSurrogate (get-instance-surrogate relationRef)))
+    (return (get-slot-maximum-cardinality instance relationSurrogate)) ))
+
+(defun (get-value-restriction DESCRIPTION) ((instanceRef OBJECT) (relationRef OBJECT))
+  :documentation "Infer a type restriction on the set of fillers of
+the range of relation 'relationRef' applied to 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef))
+        (relationSurrogate (get-instance-surrogate relationRef))
+        (type (get-slot-value-type instance relationSurrogate)))
+    (when (null? type)
+      (setq type (get-description @THING)))
+    (return type) ))
+
+;; THIS ISN'T CALLED BY ANYTHING YET:  -rmm
+(defun assert-loom-proposition ((loomSentence CONS) (retract? BOOLEAN))
+  :documentation "Convert each Loom sentence into a KIF equivalent
+and assert it or retract it."
+  (update-proposition 
+   (translate-loom-sentence-to-kif loomSentence)
+   (choose retract? :RETRACT-TRUE :ASSERT-TRUE)) )
+
+(defun delete-instance ((instanceRef OBJECT))
+  :documentation "Destroy the instance, class or relation 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef)))
+    (when (defined? instance)
+      (destroy-term instance)) ))
+
+
+(defun (generate-source-expression OBJECT) ((instanceRef OBJECT))
+  :documentation "Return an s-expression representing the
+source expression for 'instanceRef'."
+  :public? TRUE
+  (let ((instance (get-instance instanceRef)))
+    (return (generate-expression instance FALSE)) ))
+
+(defun (get-partitions CONS) ((classRef OBJECT))
+  :documentation "Return a list of partitions that
+specify disjointness of children of the class classRef'."
+  (let ((class (get-class classRef))
+        (partitions NIL))
+    (when (defined? class)
+      (foreach 
+       c in (get-subrelations class TRUE)
+       do
+       (foreach mdc in
+                (apply-retrieve (?c ?mdc)
+                             (and (member-of ?c ?mdc)
+                                  (mutually-disjoint-collection ?mdc))
+                             (c NULL))
+                where (not (member? partitions mdc))
+                do (pushq partitions mdc))))
+    (return partitions) ))
+
+(defun (disjoint-relations? BOOLEAN) ((relationRef1 OBJECT) (relationRef2 OBJECT))
+  :documentation "Return TRUE if 'relationRef1' and 'relationRef2' are
+disjoint."
+  :public? TRUE
+  (let ((relation1 (get-relation relationRef1))
+        (relation2 (get-relation relationRef2)))
+    (return (expensive-disjoint-terms? relation1 relation2)) ))
+
+(defun (covering? BOOLEAN) ((instanceRef OBJECT) (classRef OBJECT))
+  :documentation "Return TRUE if the mutually disjoint collection 'instanceRef'
+covers 'classRef'.  If 'classRef' is NULL, return TRUE if 'instanceRef' covers
+some concept."
+  (let ((mdc (get-instance instanceRef))
+        (coveredClass (get-class classRef)))
+    (when (or (null? mdc)
+              (not (test-property? mdc PL-KERNEL/@MUTUALLY-DISJOINT-COLLECTION)))
+      (return FALSE))
+    (foreach c on
+             (apply-retrieve (?mdc ?covered)
+                          (covering ?mdc ?covered)
+                          (mdc coveredClass))
+             do (return TRUE))
+    (return FALSE) ))
+
+(defun (collection-members CONS) ((instanceRef OBJECT))
+  :documentation "Return a list of concepts that belong to the collection 'instanceRef'."
+  ;; Note: This is needed for getting members of mutually disjoint collections, but
+  ;;    it obviously works for anything.
+  (let ((instance (get-instance instanceRef)))
+    (when (defined? instance)
+      (return (consify (asserted-collection-members instance FALSE))))
+    (return NIL) ))
+      
+
+
+  
+
+
+#|
+
+(defconcept A (?a)
+  :=> (range-max-cardinality R ?a 2))
+(defconcept B (?b)
+  :=> (range-min-cardinality S ?b 1))
+(defrelation R (?x ?y))
+(defrelation S (?x ?y))
+
+(finalize-objects)
+
+|#

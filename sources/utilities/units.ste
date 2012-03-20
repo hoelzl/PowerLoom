@@ -1,0 +1,974 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: units.ste,v 1.18 2006/05/14 07:23:01 hans Exp
+
+(in-package "STELLA")
+
+(in-module "UTILITIES")
+
+(defglobal *prime-numbers* (CONS OF INTEGER-WRAPPER)
+	   (quote (2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97))
+  :public? FALSE)
+(defglobal *current-prime-index* INTEGER -1
+  :public? FALSE)
+(defglobal *prime-to-measure-table* (STELLA-HASH-TABLE OF RATIO MEASURE)
+	   (new STELLA-HASH-TABLE)
+  :public? FALSE)
+(defglobal *prime-to-base-measure-table* (INTEGER-HASH-TABLE OF INTEGER MEASURE) 
+	   (new INTEGER-HASH-TABLE)
+  :public? FALSE)
+(defglobal *name-to-measure-table*  (STRING-HASH-TABLE OF STRING MEASURE)
+	   (new STRING-HASH-TABLE)
+  :public? FALSE)
+(defglobal *unit-to-measure-table*  (STRING-HASH-TABLE OF STRING MEASURE)
+	   (new STRING-HASH-TABLE)
+  :public? FALSE)
+(defglobal *all-measures*  (CONS OF MEASURE) NIL
+  :public? TRUE)
+(defglobal *base-measures*  (CONS OF MEASURE) NIL
+  :public? TRUE)
+
+
+(defun (next-prime-id INTEGER) ()
+  :public? FALSE
+  (++ *current-prime-index*)
+  (return (nth *prime-numbers* *current-prime-index*)))
+
+  ;;
+;;;;;; Exceptions
+  ;;
+
+(defclass INCOMPATIBLE-UNITS-EXCEPTION (INCOMPATIBLE-QUANTITY-EXCEPTION)
+  :public? TRUE)
+
+
+  ;;
+;;;;;; Mini RATIO
+  ;;
+
+(defglobal *ratio-one* RATIO (new RATIO :numerator 1 :denominator 1)
+  :public? TRUE)
+
+(defclass RATIO (QUANTITY)
+  :public? TRUE
+  :public-slots ((numerator :type INTEGER :required? TRUE)
+		 (denominator :type INTEGER :required? TRUE))
+  :print-form (print-stream stream (numerator self) "/" (denominator self)))
+
+(defun (make-ratio RATIO) ((num INTEGER) (denom INTEGER))
+  :public? TRUE
+  :constructor? TRUE
+  (let ((theGcd (gcd num denom))
+	(n 0)
+	(d 0)
+	(negative? FALSE))
+    ;; Canonicalize negative value
+    (if (< num 0)
+      (progn
+	(setq n (/ (- num) theGcd))
+	(setq negative? TRUE))
+      (setq n (/ num theGcd)))
+    (if (< denom 0)
+      (progn
+	(setq d (/ (- denom) theGcd))
+	(setq negative? (not negative?)))
+      (setq d (/ denom theGcd)))
+    (when negative?
+      (setq n (- n)))
+    (return (new RATIO :numerator n :denominator d))))
+
+(defmethod (hash-code INTEGER) ((self RATIO))
+  :public? TRUE
+  (return (logor (numerator self) (shift-left (denominator self) 10))))
+
+
+(defmethod (coerce-to RATIO) ((x RATIO) (y OBJECT))
+  :public? TRUE
+  :documentation "Coerces `y' to be a compatible type with `x'.
+If this isn't possible, an exception is thrown.  The exception
+will be either INCOMPATIBLE-QUANTITY-EXCEPTION or 
+INCOMPATIBLE-UNITS-EXCEPTION."
+  (typecase y
+    (RATIO
+     (return y))
+    (INTEGER
+     (return (make-ratio (wrapper-value y) 1)))
+;    (FLOAT-WRAPPER
+;     (return (rationalize (wrapper-value y))))
+    (otherwise
+     (signal INCOMPATIBLE-QUANTITY-EXCEPTION
+             "Can't convert " y " to a RATIO"))))
+
+
+(defmethod (object-eql? BOOLEAN) ((x RATIO) (y OBJECT))
+  :public? TRUE
+  (return (and (defined? y)
+	       (eql? (primary-type y) @RATIO)  ; Treat as final
+	       (= (numerator x)  (numerator (cast y RATIO)))
+	       (= (denominator x) (denominator (cast y RATIO))))))
+
+(defmethod (less? BOOLEAN) ((x RATIO) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' < `y'"
+  (let ((y-ratio RATIO (coerce-to x y)))
+    (return (< (* (numerator x) (denominator y-ratio))
+	       (* (numerator y-ratio) (denominator x))))))
+
+(defmethod (less-equal? BOOLEAN) ((x RATIO) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' <= `y'"
+  (let ((y-ratio RATIO (coerce-to x y)))
+    (return (<= (* (numerator x) (denominator y-ratio))
+		(* (numerator y-ratio)  (denominator x))))))
+
+;; eql? via object-eql?
+
+(defmethod (greater-equal? BOOLEAN) ((x RATIO) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' >= `y'"
+  (let ((y-ratio RATIO (coerce-to x y)))
+    (return (>= (* (numerator x) (denominator y-ratio))
+		(* (numerator y-ratio) (denominator x))))))
+
+(defmethod (greater? BOOLEAN) ((x RATIO) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' > `y'"
+  (let ((y-ratio RATIO (coerce-to x y)))
+    (return (> (* (numerator x)  (denominator y-ratio))
+	       (* (numerator y-ratio)  (denominator x))))))
+
+
+(defmethod (add RATIO) ((x RATIO) (y RATIO))
+  :public? TRUE
+  (return (make-ratio (+ (* (numerator x) (denominator y))
+			 (* (numerator y) (denominator x)))
+		      (* (denominator x) (denominator y)))))
+
+(defmethod (subtract RATIO) ((x RATIO) (y RATIO))
+  :public? TRUE
+  (return (make-ratio (- (* (numerator x) (denominator y))
+			 (* (numerator y) (denominator x)))
+		      (* (denominator x) (denominator y)))))
+
+(defmethod (multiply RATIO) ((x RATIO) (y RATIO))
+  :public? TRUE
+  (return (make-ratio (* (numerator x) (numerator y))
+		      (* (denominator x) (denominator y)))))
+
+(defmethod (divide RATIO) ((x RATIO) (y RATIO))
+  :public? TRUE
+  (return (make-ratio (* (numerator x) (denominator y))
+		      (* (denominator x) (numerator y)))))
+
+(defmethod (negate RATIO) ((x RATIO))
+  :public? TRUE
+  (return (new RATIO :numerator (- (numerator x))
+	       :denominator (denominator x))))
+
+(defmethod (invert RATIO) ((x RATIO))
+  :public? TRUE
+  (return (new RATIO :numerator   (denominator x)
+		     :denominator (numerator x))))
+
+(defun (ipower INTEGER) ((x INTEGER) (exp INTEGER))
+  ;; Returns `x' to the `exp' power.
+  ;; KLUDGE to work around some issues with the C++ `pow' function that
+  ;; doesn't always return integral results due to unpredictable floating
+  ;; point conversion issues (surfaced with MinGW).
+  (if (< exp 0)
+      (signal BAD-ARGUMENT-EXCEPTION "Illegal negative exponent: " exp)
+    (let ((result 1))
+      (while (>= (-- exp) 0)
+        (setq result (* result x)))
+      (return result))))
+
+;; Renamed to not conflict with the built-in math function expt
+(defmethod (exponentiate RATIO) ((x RATIO) (y INTEGER))
+  :public? TRUE
+  ;; Don't need to normalize, since numerator and denominator are relatively prime
+  (if (< y 0)
+    (return (new RATIO
+		 :numerator (ipower (denominator x) (- y))
+		 :denominator (ipower (numerator x) (- y))))
+    (return (new RATIO
+		 :numerator (ipower (numerator x) y)
+		 :denominator (ipower (denominator x) y)))))
+
+  ;;
+;;;;;; UNITS PARSING TOKEN TABLE
+  ;;
+
+
+(defglobal *unit-tokenizer-table-definition* CONS
+  (bquote
+     ((:start * "-+0123456789" :integer
+	      * "." :delimiter
+	      * "/" :fraction
+	      * "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ%" :unit
+	      :eof :eof
+	      :otherwise :error)
+      (:unit  * "-+0123456789" :integer
+	      * "." :delimiter
+	      * "/" :fraction
+	      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ%" :unit
+	      :eof :eof
+	      :otherwise :error
+	)
+      (:integer "-+0123456789" :integer
+	        * "." :delimiter
+	        * "/" :fraction
+	        * "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ%" :unit
+	        :eof :eof
+	        :otherwise :error)
+      (:fraction :include :start)
+      (:delimiter :include :start)
+      (:error :include :start)
+	)))
+
+(defglobal *unit-tokenizer-table* TOKENIZER-TABLE NULL)
+
+(startup-time-progn
+  ;; need to initialize here due to bootstrap issues:
+  (setq *unit-tokenizer-table*
+    (parse-tokenizer-definition *unit-tokenizer-table-definition*)))
+
+
+  ;;
+;;;;;; MEASURE
+  ;;
+
+(defclass MEASURE (STANDARD-OBJECT)
+  :public? TRUE
+  :public-slots
+  ((base-unit :type STRING)
+   (scale :type (KEY-VALUE-LIST OF STRING-WRAPPER FLOAT-WRAPPER)
+	  :initially (new KEY-VALUE-LIST))
+   (prime-id :type RATIO)
+   (name :type STRING))
+  :print-form 
+  (print-native-stream stream "<Measure "  (name self) "(" (base-unit self) ")>") )
+
+(defun reset-measures ()
+  :public? TRUE
+  (setq *current-prime-index*       -1)
+  (setq *prime-to-measure-table* (new STELLA-HASH-TABLE))
+  (setq *prime-to-base-measure-table* (new INTEGER-HASH-TABLE))
+  (setq *name-to-measure-table*  (new STRING-HASH-TABLE))
+  (setq *unit-to-measure-table*  (new STRING-HASH-TABLE))
+  (setq *all-measures* NIL)
+  (setq *base-measures* NIL))
+
+(defmethod setup-indices ((m MEASURE))
+  (pushq-new *all-measures* m)
+  (insert-at *prime-to-measure-table* (prime-id m)  m)
+  (insert-at *name-to-measure-table*  (name m)      m)
+  (insert-at *unit-to-measure-table*  (base-unit m) m))
+
+(defmethod (base-measure? BOOLEAN) ((m MEASURE))
+  :public? TRUE
+  :documentation "Returns `true' if `m' is a base measure."
+  (return (member? *base-measures* m)))
+
+;; TO DO:  ADD CHECKING FOR DUPLICATES, AND REMOVAL OF MEASURES & DEPENDENTS
+(defun (define-base-measure MEASURE) ((measure-name STRING) (measure-base-unit STRING))
+  :constructor? TRUE
+  (let ((prime (next-prime-id))
+	(m (new MEASURE 
+		:name measure-name
+		:base-unit measure-base-unit
+		:prime-id (make-ratio prime 1))))
+    (insert-at (scale m) measure-base-unit 1.0)
+    (insert-at *prime-to-base-measure-table* prime  m)
+    (pushq-new *base-measures* m)
+    (setup-indices m)
+    (return m)))
+
+(defun (define-derived-measure MEASURE) ((measure-name STRING) 
+					 (measure-base-unit STRING)
+					 (definition STRING))
+  :constructor? TRUE
+  (mv-bind (scale-factor id)
+      (unit-to-scale-factor-and-id definition)
+    (let ((m (new MEASURE
+		  :name measure-name
+		  :base-unit measure-base-unit
+		  :prime-id id)))
+      (insert-at (scale m) measure-base-unit scale-factor)
+      (setup-indices m)
+      (return m) )))
+
+(defun (define-dimensionless-measure MEASURE) ()
+  :constructor? TRUE
+  (let ((m (new MEASURE 
+		:name "Dimensionless"
+		:base-unit ""
+		:prime-id *ratio-one*)))
+    (insert-at (scale m) "" 1.0)
+    (pushq-new *base-measures* m)
+    (setup-indices m)
+    (return m)))
+
+(defmethod add-unit ((self MEASURE) (unit-name STRING) (scale-factor FLOAT) (definition STRING))
+  (mv-bind (definition-factor id)
+      (unit-to-scale-factor-and-id definition)
+    (if (eql? id (prime-id self))
+      (progn
+	(insert-at (scale self) unit-name (* scale-factor definition-factor))
+	(insert-at *unit-to-measure-table* unit-name self))
+      (signal INCOMPATIBLE-UNITS-EXCEPTION
+	      "Unit "  unit-name " has a definition " definition
+	      " that is not compatible with Measure " (name self))) ))
+
+(defun (lookup-measure MEASURE) ((name STRING))
+  :public? TRUE :globally-inline? TRUE  :constructor? TRUE
+  (return (lookup *name-to-measure-table* name)))
+
+(defmethod (get-units (LIST OF STRING-WRAPPER)) ((self MEASURE))
+  :public? TRUE
+  (let ((result (new LIST)))
+    (foreach (key unused) in (allocate-iterator (scale self))
+	do (ignore unused)
+	collect key into result)
+    (return result)))
+
+(defun (unit-to-scale-factor-and-id FLOAT RATIO) ((definition STRING))
+  (let ((scale-factor 1.0)
+	(id *ratio-one*)
+	(factor FLOAT NULL)
+	(pid RATIO NULL)
+	(invert? FALSE)
+	(one-unit STRING NULL)
+	(exponent-value INTEGER NULL)
+	(m MEASURE NULL)
+	(scaled? TRUE))
+    
+    (with-tokenizer *unit-tokenizer-table* definition
+     (loop
+       (get-next-token FALSE)
+       (when (end-of-tokens?) (break))
+       (case (get-token-type)
+	 (:UNIT
+	  (setq one-unit (get-token-text false))
+	  (setq m (lookup *unit-to-measure-table* one-unit))
+	  (when (null? m)
+	    (signal BAD-ARGUMENT-EXCEPTION
+		    "Unrecognized unit: " definition))
+	  (setq factor (lookup (scale m) one-unit))
+	  (setq pid (prime-id m))
+	  (setq scaled? FALSE))
+	 (:INTEGER
+	  (setq exponent-value (string-to-integer (get-token-text false)))
+	  (when invert?
+	    (setq exponent-value (- exponent-value)))
+	  (setq factor (expt factor exponent-value))
+	  (setq pid (exponentiate pid exponent-value))
+	  (setq scale-factor (* scale-factor factor))
+	  (setq id (multiply id pid))
+	  (setq scaled? TRUE)
+	  )
+	 (:FRACTION
+	  (unless scaled?
+	    (setq scale-factor (* scale-factor factor))
+	    (setq id (multiply id pid))
+	    (setq scaled? TRUE))
+	  (if invert?
+	    (signal BAD-ARGUMENT-EXCEPTION
+		    "Multiple / signs in units expression is not allowed: "
+		    definition)
+	    (setq invert? true)))
+	 (:ERROR
+	  (signal BAD-ARGUMENT-EXCEPTION
+		  "Error in units expression:  Not legal syntax: " definition))
+	 (:DELIMITER
+	  (if invert?
+	    (progn 
+	      (setq scale-factor (/ scale-factor factor))
+	      (setq id (divide id pid)))
+	    (progn 
+	      (setq scale-factor (* scale-factor factor))
+	      (setq id (multiply id pid))))
+	  (setq scaled? TRUE)
+	  ))))
+    (unless scaled?
+      (if invert?
+	(progn 
+	  (setq scale-factor (/ scale-factor factor))
+	  (setq id (divide id pid)))
+	(progn 
+	  (setq scale-factor (* scale-factor factor))
+	  (setq id (multiply id pid)))))
+    (return scale-factor id)
+    ))
+
+
+(defun (compute-measures-for-integer (CONS OF MEASURE)) ((value INTEGER))
+  ;; Does a prime factorization of `value', accumulating the base measures with
+  ;; appropriate repetition instead of exponents.
+  (let ((measures NIL)
+        (p 1))
+    (foreach prime in *prime-numbers*
+	do (setq p (wrapper-value prime))
+           (while (= (rem value p) 0)
+             (setq value (/ value p))
+             (pushq measures
+                    (lookup *prime-to-base-measure-table* p)))
+           (when (< value p)
+	     (safety 3 (= value 1))
+             (break)))
+    (return (reverse measures))))
+
+(defun (compute-measures-for-prime-id (CONS OF MEASURE) (CONS OF MEASURE)) ((pid RATIO))
+  :public? TRUE
+  :documentation "Returns two CONSes of Measure objects for the prime ID `pid'"
+  (return (compute-measures-for-integer (numerator pid))
+          (compute-measures-for-integer (denominator pid))))
+
+(defun (compute-units-for-integer STRING) ((value INTEGER) (negate-exponent? BOOLEAN))
+  ;; Does a prime factorization of `value', accumulating the base units with
+  ;; appropriate exponents.
+  (let ((buffer (make-raw-mutable-string 128))
+	(i 0)				; buffer index
+        (p 1)                           ; The prime number as integer
+	(e 0)				; The exponent counter
+	(previous-no-exponent? false))	; TRUE if the last unit emitted had no exponent.
+    (foreach prime in *prime-numbers*
+	do (setq e 0)
+           (setq p (wrapper-value prime))
+	   (while (= (rem value p) 0)
+	     (setq value (/ value p))
+	     (++ e))
+	   (when (> e 0)
+	     (when previous-no-exponent?
+	       (setf (nth buffer i) #\.)
+	       (++ i))
+	     (setq i (insert-string (base-unit (lookup *prime-to-base-measure-table*
+						       p))
+				    0 null buffer i :preserve))
+             (cond (negate-exponent?
+                    (setq i (insert-string (integer-to-string (- e)) 0 null buffer i :preserve))
+                    (setq previous-no-exponent? FALSE))
+                   ((> e 1)
+		    (setq i (insert-string (integer-to-string e) 0 null buffer i :preserve))
+		    (setq previous-no-exponent? FALSE))
+                   (otherwise
+	            (setq previous-no-exponent? TRUE))))
+	   (when (< value p)
+	     (safety 3 (= value 1))
+	     (break)))
+
+    (return (subsequence buffer 0 i))))
+
+
+(defun (compute-units-for-prime-id STRING) ((pid RATIO))
+  (let ((numerator-string (compute-units-for-integer (numerator pid) false))
+	(denominator-string (compute-units-for-integer (denominator pid) false)))
+    (if (empty? denominator-string)
+      (return numerator-string)
+      (return (concatenate numerator-string "/" denominator-string)))))
+
+
+
+  ;;
+;;;;;; DIM-NUMBER
+  ;;
+
+
+(defclass DIM-NUMBER (QUANTITY)
+  :public? TRUE
+  :public-slots ((pid :type RATIO :required? TRUE)
+		 (magnitude :type FLOAT :required? TRUE)
+		 (preferred-units :type STRING :initially NULL))
+  :print-form
+  (print-stream stream "<" (get-magnitude self (get-unit self))
+		(get-unit self) ">"))
+  
+(defun (make-dim-number DIM-NUMBER) ((magnitude FLOAT) (units STRING))
+  :public? TRUE :constructor? TRUE
+  (mv-bind (scale-factor id)
+      (unit-to-scale-factor-and-id units)
+    (return (new DIM-NUMBER
+		 :pid id
+		 :magnitude (* magnitude scale-factor)
+		 :preferred-units units))))
+
+(defun (parse-dim-number DIM-NUMBER) ((input STRING))
+  :public? TRUE :constructor? TRUE
+  (let ((current-character CHARACTER NULL)
+	(last-character #\Space)
+	(sign-allowed? TRUE)
+	(decimal-seen? FALSE)
+	(len (length input))
+	(index 0)
+	(magnitude FLOAT NULL))
+    (while (< index len)
+      (setq current-character (nth input index))
+      (cond ((or (eql? current-character #\+)
+		 (eql? current-character #\-))
+	     (when (not sign-allowed?)
+	       (signal BAD-ARGUMENT-EXCEPTION
+		       "Bad number format (sign in bad place): " input))
+	     (setq sign-allowed? FALSE))
+	    ((eql? current-character #\.)
+	     (when decimal-seen?
+	       (signal BAD-ARGUMENT-EXCEPTION
+		       "Bad number format (too many decimals): " input))
+	     (setq decimal-seen? TRUE)
+	     (setq sign-allowed? FALSE))
+	    ((digit-character? current-character)
+	     (setq sign-allowed? FALSE))
+	    ((or (eql? current-character #\e)
+		 (eql? current-character #\E))
+	     (if (digit-character? last-character)
+	       (setq sign-allowed? TRUE)
+	       (break)))
+	    (otherwise
+	     (when (or (eql? last-character #\e)
+		       (eql? last-character #\E))
+	       (-- index))
+	     (break)))
+      (setq last-character current-character)
+      (++ index))
+    ;; Make the Dim number:
+    (exception-case
+	(setq magnitude (string-to-float (subsequence input 0 index)))
+      (NATIVE-EXCEPTION ()
+	(exception-case
+	    (setq magnitude (string-to-integer (subsequence input 0 index)))
+	  (NATIVE-EXCEPTION ()
+	    (signal BAD-ARGUMENT-EXCEPTION "Bad number format: " input)))))
+    (return (make-dim-number magnitude (subsequence input index len)))))
+
+(defmethod (coerce-to DIM-NUMBER) ((x DIM-NUMBER) (y OBJECT))
+  :public? TRUE
+  :documentation "Coerces `y' to be a compatible type with `x'.
+If this isn't possible, an exception is thrown.  The exception
+will be either INCOMPATIBLE-QUANTITY-EXCEPTION or 
+INCOMPATIBLE-UNITS-EXCEPTION."
+  (typecase y
+    (DIM-NUMBER
+     (return y))
+    (TIME-DURATION
+     (return (time-duration-to-dim y)))
+    ((INTEGER-WRAPPER FLOAT-WRAPPER)
+     (return (make-dim-number (wrapper-value y) "")))
+    (otherwise
+     (signal INCOMPATIBLE-QUANTITY-EXCEPTION
+             "Can't convert " y " to a DIM-NUMBER"))))
+
+
+(defmethod (get-magnitude FLOAT) ((self DIM-NUMBER) (units STRING))
+  :public? TRUE
+  :documentation "Returns the magnitude of the dim number in the given units."
+  (mv-bind (scale-factor id)
+      (unit-to-scale-factor-and-id units)
+    (if (eql? id (pid self))
+      (return (/ (magnitude self) scale-factor))
+      (signal INCOMPATIBLE-UNITS-EXCEPTION
+	      "Unit "  units " is not compatible with " (get-unit self)))))
+
+(defmethod (get-unit STRING) ((self DIM-NUMBER))
+  :public? TRUE
+  :documentation "Returns the units for the dim number.  This will return the
+preferred output units if they exist, otherwise the base units. (see `get-base-unit')"
+  (let ((units (preferred-units self)))
+    (if (defined? units)
+      (return units)
+      (return (get-base-unit self))) ))
+
+(defmethod (get-base-unit STRING) ((self DIM-NUMBER))
+  :public? TRUE
+  :documentation "Returns the base units for the dim number."
+  (let ((measure MEASURE (lookup *prime-to-measure-table* (pid self))))
+    (if (defined? measure)
+      (return (base-unit measure))
+      (return (compute-units-for-prime-id (pid self)))) ))
+
+
+(defmethod (get-measure MEASURE) ((self DIM-NUMBER))
+  :public? TRUE
+  :documentation "Returns the measure for the dim number, if one is defined."
+  (return (lookup *prime-to-measure-table* (pid self))))
+
+(defmethod (get-base-measures (CONS OF MEASURE) (CONS OF MEASURE)) ((self DIM-NUMBER))
+  :public? TRUE
+  :documentation "Returns cons of the base measures for the numerator and denominator
+of `self'."
+  (return (compute-measures-for-prime-id (pid self))))
+
+(defmethod (format-dim-number STRING) ((x DIM-NUMBER) (units STRING) (decimals INTEGER))
+  :public? TRUE
+  :documentation "Returns a string representation of `x' in `units' with `decimals' digits."
+  (when (null? units)
+    (setq units (get-unit x)))
+  (if (defined? decimals)
+    (return (concatenate (format-float (get-magnitude x units) decimals) units)) 
+    (return (concatenate (float-to-string (get-magnitude x units)) units))) )
+
+
+(defun (compatible-units? BOOLEAN) ((x DIM-NUMBER) (y DIM-NUMBER))
+  :public? TRUE
+  :globally-inline? TRUE
+  :documentation "Returns TRUE if the units of `x' and `y' are compatible."
+  (return (object-eql? (pid x) (pid y))))
+
+(defmethod (object-eql? BOOLEAN) ((x DIM-NUMBER) (y OBJECT))
+  :public? TRUE
+  (return (and (defined? y)
+	       (eql? (primary-type y) @DIM-NUMBER)   ; Treat as final
+	       (compatible-units? x (cast y DIM-NUMBER))
+	       (= (magnitude x) (magnitude (cast y DIM-NUMBER))))))
+
+(defmethod (hash-code INTEGER) ((self DIM-NUMBER))
+  :public? TRUE
+  (return (logxor (hash-code (magnitude self))
+		  (hash-code (pid self)))))
+
+(defmethod (signum INTEGER) ((x DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes the signum of `x':  -1 if negative, 0 if zero, 1 if positive"
+  (cond ((> (magnitude x) 0.0)
+	 (return 1))
+	((= (magnitude x) 0.0)
+	 (return 0))
+	(otherwise
+	 (return -1))))
+
+(defmethod (add DIM-NUMBER) ((x DIM-NUMBER) (y DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes `x' + `y'"
+  (if (compatible-units? x y)
+    (return (new DIM-NUMBER :pid (pid x) :magnitude (+ (magnitude x) (magnitude y)))) 
+    (signal INCOMPATIBLE-UNITS-EXCEPTION
+	    "Can't add " x " and " y " because of incompatible units")))
+
+(defmethod (subtract DIM-NUMBER) ((x DIM-NUMBER) (y DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes `x' - `y'"
+  (if (compatible-units? x y)
+    (return (new DIM-NUMBER :pid (pid x) :magnitude (- (magnitude x) (magnitude y)))) 
+    (signal INCOMPATIBLE-UNITS-EXCEPTION
+	    "Can't subtract " y " from " x " because of incompatible units")))
+
+(defmethod (multiply DIM-NUMBER) ((x DIM-NUMBER) (y DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes `x' * `y'"
+  (return (new DIM-NUMBER
+	       :pid (multiply (pid x) (pid y))
+	       :magnitude (* (magnitude x) (magnitude y)))))
+
+(defmethod (divide DIM-NUMBER) ((x DIM-NUMBER) (y DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes `x' / `y'"
+  (return (new DIM-NUMBER
+	       :pid (divide (pid x) (pid y))
+	       :magnitude (/ (magnitude x) (magnitude y)))))
+
+(defmethod (modulus DIM-NUMBER) ((x DIM-NUMBER) (y DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes the modulus of `x' and `y'.  `x' and `y' must be compatible
+units, and the result has the preferred units of `x'."
+  (if (compatible-units? x y)
+    (let ((quotient (/ (magnitude x) (magnitude y))))
+      (return (new DIM-NUMBER
+		   :pid (pid x)
+		   :magnitude (* (- quotient (floor quotient)) (magnitude y))
+		   :preferred-units (preferred-units x))))
+    (signal INCOMPATIBLE-UNITS-EXCEPTION
+	    "Can't perform modulus on " x " and " y
+	    " because of incompatible units")))
+
+#|
+(defmethod (modulus DIM-NUMBER) ((x DIM-NUMBER) (y DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes the modulus of `x' and `y'.  `x' and `y' must be compatible
+units, and the result has the preferred units of `x'."
+  (if (compatible-units? x y)
+    (return (new DIM-NUMBER
+		 :pid (pid x)
+		 :magnitude (fmod (magnitude x) (magnitude y))
+		 :preferred-units (preferred-units x)))
+    (signal INCOMPATIBLE-UNITS-EXCEPTION
+	    "Can't perform modulus on " x " and " y
+	    " because of incompatible units")))
+|#
+
+(defmethod (negate DIM-NUMBER) ((x DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes - `x'"
+  (return (new DIM-NUMBER
+	       :pid (pid x)
+	       :magnitude (- (magnitude x))
+	       :preferred-units (preferred-units x))))
+
+(defmethod (invert DIM-NUMBER) ((x DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes  1 / `x'"
+  (return (new DIM-NUMBER
+	       :pid (invert (pid x))
+	       :magnitude (/ (magnitude x)))))
+
+(defmethod (absolute-value DIM-NUMBER) ((x DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes  abs(`x')"
+  (if (< (magnitude x) 0.0)
+    (return (negate x))
+    (return x)))
+
+(defmethod (square-root DIM-NUMBER) ((x DIM-NUMBER))
+  :public? TRUE
+  :documentation "Computes the positive square root of x, assuming the units are perfect squares"
+  (let ((numerator-root (sqrt (numerator (pid x))))
+	(integer-numerator-root (floor numerator-root)) 
+	(denominator-root (sqrt (denominator (pid x))))
+	(integer-denominator-root (floor denominator-root)))
+    (if (and (= numerator-root (cast integer-numerator-root FLOAT))
+	     (= denominator-root (cast integer-denominator-root FLOAT)))
+      (return (new DIM-NUMBER
+		   :pid (make-ratio integer-numerator-root integer-denominator-root)
+		   :magnitude (sqrt (magnitude x))))
+      (signal BAD-ARGUMENT-EXCEPTION
+	      "Attempt to take square root of " x
+	      "  when the units are not a perfect square")) ))
+
+
+(defmethod (exponentiate DIM-NUMBER) ((x DIM-NUMBER) (y INTEGER))
+  :public? TRUE
+  :documentation "Computes `x' ^ `y'"
+  (return (new DIM-NUMBER
+	       :pid (exponentiate (pid x) y)
+	       :magnitude (expt (magnitude x) y))))
+
+
+;;;
+;;; COMPARISON
+;;;
+
+(defmethod (less? BOOLEAN) ((x DIM-NUMBER) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' < `y'"
+  (let ((y-dim DIM-NUMBER (coerce-to x y)))
+    (if (compatible-units? x y-dim)
+      (return (< (magnitude x) (magnitude y-dim)))
+      (signal INCOMPATIBLE-UNITS-EXCEPTION
+              "Can't compare " x " and " y-dim " because of incompatible units"))))
+
+(defmethod (less-equal? BOOLEAN) ((x DIM-NUMBER) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' <= `y'"
+  (let ((y-dim DIM-NUMBER (coerce-to x y)))
+    (if (compatible-units? x y-dim)
+      (return (<= (magnitude x) (magnitude y-dim)))
+      (signal INCOMPATIBLE-UNITS-EXCEPTION
+              "Can't compare " x " and " y-dim " because of incompatible units"))))
+
+;; eql? via object-eql?
+
+(defmethod (greater-equal? BOOLEAN) ((x DIM-NUMBER) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' >= `y'"
+  (let ((y-dim DIM-NUMBER (coerce-to x y)))
+    (if (compatible-units? x y-dim)
+      (return (>= (magnitude x) (magnitude y-dim)))
+      (signal INCOMPATIBLE-UNITS-EXCEPTION
+              "Can't compare " x " and " y-dim " because of incompatible units"))))
+
+(defmethod (greater? BOOLEAN) ((x DIM-NUMBER) (y OBJECT))
+  :public? TRUE
+  :documentation "Computes `x' > `y'"
+  (let ((y-dim DIM-NUMBER (coerce-to x y)))
+    (if (compatible-units? x y-dim)
+      (return (> (magnitude x) (magnitude y-dim)))
+      (signal INCOMPATIBLE-UNITS-EXCEPTION
+              "Can't compare " x " and " y-dim " because of incompatible units"))))
+
+
+  ;;
+;;;;;;  CONVERSION
+  ;;
+
+(defun (dim-to-time-duration TIME-DURATION) ((time-value DIM-NUMBER))
+  :public? TRUE
+  :documentation "Converts the dimensioned number `time-value' to its
+equivalent value as a `time-duration' object.  If `time-value' is not
+of the appropriate units, an `incompatible-units-exception' is thrown."
+  (let ((days (floor (get-magnitude time-value "days"))))
+    (return (make-time-duration days
+				(floor 
+				 (get-magnitude (subtract time-value
+							  (make-dim-number days "days"))
+						"ms")))) ))
+
+(defun (time-duration-to-dim DIM-NUMBER) ((duration TIME-DURATION))
+  :public? TRUE
+  :documentation "Converts the time duration `duration' to its
+equivalent value as dimensioned number.  The default time unit
+will be used."
+  (return (add (make-dim-number (days duration) "days")
+	       (make-dim-number (millis duration) "ms"))) )
+
+
+(defun (dms-to-degrees DIM-NUMBER) ((l (CONS OF DIM-NUMBER)))
+  :public? TRUE
+  :documentation "Converts a (Degree Minute Second) to decimal degrees."
+  (let ((degrees (first l)))
+    (foreach value in (rest l)
+      do (setq degrees (add degrees value)))
+    (return degrees)))
+
+(defun (degrees-to-dms (CONS OF DIM-NUMBER)) ((d DIM-NUMBER))
+  :public? TRUE
+  :documentation "Convert decimal degrees to a list of (Degree Minute Second)
+where Degree and Minute are integer-valued."
+  (let ((degree-magnitude (truncate (get-magnitude d "deg")))
+        (degree-value (make-dim-number degree-magnitude "deg"))
+        (minute-magnitude (truncate (get-magnitude (subtract d degree-value) "arcmin")))
+        (minute-value (make-dim-number minute-magnitude "arcmin"))
+        (second-magnitude (truncate 
+                           (get-magnitude 
+                            (subtract (subtract d degree-value) minute-value)
+                            "arcsec"))))
+    (return (cons-list degree-value minute-value (make-dim-number second-magnitude "arcsec")))))
+
+(defun (hms-to-hours DIM-NUMBER) ((l (CONS OF DIM-NUMBER)))
+  :public? TRUE
+  :documentation "Converts a (Hour Minute Second) to decimal hours"
+  (let ((hours (first l)))
+    (foreach value in (rest l)
+      do (setq hours (add hours value)))
+    (return hours)))
+
+(defun (hours-to-hms (CONS OF DIM-NUMBER)) ((d DIM-NUMBER))
+  :public? TRUE
+  :documentation "Convert decimal hours to a list of (Hour Minute Second)
+where Hour and Minute are integer-valued."
+  (let ((hour-magnitude (truncate (get-magnitude d "hr")))
+        (hour-value (make-dim-number hour-magnitude "hr"))
+        (minute-magnitude (truncate (get-magnitude (subtract d hour-value) "min")))
+        (minute-value (make-dim-number minute-magnitude "min"))
+        (second-magnitude (truncate 
+                           (get-magnitude 
+                            (subtract (subtract d hour-value) minute-value)
+                            "s"))))
+    (return (cons-list hour-value minute-value (make-dim-number second-magnitude "s")))))
+
+  ;;
+;;;;;;  PRINT INFORMATION
+  ;;
+
+(defun show-measures ()
+  :public? TRUE  :command? TRUE
+  :documentation "Print all defined measures."
+  (foreach m in *all-measures*
+    do (print (name m) "   base-unit=" (base-unit m) "   prime-id=" (prime-id m)
+              (choose (base-measure? m) "   BASE" "   DERIVED") EOL)))
+
+
+(defun show-measure ((measure-name STRING))
+  :public? TRUE  :command? TRUE
+  :documentation "Print all units and scale factors for measure `measure-name'."
+  (let ((m (lookup-measure measure-name)))
+    (if (defined? m)
+      (let ((the-scale (scale m)))
+        (print measure-name "   base-unit=" (base-unit m) "   prime-id=" (prime-id m)
+               (choose (base-measure? m) "   BASE" "   DERIVED") EOL)
+        (foreach u in (get-units m)
+          do (print "  " (unwrap-string u) "   factor=" (unwrap-float (lookup the-scale u)) EOL)))
+      (print "No measure with name `" measure-name "' found." EOL))))
+
+
+  ;;
+;;;;;;  SETUP
+  ;;
+
+(startup-time-progn :final
+  (reset-measures)
+  (initialize-unit-definitions))
+
+
+  ;;
+;;;;;;  TESTS
+  ;;
+
+#|
+
+(eval (let ((x (make-dim-number 8 "ft"))
+	    (y (make-dim-number 4 "ft")))
+	(print "x = " x EOL)
+	(print "y = " y EOL)
+	(print "x + y = " (add x y) EOL)
+	(print "x - y = " (subtract x y) EOL)
+	(print "y - x = " (subtract y x) EOL)
+	(print "x * y = " (multiply x y) EOL)
+	(print "x / y = " (divide x y) EOL EOL)
+
+	(print "x + y = " (format-dim-number (add x y) "ft" 1) EOL)
+	(print "x - y = " (format-dim-number (subtract x y) "in" 1) EOL)
+	(print "y - x = " (format-dim-number (subtract y x) "yd" 3) EOL)
+	(print "x * y = " (format-dim-number (multiply x y) "acre" null) EOL)
+	(print "x * y = " (format-dim-number (multiply x y) "acre" 8) EOL)
+	(print "sqrt(x * y) = " (format-dim-number (square-root (multiply x y)) "ft" 2) EOL)
+	(print "x / y = " (format-dim-number (divide x y) "" 2) EOL EOL)))
+
+(eval (let ((x (make-dim-number 4 "ft"))
+	    (y (make-dim-number 4 "m"))
+	    (z (make-dim-number 4 "kg")))
+	(print "x = " x EOL)
+	(print "y = " y EOL)
+	(print "x =  y = " (eql? x y) EOL)
+	(print "x >  y = " (greater? x y) EOL)
+	(print "x >= y = " (greater-equal? x y) EOL)
+	(print "x <  y = " (less? x y) EOL)
+	(print "x <= y = " (less-equal? x y) EOL EOL)
+
+	(print "x =  x = " (eql? x x) EOL)
+	(print "x >  x = " (greater? x x) EOL)
+	(print "x >= x = " (greater-equal? x x) EOL)
+	(print "x <  x = " (less? x x) EOL)
+	(print "x <= x = " (less-equal? x x) EOL EOL)
+	
+	(print "z = " z EOL)
+	(print "x = z = " (eql? x z) EOL)
+	(print "x > z should signal an error")
+	(print (greater? x z))))
+
+|#

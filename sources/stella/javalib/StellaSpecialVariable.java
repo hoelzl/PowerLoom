@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: StellaSpecialVariable.java,v 1.4 2003/04/18 21:16:11 hans Exp
+// Version: StellaSpecialVariable.java,v 1.7 2006/05/11 07:06:51 hans Exp
 
 package edu.isi.stella.javalib;
 
@@ -60,9 +60,19 @@ public class StellaSpecialVariable extends InheritableThreadLocal {
       // This is a bit of a kludge, but it is needed to handle a
       // Stella bootstrap problem where *context* and *module* are
       // set before the normal initialization of global variables.
+      // HC 09/02/05: Tom added this guard since he was afraid that the
+      // :UNBOUND-SPECIAL-VARIABLE mechanism might go away, but it is
+      // here to stay and the check might not be needed anymore - in
+      // fact, we might want change things back to null during a reset...
       if (newDefault != null) {
 	defaultValue = newDefault;
       }
+      // Also set the variable value not just its default which properly
+      // supports reset functions such as `reset-kojak' which re-call
+      // system startup functions to reset variables, etc. to their initial
+      // value.  Not sure whether this might screw things up in threaded
+      // environments such as Tomcat - we'll see...
+      set(newDefault);
     }
 
     protected Object initialValue () {

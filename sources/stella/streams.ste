@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: streams.ste,v 1.68 2003/10/23 17:06:49 tar Exp
+;;; Version: streams.ste,v 1.84 2006/05/11 07:06:25 hans Exp
 
 ;;; Procedures that manipulate streams.
 
@@ -244,6 +244,31 @@ and terminating with a newline."
   :documentation "Specialized version of `signal' that throws a READ-EXCEPTION."
   (return (bquote (signal READ-EXCEPTION && body))))
 
+(defun ensure-file-exists ((filename STRING) (context STRING))
+  :public? TRUE
+  :documentation "Ensures that `filename' exists.  If not, an exception of
+type `NO-SUCH-FILE-EXCEPTION' is thrown with `context' supplying
+context for the error message."
+  (unless (probe-file? filename)
+    (let ((ex (new NO-SUCH-FILE-EXCEPTION
+		   :message (concatenate context ": file " filename 
+					 " does not exist")
+		   :filename filename )))
+      (signal-exception ex))))
+
+(defun ensure-file-does-not-exist ((filename STRING) (context STRING))
+  :public? TRUE
+  :documentation "Ensures that `filename' does not exist.  If it does,
+an exception of type `FILE-ALREADY-EXISTS-EXCEPTION' is thrown
+with `context' supplying context for the error message."
+  (when (probe-file? filename)
+    (let ((ex (new FILE-ALREADY-EXISTS-EXCEPTION
+		   :message (concatenate context ": file " filename
+					 " already exists")
+		   :filename filename )))
+      (signal-exception ex))))
+
+
 (defun (format-walk-message-arguments CONS) ((messageArgumentsTree CONS))
   ;; Helping function for 'walk-error' and 'walk-inform'.
   ;; Wrap de-uglify function around arguments in 'messageArgumentsTree'.
@@ -269,17 +294,17 @@ and terminating with a newline."
            (print-error-context ">> ERROR: " STANDARD-ERROR)
            (print-stream STANDARD-ERROR EOL " " && messageArguments "." EOL))))) ))
 
-;;; PHASING THIS OUT:
 (defmacro walk-inform (&body (body CONS))
-  ;; Print out a warning of a translation error.
+  ;; Print out an informational note from the translator.
+  ;; This note should not be an error.
   (let ((messageArguments (format-message-arguments
 			   (format-walk-message-arguments body) FALSE)))
     (return
      (bquote
       (special ((*printReadably?* TRUE))
-         (signal-translation-warning)
+         ;(signal-translation-warning)
          (unless (suppress-warnings?)
-           (print-error-context ">> WARNING: " STANDARD-OUTPUT)
+           (print-error-context ">> NOTE: " STANDARD-OUTPUT)
            (print-stream STANDARD-OUTPUT EOL " " && messageArguments "." EOL))))) ))
 
 (defmacro walk-warn (&body (body CONS))
@@ -381,7 +406,7 @@ and terminating with a newline."
 	  :java "try {
         nativeStream.close();
       } catch (java.io.IOException e) {
-      throw InputOutputException.newInputOutputException(\"terminateInputStreamP: \" + e.getMessage());
+      throw (InputOutputException) InputOutputException.newInputOutputException(\"terminateInputStreamP: \" + e.getMessage()).fillInStackTrace();
       }
 "))
     (setf (native-stream self) NULL)
@@ -392,6 +417,10 @@ and terminating with a newline."
 ;;;
 ;;;   (new OUTPUT-FILE-STREAM :filename "foo.lisp")
 ;;;
+;;; or a call to one of the `open-...-file' functions, for example,
+;;;
+;;;   (open-output-file "foo.lisp" :if-exists :append)
+;;;
 ;;; File streams are closed by either calling 'close-stream' on them,
 ;;; or by calling 'free' in which case 'terminate-file-stream?' will
 ;;; make sure the native file stream is closed before the Stella stream
@@ -400,22 +429,97 @@ and terminating with a newline."
 (defglobal *open-file-streams* (LIST OF STREAM) (new (LIST OF STREAM))
   :documentation "List of file streams that are currently open.")
 
+(defun (open-output-file FILE-OUTPUT-STREAM) ((fileName STRING)
+                                              &rest (options KEYWORD))
+  :documentation
+  "Open file `fileName' for output and return the resulting output stream.
+By default the file will be created or overwritten if it already exists.
+If `:IF-EXISTS' (or `:IF-EXISTS-ACTION') is one of the `options' its value
+specifies what to do in case the file already exists.  If the value is
+`:SUPERSEDE' the pre-existing file will be overwritten.  If the value is
+`:APPEND' the preexisting file will be appended to (if the file did not
+yet exist the file will simply be created).  If the value is `:ERROR' then
+an error will be signaled.  If it is `:ABORT' or `:PROBE' the opening operation
+will be aborted and NULL will be returned.
+
+If `:IF-NOT-EXISTS' (or `:IF-NOT-EXISTS-ACTION') is one of the `options' its
+value specifies what to do in case the file does not already exist.  If the
+value is `:CREATE', the file will simply be created.  If the value is
+`:ERROR' then an error will be signaled.  If it is `:ABORT' or `:PROBE' the
+opening operation will be aborted and NULL will be returned."
+  :public? TRUE
+  ;; This really just works around a deficiency of our object initialization
+  ;;    protocol that runs the initializer before user-supplied values of
+  ;;    non-required slots become visible.
+  (let ((stream
+         ;; we use a NULL filename to create the object which will initialize all
+         ;; the stream slots but avoid running `initialize-file-output-stream':
+         (new FILE-OUTPUT-STREAM :filename NULL))
+        (theOptions
+         (vet-options (coerce-&rest-to-cons options)
+                      (bquote (:IF-EXISTS :IF-EXISTS-ACTION
+                               :IF-NOT-EXISTS :IF-NOT-EXISTS-ACTION)))))
+    (setf (if-exists-action stream)
+      (first-defined (lookup theOptions :IF-EXISTS)
+                     (lookup theOptions :IF-EXISTS-ACTION)
+                     :SUPERSEDE))
+    (setf (if-not-exists-action stream)
+      (first-defined (lookup theOptions :IF-NOT-EXISTS)
+                     (lookup theOptions :IF-NOT-EXISTS-ACTION)
+                     :CREATE))
+    ;; now set the filename and create the native stream:
+    (setf (filename stream) fileName)
+    (initialize-file-output-stream stream)
+    (when (eq? (native-output-stream stream) NULL)
+      ;; we had an :ABORT action:
+      (close-stream stream)
+      (setq stream NULL))
+    (return stream)))
+
 (defun initialize-file-output-stream ((self FILE-OUTPUT-STREAM))
   ;; Initialize the native stream of 'self' with an open file output stream.
+  (unless (defined? (filename self))
+    (return)) ;; skip initialization
   (let ((filename (translate-logical-pathname (filename self)))
-        (ifExistsAction (symbol-name (if-exists-action self))))
+        (append FALSE))
+    (case (if-not-exists-action self)
+      (:CREATE NULL) ;; the default
+      ((:ABORT :PROBE)
+       (unless (probe-file? filename)
+         (return)))
+      (:ERROR
+       (ensure-file-exists filename "initialize-file-output-stream"))
+      (otherwise
+       (signal BAD-ARGUMENT-EXCEPTION
+               "initialize-file-output-stream: illegal :if-not-exists action: "
+               (if-not-exists-action self))))
+    (case (if-exists-action self)
+      (:SUPERSEDE NULL) ;; the default
+      (:APPEND
+       (setq append TRUE))
+      ((:ABORT :PROBE)
+       (when (probe-file? filename)
+         (return)))
+      (:ERROR
+       (ensure-file-does-not-exist filename "initialize-file-output-stream")) 
+      (otherwise
+       (signal BAD-ARGUMENT-EXCEPTION
+               "initialize-file-output-stream: illegal :if-exists action: "
+               (if-exists-action self))))
     (setf (native-output-stream self)
       (verbatim
         :common-lisp
-        (cl:open filename :direction :output
-                 :if-exists (CL:intern ifExistsAction "KEYWORD"))
+        (cl:open filename
+                 :direction :output
+                 :if-exists (CL:if append :append :supersede)
+                 :if-does-not-exist :create)
         ;; don't GC C++ streams, since it is unnecessary and can cause
         ;;    problems during closing/deletion:
-        :cpp "(new std::ofstream(filename))"
-        :java "new java.io.PrintStream(Native.openOutputFileStream(filename))"))
-
-    ;; May not be needed anymore:
-    (when (eq? (native-output-stream self) NULL)
+        :cpp "(new std::ofstream(filename, append ? std::ios::app : std::ios::out))"
+        :java "new java.io.PrintStream(Native.openOutputFileStream(filename, append))"))
+    (when (verbatim
+            :cpp "!*(self->nativeStream)"
+            :otherwise (eq? (native-output-stream self) NULL))
       (signal INPUT-OUTPUT-EXCEPTION 
               "initialize-file-output-stream: Could not open " self))
     (setf (state self) :OPEN)
@@ -433,21 +537,65 @@ and terminating with a newline."
     (remove *open-file-streams* self)
     (return TRUE)))
 
+(defun (open-input-file FILE-INPUT-STREAM) ((fileName STRING)
+                                            &rest (options KEYWORD))
+  :documentation
+  "Open file `fileName' for input and return the resulting input stream.
+By default signal an error if the file does not exist.  The only legal
+option so far is `:IF-NOT-EXISTS' (or `:IF-NOT-EXISTS-ACTION') which
+specifies what to do in case the file does not exist.  If its value is
+`:ERROR' then an error will be signaled.  If it is `:ABORT' or `:PROBE'
+the opening operation will be aborted and NULL will be returned."
+  :public? TRUE
+  ;; This really just works around a deficiency of our object initialization
+  ;;    protocol that runs the initializer before user-supplied values of
+  ;;    non-required slots become visible.
+  (let ((stream
+         ;; we use a NULL filename to create the object which will initialize all
+         ;; the stream slots but avoid running `initialize-file-input-stream':
+         (new FILE-INPUT-STREAM :filename NULL))
+        (theOptions
+         (vet-options (coerce-&rest-to-cons options)
+                      (bquote (:IF-NOT-EXISTS :IF-NOT-EXISTS-ACTION)))))
+    (setf (if-not-exists-action stream)
+      (first-defined (lookup theOptions :IF-NOT-EXISTS)
+                     (lookup theOptions :IF-NOT-EXISTS-ACTION)
+                     :ERROR))
+    ;; now set the filename and create the native stream:
+    (setf (filename stream) fileName)
+    (initialize-file-input-stream stream)
+    (when (eq? (native-input-stream stream) NULL)
+      ;; we had an :ABORT action:
+      (close-stream stream)
+      (setq stream NULL))
+    (return stream)))
+
 (defun initialize-file-input-stream ((self FILE-INPUT-STREAM))
   ;; Initialize the native stream of 'self' with an open file input stream.
-  (let ((filename (translate-logical-pathname (filename self)))
-        (ifNotExistsAction (symbol-name (if-not-exists-action self))))
+  (unless (defined? (filename self))
+    (return)) ;; skip initialization
+  (let ((filename (translate-logical-pathname (filename self))))
+    (case (if-not-exists-action self)
+      ((:ABORT :PROBE)
+       (unless (probe-file? filename)
+         (return)))
+      (:ERROR ;; the default
+       (ensure-file-exists filename "initialize-file-input-stream"))
+      (otherwise
+       (signal BAD-ARGUMENT-EXCEPTION
+               "initialize-file-input-stream: illegal :if-not-exists action: "
+               (if-not-exists-action self))))
     (setf (native-input-stream self)
       (verbatim
         :common-lisp
-        (cl:open filename :direction :input
-                 :if-does-not-exist (CL:intern ifNotExistsAction "KEYWORD"))
+        (cl:open filename :direction :input :if-does-not-exist :error)
         ;; don't GC C++ streams, since it is unnecessary and can cause
         ;;    problems during closing/deletion:
         :cpp "(new std::ifstream(filename))"
         :java "new java.io.PushbackInputStream(Native.openInputFileStream(filename))"))
-    ;; May not be needed anymore.
-    (when (eq? (native-input-stream self) NULL)
+    (when (verbatim
+            :cpp "!*(self->nativeStream)"
+            :otherwise (eq? (native-input-stream self) NULL))
       (signal INPUT-OUTPUT-EXCEPTION
               "initialize-file-input-stream: Could not open " self))
     (setf (state self) :OPEN)
@@ -463,7 +611,7 @@ and terminating with a newline."
 		:java "try {
           nativeStream.close();
         } catch (java.io.IOException e) {
-          throw InputOutputException.newInputOutputException(\"terminateFileInputStreamP: \" + e.getMessage());
+          throw (InputOutputException) InputOutputException.newInputOutputException(\"terminateFileInputStreamP: \" + e.getMessage()).fillInStackTrace();
         }
 "))
     (setf (native-input-stream self) NULL)
@@ -471,7 +619,7 @@ and terminating with a newline."
     (remove *open-file-streams* self)
     (return TRUE)))
 
-(defun initialize-string-output-stream ((self STRING-OUTPUT-STREAM))
+(defun initialize-string-output-stream ((self OUTPUT-STRING-STREAM))
   ;; Initialize the native stream of 'self' with a new string output stream.
   (setf (native-stream self)
     (verbatim
@@ -479,7 +627,14 @@ and terminating with a newline."
       :cpp "(new (GC) std::ostringstream())"
       :java "new #$(STELLAROOT).javalib.PrintStringStream()")))
 
-(defmethod (the-string-reader STRING) ((self STRING-OUTPUT-STREAM))
+(defun (terminate-string-output-stream? BOOLEAN) ((self OUTPUT-STRING-STREAM))
+  ;; Clear the native-stream slot and set state to closed.
+  ;; GC will take care of native stream object.
+  (setf (native-stream self) NULL)
+  (setf (state self) :CLOSED)
+  (return TRUE))
+
+(defmethod (the-string-reader STRING) ((self OUTPUT-STRING-STREAM))
   ;; Access method for `the-string' accumulated by `self'.
   (let ((native-stream (native-stream self))
         (string STRING NULL))
@@ -492,7 +647,7 @@ and terminating with a newline."
       (setq string ""))
     (return string)))
 
-(defun initialize-string-input-stream ((self STRING-INPUT-STREAM))
+(defun initialize-string-input-stream ((self INPUT-STRING-STREAM))
   ;; Initialize the native stream of 'self' with a new string input stream.
   (let ((string (the-string self)))
     (setf (native-stream self)
@@ -501,12 +656,23 @@ and terminating with a newline."
         :cpp "(new (GC) std::istringstream(string))"
         :java "new java.io.PushbackInputStream(new java.io.StringBufferInputStream(string))"))))
 
+
+(defun (terminate-string-input-stream? BOOLEAN) ((self INPUT-STRING-STREAM))
+  ;; Clear the native-stream slot and set state to closed.
+  ;; GC will take care of native stream object.
+  (setf (native-stream self) NULL)
+  (setf (state self) :CLOSED)
+  (return TRUE))
+
+;; Why is this not a method?  -- tar
 (defun close-stream ((self STREAM))
   :documentation "Close the stream `self'."
   :public? TRUE
   (typecase self
-    (FILE-INPUT-STREAM (terminate-file-input-stream? self))
-    (FILE-OUTPUT-STREAM (terminate-file-output-stream? self))
+    (INPUT-FILE-STREAM (terminate-file-input-stream? self))
+    (OUTPUT-FILE-STREAM (terminate-file-output-stream? self))
+    (INPUT-STRING-STREAM (terminate-string-input-stream? self))
+    (OUTPUT-STRING-STREAM (terminate-string-output-stream? self))
     (INPUT-STREAM (terminate-input-stream? self))
     (OUTPUT-STREAM (terminate-output-stream? self))
     (otherwise NULL)))
@@ -548,9 +714,9 @@ as an input/output stream pair."
         in = new java.io.PushbackInputStream(s.getInputStream());
         out = new java.io.PrintStream(s.getOutputStream());
       } catch (java.net.UnknownHostException uhe) {
-        throw InputOutputException.newInputOutputException(\"Unknown host: \" + host);
+        throw (InputOutputException) InputOutputException.newInputOutputException(\"Unknown host: \" + host).fillInStackTrace();
       } catch (java.io.IOException ioe) {
-        throw InputOutputException.newInputOutputException(ioe.getMessage());
+        throw (InputOutputException) InputOutputException.newInputOutputException(ioe.getMessage()).fillInStackTrace();
       }
 "
       :otherwise
@@ -567,14 +733,16 @@ as an input/output stream pair."
   :documentation "Sets up an unwind-protected form which opens a file for
 input and closes it afterwards.  The stream for reading is bound to the
 variable provided in the macro form.
-Syntax is (WITH-INPUT-FILE (var filename) body+)"
+Syntax is `(WITH-INPUT-FILE (var filename options*) body+)' where `options'
+can be any that are legal for `open-input-file' (which see)."
   (let ((var SYMBOL (first binding)))
     (return
       (bquote 
        (let ((& var FILE-INPUT-STREAM NULL))
 	 (unwind-protect
 	     (progn 
-	       (setq & var (new FILE-INPUT-STREAM :filename & (second binding)))
+	       (setq & var (open-input-file & (second binding)
+                                            && (rest (rest binding))))
 	       && body)
 	   (when (defined? & var)
 	     (free & var))))))))
@@ -584,14 +752,16 @@ Syntax is (WITH-INPUT-FILE (var filename) body+)"
   :documentation "Sets up an unwind-protected form which opens a file for
 output and closes it afterwards.  The stream for writing is bound to the
 variable provided in the macro form.
-Syntax is (WITH-OUTPUT-FILE (var filename) body+)"
+Syntax is `(WITH-OUTPUT-FILE (var filename options*) body+)' where `options'
+can be any that are legal for `open-output-file' (which see)."
   (let ((var SYMBOL (first binding)))
     (return
       (bquote 
        (let ((& var FILE-OUTPUT-STREAM NULL))
 	 (unwind-protect
 	     (progn 
-	       (setq & var (new FILE-OUTPUT-STREAM :filename & (second binding)))
+	       (setq & var (open-output-file & (second binding)
+                                             && (rest (rest binding))))
 	       && body)
 	   (when (defined? & var)
 	     (free & var))))))))
@@ -921,6 +1091,12 @@ associated characters."
 
 (defclass LINE-ITERATOR (STREAM-ITERATOR)
   :public? TRUE
+  :documentation "Iterator that yields lines with any line terminator sequence from an input stream."
+  :parameters ((any-value :type STRING)))
+
+;; Should this be a sub of LINE-ITERATOR?  A super?
+(defclass NATIVE-LINE-ITERATOR (STREAM-ITERATOR)
+  :public? TRUE
   :documentation "Iterator that yields lines from an input stream."
   :parameters ((any-value :type STRING)))
 
@@ -952,22 +1128,38 @@ associated characters."
            (setf (slot-value self value) object)
            (return TRUE)))))
 
+(defun (native-lines NATIVE-LINE-ITERATOR) ((stream INPUT-STREAM))
+  :public? TRUE
+  (return (new NATIVE-LINE-ITERATOR :the-stream stream)))
+
+(defmethod (next? BOOLEAN) ((self NATIVE-LINE-ITERATOR))
+  :public? TRUE
+  ;; Returns the next line from an input stream using the native line reader.
+  ;; Closes the stream on EOF.
+  (let ((line (native-read-line (the-stream self))))
+    (setf (first-iteration? self) FALSE)
+    (setf (slot-value self value) line)
+    (cond ((null? line)
+           (close-stream (the-stream self))
+           (return FALSE))
+          (otherwise
+           (return TRUE)))))
+
 (defun (lines LINE-ITERATOR) ((stream INPUT-STREAM))
   :public? TRUE
   (return (new LINE-ITERATOR :the-stream stream)))
 
 (defmethod (next? BOOLEAN) ((self LINE-ITERATOR))
   :public? TRUE
-  ;; Returns the next line from an input stream.
+  ;; Returns the next line from an input stream using the cross-platform line reader.
   ;; Closes the stream on EOF.
-  (setf (first-iteration? self) FALSE)
-  (mv-bind (line eof?)
-      (read-line (the-stream self))
-    (cond (eof?
+  (let ((line (read-line (the-stream self))))
+    (setf (first-iteration? self) FALSE)
+    (setf (slot-value self value) line)
+    (cond ((null? line)
            (close-stream (the-stream self))
            (return FALSE))
           (otherwise
-           (setf (slot-value self value) line)
            (return TRUE)))))
 
 (defun (characters CHARACTER-ITERATOR) ((stream INPUT-STREAM))
@@ -982,6 +1174,7 @@ associated characters."
   (mv-bind (char eof?)
       (read-character (the-stream self))
     (cond (eof?
+           (setf (slot-value self value) NULL)
            (close-stream (the-stream self))
            (return FALSE))
           (otherwise
@@ -1005,3 +1198,112 @@ associated characters."
            do (print-stream STANDARD-OUTPUT char)))
 
 |#
+
+
+  ;;
+;;;;;; Simple logging support
+  ;;
+
+(defglobal *logging-registry*
+    (KEY-VALUE-LIST OF STRING-WRAPPER (PROPERTY-LIST OF KEYWORD OBJECT))
+    (new KEY-VALUE-LIST))
+
+(defglobal *logging-local-time-zone* FLOAT (get-local-time-zone))
+
+(defun (lookup-logging-parameter OBJECT) ((module STRING)
+                                          (parameter KEYWORD)
+                                          (default OBJECT))
+  :documentation "Lookup logging `parameter' for `module'.  Use `default' if no
+value is defined."
+  :public? TRUE
+  (let ((value OBJECT NULL))
+    (foreach (mod props) in *logging-registry*
+        where (string-equal? module mod)
+        do (setq value (first-defined (lookup props parameter) default))
+           (break))
+    (return value)))
+
+(defun set-logging-parameters ((module STRING) &rest (params&values OBJECT))
+  :documentation "Set logging parameters for `module'.  The supported parameters are:
+  :LOG-LEVELS - a cons list of legal levels in ascending log level order;
+                for example, (:NONE :LOW :MEDIUM :HIGH) or (0 1 2 3).
+  :LEVEL      - the current log level for `module'
+  :STREAM     - the stream to log to (defaults to STANDARD-OUTPUT)
+  :PREFIX     - the prefix to use to identify the module (defaults to `module')
+  :MAX-WIDTH  - logging output lines will be kept to approximately this width
+                (defaults to 10000, minimum width of about 30 is used to
+                print line header information)."
+  :public? TRUE
+  ;; TO DO: SUPPORT DIFFERENT LOGGING FORMATS.
+  (let ((options (vet-options (coerce-&rest-to-cons params&values)
+                              (quote (:LOG-LEVELS :LEVEL :STREAM :PREFIX :MAX-WIDTH))))
+        (logInfo PROPERTY-LIST NULL))
+    (foreach (mod props) in *logging-registry*
+        where (string-equal? module mod)
+        do (setq logInfo props))
+    (when (null? logInfo)
+      (setq logInfo (new PROPERTY-LIST))
+      (insert-at *logging-registry* module logInfo))
+    (foreach (key value) in options
+        do (insert-at logInfo key value))))
+
+(defun (log-level<= BOOLEAN) ((level OBJECT) (module STRING))
+  :documentation "Return TRUE if `level' is lower than or equal to the current
+log level of `module'.  Return FALSE if any of them are undefined."
+  :public? TRUE
+  (let ((logLevels CONS (lookup-logging-parameter module :LOG-LEVELS NIL))
+        (moduleLevel (lookup-logging-parameter module :LEVEL NULL))
+        (pos1 (position logLevels level 0))
+        (pos2 (position logLevels moduleLevel 0)))
+    (return (and (defined? pos1)
+                 (defined? pos2)
+                 (<= pos1 pos2)))))
+
+(defun log-message ((module STRING) (logLevel OBJECT) (message CONS))
+  :documentation "Log all elements of `message' to `module's log stream if
+`logLevel' is the same or lower than the `module's log level.  Interprets `EOL'
+or :EOL to print a line terminator."
+  :public? TRUE
+  (when (log-level<= logLevel module)
+    (let ((log OUTPUT-STREAM (lookup-logging-parameter module :STREAM STANDARD-OUTPUT))
+          (modulePrefix STRING (lookup-logging-parameter module :PREFIX module))
+          (maxRoom INTEGER (lookup-logging-parameter module :MAX-WIDTH 10000))
+          (room maxRoom)
+          (eltString STRING NULL))
+      (print-stream log
+                    "["
+                    (calendar-date-to-string
+                     (make-current-date-time)
+                     *logging-local-time-zone*
+		     FALSE
+                     FALSE)
+                    (choose (empty? modulePrefix) "" " ")
+                    modulePrefix
+                    "] ")
+      (-- room (+ 27 (length modulePrefix)))
+      (special ((*printReadably?* TRUE))
+        (foreach elt in message
+            do (typecase elt
+                 (STRING-WRAPPER
+                  (setq eltString (wrapper-value elt)))
+                 (SYMBOL
+                  (cond ((eql? (symbol-name elt) "EOL")
+                         (print-stream log EOL)
+                         (setq room maxRoom)
+                         (continue))
+                        (otherwise
+                         (setq eltString (stringify elt)))))
+                 (otherwise
+                  (setq eltString (stringify elt))))
+               (if (< room (length eltString))
+                   (print-stream log (subsequence eltString 0 room) "...")
+                 (print-stream log eltString))))
+      (print-stream log EOL)
+      (flush-output log))))
+
+(defun logmsg ((module STRING) (logLevel OBJECT) &rest (message OBJECT))
+  :documentation "Log all elements of `message' to `module's log stream if
+`logLevel' is the same or lower than the `module's log level.  Interprets `EOL'
+or :EOL to print a line terminator."
+  :public? TRUE
+  (log-message module logLevel (coerce-&rest-to-cons message)))

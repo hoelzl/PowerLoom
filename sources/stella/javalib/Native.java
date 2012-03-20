@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: Native.java,v 1.40 2003/10/23 17:16:50 tar Exp
+// Version: Native.java,v 1.54 2006/05/11 07:06:47 hans Exp
 
 // Native Java stuff for STELLA
 
@@ -52,6 +52,7 @@ import java.io.*;
 public class Native {
 
   public static boolean $BREAK_ON_CERROR$ = true;
+  public static java.util.Random RNG = new java.util.Random();
 
     //
   ///// 'null?' and 'defined?':
@@ -86,6 +87,15 @@ public class Native {
   public static int round (double n) {
     return (int) Math.round(n);
   }
+
+  public static int truncate (int n) {
+    return n;
+  }
+
+  public static int truncate (double n) {
+    return (int) n;
+  }
+
 
   public static double exp (double n) {
     return Math.exp(n);
@@ -122,7 +132,7 @@ public class Native {
     case 2:                       // Fall through to case 3
     case 3: return ilength + 2;
     }
-    throw StellaException.newStellaException("Error in integerLength(" + x + "):  Shouldn't get here!");
+    throw (StellaException) StellaException.newStellaException("Error in integerLength(" + x + "):  Shouldn't get here!").fillInStackTrace();
   }
 
     //
@@ -257,6 +267,30 @@ public class Native {
     }
   }
 
+  public static int string_lastPosition(String string, char character, int end) {
+    // Return the last position of 'character' within 'string' (counting
+    // from zero), or return NULL if 'character' does not occur within 'string'.
+    // If 'end' was supplied as non-NULL, only consider the substring ending
+    // at 'end', however, the returned position will always be relative to the
+    // entire string.
+
+    int pos;
+    if (end == Stella.NULL_INTEGER) {
+      pos = string.lastIndexOf(character);
+    }
+    else {
+      pos = string.lastIndexOf(character, end);
+    }
+
+    if (pos == -1) {
+      return Stella.NULL_INTEGER;
+    }
+    else {
+      return pos;
+    }
+  }
+
+
   public static int stringSearch(String string, String substring, int start) {
     // Return start position of the left-most occurrence right of
     // 'start' of 'substring' in 'string'.  Return NULL if it is not 
@@ -317,10 +351,10 @@ public class Native {
     }
     String newstring;
     Object old_printreadablyp = Stella.$PRINTREADABLYp$.get();
-    Stella.$PRINTREADABLYp$.set(Boolean.TRUE);
     Object old_printprettyp = Stella.$PRINTPRETTYp$.get();
-    Stella.$PRINTPRETTYp$.set(Boolean.FALSE);
     try {
+      Stella.$PRINTREADABLYp$.set(Boolean.TRUE);
+      Stella.$PRINTPRETTYp$.set(Boolean.FALSE);
       newstring = stringify_via_print(expression);
     }
     finally {
@@ -334,6 +368,14 @@ public class Native {
 
   public static String integerToString(int i) {
     return Integer.toString(i);
+  }
+
+  public static String integerToHexString(int i) {
+    return Integer.toHexString(i);
+  }
+
+  public static String integerToStringInBase(int i, int base) {
+    return Integer.toString(i, base);
   }
 
   public static String floatToString(double f) {
@@ -367,16 +409,16 @@ public class Native {
       return (new BufferedInputStream(new FileInputStream(filename)));
     }
     catch (java.io.FileNotFoundException e) {
-      throw NoSuchFileException.newNoSuchFileException("openInputFileStream: " + e.getMessage());
+      throw (NoSuchFileException) NoSuchFileException.newNoSuchFileException("openInputFileStream: " + e.getMessage()).fillInStackTrace();
     }
   }
 
-  public static BufferedOutputStream openOutputFileStream(String filename) {
+  public static BufferedOutputStream openOutputFileStream(String filename, boolean append) {
    try {
-     return (new BufferedOutputStream (new FileOutputStream(filename)));
+     return (new BufferedOutputStream (new FileOutputStream(filename, append)));
    }
    catch (java.io.IOException e) {
-     throw InputOutputException.newInputOutputException("openOutputFileStream: " + e.getMessage());
+     throw (InputOutputException) InputOutputException.newInputOutputException("openOutputFileStream: " + e.getMessage()).fillInStackTrace();
    }
   }
 
@@ -391,7 +433,7 @@ public class Native {
       return s.readLine();
     }
     catch (IOException e) {
-      throw InputOutputException.newInputOutputException("readLine: " + e.getMessage());
+      throw (InputOutputException) InputOutputException.newInputOutputException("readLine: " + e.getMessage()).fillInStackTrace();
     }
   }
 
@@ -412,7 +454,7 @@ public class Native {
       }
     }
     catch (IOException e) {
-      throw InputOutputException.newInputOutputException("readCharacter: " + e.getMessage());
+      throw (InputOutputException) InputOutputException.newInputOutputException("readCharacter: " + e.getMessage()).fillInStackTrace();
     }
 
     return return_char;
@@ -423,7 +465,7 @@ public class Native {
       stream.unread(c);
     }
     catch (IOException e) {
-      throw InputOutputException.newInputOutputException("unreadCharacter: " + e.getMessage());
+      throw (InputOutputException) InputOutputException.newInputOutputException("unreadCharacter: " + e.getMessage()).fillInStackTrace();
     }
   }
 
@@ -469,9 +511,9 @@ public class Native {
         if (bytesRead > 0) toFile.write(buffer, 0, bytesRead);
       }
     } catch (java.lang.FileNotFoundException fnf) {
-      throw NoSuchFileException.newNoSuchFileException(fnf.getMessage());
+      throw (NoSuchFileException) NoSuchFileException.newNoSuchFileException(fnf.getMessage()).fillInStackTrace();
     } catch (java.lang.IOException ioe) {
-      throw InputOutputException.newInputOutputException("copyFile: " + e.getMessage());
+      throw (InputOutputException) InputOutputException.newInputOutputException("copyFile: " + e.getMessage()).fillInStackTrace();
     } finally {
       if (fromFile != null) fromFile.close();
       if (toFile != null) toFile.close();
@@ -519,6 +561,20 @@ public class Native {
     return arr;
   }
 
+  public static Object [][] consToArrayArray (Cons c) {
+    int i = 0;
+    Object [] arr = new Object[c.length()];
+    Cons iter_000 = c;
+
+    while (!(iter_000 == Stella.NIL)) {
+      arr[i] = consToArray((Cons)iter_000.value);
+      i++;
+      iter_000 = iter_000.rest;
+    }
+    return (Object [][])arr;
+  }
+
+
   public static String formatArguments (Object [] argArray) {
     // Formats the arguments in argArray.
     StringBuffer args = new StringBuffer(" (");
@@ -553,24 +609,24 @@ public class Native {
     }
     catch (IllegalAccessException e) {
       if (y == null) {
-	throw StellaException.newStellaException("Illegal Java Access in funcall of function:\n  "
-                         + x + formatArguments(z));
+	throw (StellaException) StellaException.newStellaException("Illegal Java Access in funcall of function:\n  "
+								   + x + formatArguments(z)).fillInStackTrace();
       }
       else {
-	throw StellaException.newStellaException("Illegal Java Access in funcall of:\n  "
-                         + x + " on " + y + formatArguments(z));
+	throw (StellaException) StellaException.newStellaException("Illegal Java Access in funcall of:\n  "
+								   + x + " on " + y + formatArguments(z)).fillInStackTrace();
       }
     }
     catch (IllegalArgumentException e) {
       if (y == null) {
-	throw StellaException.newStellaException("Illegal Java Arguments in funcall of function:\n  "
-                        + x + formatArguments(z)
-			+ "\n  of types " + formatArgumentTypes(z));
+	throw (StellaException) BadArgumentException.newBadArgumentException("Illegal Java Arguments in funcall of function:\n  "
+								   + x + formatArguments(z)
+								   + "\n  of types " + formatArgumentTypes(z)).fillInStackTrace();
       }
       else {
-	throw StellaException.newStellaException("Illegal Java Arguments in funcall of:\n  " 
-                        + x + " on " + y + formatArguments(z)
-			+ "\n  of types " + formatArgumentTypes(z));
+	throw (StellaException) BadArgumentException.newBadArgumentException("Illegal Java Arguments in funcall of:\n  " 
+								   + x + " on " + y + formatArguments(z)
+								   + "\n  of types " + formatArgumentTypes(z)).fillInStackTrace();
       }
     }
     catch (java.lang.reflect.InvocationTargetException e) {
@@ -578,18 +634,22 @@ public class Native {
       if (e.getTargetException() instanceof StellaException) {
 	throw (StellaException) e.getTargetException();
       // and generate a new stella exception for the others:
-      }	else if (y == null) {
-	java.lang.System.err.println("Invocation Target Exception in funcall of function:");
-        java.lang.System.err.println("    " + x + formatArguments(z));
+      }
+      PrintStringStream msg = new PrintStringStream();
+      if (y == null) {
+	msg.println("Invocation Target Exception in funcall of function:");
+        msg.println("    " + x + formatArguments(z));
       }
       else {
-	java.lang.System.err.println("Invocation Target Exception in funcall of:");
-        java.lang.System.err.println("    " + x + " on " + y + formatArguments(z));
+	msg.println("Invocation Target Exception in funcall of:");
+        msg.println("    " + x + " on " + y + formatArguments(z));
       }
-      java.lang.System.err.println("    " + e.getTargetException());
-      e.getTargetException().printStackTrace(java.lang.System.err);
-      java.lang.System.err.println();
-      throw StellaException.newStellaException("Funcall failed:" + e.getTargetException().getMessage());
+      msg.println("    " + e.getTargetException());
+      msg.println("    " + e.getTargetException().getMessage());
+      e.getTargetException().printStackTrace(msg);
+      String errorMessage = msg.toString();
+      msg.close();
+      throw  (StellaException) StellaException.newStellaException(errorMessage).fillInStackTrace();
     }
   }
 
@@ -598,7 +658,7 @@ public class Native {
       return Class.forName(className);
     }
     catch (ClassNotFoundException e) {
-      throw NoSuchObjectException.newNoSuchObjectException ("Can't find class `" + className + "' in find_java_class");
+      throw (NoSuchObjectException) NoSuchObjectException.newNoSuchObjectException ("Can't find class `" + className + "' in find_java_class").fillInStackTrace();
     }
   }
 
@@ -613,7 +673,7 @@ public class Native {
       return theMethod;
     }
     catch (ClassNotFoundException e) {
-      throw NoSuchObjectException.newNoSuchObjectException ("Can't find class `" + className + "' in find_java_method");
+      throw (NoSuchObjectException) NoSuchObjectException.newNoSuchObjectException ("Can't find class `" + className + "' in find_java_method").fillInStackTrace();
     }
     catch (NoSuchMethodException e) {
       StringBuffer params = new StringBuffer(" [");
@@ -625,7 +685,7 @@ public class Native {
 	  }
       params.append("]");
 
-      throw NoSuchObjectException.newNoSuchObjectException ("Can't find method `" + methodName + "' on `" + className + "' for " + params + " in find_java_method");
+      throw (NoSuchObjectException) NoSuchObjectException.newNoSuchObjectException ("Can't find method `" + methodName + "' on `" + className + "' for " + params + " in find_java_method").fillInStackTrace();
     }
   }
 
@@ -740,7 +800,7 @@ public class Native {
 
   public static void continuableError (String message) {
     if ($BREAK_ON_CERROR$) {
-      throw StellaException.newStellaException(message);
+      throw (StellaException) StellaException.newStellaException(message).fillInStackTrace();
     } else {
       System.err.println(message);
     }

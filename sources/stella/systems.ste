@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: systems.ste,v 1.31 2003/08/08 23:07:43 hans Exp
+;;; Version: systems.ste,v 1.42 2006/05/14 06:50:46 hans Exp
 
 ;;; Command Interpreter and System Definition 'defsystem'
 
@@ -232,6 +232,9 @@ The remaining commands are evaluated one-by-one, applying the function
                  (:DEVELOPMENT-SETTINGS (setf (development-settings system) value))
                  (:FINALIZATION-FUNCTION 
                   (setf (finalization-function system) value))))
+      (when (null? (directory system))
+        ;; default to the system name:
+        (setf (directory system) (name system)))
       (push *systemDefinitions* system)
       (when (defined? oldSystem)
         (inform "Redefining system " (name system) EOL)
@@ -243,8 +246,8 @@ The remaining commands are evaluated one-by-one, applying the function
   :documentation "Define a system of files that collectively define
 a Stella application.
    Required options are:
-   :directory -- the path from the Stella root directory to the directory
-                 containing the system files.  Can be a string or a list
+   :directory -- the relative path from the respective source/native/binary root directory
+                 to the directory containing the system files.  Can be a string or a list
                  of strings (do not include directory separators).
    :files -- a list of files in the system, containing strings and lists
              of strings; the latter defines exploded paths to files
@@ -317,7 +320,7 @@ a Stella application.
                  (:java
                   (setq fileName
 		    (java-translate-class-namestring
-		     (concatenate "Startup-"  f))))
+		     (concatenate "_STARTUP-" (string-upcase f)))))
                  (otherwise
                   (setq fileName (make-file-name-from-relative-path f type))))
                (help-get-system-files fileName files probeFiles?))
@@ -711,7 +714,7 @@ be called once all files have been loaded."
 
 (defmethod (system-startup-function-name STRING) ((systemName STRING))
   ;; Return the name of the system startup function.
-  (return (string-upcase (concatenate "startup-" systemName "-system")) ))
+  (return (concatenate "STARTUP-" (string-upcase systemName) "-SYSTEM") ))
 
 (defun (system-startup-function-symbol SYMBOL) ((system SYSTEM-DEFINITION))
   ;; Return the symbol naming the system startup function.
@@ -725,29 +728,28 @@ be called once all files have been loaded."
     (error "STELLA source file " (make-file-name file :stella TRUE)
            " does not exist"))
   (let ((longName (make-file-name file :stella TRUE))
-        (inputStream (new INPUT-FILE-STREAM :filename longName))
         (savedModule *module*)
         (seenInModule? FALSE)
         (unused? FALSE)
         (startupFnName SYMBOL NULL))
-    (with-transient-objects
-      (foreach
-       tree in (s-expressions inputStream)
-       do (with-permanent-objects
-            (typecase tree
-              (CONS
-               (mv-setq (unused? seenInModule?)
-                        (handle-in-module-tree tree seenInModule?))
-               (ignore unused?)
-               (when seenInModule?
-                 (setq startupFnName (yield-startup-function-name file))
-                 (change-module savedModule)
-                 (free inputStream)
-                 (return startupFnName)))
-              ;; ignore atomic expressions:
-              (otherwise NULL)))))
-    (warn "Missing IN-MODULE declaration for file " file EOL)
-    (return NULL) ))
+    (with-input-file (inputStream longName)
+      (with-transient-objects
+        (foreach
+          tree in (s-expressions inputStream)
+          do (with-permanent-objects
+               (typecase tree
+                 (CONS
+                  (mv-setq (unused? seenInModule?)
+                           (handle-in-module-tree tree seenInModule?))
+                  (ignore unused?)
+                  (when seenInModule?
+                    (setq startupFnName (yield-startup-function-name file))
+                    (change-module savedModule)
+                    (return startupFnName)))
+                 ;; ignore atomic expressions:
+                 (otherwise NULL))))))
+    (warn "Missing IN-MODULE declaration for file " file EOL))
+    (return NULL) )
 
 (defun (startup-names-from-files (CONS OF SYMBOL))
     ((files (CONS OF STRING-WRAPPER)))
@@ -779,8 +781,8 @@ be called once all files have been loaded."
 (defun (system-started-up? BOOLEAN)
     ((systemName STRING) (systemModuleName STRING))
   ;; Return TRUE if the startup function of system `systemName' has been run.
-  (when (eql? (string-upcase systemName) "STELLA")
-    (return (defined? *module*)))
+  (when (string-equal? systemName "STELLA")
+    (return (defined? *function-lookup-table*)))
   (when (null? (get-stella-module systemModuleName FALSE))
     (return FALSE))
   (let ((startupFunctionSymbol
@@ -820,33 +822,33 @@ be called once all files have been loaded."
   ;; Currently, this only collects module definitions, but conceivably, it
   ;;    could also collect the system definitons or even the whole file.
   (let ((systemFileName (make-system-definition-file-name (name system)))
-	(inputStream (new INPUT-FILE-STREAM :filename systemFileName))
         (module MODULE NULL)
         (startupForm CONS NULL)
 	(startupForms NIL))
     (within-module *module*
-      (foreach tree in (s-expressions inputStream)
+      (with-input-file (inputStream systemFileName)
+        (foreach tree in (s-expressions inputStream)
 	  do (setq startupForm NULL)
-	     (typecase tree
-	       (CONS
-		(when (eql? (value tree) (quote DEFMODULE))
-		  (evaluate tree)
-		  (setq module
-		    (get-stella-module
-		     (coerce-to-module-name (second tree) TRUE)
-		     TRUE))
-		  (when (defined? module)
-		    (setq startupForm
-		      (bquote
-		       (STARTUP-TIME-PROGN :modules
-					   & (yield-define-module module))))))
-		(when (eql? (value tree) (quote IN-MODULE))
-		  (evaluate tree)))
-	       (otherwise NULL))
-	     (when (null? startupForm)
-	       (continue))
+          (typecase tree
+            (CONS
+             (when (eql? (value tree) (quote DEFMODULE))
+               (evaluate tree)
+               (setq module
+		     (get-stella-module
+		      (coerce-to-module-name (second tree) TRUE)
+		      TRUE))
+               (when (defined? module)
+                 (setq startupForm
+		       (bquote
+		        (STARTUP-TIME-PROGN :modules
+					    & (yield-define-module module))))))
+             (when (eql? (value tree) (quote IN-MODULE))
+               (evaluate tree)))
+            (otherwise NULL))
+          (when (null? startupForm)
+            (continue))
 	  collect startupForm into startupForms))
-    (return startupForms)))
+    (return startupForms))))
 
 (defun create-system-startup-file ((system SYSTEM-DEFINITION))
   ;; Create a system startup file whose startup function calls all relevant
@@ -867,73 +869,92 @@ be called once all files have been loaded."
     (return))
   (within-module (get-cardinal-module system)
    (let ((file (make-file-name (system-startup-file-name system) :stella TRUE))
-         (outputStream (new OUTPUT-FILE-STREAM :filename file))
          (startupFnNames (CONS OF SYMBOL) NIL)
          (startupForms (CONS OF CONS) NIL))
-     ;; Collect all startup function names:
-     (foreach f in (system-definition-source-files system)
+     (with-output-file (outputStream file)
+       ;; Collect all startup function names:
+       (foreach f in (system-definition-source-files system)
          collect (startup-name-from-file f) into startupFnNames)
-
-     ;; output file preamble:
-     (cl-output-file-header outputStream file false)
-     (pushq startupForms
-            (bquote
-             (IN-MODULE & (module-full-name (get-cardinal-module system)))))
-
-     ;; generate a forward declaration of the system startup function
-     ;;    so it can be referenced by user code:
-     (pushq startupForms
-            (bquote (DEFUN & (system-startup-function-symbol system) ()
-                           :public? TRUE)))
-
-     ;; assemble the call sequence for all startup functions defined in
-     ;;    `system' (special-case "STELLA" due to bootstrap issues):
-     (cond
-      ((eql? (string-upcase (name system)) "STELLA")
+       
+       ;; output file preamble:
+       (cl-output-file-header outputStream file false)
        (pushq startupForms
               (bquote
-               (STARTUP-TIME-PROGN :early-inits
-                 (startup FALSE)))))
-      (otherwise
-       ;; startup required systems:
-       (when (defined? (required-systems system))
-         ;; do we need forward declarations for these also?
-         (pushq startupForms (yield-startup-required-systems system)))
-       ;; collect module definitions and other relevant forms from
-       ;;    the definition file of `system':
-       (foreach form in (collect-startup-forms-from-system-file system)
+               (IN-MODULE & (module-full-name (get-cardinal-module system)))))
+       
+       ;; generate a forward declaration of the system startup function
+       ;;    so it can be referenced by user code:
+       (pushq startupForms
+              (bquote (DEFUN & (system-startup-function-symbol system) ()
+                             :public? TRUE)))
+       
+       ;; assemble the call sequence for all startup functions defined in
+       ;;    `system' (special-case "STELLA" due to bootstrap issues):
+       (cond
+        ((string-equal? (name system) "STELLA")
+         (pushq startupForms
+                (bquote
+                 (startup-time-progn :early-inits
+                   (unless (system-started-up? "stella" "/STELLA")
+                     (startup FALSE))))))
+        (otherwise
+         ;; startup required systems:
+         (when (defined? (required-systems system))
+           ;; do we need forward declarations for these also?
+           (pushq startupForms (yield-startup-required-systems system)))
+         ;; collect module definitions and other relevant forms from
+         ;;    the definition file of `system':
+         (foreach form in (collect-startup-forms-from-system-file system)
            do (pushq startupForms form))
-       ;; generate forward declarations of all undefined startup functions
-       ;;    to support translation of a partially changed system in Lisp (the
-       ;;    signatures only become available after the startup code is run):
-       ;; KLUDGE: We don't generate real forward declarations, since that
-       ;;    causes problems for out-of-module functions, instead we generate
-       ;;    the necessary startup function objects on the fly: 
-       (foreach startupFn in startupFnNames
+         ;; generate forward declarations of all undefined startup functions
+         ;;    to support translation of a partially changed system in Lisp (the
+         ;;    signatures only become available after the startup code is run):
+         ;; KLUDGE: We don't generate real forward declarations, since that
+         ;;    causes problems for out-of-module functions, instead we generate
+         ;;    the necessary startup function objects on the fly: 
+         (foreach startupFn in startupFnNames
            where (null? (lookup-function startupFn))
            do (within-module (home-module startupFn)
                 (define-method-from-parse-tree
                   (bquote (DEFUN & startupFn () :public? TRUE)))))
-       ;; assemble the startup function call sequence:
-       (let ((startupFnCalls NIL))
-         (foreach startupFn in startupFnNames
+         ;; assemble the startup function call sequence:
+         (let ((startupFnCalls NIL))
+           (foreach startupFn in startupFnNames
              collect (bquote (& startupFn)) into startupFnCalls)
-         (pushq startupForms
-                (bquote
-                 (STARTUP-TIME-PROGN
-                  (foreach phase in (interval (phase-to-integer :early-inits)
-                                              (phase-to-integer :final))
-                      do (setq *startup-time-phase* phase)
-                         && startupFnCalls)
-                  (setq *startup-time-phase* 999)))))))
+           (pushq startupForms
+                  (bquote
+                   (STARTUP-TIME-PROGN
+                     (foreach phase in (interval (phase-to-integer :early-inits)
+                                                 (phase-to-integer :final))
+                       do (setq *startup-time-phase* phase)
+                       && startupFnCalls)
+                     (setq *startup-time-phase* 999)))))))
+       
+       (special ((*printReadably?* TRUE)
+                 (*printPretty?* TRUE))
+         ;; Printing parse trees instead of strings will make sure we'll get
+         ;;    symbol module information right relative to the system module:
+         (foreach form in (reverse startupForms)
+           do (print-stream outputStream form EOL EOL))) ))) )
 
-     (special ((*printReadably?* TRUE)
-               (*printPretty?* TRUE))
-       ;; Printing parse trees instead of strings will make sure we'll get
-       ;;    symbol module information right relative to the system module:
-       (foreach form in (reverse startupForms)
-           do (print-stream outputStream form EOL EOL)))
-     (free outputStream))) )
+(defun (help-all-required-systems (LIST OF STRING-WRAPPER))
+       ((system-name STRING) (found (LIST OF STRING-WRAPPER)))
+  (let ((system (get-system-definition system-name)))
+    (when (null? system)
+      (error "Couldn't find system " system-name))
+    (let ((required-system-names (required-systems system)))
+      (when (defined? required-system-names)
+        (foreach sys in required-system-names
+          where (not (member? found sys))
+          do (help-all-required-systems sys found)
+             (push found sys)))
+      (return found))))
+
+(defun (all-required-systems (CONS OF STRING-WRAPPER)) ((system-name STRING))
+  :public? TRUE
+  :documentation "Returns a CONS of all of the systems required by `system-name'"
+  (return (the-cons-list (help-all-required-systems system-name
+                                                    (new (LIST OF STRING-WRAPPER))))))
 
 
   ;;
@@ -952,8 +973,9 @@ be called once all files have been loaded."
 ;;;;;; Support for runtime configuration via Java-style property files
   ;;
 
-(defun (parse-configuration-file-line STRING-WRAPPER WRAPPER) ((line STRING))
-  ;; Parse the configuration file `line' and return its property name and value.
+(defun (parse-configuration-file-line STRING-WRAPPER WRAPPER KEYWORD) ((line STRING))
+  ;; Parse the configuration file `line' and return its property name, value
+  ;;    and the assignment operator (one of :set for '=' or :add for '+=').
   ;; Return NULL for empty, commented or illegal lines.
   ;; Assumes Java-style configuration file syntax.
   (let ((start 0)
@@ -963,22 +985,26 @@ be called once all files have been loaded."
         (length (length line))
         (property STRING NULL)
         (valueString STRING NULL)
-        (value OBJECT NULL))
+        (value OBJECT NULL)
+        (operator :SET))
     (when (forall i in (interval 0 (1- (choose (defined? hashPos) hashPos length)))
               always (white-space-character? (nth line i)))
       ;; we have a commented or blank line:
-      (return NULL NULL))
+      (return NULL NULL NULL))
     (when (or (null? equalPos)
               (= equalPos 0))
       (warn "Illegal line in configuration file: " line)
-      (return NULL NULL))
+      (return NULL NULL NULL))
     (while (white-space-character? (nth line start))
       (++ start))
+    (when (eql? (nth line (1- end)) #\+)
+      (setq operator :ADD)
+      (-- end))
     (while (white-space-character? (nth line (1- end)))
       (-- end))
     (when (<= end start)
       (warn "Illegal property in configuration file: " line)
-      (return NULL NULL))
+      (return NULL NULL NULL))
     (setq property (subsequence line start end))
     ;; anything after the `=' is considered part of the value:
     (setq valueString (subsequence line (1+ equalPos) length))
@@ -995,9 +1021,9 @@ be called once all files have been loaded."
                   (setq value valueString)))
              (READ-EXCEPTION ()
                (setq value valueString)))))
-    (return property value)))
+    (return property value operator)))
 
-(deftype CONFIGURATION-TABLE (KEY-VALUE-LIST OF STRING-WRAPPER WRAPPER))
+(deftype CONFIGURATION-TABLE (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT))
 
 (defglobal *system-configuration-table* CONFIGURATION-TABLE
            (new CONFIGURATION-TABLE))
@@ -1008,17 +1034,62 @@ be called once all files have been loaded."
 Also enter each property read into the global system configuration table.
 Assumes Java-style property file syntax.  Each property name is represented
 as a wrapped string and each value as a wrapped string/integer/float or boolean."
-  :public? TRUE
+  :public? TRUE  :constructor? TRUE
   (let ((configuration (new KEY-VALUE-LIST)))
-    (foreach line in (lines (new FILE-INPUT-STREAM :filename file))
-        do (mv-bind (key value)
-               (parse-configuration-file-line line)
+    (with-input-file (in file)
+      (foreach line in (lines in)
+        do (mv-bind (key value operator)
+                    (parse-configuration-file-line line)
              (when (defined? key)
-               (insert-at configuration key value)
-               (insert-at *system-configuration-table* key value))))
+               (case operator
+                 (:SET
+                  (set-configuration-property key value configuration)
+                  (set-configuration-property key value NULL))
+                 (:ADD
+                  (add-configuration-property key value configuration)
+                  (add-configuration-property key value NULL)))))))
     (return configuration)))
 
-(defun (lookup-configuration-property WRAPPER)
+(defun save-configuration-value ((stream OUTPUT-STREAM) (value OBJECT))
+  :documentation "Save `value' to `stream' as a properly formatted configuration
+value."
+  (typecase value
+    (STRING-WRAPPER 
+     (print-stream stream (wrapper-value value)))
+    (BOOLEAN-WRAPPER
+     (if (eq? value TRUE-WRAPPER)
+       (print-stream stream "true")
+       (print-stream stream "false")))
+    (INTEGER-WRAPPER
+     (print-stream stream (integer-to-string value)))
+    (FLOAT-WRAPPER
+     (print-stream stream (float-to-string value)))
+    (otherwise
+     (special ((*printReadably?* TRUE))
+       (print-stream stream value)))))
+
+(defun save-configuration-file ((table CONFIGURATION-TABLE) (file FILE-NAME) (title STRING))
+  :documentation
+  "Save `table' as a configuration file.  Uses a Java-style property file syntax."
+  :public? TRUE
+  (special ((*printReadably?* FALSE))
+    (with-output-file (out file)
+      (when (defined? title)
+        ;; TO DO:  MAKE THIS HANDLE STRINGS WITH EMBEDDED NEWLINES AS WELL!
+        (print-stream out "# " title EOL))
+      (foreach (key value) in table
+        do (typecase value
+             (CONS                      ; multi-valued property
+              (foreach v in value
+                do (print-stream out (unwrap-string key) " +=")
+                   (save-configuration-value out v)
+                   (print-stream out EOL)))
+             (otherwise
+              (print-stream out (unwrap-string key) " =")
+              (save-configuration-value out value)
+              (print-stream out EOL)))))))
+
+(defun (lookup-configuration-property OBJECT)
     ((property STRING) (defaultValue WRAPPER) (configuration CONFIGURATION-TABLE))
   :documentation "Lookup `property' in `configuration' and return its value.
 Use the global system configuration table if `configuration' is NULL.  Return
@@ -1031,8 +1102,25 @@ Use the global system configuration table if `configuration' is NULL.  Return
         (return value)
       (return defaultValue))))
 
-(defun (set-configuration-property WRAPPER)
-    ((property STRING) (value WRAPPER) (configuration CONFIGURATION-TABLE))
+(defun (lookup-configuration-property-values CONS)
+    ((property STRING) (defaultValue OBJECT) (configuration CONFIGURATION-TABLE))
+  :documentation "Lookup `property' in `configuration', assume it is a multi-valued
+property and return its value(s) as a list.  Use the global system configuration table
+if `configuration' is NULL.  Return `defaultValue' if `property' is not defined or
+NIL is no default value is specified."
+  :public? TRUE
+  (when (null? configuration)
+    (setq configuration *system-configuration-table*))
+  (let ((value (lookup configuration property)))
+    (cond ((defined? value)
+           (return (consify value)))
+          ((defined? defaultValue)
+           (return (consify defaultValue)))
+          (otherwise
+           (return NIL)))))
+
+(defun (set-configuration-property OBJECT)
+    ((property STRING) (value OBJECT) (configuration CONFIGURATION-TABLE))
   :documentation "Set `property' in `configuration' to `value' and return it.
 Use the global system configuration table if `configuration' is NULL."
   :public? TRUE
@@ -1040,6 +1128,48 @@ Use the global system configuration table if `configuration' is NULL."
     (setq configuration *system-configuration-table*))
   (insert-at configuration property value)
   (return value))
+
+(defun (add-configuration-property OBJECT)
+    ((property STRING) (value OBJECT) (configuration CONFIGURATION-TABLE))
+  :documentation "Add `value' to `property' in `configuration' and return it.
+If a previous value exists add `value' to the end (listify the old value
+if it is not yet a list).  Otherwise, create a new list containing `value'.
+Use the global system configuration table if `configuration' is NULL."
+  :public? TRUE
+  (when (null? configuration)
+    (setq configuration *system-configuration-table*))
+  (insert-at configuration
+             property
+             (concatenate
+               (consify (first-defined (lookup configuration property) NIL))
+               (cons value NIL)))
+  (return value))
+
+(defun (clear-configuration-property OBJECT)
+    ((property STRING) (configuration CONFIGURATION-TABLE))
+  :documentation "Remove `property' in `configuration' and return the previous
+value.
+Use the global system configuration table if `configuration' is NULL."
+  :public? TRUE
+  (when (null? configuration)
+    (setq configuration *system-configuration-table*))
+  (let ((current-value (lookup configuration property)))
+    (remove-at configuration property)
+    (return current-value)))
+
+(defun (remove-configuration-property OBJECT)
+    ((property STRING) (value OBJECT) (configuration CONFIGURATION-TABLE))
+  :documentation "Remove `value' from `property' in `configuration' and return it.
+Use the global system configuration table if `configuration' is NULL."
+  :public? TRUE
+  (when (null? configuration)
+    (setq configuration *system-configuration-table*))
+  (let ((current-value (cast (lookup configuration property) CONS)))
+    (when (defined? current-value)
+      (insert-at configuration
+                 property
+                 (remove current-value value)))
+    (return value)))
 
 (defun configure-stella ((file FILE-NAME))
   :documentation "Perform STELLA run-time configuration.  If supplied, load the

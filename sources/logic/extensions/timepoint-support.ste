@@ -1,0 +1,697 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: timepoint-support.ste,v 1.11 2006/05/11 07:05:43 hans Exp
+
+(in-package "STELLA")
+
+(in-module "TIMEPOINT-SUPPORT")
+;; Note that this is not a case-sensitive module!
+
+
+;; TO DO:
+;;   o Integrate time durations with units for time.
+;;     Arithmetic needs to be upgraded.
+;;
+
+(defglobal *date-time-hash-table* 
+  (STELLA-HASH-TABLE OF DATE-TIME-OBJECT DATE-TIME-LOGIC-WRAPPER)
+  (new STELLA-HASH-TABLE)
+  :documentation "Table for interning date-time logic wrappers")
+
+(defclass DATE-TIME-LOGIC-WRAPPER (QUANTITY-LOGIC-WRAPPER)
+  :public-slots
+  ((wrapper-value :type DATE-TIME-OBJECT :required? TRUE))
+  :print-form (if *printreadably?*
+                (print-native-stream stream (wrapper-value self))
+                (print-native-stream stream "|tw|" (wrapper-value self))))
+
+(defmethod (generate-specialized-term OBJECT) ((self DATE-TIME-LOGIC-WRAPPER))
+  (let ((term (function-term self))
+        (datetime (wrapper-value self)))
+    (cond ((defined? term) (return term))
+          ((defined? datetime)
+           (typecase datetime
+             (CALENDAR-DATE 
+              (setq term (bquote (& (generate-term /timepoint-kb/@timepoint-of)
+                                    &  (calendar-date-to-string datetime 0.0 FALSE TRUE)))))
+             (TIME-DURATION
+              (setq term (bquote (& (generate-term /timepoint-kb/@duration-of)
+                                    & (time-duration-to-string datetime))))))
+           (setf (function-term self) term)
+           (return term))
+          (otherwise
+           (signal-exception (new TERM-GENERATION-EXCEPTION
+                                  :message "Date Time Number Wrapper doesn't have a value."
+                                  :offending-term self)))) ))
+
+(defmethod (hash-code INTEGER) ((self DATE-TIME-LOGIC-WRAPPER))
+  (if (defined? (wrapper-value self))
+    (return (hash-code (wrapper-value self)))
+    (return 0)))
+
+(defmethod (object-eql? BOOLEAN) ((self DATE-TIME-LOGIC-WRAPPER) (x OBJECT))
+  ;; If the types inside the wrapper are not compatible, then an exception
+  ;; will be thrown and we know they are not eql.
+  ;; NOTE: It might be cleaner to do a type test rather than use the exception
+  ;;       handling mechanism.  It might be faster, too.
+  (exception-case
+   (return (and (isa? x @DATE-TIME-LOGIC-WRAPPER)
+                (object-eql? (wrapper-value self)
+			     (wrapper-value (cast x DATE-TIME-LOGIC-WRAPPER)))))   (STELLA-EXCEPTION ()
+     (return false))))
+
+(defun (wrap-date-time DATE-TIME-LOGIC-WRAPPER)  ((value DATE-TIME-OBJECT))
+  :public? TRUE
+  :documentation "Return an interned LOGIC-WRAPPER for `value'.  This assures us
+that all logic-wrapped DATE-TIME-OBJECTs are the same object."
+  (let ((wrapper (lookup *date-time-hash-table* value)))
+    (when (null? wrapper)
+      (setq wrapper
+            (new DATE-TIME-LOGIC-WRAPPER :wrapper-value value))
+      (insert-at *date-time-hash-table* value wrapper))
+    (return wrapper)))
+
+(defun (help-get-calendar-time DATE-TIME-LOGIC-WRAPPER) ((item OBJECT))
+  (typecase item
+    (STRING-WRAPPER
+     (let ((value (string-to-calendar-date item)))
+       (if (defined? value)
+	   (return (wrap-date-time value))
+	   ;; Complain about bad format?
+	   (return null))))
+    (PATTERN-VARIABLE
+     (let ((value (safe-bound-to item)))
+       (if (defined? value)
+	   (return (help-get-calendar-time value))
+	   (return NULL))))
+    (DATE-TIME-LOGIC-WRAPPER
+     (return item))
+    (SKOLEM
+     (let ((value (variable-value item)))
+       (typecase value
+	 (DATE-TIME-LOGIC-WRAPPER
+	   (return value))
+	 (SKOLEM
+	  (if (isa? (variable-value value) @SKOLEM)
+	      (return null)
+	      (return (help-get-calendar-time (variable-value value)))))
+	 (otherwise
+	  (if (isa? (variable-value item) @SKOLEM)
+	      (return NULL)
+	      (return (help-get-calendar-time (variable-value item))))))))
+    (otherwise
+     (return null))))
+
+(defun (help-get-time-duration DATE-TIME-LOGIC-WRAPPER) ((item OBJECT))
+  (typecase item
+    (STRING-WRAPPER
+     (let ((value (string-to-time-duration item)))
+       (if (defined? value)
+	   (return (wrap-date-time value))
+	   ;; Complain about bad format?
+	   (return NULL))))
+    (PATTERN-VARIABLE
+     (let ((value (safe-bound-to item)))
+       (if (defined? value)
+	   (return (help-get-time-duration value))
+	   (return NULL))))
+    (DATE-TIME-LOGIC-WRAPPER
+     (return item))
+    (/UNIT-SUPPORT/DIM-NUMBER-LOGIC-WRAPPER
+     (exception-case 
+      (return (wrap-date-time (dim-to-time-duration (wrapper-value item))))
+      (/utilities/INCOMPATIBLE-UNITS-EXCEPTION ()
+        (return NULL))))
+    (SKOLEM
+     (let ((value (variable-value item)))
+       (typecase value
+	 (DATE-TIME-LOGIC-WRAPPER
+	   (return value))
+	 (SKOLEM
+	  (if (isa? (variable-value value) @SKOLEM)
+	      (return null)
+	      (return (help-get-time-duration (variable-value value)))))
+	 (otherwise
+	  (if (isa? (variable-value item) @SKOLEM)
+	      (return null)
+	      (return (help-get-time-duration (variable-value item))))))))
+    (otherwise
+     (return NULL))))
+
+(defun (help-get-time-object DATE-TIME-LOGIC-WRAPPER) ((item OBJECT))
+  (typecase item
+    (STRING-WRAPPER
+     (let ((value DATE-TIME-OBJECT (string-to-calendar-date item)))
+       (when (null? value)
+         (setq value (string-to-time-duration item)))  
+       (if (defined? value)
+	 (return (wrap-date-time value))
+	   ;; Complain about bad format?
+         (return NULL))))
+    (PATTERN-VARIABLE
+     (let ((value (safe-bound-to item)))
+       (if (defined? value)
+	   (return (help-get-time-object value))
+	   (return null))))
+    (DATE-TIME-LOGIC-WRAPPER
+     (return item))
+    (/UNIT-SUPPORT/DIM-NUMBER-LOGiC-WRAPPER
+     (exception-case 
+      (return (wrap-date-time (dim-to-time-duration (wrapper-value item))))
+      (/utilities/INCOMPATIBLE-UNITS-EXCEPTION ()
+        (return NULL))))
+    (SKOLEM
+     (let ((value (variable-value item)))
+       (typecase value
+	 (DATE-TIME-LOGIC-WRAPPER
+	   (return value))
+	 (SKOLEM
+	  (if (isa? (variable-value value) @SKOLEM)
+	      (return NULL)
+	      (return (help-get-time-object (variable-value value)))))
+	 (otherwise
+	  (if (isa? (variable-value item) @SKOLEM)
+	      (return NULL)
+	      (return (help-get-time-object (variable-value item))))))))
+    (otherwise
+     (return NULL))))
+
+(defun (help-get-integer INTEGER) ((obj OBJECT))
+  (if (null? obj)
+    (return NULL)
+    (typecase obj
+      (FLOAT-WRAPPER
+       (if (integer-valued? (wrapper-value obj))
+         (return (floor (wrapper-value obj)))
+         (return NULL)))
+      (INTEGER-WRAPPER 
+       (return (wrapper-value obj)))
+      (otherwise
+       (return NULL)))))
+
+(defun (help-get-float FLOAT) ((obj OBJECT))
+  (if (null? obj)
+    (return NULL)
+    (typecase obj
+      (FLOAT-WRAPPER 
+       (return (wrapper-value obj)))
+      (INTEGER-WRAPPER
+       (return (wrapper-value obj)))
+      (otherwise
+       (return NULL)))))
+
+(defun (help-get-timezone FLOAT) ((obj OBJECT))
+  (if (null? obj)
+    (return NULL)
+    (typecase obj
+      (FLOAT-WRAPPER 
+       (return (wrapper-value obj)))
+      (INTEGER-WRAPPER 
+       (return (wrapper-value obj)))
+      (STRING-WRAPPER
+       ;; Use zone parser code from Stella's date-time parser.
+       ;; Tricky:  1)  zone assumes all strings are canonicalized to lower case
+       ;;          2)  zone returns float wrappers, which means it returns a
+       ;;              real NULL rather than a NULL-FLOAT-WRAPPER, so we need
+       ;;              to test for that explicitly to allow proper type coersion.
+       (let ((decoded-zone (zone (string-downcase obj))))
+         (if (defined? decoded-zone)
+           (return (wrapper-value decoded-zone))
+           (return NULL-FLOAT))))
+      (otherwise
+       (return NULL)))))
+
+
+(defun (can-bind-all? BOOLEAN) ((pl-objects CONS) (values CONS))
+  ;; Return TRUE if all objects in `pl-objects' can be bound to corresponding
+  ;; elements of `values'.
+  (foreach obj in pl-objects
+    as value in values
+    do (typecase obj
+         (PATTERN-VARIABLE
+          (unless (bind-variable-to-value? obj value TRUE)
+            (return FALSE)))
+         (SKOLEM
+          (setf (variable-value obj) value))
+         (otherwise
+          ;; we have an object for the first argument, but it isn't bindable.
+          ;; Unless it happens to be the same as the value, return FALSE.
+          (unless (object-eql? obj value)
+            (return FALSE)))))
+  (return TRUE))
+
+(defun timepoint-of-evaluator ((self PROPOSITION))
+  ;; If the second value is a skolem, attach a Stella CALENDAR-DATE object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((value1 (value-of (nth (arguments self) 0)))
+        (value2 (value-of (nth (arguments self) 1)))
+	(time1 (help-get-calendar-time value1)))
+    (when (defined? time1)
+       (typecase value2
+	  (SKOLEM
+           (bind-skolem-to-value value2 time1 FALSE))
+          ;;; issue: would need to extend `equate-values' to become extensible
+	  (DATE-TIME-LOGIC-WRAPPER
+           (unless (object-eql? (wrapper-value time1) (wrapper-value value2))
+	     (signal-unification-clash time1 value2)))
+          (otherwise
+           (signal-unification-clash time1 value2))))))
+
+(defun (timepoint-of-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; If the second value is a skolem, attach a Stella CALENDAR-DATE object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((proposition (proposition frame))
+	(value1 (value-of (nth (arguments proposition) 0)))
+        (value2 (value-of (nth (arguments proposition) 1)))
+	(the-time (help-get-calendar-time value1)))
+       (ignore lastmove)
+  (cond ((defined? the-time)
+	 (typecase value2
+	   (PATTERN-VARIABLE
+	    (return (select-proof-result (bind-variable-to-value? value2 the-time TRUE) 
+					 FALSE TRUE)))
+	   (SKOLEM
+	    (setf (variable-value value2) the-time)
+	    (return :FINAL-SUCCESS))
+	   (DATE-TIME-LOGIC-WRAPPER
+	    (return (select-proof-result (object-eql? (wrapper-value the-time)
+						    (wrapper-value value2)) 
+					 FALSE TRUE)))))
+	((defined? value2)
+	 (setq the-time (help-get-calendar-time value2))
+	 (if (defined? the-time)
+             (typecase value1
+	       (PATTERN-VARIABLE
+		(return (select-proof-result 
+			 (bind-variable-to-value?
+			  value1 (calendar-date-to-string (cast (wrapper-value the-time) 
+                                                                CALENDAR-DATE)
+                                                          0.0 FALSE TRUE) TRUE)
+			 FALSE TRUE)))
+	       (SKOLEM
+		(setf (variable-value value1) 
+		      (calendar-date-to-string (cast (wrapper-value the-time) 
+                                                     CALENDAR-DATE)
+                                               0.0 FALSE TRUE))
+		(return :FINAL-SUCCESS))
+	       (otherwise
+		;; we have a value for the first argument, but it doesn't represent
+		;; a valid time, or else there is some other problem with it.
+		(return :TERMINAL-FAILURE)))
+	     (return :TERMINAL-FAILURE)))
+	;; Should this be :TERMINAL-FAILURE?
+	(otherwise
+	 (return :FAILURE))) ))
+
+(defun timepoint-of*-evaluator ((self PROPOSITION))
+  ;; If the second value is a skolem, attach a Stella CALENDAR-DATE object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((args (arguments self))
+        (yy-value (value-of (nth args 0)))
+        (mm-value (value-of (nth args 1)))
+        (dd-value (value-of (nth args 2)))
+        (hr-value (value-of (nth args 3)))
+        (min-value (value-of (nth args 4)))
+        (sec-value (value-of (nth args 5)))
+        (tz-value (value-of (nth args 6)))
+        (tp-value (value-of (nth args 7)))
+        (year (help-get-integer yy-value))
+        (month (help-get-integer mm-value))
+        (day (help-get-integer dd-value))
+        (hour (help-get-integer hr-value))
+        (minute (help-get-integer min-value))
+        (second-float (help-get-float sec-value))
+        (zone (help-get-timezone tz-value))
+        (second 0)
+        (time1 DATE-TIME-LOGIC-WRAPPER NULL))
+    (when (all-defined? year month day hour minute second-float zone)
+      (setq second (floor second-float))
+      (setq time1 (wrap-date-time (make-date-time year month day hour minute
+                                                  second
+                                                  (floor (* 1000 (- second-float second)))
+                                                  zone)))
+      (typecase tp-value
+        (SKOLEM
+         (bind-skolem-to-value tp-value time1 FALSE))
+        ;;; issue: would need to extend `equate-values' to become extensible
+        (DATE-TIME-LOGIC-WRAPPER
+         (unless (object-eql? (wrapper-value time1) (wrapper-value tp-value))
+           (signal-unification-clash time1 tp-value)))
+        (otherwise
+         (signal-unification-clash time1 tp-value))))))
+
+
+(defun (timepoint-of*-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; If the second value is a skolem, attach a Stella CALENDAR-DATE object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((proposition (proposition frame))
+        (args (arguments proposition))
+        (yy-value (value-of (nth args 0)))
+        (mm-value (value-of (nth args 1)))
+        (dd-value (value-of (nth args 2)))
+        (hr-value (value-of (nth args 3)))
+        (min-value (value-of (nth args 4)))
+        (sec-value (value-of (nth args 5)))
+        (tz-value (value-of (nth args 6)))
+        (tp-value (value-of (nth args 7)))
+        (year (help-get-integer yy-value))
+        (month (help-get-integer mm-value))
+        (day (help-get-integer dd-value))
+        (hour (help-get-integer hr-value))
+        (minute (help-get-integer min-value))
+        (second-float (help-get-float sec-value))
+        (second 0)
+        (zone (help-get-timezone tz-value))
+        (the-time DATE-TIME-LOGIC-WRAPPER NULL)
+        (calendar-date CALENDAR-DATE NULL))
+       (ignore lastmove)
+  (cond ((all-defined? year month day hour minute second-float zone)
+         (setq second (floor second-float))
+         (setq the-time (wrap-date-time (make-date-time year month day hour minute
+                                                        second
+                                                        (floor (* 1000 (- second-float second)))
+                                                        zone)))
+	 (typecase tp-value
+	   (PATTERN-VARIABLE
+	    (return (select-proof-result (bind-variable-to-value? tp-value the-time TRUE) 
+					 FALSE TRUE)))
+	   (SKOLEM
+	    (setf (variable-value tp-value) the-time)
+	    (return :FINAL-SUCCESS))
+	   (DATE-TIME-LOGIC-WRAPPER
+	    (return (select-proof-result (object-eql? (wrapper-value the-time)
+						    (wrapper-value tp-value)) 
+					 FALSE TRUE)))))
+	((defined? tp-value)
+	 (setq the-time (help-get-calendar-time tp-value))
+         (setq calendar-date (wrapper-value the-time))
+         (when (null? zone)
+           (setq zone 0.0)              ; Default UTC
+           (typecase tz-value
+             (PATTERN-VARIABLE
+              (unless (bind-variable-to-value? tz-value zone TRUE)
+                (return :FAILURE)))
+             (SKOLEM
+              (setf (variable-value tz-value) zone))
+             (otherwise
+              ;; we have an object for the first argument, but it isn't bindable.
+              (return :FAILURE))))
+	 (if (defined? the-time)
+           (mv-bind (yy mm dd dow) (get-calendar-date calendar-date zone)
+             (ignore dow)
+             (mv-bind (h m s milli) (get-time calendar-date zone)
+               (return
+                (select-proof-result
+                 (can-bind-all? 
+                  (cons-list yy-value mm-value dd-value hr-value min-value sec-value)
+                  (cons-list yy mm dd 
+                             h m (cast (+ s (* milli 0.001)) FLOAT)))
+                 FALSE TRUE))))
+           (return :TERMINAL-FAILURE)))
+	;; Should this be :TERMINAL-FAILURE?
+	(otherwise
+	 (return :FAILURE))) ))
+
+
+
+(defun duration-of-evaluator ((self PROPOSITION))
+  ;; If the second value is a skolem, attach a Stella CALENDAR-DATE object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((value1 (value-of (nth (arguments self) 0)))
+        (value2 (value-of (nth (arguments self) 1)))
+	(time1 (help-get-calendar-time value1)))
+    (when (defined? time1)
+       (typecase value2
+	  (SKOLEM
+           (bind-skolem-to-value value2 time1 FALSE))
+          ;;; issue: would need to extend `equate-values' to become extensible
+	  (DATE-TIME-LOGIC-WRAPPER
+	   (unless (object-eql? (wrapper-value time1) (wrapper-value value2))
+	     (signal-unification-clash time1 value2)))))))
+
+(defun (duration-of-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; If the second value is a skolem, attach a Stella CALENDAR-DATE object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((proposition (proposition frame))
+	(value1 (value-of (nth (arguments proposition) 0)))
+        (value2 (value-of (nth (arguments proposition) 1)))
+	(the-time (help-get-time-duration value1)))
+       (IGNORE lastMove)
+  (cond ((defined? the-time)
+	 (typecase value2
+	   (PATTERN-VARIABLE
+	    (return (select-proof-result (bind-variable-to-value? value2 the-time TRUE) 
+					 FALSE TRUE)))
+	   (SKOLEM
+	    (setf (variable-value value2) the-time)
+	    (return :FINAL-SUCCESS))
+	   (DATE-TIME-LOGIC-WRAPPER
+	    (return (select-proof-result (object-eql? (wrapper-value the-time)
+						    (wrapper-value value2)) 
+					 FALSE TRUE)))))
+	((defined? value2)
+	 (setq the-time (help-get-time-duration value2))
+	 (if (defined? the-time)
+             (typecase value1
+	       (PATTERN-VARIABLE
+		(return (select-proof-result 
+			 (bind-variable-to-value?
+			  value1 (time-duration-to-string (cast (wrapper-value the-time) TIME-DURATION))
+                          TRUE)
+			 FALSE TRUE)))
+	       (SKOLEM
+		(setf (variable-value value1) 
+		      (time-duration-to-string (cast (wrapper-value the-time) TIME-DURATION)))
+		(return :FINAL-SUCCESS))
+	       (otherwise
+		;; We have a value for the first argument, but it doesn't represent
+		;; a valid time, or else there is some other problem with it.
+		(return :TERMINAl-FAILURE)))
+	     (return :TERMINAL-FAILURE)))
+	;; Should this be :TERMINAL-FAILURE?
+	(otherwise
+	 (return :FAILURE))) ))
+
+;;;
+;;;  TIME Arithmetic Functions
+;;;
+
+(defun time-minus-evaluator ((self PROPOSITION))
+  ;; If the second value is a skolem, attach a Stella TIME-OBJECT object
+  ;;    corresponding to the parsed version of the first argument.
+  ;; This will get three values
+  (let ((value1 (value-of (nth (arguments self) 0)))
+        (value2 (value-of (nth (arguments self) 1)))
+        (value3 (value-of (nth (arguments self) 2)))
+        (time1 (help-get-time-object value1))
+        (time2 (help-get-time-object value2))
+        (time3 (help-get-time-object value3)))
+    (when (and (defined? time1)
+	     (defined? time2)
+	     (defined? time3))
+      (exception-case
+	(unless (object-eql? (wrapper-value time3)
+		         (time-subtract (wrapper-value time1) (wrapper-value time2)))
+	  (signal-truth-value-clash self))
+        (STELLA-EXCEPTION ()
+	(signal-truth-value-clash self))))))
+
+(defun time-add-evaluator ((self PROPOSITION))
+  ;; If the second value is a skolem, attach a Stella TIME-OBJECT object
+  ;;    corresponding to the parsed version of the first argument.
+  ;; This will get three values
+  (let ((value1 (value-of (nth (arguments self) 0)))
+        (value2 (value-of (nth (arguments self) 1)))
+        (value3 (value-of (nth (arguments self) 2)))
+        (time1 (help-get-time-object value1))
+        (time2 (help-get-time-object value2))
+        (time3 (help-get-time-object value3)))
+    (when (and (defined? time1)
+	     (defined? time2)
+	     (defined? time3))
+      (exception-case
+	(unless (object-eql? (wrapper-value time3)
+		         (time-add (wrapper-value time1) (wrapper-value time2)))
+	  (signal-truth-value-clash self))
+        (STELLA-EXCEPTION ()
+	(signal-truth-value-clash self))))))
+
+
+(define-computed-constraint time-minus-constraint ((x1 DATE-TIME-LOGIC-WRAPPER)
+						   (x2 DATE-TIME-LOGIC-WRAPPER)
+						   (x3 DATE-TIME-LOGIC-WRAPPER))
+  (setq value
+      (object-eql? (time-subtract (wrapper-value x1) (wrapper-value x2)) (wrapper-value x3)))
+  (setq value (wrap-date-time (time-add (wrapper-value x2) (wrapper-value x3))))
+  (setq value (wrap-date-time (time-subtract (wrapper-value x1) (wrapper-value x3))))
+  (setq value (wrap-date-time (time-subtract (wrapper-value x1) (wrapper-value x2)))))
+
+(define-computed-constraint time-add-constraint ((x1 DATE-TIME-LOGIC-WRAPPER)
+						 (x2 DATE-TIME-LOGIC-WRAPPER)
+						 (x3 DATE-TIME-LOGIC-WRAPPER))
+  (setq value
+    (object-eql? (time-add (wrapper-value x1) (wrapper-value x2)) (wrapper-value x3)))
+  (setq value (wrap-date-time (time-subtract (wrapper-value x3) (wrapper-value x2))))
+  (setq value (wrap-date-time (time-subtract (wrapper-value x3) (wrapper-value x1))))
+  (setq value (wrap-date-time (time-add (wrapper-value x1) (wrapper-value x2)))))
+
+
+;;;;
+;;;;  Time component accessors
+;;;;
+
+
+(defun (help-get-time-zone FLOAT) ((time-zone-specifier OBJECT))
+  (when (null? time-zone-specifier)
+    (return NULL))
+  (typecase time-zone-specifier
+    (STRING-WRAPPER
+     (let ((zone (lookup *zone-strings*
+                         (string-downcase (wrapper-value time-zone-specifier)))))
+       (if (null? zone)
+         (return NULL)
+         (return (wrapper-value (cast zone FLOAT-WRAPPER))))))
+    ((INTEGER-WRAPPER FLOAT-WRAPPER)
+     (return (wrapper-value time-zone-specifier)))
+    (otherwise
+     (return NULL))))
+
+(defun (dow-keyword-to-instance LOGIC-OBJECT) ((dow KEYWORD))
+  (case dow
+    (:monday    (return (surrogate-value /TIMEPOINT-KB/@MONDAY)))
+    (:tuesday   (return (surrogate-value /TIMEPOINT-KB/@TUESDAY)))
+    (:wednesday (return (surrogate-value /TIMEPOINT-KB/@WEDNESDAY)))
+    (:thursday  (return (surrogate-value /TIMEPOINT-KB/@THURSDAY)))
+    (:friday    (return (surrogate-value /TIMEPOINT-KB/@FRIDAY)))
+    (:saturday  (return (surrogate-value /TIMEPOINT-KB/@SATURDAY)))
+    (:sunday    (return (surrogate-value /TIMEPOINT-KB/@SUNDAY)))))
+
+(defun (help-extract-date-time-component OBJECT) ((timepoint DATE-TIME-LOGIC-WRAPPER)
+                                                  (time-zone FLOAT)
+                                                  (predicate GENERALIZED-SYMBOL))
+  (let ((date CALENDAR-DATE (wrapper-value timepoint)))
+    (case predicate
+      (/TIMEPOINT-KB/@TIMEPOINT-YEAR
+       (mv-bind (year month day dow) 
+                (get-calendar-date date time-zone)
+         (ignore month day dow)
+         (return year)))
+      (/TIMEPOINT-KB/@TIMEPOINT-MONTH
+       (mv-bind (year month day dow) 
+                (get-calendar-date date time-zone)
+         (ignore year day dow)
+         (return month)))
+      (/TIMEPOINT-KB/@TIMEPOINT-DAY
+       (mv-bind (year month day dow) 
+                (get-calendar-date date time-zone)
+         (ignore year month dow)
+         (return day)))
+      (/TIMEPOINT-KB/@TIMEPOINT-DAY-OF-WEEK
+       (mv-bind (year month day dow) 
+                (get-calendar-date date time-zone)
+         (ignore year month day)
+         (return (dow-keyword-to-instance dow))))
+      (/TIMEPOINT-KB/@TIMEPOINT-HOUR
+       (mv-bind (hour minute second millisecond) 
+                (get-time date time-zone)
+         (ignore minute second millisecond)
+         (return hour)))
+      (/TIMEPOINT-KB/@TIMEPOINT-MINUTE
+       (mv-bind (hour minute second millisecond) 
+                (get-time date time-zone)
+         (ignore hour second millisecond)
+         (return minute)))
+      (/TIMEPOINT-KB/@TIMEPOINT-SECOND
+       (mv-bind (hour minute second millisecond) 
+                (get-time date time-zone)
+         (ignore hour minute)
+         (if (eql? millisecond 0)
+           (return second)
+           (return (/logic/+ (cast second FLOAT)
+                             (/logic/* millisecond 0.001))))))
+      (/TIMEPOINT-KB/@TIMEPOINT-DATE
+       (return (calendar-date-to-date-string date time-zone FALSE)))
+      (/TIMEPOINT-KB/@TIMEPOINT-TIME
+       (return (calendar-date-to-time-string date time-zone TRUE TRUE TRUE)))) ))
+
+(defun (timepoint-accessor-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; If the second value is a skolem, attach a Stella TIME-OBJECT object
+  ;;    corresponding to the parsed version of the first argument.
+  (let ((proposition (proposition frame))
+        (predicate (operator proposition))
+        (timepoint-value (value-of (nth (arguments proposition) 0)))
+        (time-zone-value (value-of (nth (arguments proposition) 1)))
+        (result (logic/value-of (nth (logic/arguments proposition) 2)))
+        (timepoint (help-get-time-object timepoint-value))
+        (time-zone (help-get-time-zone time-zone-value)))
+    (ignore lastmove)
+    (exception-case
+        (cond ((or (null? timepoint) (null? time-zone))
+	       (return :FAILURE))
+              ((defined? result)
+               (let ((the-value
+                      (help-extract-date-time-component timepoint time-zone predicate)))
+                 (typecase result
+	           (LOGIC/PATTERN-VARIABLE
+	            (return (logic/select-proof-result
+                             (logic/bind-variable-to-value? result the-value true) 
+                             false true)))
+	           (LOGIC/SKOLEM
+	            (setf (logic/variable-value result) the-value)
+	            (return :final-success))
+	           (NUMBER-WRAPPER
+	            (return (logic/select-proof-result (object-eql? the-value result) 
+					               false true)))
+                   (STRING-WRAPPER
+                    (if (isa? the-value @STRING-WRAPPER)
+                      (return (logic/select-proof-result
+			       (string-equal? (wrapper-value (cast the-value STRING-WRAPPER))
+					      (wrapper-value result))
+			       false true))
+                      (return :FAILURE))))))
+	      (otherwise
+	       (return :FAILURE)))
+      (STELLA-EXCEPTION ()
+        (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+        (return :TERMINAL-FAILURE)))))
+

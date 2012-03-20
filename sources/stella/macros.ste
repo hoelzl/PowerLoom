@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: macros.ste,v 1.47 2003/10/21 00:36:54 hans Exp
+;;; Version: macros.ste,v 1.51 2006/05/11 07:06:15 hans Exp
 
 ;;; Macros that define some built-in Stella operators.
 
@@ -199,15 +199,36 @@ return TRUE if none of them are NULL."
   :documentation "If 'value1' is defined, return that, else return 'value2'."
   (return (bquote (first-defined & value1 & value2))))
 
-(defmacro collect ((collectVariable SYMBOL) &body (body CONS))
-  :documentation "Use a VRLET to collect values.  Input has the form
-'(collect <x> in <expression> where (<test> <x>))'."
+(defmacro collect (&body (body CONS))
+  :documentation "Use a VRLET to collect values.  Input can have one of
+the following forms:
+	 
+  (collect <var> in <expression> [where <test> <var>])
+  (collect <collect-expression>
+           foreach <var> in <expression>
+           {as ...}*
+           [where <test> <var>]
+           [do ...])
+	
+The second form really accepts an arbitrary `foreach' expression following
+the `foreach' keyword."
   (let ((collection (local-gensym "VALUE")))
-    (return (bquote (vrlet ((& collection NIL))
-                           (foreach & collectVariable && body
-                                    collect & collectVariable
-                                    into & collection)
-                           & collection))) ))
+    (if (and (eql? (second body) (quote FOREACH))
+             (symbol? (third body)))
+        (return
+          (bquote
+           (vrlet ((& collection NIL))
+             (foreach && (rest (rest body))
+                 collect & (first body)
+                 into & collection)
+             & collection)))
+      (return
+        (bquote
+         (vrlet ((& collection NIL))
+           (foreach & (first body) && (rest body)
+               collect & (first body)
+               into & collection)
+           & collection))))))
 
 (defmacro with-permanent-objects (&body (body CONS))
   :documentation "Allocate 'permanent' (as opposed to 'transient')
@@ -358,6 +379,7 @@ FALSE.  There can only be one DEFMAIN per module."
   (let ((processCmdLineArgs? (non-empty? varList))
         (v1Name SYMBOL (first varList))
 	(v2Name SYMBOL (second varList))
+        (mainName (intern-symbol-in-module "MAIN" *module* TRUE))
         (bodyWithHeader (cons NULL body)) ;; needed by `extract-options'
         (options (new PROPERTY-LIST
                       :the-plist (extract-options bodyWithHeader NULL)))
@@ -379,14 +401,14 @@ FALSE.  There can only be one DEFMAIN per module."
         (:common-lisp
          (return
            (bquote
-            (defun main ()
+            (defun & mainName ()
               :PUBLIC? TRUE
               && startupFunctionCall
               && body))))
         ((:cpp :cpp-standalone :idl)
          (return
            (bquote
-            (defun (main INTEGER) ()
+            (defun (& mainName INTEGER) ()
               :PUBLIC? TRUE
               && startupFunctionCall
               && body
@@ -394,7 +416,7 @@ FALSE.  There can only be one DEFMAIN per module."
         (:java
          (return
            (bquote 
-            (defun main ((& (local-gensym "ARGV") (ARRAY () of STRING)))
+            (defun & mainName ((& (local-gensym "ARGV") (ARRAY () of STRING)))
               :PUBLIC? TRUE
 	      && startupFunctionCall
 	      && body))))
@@ -405,7 +427,7 @@ FALSE.  There can only be one DEFMAIN per module."
         (:common-lisp
          (return
            (bquote 
-            (defun main (&rest (%%args STRING))
+            (defun & mainName (&rest (%%args STRING))
               :PUBLIC? TRUE
               (let ((& v1Name INTEGER
                        (verbatim :common-lisp (cl:length %%args)))
@@ -418,7 +440,7 @@ FALSE.  There can only be one DEFMAIN per module."
         (:java
          (return
            (bquote 
-            (defun main ((& v2Name (ARRAY () of STRING)))
+            (defun & mainName ((& v2Name (ARRAY () of STRING)))
               :PUBLIC? TRUE
               (let ((& v1Name INTEGER
                        (verbatim
@@ -431,7 +453,7 @@ FALSE.  There can only be one DEFMAIN per module."
         ((:cpp :cpp-standalone :idl)
          (return
            (bquote
-            (defun (main INTEGER) ((& v1Name INTEGER) (& v2Name (ARRAY () of STRING)))
+            (defun (& mainName INTEGER) ((& v1Name INTEGER) (& v2Name (ARRAY () of STRING)))
               :PUBLIC? TRUE
               && startupFunctionCall
               && body

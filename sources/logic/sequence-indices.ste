@@ -1,0 +1,404 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: sequence-indices.ste,v 1.14 2006/05/11 07:05:36 hans Exp
+
+;;; Support for paging indices from secondary storage
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Sequence and Paging Indices
+  ;;
+
+#|
+Sequence indices come in two flavors, paging and non-paging.
+Paging indices have separate slots for the regenerable and
+non-regenerable portions of sequences.  Non-paging indices
+have only one slot, for holding non-regenerable objects.
+If an index MIGHT hold both kinds of objects, then it should be
+a paging index.
+
+We adopt the following strategy for deciding
+which kind to allocate:
+   - Relation extensions are always :PAGING, because you never
+        know if a regenerable proposition might be asserted for
+        that relation.
+   - Module extensions (propositions and instances) are always
+        :PAGING.  A module associated with a persistent/regenerable
+        object store uses the non-regenerable part for storing transient
+        objects (e.g., skolems).  Possibly it should NOT instatiate
+        the regenerable sequence, so that fewer objects get pinned
+        (this decision is delegated to the underlying object store).
+   - Dependent extensions are always allocated as :PAGING (there used
+        to be an optimization to use :NON-PAGING in case the slot
+        `use-non-paging-indices?' was set on a module, however, it's not
+        clear anymore whether the minor speedup gained from that warrants
+        the extra complexity).
+   - Dependents of propositions are always allocated as :NON-PAGING,
+        for efficiency, and because they would be hard to generate.
+|#
+
+;;; see `backlinks.ste' for pattern definitions:
+(deftype SELECTION-PATTERN CONS)
+
+(defclass SEQUENCE-INDEX (STANDARD-OBJECT)
+  :documentation "Abstract class for managing a sequence of objects."
+  :parameters ((any-value :type OBJECT))
+  :abstract? TRUE
+  :slots ((the-sequence :type CONS :initially NIL)
+          (the-sequence-length :type INTEGER :initially NULL))
+  :print-form (print-sequence-index self stream))
+
+(defclass NON-PAGING-INDEX (SEQUENCE-INDEX)
+  :documentation "Index that manages an always-in-memory data
+strucure containing a sequence of objects.")
+
+(defclass PAGING-INDEX (SEQUENCE-INDEX)
+  :documentation "Index that manages a sequence of objects retrievable from
+persistent storage.  Needs to be appropriately subclassed by actual store
+implementations and facilitated with a proper iterator class."
+  :slots ((selection-pattern :type SELECTION-PATTERN)
+          (store :type OBJECT-STORE))
+  :print-form (print-paging-index self stream))
+
+(defconstant NIL-NON-PAGING-INDEX NON-PAGING-INDEX (new NON-PAGING-INDEX)
+  :documentation "Returns a non-writable empty sequence.")
+
+(defconstant NIL-PAGING-INDEX PAGING-INDEX
+  (new PAGING-INDEX
+       :selection-pattern (quote (:NIL-SEQUENCE)))
+  :documentation "Returns a non-writable empty sequence.")
+
+(defmethod insert ((self SEQUENCE-INDEX) (value (LIKE (any-value self))))
+  :public? TRUE
+  ;; Add a new item to the index 'self'.  Don't check for duplicates.
+  (safety 1 (not (eql? self NIL-NON-PAGING-INDEX)) 
+          "Attempt to insert into NIL-NON-PAGING-INDEX")
+  (setf (the-sequence self) (cons value (the-sequence self)))
+  ;; update cached length:
+  (let ((length (the-sequence-length self)))
+    (when (defined? length)
+      (setf (the-sequence-length self) (1+ length)))))
+
+(defmethod push ((self SEQUENCE-INDEX) (value (LIKE (any-value self))))
+  :public? TRUE
+  ;; Add a new item to the index 'self'.  Don't check for duplicates.
+  (insert self value) )
+
+(defmethod (first OBJECT) ((self SEQUENCE-INDEX))
+  :public? TRUE
+  ;; Return the first item in 'self', if there is one.
+  (foreach item in self do (return item))
+  (return NULL))
+
+(defmethod (empty? BOOLEAN) ((self SEQUENCE-INDEX))
+  :public? TRUE
+  ;; Return TRUE if there are no items in 'self'.
+  (when (empty? (the-sequence self))
+    (return TRUE))
+  (when (not (deleted? (first (the-sequence self))))
+    (return FALSE))
+  (remove-deleted-members self)
+  (return (empty? (the-sequence self))))
+
+(defmethod (estimated-length INTEGER) ((self SEQUENCE-INDEX))
+  ;; Return the length of 'self', or an estimation if computing
+  ;;    the length would be too expensive.
+  (return (SEQUENCE-INDEX.estimated-length self)))
+
+(defun (SEQUENCE-INDEX.estimated-length INTEGER) ((self SEQUENCE-INDEX))
+  ;; Return an estimate of the non-paging length of `self'.
+  (let ((length (the-sequence-length self)))
+    (when (null? length)
+      (setq length (length (the-sequence self))) ;; might count deleted props
+      (setf (the-sequence-length self) length))
+    (return length)))
+
+(defmethod (remove-deleted-members (LIKE self)) ((self SEQUENCE-INDEX))
+  :public? TRUE
+  ;; Remove all members of 'self' marked 'deleted?'.
+  ;; For sequence indices, this is advisory only.  Paging indices
+  ;;    will ignore this particular command.
+  (let ((sequence (remove-deleted-members (the-sequence self))))
+    (setf (the-sequence self) sequence)
+    ;; invalidate cached length:
+    (setf (the-sequence-length self) NULL)
+    (return self)))
+
+(defmethod (remove (LIKE self)) ((self SEQUENCE-INDEX) (value OBJECT))
+  ;; Remove 'value' from the sequence 'self'.
+  (setf (the-sequence self) (remove (the-sequence self) value))
+  ;; invalidate cached length:
+  (setf (the-sequence-length self) NULL)
+  (return self))
+
+(defmethod (consify (CONS OF (LIKE (any-value self)))) ((self SEQUENCE-INDEX))
+  ;; Collect all elements of 'self' into a cons list.
+  (return (collect i in self)) )
+
+(defun print-sequence-index ((self SEQUENCE-INDEX) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print out the first few elements of `self'.
+  (let ((limit 10))
+    (print-stream stream "|SEQ-IDX|(")
+    (foreach elt in (the-sequence self)
+        as i in (interval 1 limit)
+        do (when (> i 1)
+             (print-stream stream " "))
+           (print-stream stream elt)
+           (when (= i limit)
+             (print-stream stream "...")))
+    (print-stream stream ")")))
+
+(defclass SEQUENCE-INDEX-ITERATOR (ITERATOR)
+  :documentation
+  "Iterator that generates successive members of a sequence index."
+  :parameters ((any-value :type OBJECT))
+  :slots ((list-iterator-cursor :type CONS)))
+
+(defmethod (allocate-iterator (ITERATOR OF (LIKE (any-value self))))
+    ((self SEQUENCE-INDEX))
+  ;; Return an iterator that generates the elements of `self'.
+  (return (new SEQUENCE-INDEX-ITERATOR
+               :list-iterator-cursor (the-sequence self))))
+
+(defmethod (next? BOOLEAN) ((self SEQUENCE-INDEX-ITERATOR))
+  ;; Advance to the next (non-deleted) member of 'self'.
+  (let ((cursor (list-iterator-cursor self))
+        (value OBJECT NULL))
+    (loop
+      (when (nil? cursor)
+        (return FALSE))
+      (setq value (value cursor))
+      (when (not (deleted? value))
+        (setf (slot-value self value) value) 
+        (setf (list-iterator-cursor self) (rest cursor))
+        (return TRUE))
+      (setq cursor (rest cursor))) ))
+
+(defmethod (empty? BOOLEAN) ((self SEQUENCE-INDEX-ITERATOR) )
+  ;; Return TRUE if 'self' has no more elements.
+  (return (empty? (list-iterator-cursor self))))
+
+
+;;; Methods on Non-Paging Indices
+
+(defmethod (copy NON-PAGING-INDEX) ((self NON-PAGING-INDEX))
+  ;; Return a shallow copy of 'self'.
+  (return (new NON-PAGING-INDEX 
+               :the-sequence (copy-cons-list (the-sequence self)))) )
+
+(defmethod clear ((self NON-PAGING-INDEX))
+  ;; Return a shallow copy of 'self'.
+  (setf (the-sequence self) NIL) )
+
+
+;;; Paging indices
+
+;;; These mostly mirror the methods for non-paging SEQUENCE-INDEX'es.
+;;; They need to be appropriately implemented on specializations
+;;; of PAGING-INDEX.
+
+(defmethod insert ((self PAGING-INDEX) (value (LIKE (any-value self))))
+  ;; Add a new item to the index 'self'.  Don't check for duplicates.
+  :public? TRUE
+  (safety 1 (not (eql? self NIL-PAGING-INDEX)) 
+          "Attempt to insert into NIL-PAGING-INDEX")
+  (setf (the-sequence self) (cons value (the-sequence self))))
+
+(defmethod push ((self PAGING-INDEX) (value (LIKE (any-value self))))
+  ;; Add a new item to the index 'self'.  Don't check for duplicates.
+  :public? TRUE
+  (insert self value))
+
+(defmethod (estimated-length INTEGER) ((self PAGING-INDEX))
+  :documentation "Return the estimated length of the sequences in 'self',
+which could be too large if some of the members have been deleted."
+  :public? TRUE
+  (let ((length (the-sequence-length self)))
+    (when (null? length)
+      (setq length (length (the-sequence self))) ;; might count deleted props
+      (setf (the-sequence-length self) length))
+    (return length)))
+
+(defmethod (remove-deleted-members (LIKE self)) ((self PAGING-INDEX))
+  :documentation "Destructively remove all deleted members of `self'."
+  :public? TRUE
+  (let ((sequence (remove-deleted-members (the-sequence self))))
+    (setf (the-sequence self) sequence)
+    ;; invalidate cached length:
+    (setf (the-sequence-length self) NULL)
+    ;; don't do anything for the paging portion of the index:
+    (return self)))
+
+(defmethod (remove (LIKE self)) ((self PAGING-INDEX) (value OBJECT))
+  ;; Remove 'value' from the sequence 'self'.
+  ;; To properly handle removal from the paging portion of the index - if that's
+  ;;    necessary - the particular store implementation has to override this.
+  (let ((sequence (remove (the-sequence self) value)))
+    (setf (the-sequence self) sequence)
+    ;; invalidate cached length:
+    (setf (the-sequence-length self) NULL)
+    (return self)))
+
+(defun print-paging-index ((self PAGING-INDEX) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print out the first few elements of 'self'.
+  (let ((limit 10))
+    (print-stream stream "|PAGING-IDX|(" (selection-pattern self))
+    (foreach elt in (the-sequence self)
+        as i in (interval 1 limit)
+        do (print-stream stream " " elt)
+           (when (= i limit)
+             (print-stream stream "...")))
+    (print-stream stream ")")))
+
+(defclass PAGING-INDEX-ITERATOR (SEQUENCE-INDEX-ITERATOR)
+  :documentation
+  "Iterator that generates successive members of a paging index."
+  :parameters ((any-value :type OBJECT)))
+
+(defmethod (allocate-iterator (ITERATOR OF (LIKE (any-value self))))
+    ((self PAGING-INDEX))
+  ;; Return an iterator that generates the elements of `self'.
+  (return (new PAGING-INDEX-ITERATOR
+               :list-iterator-cursor (the-sequence self))))
+
+
+  ;;
+;;;;;; Creating sequence indices and connecting modules
+;;;;;; with (potentially persistent) object stores
+  ;;
+
+(defclass OBJECT-STORE (STANDARD-OBJECT)
+  :abstract? TRUE
+  :slots ((module :type MODULE)))
+
+(defslot MODULE object-store :type OBJECT-STORE)
+
+(defspecial *loadingRegenerableObjects?* BOOLEAN FALSE
+  :documentation "If TRUE, objects being created are regenerable,
+and should not be indexed using the backlinks procedures.")
+
+(defun (home-object-store OBJECT-STORE) ((self OBJECT))
+  ;; Return the object store with which `self' is associated, or NULL
+  ;;    if no such association exists.
+  (let ((module (home-module self)))
+    (return (choose (defined? module)
+                    (object-store module)
+                    NULL))))
+
+(defun (create-sequence-index SEQUENCE-INDEX) 
+    ((self OBJECT) (pattern SELECTION-PATTERN))
+  ;; Create a sequence index for `pattern' relative to `self' which can be
+  ;;    a module, a keyword or a persistent object store.
+  ;; This is a bit clumsy, since we can't have methods on STELLA types.
+  (typecase self
+    (KEYWORD
+     (return (KEYWORD.create-sequence-index self pattern)))
+    (MODULE
+     (return (MODULE.create-sequence-index self pattern)))
+    (OBJECT-STORE
+     (return (OBJECT-STORE.create-sequence-index self pattern)))
+    (otherwise
+     (error "Don't know how to create a sequence index on " self))))
+  
+(defun (KEYWORD.create-sequence-index SEQUENCE-INDEX) 
+    ((kind KEYWORD) (pattern SELECTION-PATTERN))
+  ;; Create and return a new (empty) paging or non-paging index.
+  (case kind
+    (:PAGING
+     (let ((anchor (first (pattern-arguments pattern)))
+           (store OBJECT-STORE NULL))
+       (safety 1 (defined? anchor)
+               "Null argument passed into paging index pattern")
+       (setq store (home-object-store anchor))
+       (if (defined? store)
+           (return (create-sequence-index store pattern))
+         (return (new NON-PAGING-INDEX)))))
+    (:NON-PAGING
+     (return (new NON-PAGING-INDEX)))))
+
+(defun (MODULE.create-sequence-index SEQUENCE-INDEX) 
+       ((module MODULE) (pattern SELECTION-PATTERN))
+  ;; Create and return a new paging index.
+  (let ((store (object-store module)))
+    (if (defined? store)
+        (return (create-sequence-index store pattern))
+      (return (create-sequence-index :PAGING pattern)))))
+
+(defmethod (OBJECT-STORE.create-sequence-index SEQUENCE-INDEX)
+    ((store OBJECT-STORE) (pattern SELECTION-PATTERN))
+  ;; Create a paging index for the persistent store `store'.  This needs to
+  ;;    be appropriately specialized on actual OBJECT-STORE implementations.
+  ;; TO DO: FIGURE OUT A BETTER NAME FOR THIS.
+  (return (new PAGING-INDEX
+               :store store
+               :selection-pattern pattern)))
+
+(defmethod (fetch-relation NAMED-DESCRIPTION) ((store OBJECT-STORE) (name OBJECT))
+  :documentation
+  "Fetch the relation identified by `name' (a string or symbol) from `store'
+and return it as a named description.  This needs to be appropriately 
+specialized on actual OBJECT-STORE implementations."
+  :public? TRUE
+  (error "Don't know how to fetch relation " name " from " store))
+
+(defmethod (fetch-instance OBJECT) ((store OBJECT-STORE) (name OBJECT))
+  :documentation
+  "Fetch the instance identified by `name' (a string or symbol) from `store'
+and return it as an appropriate logic object.  This needs to be appropriately
+specialized on actual OBJECT-STORE implementations."
+  :public? TRUE
+  (error "Don't know how to fetch instance " name " from " store))
+
+(defmethod update-proposition-in-store ((store OBJECT-STORE)
+					(proposition PROPOSITION)
+					(update-mode KEYWORD))
+  :documentation "A module with `store' has had the truth value of `proposition'
+change according to `update-mode'.  The default method does nothing."
+  :public? TRUE
+  (ignore proposition update-mode)
+  (return))
+

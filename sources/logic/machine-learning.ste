@@ -1,0 +1,991 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: machine-learning.ste,v 1.22 2006/05/11 07:05:22 hans Exp
+
+;;; General machine learning support
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(defclass TRAINING-EXAMPLE (Standard-Object)
+  :documentation "A single example of a proposition paired with the score
+  that should be returned and the module it should be evaluated in."
+  :slots 
+  ((query :type CONS)
+   (concept :type SYMBOL)  ;; what concept are you trying to learn
+   (name :type SYMBOL)
+   (score :type PARTIAL-MATCH-SCORE)
+   (module :type MODULE)
+   (input-features :type LIST)
+   (input :type VECTOR)
+   (facts :type (CONS of CONS))
+   ;; the pattern in the classification nn hid layer.
+   (nn-hidden :type (VECTOR of FLOAT-WRAPPER))
+   (output :type OBJECT)
+   (temp :type FLOAT) ;; misc storage
+   (cached-solution :type OBJECT)
+   (timestamp :type TIMESTAMP))
+  )
+;;  :print-form (print-training-example self)) 
+
+  
+(defglobal *Training-Examples* (List of TRAINING-EXAMPLE) 
+	   (new list))
+
+(defglobal *Testing-Examples* (List of TRAINING-EXAMPLE) 
+	   (new list))
+
+(defglobal *Closed-World-Training-Examples* BOOLEAN TRUE)
+
+(defun set-closed-world-training-examples ((b boolean))
+  :command? TRUE
+  (setq *Closed-World-Training-Examples* b))
+
+(defun print-training-example ((example TRAINING-EXAMPLE))
+  (print (query example) " in " (module example) EOL))
+
+(defun add-training-example ((form CONS) (score PARTIAL-MATCH-SCORE))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  :documentation "Add a query and score pair to the master list of 
+  training examples"
+  (let ((example (new TRAINING-EXAMPLE)))
+    (setf (query example) (copy-cons-list form))
+    (setf (score example) score)
+    (push *Training-Examples* example)))
+
+(defun add-training-example-in-module ((form CONS) (score PARTIAL-MATCH-SCORE)
+				       (module SYMBOL))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  (setq module (permanentify module))
+  (let ((example (new TRAINING-EXAMPLE)))
+    (setf (query example) (copy-cons-list form))
+    (setf (score example) score)
+    (setf (module example) (get-module module))
+    (push *Training-Examples* example)))
+				       
+
+(defun add-testing-example ((form CONS) (score PARTIAL-MATCH-SCORE))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  :documentation "Add a query and score pair to the master list of 
+  testing examples"
+  (let ((example (new TRAINING-EXAMPLE)))
+    (setf (query example) (copy-cons-list form))
+    (setf (score example) score)
+    (push *Testing-Examples* example)))
+
+(defun clear-training-examples ()
+  :command? TRUE  :public? TRUE
+  (setq *training-examples* (new list)))
+
+(defun shuffle-list ((cards list))
+  ;; Randomize items in the list
+  (let ((num (length cards))
+	(stop (/ num 2.0))
+	(temp OBJECT null)
+	(i 0)
+	(one integer 0)
+	(two integer 0))
+    (while (< i stop)
+      (++ i)
+      (setq one (random num))
+      (setq two (random num))
+      (setq temp (nth cards one))
+      (setf (nth cards one) (nth cards two))
+      (setf (nth cards two) temp))))
+
+(defun shuffle-vector ((cards vector))
+  ;; Randomize items in the vector
+  ;; There's got to be a common parent class between vectors and lists that
+  ;; this could be written for.
+  (let ((num (length cards))
+	(stop (/ num 2.0))
+	(temp OBJECT null)
+	(i 0)
+	(one integer 0)
+	(two integer 0))
+    (while (< i stop)
+      (++ i)
+      (setq one (random num))
+      (setq two (random num))
+      (setq temp (nth cards one))
+      (setf (nth cards one) (nth cards two))
+      (setf (nth cards two) temp))))
+
+;;
+;; Code for creating propositional training examples from queries
+;;
+
+;; First, make sure that all of the outputs are saved in the
+;; *training-examples*.  Do this by calling fill-in-example-outputs.
+;; Next, call save-training-examples.
+
+(defun save-training-examples ()
+  :command? TRUE  :public? TRUE
+  (let ((name-file (new OUTPUT-FILE-STREAM :filename "training.names"))
+	(data-file (new OUTPUT-FILE-STREAM :filename "training.data")))
+    (create-propositional-training-examples *training-examples*
+					   name-file data-file)
+    (free name-file)
+    (free data-file)))
+
+(defun (create-propositional-training-examples INTEGER)
+    ((examples (list of TRAINING-EXAMPLE))
+     (name-file OUTPUT-FILE-STREAM) (data-file OUTPUT-FILE-STREAM))
+  ;; create-propositional-training-examples generates a propositional
+  ;; input vector from queries.  The query is limited to a single
+  ;; arity relation (or concept) applied to instances of a specified
+  ;; class.  The output is in the format suitable for Quinlan's c4.5
+  ;; program.  The file-prefix will be used to generate .data and .names
+  ;; files
+  (let ((num-inputs 0)
+	(home *module*)
+	(temp 0)
+	(input (VECTOR of INTEGER-WRAPPER) NULL))
+    
+    ;; write to data file
+    (foreach example in examples do
+	(when (not (null? (module example)))
+	  (change-module (module example)))
+	(setq input (create-input-signature (query example)))
+	(setf (input example) input)
+	(change-module home)
+	(foreach ele in input do
+	      (setq temp ele)
+	      (print-stream data-file temp ","))
+	
+;;	(if (cast (output example) BOOLEAN-WRAPPER)
+;;	    (print-stream data-file "true." EOL)
+;;	  (print-stream data-file "false." EOL))
+	(print-stream data-file (output example) EOL))
+
+    (setq num-inputs (length input))
+    ;; create names file
+    (print-stream name-file "true,false" EOL)
+    (foreach i in (interval 0 (1- num-inputs)) do
+	  (print-stream name-file "A" (stringify i) ":  1,0" EOL))
+    (return num-inputs)))
+
+(defun fill-in-example-outputs ((examples (list of training-example))
+				(slot-name SYMBOL))
+  (let ((slot (surrogate-value-inverse (get-description slot-name)))
+	(slot-value OBJECT NULL)
+	(instance LOGIC-OBJECT NULL))
+    (foreach example in examples do
+       (when (defined? (module example))
+	 (change-module (module example)))
+       (setq instance (get-instance (second (query example))))
+       (setq slot-value (get-slot-value instance slot))
+       (setf (output example) slot-value))))
+
+
+(defun detect-noise-in-training-examples ((examples (list of TRAINING-EXAMPLE)))
+  ;; Determines if there are training examples with the same input and 
+  ;; different output.
+  (let ((home *module*)
+	(sig-length 0)
+	(same BOOLEAN true))
+    ;; make sure all examples have input signatures
+    (foreach example in examples 
+	where (null? (input example)) do
+	  (when (not (null? (module example)))
+	    (change-module (module example)))
+	  (setf (input example) (create-input-signature (query example)))
+	  (change-module home))
+    (setq sig-length (length (input (first examples))))
+    (foreach example1 in examples do
+       (foreach example2 in examples do
+	  (setq same true)
+	  (foreach k in (interval 0 (1- sig-length)) do
+	     (when (not (eql? (nth (input example1) k)
+			   (nth (input example2) k)))
+	       (setq same false)
+	       (break)))
+	  (when (and same (not (eql? (output example1) (output example2))))
+	    (print (last (query example1)) " and " (last (query example2)) " have the same input but different output" EOL))))))
+
+(defun (get-classification-relations (list of PROPOSITION)) ((cons-query CONS))
+  ;; Returns a list of propositions that denote the antecedent of the
+  ;; classification rule
+  (let ((query (make-query NIL (copy-cons-tree cons-query) NIL NIL))
+	(result (new (LIST OF PROPOSITION)))
+	(pmf INCREMENTAL-PARTIAL-MATCH NULL))
+    (insert-at (options query) :MATCH-MODE :BASIC)
+    (insert-at (options query) :MAXIMIZE-SCORE? TRUE-WRAPPER)
+    (call-ask-partial query)
+    ;; THIS IS UGLY AND VERY FRAGILE (hc):
+    ;; first pmf is :pattern, second :strategies, third :and
+    (setq pmf (child (child (partial-match-frame (base-control-frame query)))))
+    (foreach prop in (cast (arguments (proposition (control-frame pmf))) 
+			   (VECTOR OF PROPOSITION))
+	collect prop into result)
+    (return result)))
+
+(defun (create-input-signature (VECTOR of INTEGER-WRAPPER)) ((cons-query CONS))
+  ;; create-input-signature generates a propositional input vector for
+  ;; a particular query.  This works by calling the partial matcher
+  ;; and then recording the truth value of the antecedent of the first
+  ;; rule backchained on.
+  (let ((query (make-query NIL (copy-cons-tree cons-query) NIL NIL))
+	(pmf INCREMENTAL-PARTIAL-MATCH NULL)
+	(arg-scores NIL)
+	(signature (VECTOR of INTEGER-WRAPPER) NULL))
+    (setq *Fail-Unbound-Clauses?* TRUE) ;; need to enforce structure
+    (insert-at (options query) :MATCH-MODE :BASIC)
+    (insert-at (options query) :MAXIMIZE-SCORE? TRUE-WRAPPER)
+    (call-ask-partial query)
+    ;; THIS IS UGLY AND VERY FRAGILE (hc):
+    ;; first pmf is :pattern, second :strategies, third :and
+    (setq pmf (child (child (partial-match-frame (base-control-frame query)))))
+    (setq arg-scores (argument-scores pmf))
+    (setq signature (new (VECTOR of INTEGER-WRAPPER) 
+			 :array-size (length arg-scores)))
+    (foreach score in (reverse arg-scores)
+	as i in (interval 0 NULL) do
+	  (if (eql? score (wrap-literal 1.0))
+	      (setf (nth signature i) 1)
+	    (setf (nth signature i) 0)))
+    (return signature)))
+
+
+;;
+;; Code for creating classification rules and input signatures for
+;; running arbitrary propositional machine learning algorithms
+;;
+
+(defun generate-classification-rule ((instances (VECTOR of LOGIC-OBJECT))
+				     (concept-name SYMBOL)
+				     (class-name SYMBOL)
+				     (build-rule? BOOLEAN))
+  ;; this function will build a rule with the generalized structured
+  ;; of the given instances as the antecedent
+  (let ((num-instances (length instances))
+	(kind (surrogate-value-inverse (get-description class-name)))
+	(name SYMBOL NULL)
+	(prop PROPOSITION NULL)
+	(function-values? *Drop-Function-Values?*))
+
+    (setq *Drop-Function-Values?* false) ;; need these values
+    (foreach i in (interval 0 (1- num-instances)) do
+	  ;; need to get all directly asserted facts about the concept.
+	  ;; We will delete this information when we build our rule so we 
+	  ;; don't learn stupid things like (happy ?x) -> (happy ?x).
+	  (setq name (object-name (nth instances i)))
+          (setq prop (conceive-formula (cons-list concept-name name)))
+	  (when (true? prop)
+	    (help-update-top-level-proposition prop :retract-true)
+	    (build-case-from-instance (nth instances i) kind)
+	    (help-update-top-level-proposition prop :assert-true))
+	  (when (false? prop)
+	    (help-update-top-level-proposition prop :retract-false)
+	    (build-case-from-instance (nth instances i) kind)
+	    (help-update-top-level-proposition prop :assert-false)))
+    (setq *Drop-Function-Values?* function-values?) ;; restore
+    (when Build-Rule?
+      (build-classification-rule concept-name class-name))))
+
+
+(defun build-classification-rule ((kind SYMBOL) (class-name symbol))
+  ;; Build the classification rule from the cons version
+  (let ((rule-name (intern-symbol (concatenate (symbol-name kind) 
+					       "-Classification-Rule")))
+	(relation-name (intern-symbol (concatenate (symbol-name kind) 
+					       "-Classification")))
+	(index (concatenate (symbol-name class-name) "-match"))
+	(rule-antecedent (lookup *Case-Antecedent-Table* index))
+	(converted-antecedent nil)
+	(rule-types (lookup *Case-Types-Table* index))
+	(converted-types nil)
+	(relation (bquote (defrelation & relation-name ((?p thing)))))
+	(rule nil))
+
+    ;; we only need the clauses for one variable
+    (foreach clause in rule-antecedent 
+	collect clause into converted-antecedent)
+    (foreach type in rule-types
+	collect type into converted-types)
+    
+    (setq rule (bquote 
+		(defrule & rule-name
+		  (forall & converted-types
+		    (=> (and && converted-antecedent)
+			(& relation-name /logic/?Y)))
+		  :dont-optimize? TRUE))) 
+    (when *Log-Match-Rules*
+      (print rule EOL))
+    (print "Building classification rule with " (length converted-antecedent) " clauses and " (length converted-types) " variables" EOL)
+    (when (not (empty? rule-antecedent))
+      (evaluate-logic-command relation false)
+      (evaluate-logic-command rule false))))
+
+
+(defun (old-generate-classification-training-examples INTEGER)
+    ((instances (VECTOR of LOGIC-OBJECT)) (concept SURROGATE))
+  (let ((num-instances (length instances))
+	(cons-query nil)
+	(target false)
+	(concept-name (intern-symbol (symbol-name concept))))
+    
+    (foreach i in (interval 0 (1- num-instances)) do
+       (let ((example (new TRAINING-EXAMPLE)))
+	 (setq target
+	   (true-truth-value? 
+            (call-ask  
+             (make-query nil (cons-list concept-name
+				        (object-name (nth instances i))) nil nil))))
+	 (setq cons-query (cons-list (intern-symbol
+				      (concatenate (symbol-name concept-name)
+						   "-Classification"))
+				     (object-name (nth instances i))))
+	 (setf (query example) cons-query)
+	 (setf (output example) target)
+	 (setf (concept example) concept-name)
+	 (setf (name example) (object-name (nth instances i)))
+	 (setf (module example) *module*)
+	 ;; need to collect the input signature here
+	 (setf (input example) (create-input-signature cons-query))
+	 (setf (timestamp example) -1)
+	 (push *Training-Examples* example)))
+    (return num-instances)))
+
+
+(defun test-domain-theory ((relation-name SYMBOL) (class-name SYMBOL))
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  (let ((class (surrogate-value-inverse (get-description class-name)))
+	(prop PROPOSITION NULL)
+	(cons-query nil)
+	(query QUERY-ITERATOR NULL)
+	(instances (listify (all-class-instances class)))
+	(correct? BOOLEAN TRUE)
+	(num-correct 0))
+    (foreach instance in instances do
+       (setq cons-query (cons-list relation-name (object-name instance)))
+       (setq prop (conceive-formula (copy-cons-tree cons-query)))
+	;; if the query is asserted true, retract it and see if you
+       ;; can infer it.
+       (setq correct? TRUE)
+       (when (true? prop)
+	  (print cons-query " is true" EOL)
+	  (help-update-top-level-proposition prop :retract-true)
+	  (setq query (make-query nil (copy-cons-tree 
+				       (bquote (not & cons-query))) nil nil))
+	  (when	(true-truth-value? (call-ask query))
+	    (setq correct? FALSE)
+	    (print "  **Theory disproves " cons-query " true" EOL))
+	  (setq query (make-query nil (copy-cons-tree cons-query) nil nil))
+	  (when	(unknown-truth-value? (call-ask query))
+	    (setq correct? FALSE)
+	    (print "  **Theory cannot prove " cons-query EOL))
+	  (help-update-top-level-proposition prop :assert-true))
+	;; Do the same for its negation
+       (when (false? prop)
+	  (print cons-query " is false" EOL)
+	  (help-update-top-level-proposition prop :retract-false)
+	  (setq query (make-query nil (copy-cons-tree cons-query) nil nil))
+	  (when	(true-truth-value? (call-ask query))
+	    (setq correct? FALSE)
+	    (print "  **Theory proves " cons-query "true" EOL))
+	  (setq query (make-query nil (copy-cons-tree 
+				   (bquote (not & cons-query))) nil nil))
+	  (when (unknown-truth-value? (call-ask query))
+	    (setq correct? FALSE)
+	    (print "  **Theory cannot disprove " cons-query EOL))
+	  (help-update-top-level-proposition prop :assert-false))
+       (when correct?
+	 (++ num-correct)))
+    (print EOL "Theory got " num-correct " out of " (length instances) EOL)))
+
+
+(defun (test-theory-over-examples FLOAT) 
+    ((examples (LIST of TRAINING-EXAMPLE)))
+  (let ((correct 0.0)
+	(query QUERY-ITERATOR NULL)
+	(cons-query nil)
+	(prop PROPOSITION NULL))
+    (foreach example in examples do
+       (setq cons-query (copy-cons-tree (query example)))
+       (setq prop (conceive-formula (copy-cons-tree cons-query)))
+       (setq query (make-query nil (copy-cons-tree (query example)) nil nil))
+       (typecase (output example)
+	 (BOOLEAN
+	  (if (output example)
+	      (progn
+		(help-update-top-level-proposition prop :retract-true)
+		(when (true-truth-value? (call-ask query))
+		  (++ correct))
+		(help-update-top-level-proposition prop :assert-true))
+	      (progn
+	        (help-update-top-level-proposition prop :retract-false)
+                ;; *** Should this be (not (true-truth-value? (call-ask query))) ??
+	        (when (unknown-truth-value? (call-ask query))  
+		  (++ correct))
+	        (help-update-top-level-proposition prop :assert-false))))
+	 (otherwise nil)))
+    (return (/ correct (length examples)))))
+	     
+
+(defun (generate-training-examples INTEGER)
+    ((instances (VECTOR of LOGIC-OBJECT)) 
+     (concept SURROGATE))
+    (let ((num-instances (length instances))
+	  (cons-query nil)
+	  (num-examples 0)
+	  (example TRAINING-EXAMPLE NULL)
+	  (prop PROPOSITION NULL)
+	  (query QUERY-ITERATOR NULL)
+	  (concept-name (intern-symbol (symbol-name concept))))
+    
+    (foreach i in (interval 0 (1- num-instances)) do
+	(setq cons-query (cons-list concept-name 
+				    (object-name (nth instances i))))
+
+	(setq prop (conceive-formula (copy-cons-tree cons-query)))
+	(setq example NULL)
+	;; if the query is asserted true, retract it and see if you
+	;; can infer it.  If you can, you already have a rule and don't 
+	;; need to learn this example.  If you cannot, add it to your 
+	;; training examples.
+	(if (true? prop)
+	    (progn
+	      (help-update-top-level-proposition prop :retract-true)
+	      (setq query (make-query nil (copy-cons-tree cons-query) nil nil))
+	      (when (unknown-truth-value? (call-ask query))
+		(setq example (new TRAINING-EXAMPLE))
+		(setf (query example) cons-query)
+		(setf (output example) true)
+		(setf (concept example) concept-name)
+		(setf (name example) (object-name (nth instances i)))
+		(setf (score example) 1.0))
+	      (help-update-top-level-proposition prop :assert-true))
+	  (when (or (false? prop)
+		    *Closed-World-Training-Examples*)
+	    (progn
+	      (setq example (new TRAINING-EXAMPLE))
+	      (setf (query example) cons-query)
+	      (setf (output example) false) 
+	      (setf (concept example) concept-name)
+	      (setf (name example) (object-name (nth instances i)))
+	      (setf (score example) 0.0))))
+
+	(when (not (null? example))
+	  (setf (module example) *module*)
+	  (setf (timestamp example) -1)
+	  (++ num-examples)
+	  (push *Training-Examples* example)))
+;;    (print "Adding " num-examples " training examples; Rejecting " 
+;;	   (- num-instances num-examples) " because they are already covered" 
+;;	   EOL)
+    (return num-examples)))
+
+(defun (generate-classification-training-examples INTEGER)
+    ((instances (VECTOR of LOGIC-OBJECT)) (concept SURROGATE)
+     (create-signature? BOOLEAN))
+  ;; Generates a set of training example for learning to predict
+  ;; concept membership for a set of instances.  This version only generates
+  ;; training examples for instances which have been explicitly asserted
+  ;; to be a member of that concept.  If it is an inferred member, we do
+  ;; not want training examples because we already have a rule that
+  ;; gives us that inference.  Basically, we are learning on top of the
+  ;; existing rule structure.
+  (let ((num-instances (length instances))
+	(cons-query nil)
+	(num-examples 0)
+	(example TRAINING-EXAMPLE NULL)
+	(prop PROPOSITION NULL)
+	(classification-query nil)
+	(query QUERY-ITERATOR NULL)
+	(concept-name (intern-symbol (symbol-name concept))))
+    
+    (foreach i in (interval 0 (1- num-instances)) do
+	(setq cons-query (cons-list concept-name 
+				    (object-name (nth instances i))))
+	(setq classification-query 
+	  (cons-list (intern-symbol
+		      (concatenate (symbol-name concept-name)
+				   "-Classification"))
+		     (object-name (nth instances i))))	
+
+	(setq prop (conceive-formula (copy-cons-tree cons-query)))
+	(setq example NULL)
+	;; if the query is asserted true, retract it and see if you
+	;; can infer it.  If you can, you already have a rule and don't 
+	;; need to learn this example.  If you cannot, add it to your 
+	;; training examples.
+	(if (true? prop)
+	    (progn
+	     (help-update-top-level-proposition prop :retract-true)
+	     (setq query (make-query nil (copy-cons-tree cons-query) nil nil))
+	     (when (unknown-truth-value? (call-ask query))
+	       (setq example (new TRAINING-EXAMPLE))
+	       (setf (query example) classification-query)
+	       (setf (output example) true)
+	       (setf (concept example) concept-name)
+	       (setf (name example) (object-name (nth instances i)))
+	       (setf (score example) 1.0))
+	     (help-update-top-level-proposition prop :assert-true))
+	  (when (or (false? prop)
+		    *Closed-World-Training-Examples*)
+	    (progn
+	      (setq example (new TRAINING-EXAMPLE))
+	      (setf (query example) classification-query)
+	      (setf (output example) false) 
+	      (setf (concept example) concept-name)
+	      (setf (name example) (object-name (nth instances i)))
+	      (setf (score example) 0.0))))
+
+	(when (not (null? example))
+	  (when create-signature?
+	    ;; need to collect the input signature here
+	    (setf (input example)
+	      (create-input-signature classification-query)))
+	  (setf (module example) *module*)
+	  (setf (timestamp example) -1)
+	  (++ num-examples)
+	  (push *Training-Examples* example)))
+;;    (print "Adding " num-examples " training examples; Rejecting " 
+;;	   (- num-instances num-examples) " because they are already covered" 
+;;	   EOL)
+    (return num-examples)))
+
+
+;;;
+;;; Code for structured regression.  
+;;;
+
+;;; This code will form a rule and train a neural network to predict a
+;;; floating point slot value for a give class of instances.
+
+
+(defun generate-regression-rule-wo-slot ((cases (VECTOR of LOGIC-OBJECT))
+					 (slot-name SYMBOL)
+					 (class-name symbol)
+					 (really-build-rule BOOLEAN))
+  ;; this function will build a rule with the generalized structured
+  ;; of the given cases as the antecedent and the slot-name as the
+  ;; consequent
+  (let ((num-cases (length cases))
+	(kind (surrogate-value-inverse (get-description class-name)))
+	(case-names (new (LIST OF SYMBOL)))
+	(slot (surrogate-value-inverse (get-description slot-name)))
+	(slot-values (new (VECTOR of OBJECT) :array-size num-cases))
+	(function-values? *Drop-Function-Values?*))
+
+    (setq *Drop-Function-Values?* false) ;; need these values
+
+    (foreach case in cases
+	collect (object-name case) into case-names)
+
+    (foreach case in cases 
+	as case-name in case-names
+	as i in (interval 0 NULL) do
+	  (let ((val (get-slot-value case slot)))
+	    (setf (nth slot-values i) val)
+	    (when (not (null? val))
+	      ;; don't build rule with slot you are trying to predict
+	      (smart-update-proposition 
+	       (bquote (& slot-name & case-name & val)) :retract-true))))
+    
+    (foreach i in (interval 0 (1- num-cases)) 
+	where (not (null? (nth slot-values i))) do
+	  (build-case-from-instance (nth cases i) kind))
+
+    (when Really-Build-Rule
+      (build-classification-rule slot-name class-name))
+
+    (setq *Drop-Function-Values?* function-values?) ;; need these values
+    
+    ;; put slot value back
+    (foreach val in slot-values
+	as case-name in case-names 
+	where (not (null? val)) do
+	  (smart-update-proposition 
+	   (bquote (& slot-name & case-name & val)) :assert-true))))
+
+(defun (generate-regression-training-examples INTEGER)
+    ((instances (VECTOR of LOGIC-OBJECT)) (slot SURROGATE))
+  (let ((num-instances (length instances))
+	(pred-name 
+	 (intern-symbol (concatenate (symbol-name slot) "-Classification")))
+	(slot-values (new (vector of float-wrapper) :array-size num-instances)))
+    ;; Set up instance and value vector.  Get slot value for each instance
+    (foreach i in (interval 0 (- num-instances 1)) 
+	as inst in instances do
+	  (setf (nth slot-values i) (get-slot-value inst slot)))
+    (normalize-numbers slot-values)
+    (foreach i in (interval 0 (1- num-instances)) 
+	where (not (null? (nth slot-values i))) do
+       (let ((example (new TRAINING-EXAMPLE)))  
+	 (setf (query example) 
+	   (bquote (& pred-name & (logic-symbol (nth instances i)))))
+	 (setf (concept example) (intern-symbol (symbol-name slot)))
+	    (setf (name example) (object-name (nth instances i)))
+	 (setf (score example) (nth slot-values i))
+	 (setf (timestamp example) -1)
+	 (push *Training-Examples* example)))
+    (return num-instances)))
+
+
+(defun (approximate FLOAT) ((inst-name SYMBOL) (slot-name SYMBOL))
+  ;; approximate is the main query engine for the structured
+  ;; regression method.  Given a particular instance and a slot name,
+  ;; it will activate the regression network and generate a prediction
+  :command? TRUE :evaluate-arguments? FALSE  :public? TRUE
+  (setq inst-name (permanentify inst-name))
+  (setq slot-name (permanentify slot-name))
+  (let ((slot (surrogate-value-inverse (get-description slot-name))))
+    (if (float-function? slot)
+	(return (generate-slot-approximation inst-name slot))
+      (progn 
+	(print-stream STANDARD-ERROR
+		      "ERROR " slot-name " is not a function of type float or integer" EOL)
+	(return 0.0)))))
+     
+				 
+(defun (generate-slot-approximation FLOAT) ((inst-name SYMBOL) (slot SURROGATE))
+  (let ((probe (get-instance inst-name))
+	(class (surrogate-value-inverse 
+		(cast (last (get-most-specific-classes probe))
+		      LOGIC-OBJECT)))
+	(rule-name (intern-symbol 
+		    (concatenate (symbol-name slot) "-Classification")))
+	(instances (listify (all-class-instances class)))
+	(max 0.0)
+	(score 0.0)
+	(min 999999.0)
+	(range 0.0)
+	(prop (bquote (& rule-name & inst-name))))
+
+    (foreach instance in instances do
+       (let ((value (get-slot-value instance slot)))
+	 (when (not (null? value))
+	   (let ((fl-value FLOAT value))
+	     (when (> fl-value max)
+	       (setq max value))
+	     (when (< fl-value min)
+	       (setq min fl-value))))))
+    (setq range (- max min))
+    (setq score (return-partial-truth
+                 (make-query NIL (coerce-to-tree prop) NIL NIL)
+                 TRUE))
+    (return (+ (* score range) min))))
+			     
+
+(defun (float-function? BOOLEAN) ((relation SURROGATE))
+  ;; returns true if the slot is a function with return type Float
+  (let ((des NAMED-DESCRIPTION (surrogate-value relation)))
+    (if (and (function-description? des)
+	     (eql? (last (io-variable-types des))
+		   /STELLA/@FLOAT))
+	(return true)
+      (return false))))
+
+;;
+;; Utilities for building feature rules
+;;
+
+(defglobal *Max-Structure-Depth* INTEGER 3)  ;; depth to build the structure
+
+(defglobal *Drop-Function-Values?* BOOLEAN TRUE) 
+
+(defun set-structure-depth ((d INTEGER))
+  :command? TRUE :public? TRUE
+  (setq *Max-Structure-Depth* d))
+
+(defglobal *TABOO-OPERATORS* (LIST OF SURROGATE) (NEW (LIST OF SURROGATE))) ;; list of operators that should not be incuded in building the antecedent
+
+(defun add-taboo-operators ((s symbol))
+  :command? TRUE :evaluate-arguments? FALSE
+  (insert-new *TABOO-OPERATORS* (surrogatify s)))
+
+(defun (get-assertion-structure (LIST of CONS)) ((inst SYMBOL) 
+						 (depth integer))
+  (setq *Visited-Propositions* (NEW (LIST of PROPOSITION)))
+  (setq *Visited-Instances* (NEW (LIST of SYMBOL)))
+  (return (help-get-assertion-structure inst depth)))
+
+(defun (help-get-assertion-structure (LIST of CONS)) ((inst SYMBOL) 
+						  (depth integer))
+  ;; Traverses the relation links from a given instance, collecting
+  ;; and recursively calling itself on related instances
+  (push *Visited-Instances* inst)
+  (let ((home (interned-in inst))
+	(facts (new (list of proposition))) 
+	(antecedent (new (list of cons)))
+	(children (LIST of CONS) NULL))
+    (within-module home 
+      (setq facts (all-facts-of-instance (get-instance inst) false false))) 
+    (foreach fact in facts 
+       where (and (not (member? *Visited-Propositions* fact))
+		  (or (null? *Taboo-Operators*)
+		      (not (member? *Taboo-Operators* (operator fact))))) do
+       (push *Visited-Propositions* fact)
+       (let ((cons-prop (proposition-to-cons fact))
+             (cons-props (CONS of CONS) nil))
+
+         (cond ((eql? (kind fact) :ISA)
+                (pushq cons-props cons-prop))
+               ((< depth *Max-Structure-Depth*)
+                (case (kind fact)
+	          (:FUNCTION
+                   (pushq cons-props cons-prop)
+	           ;; special case for number functions: add >= and =<
+	           (when (isa? (last cons-prop) @NUMBER-WRAPPER)
+		     (let ((skolem-name 
+		            (reverse (rest (reverse 
+				            (copy-cons-tree cons-prop)))))
+		           (skolem-value (last cons-prop)))
+		       (pushq cons-props 
+		              (bquote (>= & (copy-cons-tree skolem-name) 
+				          & skolem-value)))
+                       (pushq cons-props
+                              (bquote (=< & (copy-cons-tree skolem-name) 
+                                          & skolem-value))))))
+	          (otherwise
+                   ;; Skip trivial equality propositions:
+                   (unless (and (eql? (first cons-prop) (quote =))
+                                (eql? (second cons-prop) (third cons-prop)))
+	             (pushq cons-props cons-prop)))))
+               (otherwise NULL))
+
+	 (when (not (empty? cons-props))
+	   (foreach prop in cons-props
+                    do (push antecedent prop))
+	   (foreach ele in (rest cons-prop) do
+	      (when (and (isa? ele @SYMBOL)
+			 (not (member? *Visited-Instances* ele))
+			 (< depth *Max-Structure-Depth*))
+		(if (null? children)
+		    (setq children 
+		      (help-get-assertion-structure ele (+ depth 1)))
+		  (setq children
+		    (concatenate (help-get-assertion-structure ele (+ depth 1))
+				 children))))))))
+    (if (null? children)
+	(return antecedent)
+      (return (concatenate antecedent children)))))
+
+(defun collect-facts-in-examples ((examples (LIST of TRAINING-EXAMPLE)))
+  ;; Generates a set of structured facts for a set of training
+  ;; examples and stores the facts with each. The query to be learned
+  ;; is retracted before generating all-facts-of to prevent learning
+  ;; rules like (happy ?x) -> (happy ?x)
+  (let ((prop PROPOSITION NULL))
+    (foreach example in examples do
+       (when (defined? (module example))
+	 (change-module (module example)))
+       (setq prop (conceive-formula (query example)))
+       (when (true? prop)
+	 (help-update-top-level-proposition prop :retract-true)
+	 (setf (facts example)
+	   (consify (get-assertion-structure (name example) 1)))
+	 (help-update-top-level-proposition prop :assert-true))
+       (when (false? prop)
+	 (help-update-top-level-proposition prop :retract-false)
+	 (setf (facts example)
+	   (consify (get-assertion-structure (name example) 1)))
+	 (help-update-top-level-proposition prop :assert-false)))))
+
+
+(defun (old-recursive-build-antecedent CONS) ((inst SYMBOL) 
+					  (depth integer))
+  ;; Traverses the relation links from a given instance, collecting
+  ;; and recursively calling itself on related instances
+  (push *Visited-Instances* inst)
+  (let ((home (interned-in inst))
+	(facts (new (list of proposition))) 
+	(antecedent (cons of cons) nil)
+	(children nil))
+    (within-module home 
+      (setq facts (all-facts-of-instance (get-instance inst) false false))) 
+    (foreach fact in facts 
+       where (and (not (member? *Visited-Propositions* fact))
+		  (not (member? *Taboo-Operators* (operator fact)))) do
+       (push *Visited-Propositions* fact)
+       (let ((cons-prop (CONS of CONS) (proposition-to-cons fact)))
+	 (case (kind fact)
+	   (:FUNCTION
+	    (if *Drop-Function-Values?*
+		(setq cons-prop 
+		  (bquote (= & (reverse (rest (reverse cons-prop))))))
+	      (setq cons-prop (bquote (and & cons-prop)))))
+	   (:ISA
+	    (setq cons-prop (bquote (and & cons-prop))))
+	   (otherwise
+	    ;; only type constraints at last level
+	    (if (< depth *Max-Structure-Depth*)
+	        (setq cons-prop (bquote (and & cons-prop)))
+	      (setq cons-prop nil))))
+
+	 (when (not (empty? cons-prop))
+	   (setq antecedent (cons cons-prop antecedent))
+	   (foreach ele in (rest (second cons-prop)) do
+		 (when (and (isa? ele @SYMBOL)
+			    (not (member? *Visited-Instances* ele))
+			    (< depth *Max-Structure-Depth*))
+		   (setq children
+		     (concatenate (old-recursive-build-antecedent ele (+ depth 1))
+				  children)))))))
+    (if (empty? children)
+	(return antecedent)
+      (return (concatenate antecedent children)))))
+
+
+(defun (get-argument-binding OBJECT) ((arg OBJECT))
+  ;; Helper for proposition-to-cons.  Returns binding for a given pattern
+  ;; variable if one exists.
+  (let ((bind (argument-bound-to arg)))
+    (if (null? bind)
+	(return (intern-symbol (get-skolem-print-name arg)))
+      (typecase bind
+	(DESCRIPTION 
+	 (return (native-relation bind)))
+		  
+	(SKOLEM 
+	 (cond
+	  ((defined? (defining-proposition bind))
+	   (return (proposition-to-cons (defining-proposition bind))))
+	  ((eql? (get-skolem-print-name bind) "ANONYMOUS")
+	   ;; don't print the name anonymous
+	   (return (intern-symbol (get-skolem-print-name arg))))
+	  (otherwise
+	   (return bind))))
+	(LOGIC-OBJECT
+	 (return (intern-symbol (symbol-name (surrogate-value-inverse bind)))))
+	(otherwise
+	 (return bind))))))
+
+(defun (consify-argument OBJECT) ((arg object))
+  ;; Helper function for proposition-to-cons.  Turns an argument into a cons or  ;; symbol.
+  (typecase arg
+    (PROPOSITION
+     (return (proposition-to-cons arg)))
+    (PATTERN-VARIABLE
+     (if (null? *queryIterator*)
+	 (return (intern-symbol (get-skolem-print-name arg)))
+       (return (get-argument-binding arg))))
+    (NAMED-DESCRIPTION
+     (return (intern-symbol (symbol-name (surrogate-value-inverse arg)))))
+    (DESCRIPTION
+     (signal LOGIC-EXCEPTION "Can't consify"))     
+;;    (DESCRIPTION
+;;     (return (native-relation arg)))
+    (SURROGATE
+     (return (intern-symbol (symbol-name (cast arg SURROGATE)))))
+    (SKOLEM
+     (if (defined? (variable-value arg))
+	 (return (consify-argument (variable-value arg)))
+       (if (defined? (defining-proposition arg))
+	   (let ((prop proposition (defining-proposition arg))
+		 (sk-args (arguments prop))
+		 (cons-args nil))
+	     (foreach i in (interval 0 (- (length sk-args) 2))
+		 collect (consify-argument (nth sk-args i)) into cons-args)
+	     (return (cons (intern-symbol (stringified-kif-operator prop)) 
+			   cons-args)))
+	 (return arg))))
+
+    (LOGIC-OBJECT 
+     (return (intern-symbol (symbol-name (surrogate-value-inverse arg)))))
+    (otherwise
+     (return arg))))
+
+(defun (proposition-to-cons CONS) ((prop PROPOSITION))
+  ;; This function will build a cons of a proposition, substituting variable
+  ;; bindindings when available.
+  (let ((result nil))
+    (foreach arg in (arguments prop) 
+	do (pushq result (consify-argument arg)))
+    (case (kind prop)
+      (:IN 
+       (return result))
+      ((:PREDICATE :FUNCTION)
+       (setq result
+	 (cons (surrogate-to-symbol (cast (operator prop) SURROGATE))
+	       (reverse result))))
+      (:EQUIVALENT
+       (setq result (cons (quote =) (reverse result))))
+      ((:FORALL :EXISTS)
+       (if (not (empty? (rest result)))
+	   (setq result 
+	     (cons-list (quote OR) 
+			(cons-list (quote not) (second result)) 
+			(first result)))  ;;(reverse result)))
+	 (setq result (first result)))
+       (let ((bindings nil))
+	 (foreach io in (io-variables prop)
+	     do (when (null? (argument-bound-to io)) 
+		  (setq bindings
+		    (cons (cons-list (intern-symbol (get-skolem-print-name io))
+				     (intern-symbol (symbol-name 
+						     (logical-type io))))
+			  bindings))))
+	 ;; if there are some bindings left, print the forall structure
+	 (when (not (empty? bindings))
+	     (setq result (cons-list (intern-symbol (symbol-name (kind prop)))
+				bindings result)))))
+      (otherwise
+       (setq result
+	 (cons (intern-symbol (symbol-name (cast (operator prop) SURROGATE)))
+	       (reverse result)))))
+    (if (false? prop)  ;; add not if proposition is negated
+	(return (bquote (not & result)))
+      (return result))))
+
+
+
+;; useful utilities
+
+(defun thingify-untyped-instances ()
+  :command? TRUE  :public? TRUE
+  ;; turns all untyped instances into type thing
+  (foreach item in (all-named-instances *module* true)
+      where (empty? (all-asserted-types item))
+      do (assert-isa-proposition item @THING)))
+				 
+    
+(defun print-facts ((instanceRef OBJECT))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  (let ((instance (coerce-to-instance instanceRef NULL)))
+    (foreach fact in (all-facts-of-instance instance false false)
+	do (print fact EOL))))

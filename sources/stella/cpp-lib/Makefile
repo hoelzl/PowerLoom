@@ -1,13 +1,14 @@
 # Makefile for primal C++ support
 
-# Version: Makefile,v 1.17 2003/02/11 01:43:03 hans Exp
+# Version: Makefile,v 1.21 2006/05/16 06:42:06 hans Exp
 
+SYSTEMS-ROOT = ../..
 STELLA-ROOT = ..
 
 # g++ settings:
 CXX   = g++
 CC    = gcc
-CFLAGS = -w -O2 -g
+CFLAGS = -w -O2 -g -fno-common
 CXXFLAGS = $(CFLAGS)
 
 # Comment GC-SWITCHES and GC-LIB to not use the garbage collector:
@@ -30,10 +31,12 @@ all: $(CXX-OBJS) $(GC-LIB)
 $(GC-LIB):
 	if (test -n "$(GC-SWITCHES)"); then \
 	  cd gc; \
-	  if (test ! -e ./config.status); then \
-	    ./configure; \
+	  if (test ! -f ./config.status); then \
+	    ./configure $(shell if [ $(OS) = "MINGW" ]; then echo --disable-threads; fi); \
 	  fi; \
 	  $(MAKE) $(MFLAGS) MY_CFLAGS="$(CFLAGS)" CPPFLAGS="$(CFLAGS)"; \
+          cd ..; \
+          cp -p gc/.libs/* $(SYSTEMS-ROOT)/lib; \
 	fi
 
 #

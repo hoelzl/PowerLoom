@@ -1,0 +1,1036 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: loom-to-kif.ste,v 1.24 2006/05/11 07:05:21 hans Exp
+
+;;; Loom to KIF translation support.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(defun (loom-argument-description-to-kif OBJECT)
+       ((tree OBJECT) (arity KEYWORD))
+  ;; Situation: 'tree' occupies an argument position.  If it is
+  ;;    non-atomic, then it is expanded as a KAPPA term rather than
+  ;;    as a sentence.
+  ;; We assume that the KAPPA is either unary or binary.
+  (typecase tree
+    (CONS
+     (when (or (eql? (first tree) (quote INVERSE))
+	       (eql? (first tree) (quote PL-KERNEL/INVERSE)))
+       ;; allow '(inverse R)' to be a legal argument expression:
+       (return (bquote (INVERSE & (loom-argument-description-to-kif
+                                   (second tree) :BINARY)))))
+     ;; create a KAPPA term:
+     (let ((x (nth SYSTEM-DEFINED-ARGUMENT-NAMES 0))
+           (y (nth SYSTEM-DEFINED-ARGUMENT-NAMES 1))
+           (kappaArgs 
+            (choose (eql? arity :UNARY) (cons-list x) (cons-list x y)))
+           (implicitArgs (copy-cons-list kappaArgs)))
+       (return (bquote (kappa & kappaArgs
+                              & (loom-description-to-kif tree implicitArgs))))))
+    (otherwise
+     ;; atomic symbol can be an argument without a kappa:
+     (return tree)) ))
+
+(defun (loom-restriction-to-kif CONS)
+       ((tree CONS) (implicitVariable SYMBOL))
+  ;; Translate an AT-LEAST, AT-MOST, or ALL restriction.
+  (let ((operator SYMBOL (first tree))
+        (role OBJECT NULL)
+        (argument OBJECT NULL)
+	(existsVariable SYMBOL NULL)
+        (qualification (fourth tree))
+;        (roleTree OBJECT (choose (defined? (fourth tree))
+;                                 (bquote (and & role
+;                                              (range & (fourth tree))))
+;                                 role))
+        )
+
+    (if (member? (quote (AT-LEAST AT-MOST EXACTLY)) operator)
+      (progn                            ; Form is (OP n R [Q])
+        (setq argument (second tree))
+        (setq role (third tree)))
+      (progn                            ; Form is (OP R C [Q])
+        (setq role (second tree))
+        (setq argument (third tree))))
+
+    (case operator
+      ((AT-LEAST AT-MOST EXACTLY)
+       (if (defined? qualification)
+         (case operator
+           (AT-LEAST (setq operator (quote PL-KERNEL/range-cardinality-lower-bound)))
+           (AT-MOST (setq operator (quote PL-KERNEL/range-cardinality-upper-bound)))
+           (EXACTLY (setq operator (quote PL-KERNEL/range-cardinality))))
+         (case operator
+           (AT-LEAST (setq operator (quote PL-KERNEL/qualified-range-cardinality-lower-bound)))
+           (AT-MOST (setq operator (quote PL-KERNEL/qualified-range-cardinality-upper-bound)))
+           (EXACTLY (setq operator (quote PL-KERNEL/qualified-range-cardinality)))))
+       (return (bquote (& operator
+                          & (loom-argument-description-to-kif role :BINARY)
+                          & implicitVariable
+                          & argument
+                          && (choose (defined? qualification)
+                                     (cons-list (loom-argument-description-to-kif
+                                                 qualification :UNARY))
+                                     NIL)))))
+      (ALL
+       (if (defined? qualification)
+	   ;; No built-in frame predicate, so write the expanded logic:
+	   ;;  (:all R C Q)  becomes   (=> (and (R ?x ?x1) (Q ?x1)) (C ?x1))
+	   (progn
+	     (foreach v in SYSTEM-DEFINED-ARGUMENT-NAMES
+		 where (not (eq? implicitVariable v))
+		 do (setq existsVariable v)
+		    (break))
+	     (return (bquote (exists (& existsVariable)
+			       (=> (and (& (loom-argument-description-to-kif role :BINARY)
+					   & implicitVariable
+					   & existsVariable)
+					(& (loom-argument-description-to-kif qualification :UNARY)
+					   & existsVariable))
+				   (& (loom-argument-description-to-kif argument :UNARY)
+				      & (nth SYSTEM-DEFINED-ARGUMENT-NAMES 0)))))))
+	 (return (bquote (PL-KERNEL/range-type
+			  & (loom-argument-description-to-kif role :BINARY)
+			  & implicitVariable
+			  & (loom-argument-description-to-kif argument :UNARY))))))
+      (SOME
+       (return (loom-restriction-to-kif
+                (bquote (AT-LEAST 1 & role & argument))
+                implicitVariable)))
+      (THE
+        (return (loom-description-to-kif
+                 (bquote (AND (EXACTLY 1 & role) (ALL & role & argument)))
+                 (cons-list implicitVariable))))
+      ((FILLED-BY FILLERS)
+       (let ((clauses NIL)
+             (translatedRole (loom-argument-description-to-kif role :BINARY)))
+         (foreach filler in (rest (rest tree))
+                  collect (bquote (& translatedRole & implicitVariable & filler))
+                  into clauses)
+         (return (conjoin-sentences clauses))))
+      (NOT-FILLED-BY
+       (let ((clauses NIL)
+             (translatedRole (loom-argument-description-to-kif role :BINARY)))
+         (foreach filler in (rest (rest tree))
+                  collect (bquote (NOT (& translatedRole & implicitVariable & filler)))
+                  into clauses)
+         (return (conjoin-sentences clauses)))))))
+
+(defun (loom-RELATES-to-kif CONS) ((tree CONS) (implicitVariables (CONS OF SYMBOL)))
+  ;; Translate a RELATES, >, <, >=, <=, <> or = to KIF.
+  (when (eql? (first tree) (quote RELATES))
+    (setq tree (rest tree)))
+  (let ((clauses NIL)
+        (existsVariables NIL)
+        (arguments NIL)
+        (skolemVariables NIL))
+    (foreach v in SYSTEM-DEFINED-ARGUMENT-NAMES
+             where (and (not (member? implicitVariables v))
+                        (< (length skolemVariables) (1- (length tree))))
+             do (pushq skolemVariables v))
+    (foreach arg in (rest tree)
+             as v in skolemVariables
+             do
+             (progn
+               (when (isa? arg @NUMBER-WRAPPER)
+                 (pushq arguments arg)
+                 (continue))
+               (pushq arguments v)
+               (pushq existsVariables v))
+             collect (loom-description-to-kif
+                      arg (cons-list (first implicitVariables) v))
+             into clauses)
+    (return (bquote (exists & (reverse existsVariables)
+                            (and && clauses
+                                 & (loom-description-to-kif
+                                    (first tree) (reverse arguments))))))) )
+
+(defun substitute-variables-in-tree ((tree CONS) (substitution CONS))
+  ;; Helping function for 'loom-SATISFIES-to-kif'.
+  ;; Destructively substitute variables in 'tree'.
+  ;; 'substitution' is in plist form.
+  (let ((operator (first tree)))
+    (case operator
+      ((EXISTS FORALL)
+       (let ((variables OBJECT (second tree)))
+         (when (not (cons? variables))
+           (setq variables (cons-list variables)))
+         (foreach v1 in (cast variables CONS)
+                  where (member? substitution v1)
+                  do
+                  (foreach v2 in SYSTEM-DEFINED-ARGUMENT-NAMES
+                           where (not (member? substitution v2))
+                           do
+                           (pushq substitution v2)
+                           (pushq substitution v1)
+                           (break))))
+       ;; tricky: this substitutes the current existential or
+       ;;    universal variables, as well as the body
+       (substitute-variables-in-tree (rest tree) substitution))
+      (otherwise
+       (foreach it1 on tree
+                do
+                (let ((arg (value it1)))
+                  (typecase arg
+                    (SYMBOL
+                     (when (question-mark-symbol? arg)
+                       (foreach it2 on substitution
+                                where (eql? (value it2) arg)
+                                do
+                                ;; bump forward to the substitution value:
+                                (next? it2)
+                                (setf (value it1) (value it2))
+                                (break))))
+                    (CONS
+                     (substitute-variables-in-tree arg substitution))
+                    (otherwise NULL)))))) ))
+
+(defun (loom-THROUGH-to-kif CONS)
+       ((tree CONS) (implicitVariables (CONS OF SYMBOL)))
+  ;; Translate a Loom 'through' to KIF.
+  (let ((lowerBound (second tree))
+        (upperBound (third tree))
+        (clauses NIL))
+    (when (isa? upperBound @NUMBER-WRAPPER)
+      (case (first tree)
+	((THROUGH INTERVAL++ INTERVAL+-)
+	 (pushq clauses 
+		(bquote (=< & (first implicitVariables) & upperBound))))
+	((INTERVAL-+ INTERVAL--)
+	 (pushq clauses 
+		(bquote (< & (first implicitVariables) & upperBound))))))
+    (when (isa? lowerBound @NUMBER-WRAPPER)
+      (case (first tree)
+	((THROUGH INTERVAL++ INTERVAL-+)
+	 (pushq clauses 
+             (bquote (>= & (first implicitVariables) & lowerBound))))
+	((INTERVAL+- INTERVAL--)
+	 (pushq clauses 
+             (bquote (> & (first implicitVariables) & lowerBound))))))
+    (return (conjoin-sentences clauses)) ))
+
+(defun (loom-SATISFIES-to-kif CONS)
+       ((tree CONS) (implicitVariables (CONS OF SYMBOL)))
+  ;; Translate a Loom 'satisfies' to KIF.
+  ;; Strategy, substitute the io-variables in the 'satisfies' with
+  ;;    'implicitVariables', and return the body of the 'satisfies'.
+  (let ((ioVariables OBJECT (second tree))
+        (body (third tree))
+        (substitution NIL))
+    (when (not (cons? ioVariables))
+      (setq ioVariables (cons-list ioVariables)))
+    (foreach v1 in (cast ioVariables CONS)
+             as v2 in implicitVariables
+             do
+             (pushq substitution v2)
+             (pushq substitution v1))
+    (substitute-variables-in-tree body substitution)
+    (return body) ))
+
+(defun (loom-description-to-kif CONS) 
+       ((tree OBJECT) (implicitVariables (CONS OF SYMBOL)))
+  ;; Return a KIF sentence representing the Loom description expression
+  ;;    'descriptionTree' applied to the variables 'implicitVariables'.
+  ;; For example,  '(at-least 1 R) (?x)' becomes
+  ;;     '(range-cardinality-lower-bound R ?x 1)'.
+  ;; Assumes keywords have been eliminated.
+  (typecase tree
+    (CONS
+     (let ((operator (first tree)))
+       (case operator
+         ((AND OR NOT)
+          (let ((clauses NIL))
+            (foreach arg in (rest tree)
+                     collect (loom-description-to-kif arg implicitVariables)
+                     into clauses)
+            (return (bquote (& operator && clauses)))))
+         ((AT-LEAST AT-MOST EXACTLY ALL SOME THE FILLED-BY FILLERS)
+          (return (loom-restriction-to-kif tree (first implicitVariables))))
+         (SAME-AS
+          ;; (same-as r s) --> (exists ?y (and (r ?x ?y) (s ?x ?y)))
+          (let ((selfVariable (first implicitVariables))
+                (y SYMBOL NULL))
+            (foreach v in SYSTEM-DEFINED-ARGUMENT-NAMES
+                     where (not (eql? v selfVariable))
+                     do 
+                     (setq y v)
+                     (break))
+            (let ((localImplicitVariables (cons-list selfVariable Y))
+                  (clauses NIL))
+              (foreach arg in (rest tree)
+                       collect (loom-description-to-kif
+                                arg localImplicitVariables)
+                       into clauses)
+              (return (bquote (exists & y (and && clauses)))))))
+         ((RELATES > < >= <= <> =)
+          (return (loom-RELATES-to-kif tree implicitVariables)))
+         (ONE-OF
+          (return
+           (bquote (member-of && (copy-cons-list implicitVariables)
+                              (setof && (rest tree))))))
+	 (THE-ORDERED-SET
+          (return
+           (bquote (member-of && (copy-cons-list implicitVariables)
+                              (listof && (rest tree))))))
+         ((THROUGH INTERVAL++ INTERVAL+- INTERVAL-+ INTERVAL--)
+          (return (loom-THROUGH-to-kif tree implicitVariables)))
+         (SATISFIES
+          (return (loom-SATISFIES-to-kif tree implicitVariables)))
+         ;; TO DO:  Make these use the frame operators??
+         (DOMAIN
+          (return (loom-description-to-kif 
+                   (second tree) (cons-list (first implicitVariables)))))
+         (DOMAINS
+          (let ((clauses NIL))
+            (foreach domain in (rest tree)
+                as var in implicitVariables
+                collect (loom-description-to-kif domain (cons-list var))
+                into clauses)
+            (return (conjoin-sentences clauses))))
+         (RANGE
+          (return (loom-description-to-kif 
+                   (second tree) (cons-list (last implicitVariables)))))
+         ((INVERSE PL-KERNEL/INVERSE)
+          (let ((inverseImplicitVariables
+                 (cons-list (second implicitVariables) 
+                            (first implicitVariables))))
+            (return (loom-description-to-kif 
+                     (second tree) inverseImplicitVariables))))
+	 (COMPOSE
+	  (let ((chain (bquote (& (second tree) & (first implicitVariables)))))
+	    (foreach function in (rest (rest tree))
+		do (setq chain (bquote (& function & chain))))
+	    (return (bquote (&& chain & (second implicitVariables))))))
+         (otherwise
+          (inform 
+           "Illegal or unimplemented Loom operator cannot be translated to KIF."
+           EOL "   Problem expression:  " tree EOL)
+          (return NIL)))))
+    (otherwise
+     (case tree
+       (<> (return (bquote (not (= && (copy-cons-list implicitVariables))))))
+       (otherwise
+        (return (bquote (& tree && (copy-cons-list implicitVariables)))))))) )
+
+(defun (loom-description-operator? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' is an operator that could appear
+  ;;    in a Loom description.
+  (return 
+   (member? (quote (AND OR NOT AT-LEAST AT-MOST EXACTLY 
+                        ALL SOME THE FILLED-BY FILLERS
+                        SAME-AS RELATES ONE-OF THROUGH)) self)) )
+
+(defun (loom-sentence-to-kif OBJECT) ((tree OBJECT))
+  ;; Translate a Loom sentence into a KIF sentence.
+  ;; Assumes keywords have been eliminated.
+  (typecase tree
+    (CONS
+     (when (not (symbol? (first tree)))
+       (signal-proposition-error "Illegal clause " tree " in Loom formula."))
+     (case (first tree)
+       ((AND OR NOT)
+        (let ((clauses NIL))
+          (foreach arg in (rest tree)
+                   collect (loom-sentence-to-kif arg) into clauses)
+	  (setq clauses (reverse clauses))
+          (pushq clauses (first tree))
+          (return clauses)))
+       (ABOUT
+        (let ((aboutClauses NIL)
+              (implicitVariables CONS NULL))
+          (foreach clause in (rest (rest tree))
+                   do
+                   (setq implicitVariables (cons-list (second tree)))
+                   (cond
+                    ((not (cons? clause))
+                     (pushq aboutClauses
+                            (bquote (& clause && implicitVariables))))
+                    ((loom-description-operator? (first (cast clause CONS)))
+                     (pushq aboutClauses
+                            (loom-description-to-kif clause implicitVariables)))
+                    (otherwise
+                     (let ((expression CONS clause))
+                       (pushq aboutClauses
+                              (bquote (& (first expression)
+                                         && implicitVariables
+                                         && (copy-cons-list (rest expression)))))))))
+          (return (conjoin-sentences (reverse aboutClauses)))))
+       (CREATE
+        (return (translate-loom-create-clause (rest tree))))
+       (otherwise (return tree))))
+    (otherwise (return tree))) )
+
+
+  ;;
+;;;;;; Top-level translation routines
+  ;;
+
+(defun (compute-loom-description-arity INTEGER) ((tree OBJECT))
+  ;; Helping function for 'guess-arity'.
+  ;; Returning '-1' means you can't tell.
+  (typecase tree
+    (SYMBOL
+     (let ((description (get-description tree)))
+       (when (defined? description)
+         (return (arity description))))) 
+    (CONS
+     (case (first tree)
+       ((AND OR)
+        (foreach arg in (rest tree)
+                 do
+                 (let ((guess (compute-loom-description-arity arg)))
+                   (when (> guess 0)
+                     (return guess)))))
+       ((AT-LEAST AT-MOST ALL SAME-AS) (return 1))
+       ((DOMAIN RANGE INVERSE PL-KERNEL/INVERSE COMPOSE) (return 2))
+       ((> < >= <= <> =) (return (length (rest tree))))
+       (RELATES (return (length (rest (rest tree)))))
+       (SATISFIES
+        (let ((variables OBJECT (second tree)))
+          (if (cons? variables)
+            (return (length (cast variables CONS)))
+            (return 1))))
+       (otherwise NULL)))
+    (otherwise NULL))
+  ;; couldn't figure out arity:
+  (return -1) )
+
+(defun (eliminate-loom-keywords OBJECT) ((tree OBJECT))
+  ;; Destructively replace all keywords in 'tree' 
+  ;;    by symbols.
+  ;; IF THAT TURNS OUT TO BE A MISTAKE, SELECTIVELY REPLACE
+  ;;    KEYWORDS.
+  ;; Also, eliminate QUOTEs and translate "/=" to "<>".
+  (typecase tree
+    (KEYWORD
+     ;; Intern in LOGIC module to make sure we get the right symbols
+     ;;    (e.g., INVERSE):
+     (return (intern-symbol-in-module
+              (symbol-name tree) *logic-module* FALSE)))
+    (SYMBOL
+     (case tree
+       ((SUPERRELATIONS SUPERCONCEPTS) (return (quote PL-KERNEL/SUBSET-OF)))
+       (otherwise NULL))
+     (when (eql? (symbol-name tree) "/=")
+       (return (quote <>))))
+    (CONS
+     (foreach it on tree
+              do (setf (value it) (eliminate-loom-keywords (value it))))
+     (when (or (null? (first tree))
+               (not (symbol? (first tree))))
+       (return tree))
+     (let ((operator SYMBOL (first tree)))
+       (case operator
+         (QUOTE
+          (return (second tree)))
+         (otherwise NULL))))
+    (otherwise NULL))
+  (return tree) )
+
+(defun (yield-implicit-variables (CONS OF SYMBOL)) ((arity INTEGER))
+  ;; 'tree' represents a Loom description.  Guess its arity, and
+  ;;     return a list of that many variables.
+  (let ((variables NIL))
+    (foreach i on (interval 1 arity)
+             as v in SYSTEM-DEFINED-ARGUMENT-NAMES
+             collect v into variables)
+    (return variables) ))
+
+(defun (help-translate-loom-description-to-kif CONS) 
+       ((tree OBJECT) (implicitVariables (CONS OF SYMBOL)))
+  ;; Remove keywords from 'tree' and translate a Loom description
+  ;;    into a KIF sentence representing the body of a KAPPA.
+  (return (loom-description-to-kif
+           (eliminate-loom-keywords tree) implicitVariables)) )
+
+(defun (translate-loom-description-to-kif CONS) ((tree OBJECT))
+  :public? TRUE
+  ;; Translate a top-level Loom description into a KIF KAPPA.
+  ;; If we can't tell if 'tree' represents a Loom concept or relation,
+  ;;    guess that its a concept.
+  (exception-case
+   (let ((arity (compute-loom-description-arity tree))
+         (implicitVariables
+          (yield-implicit-variables (choose (> arity 0) arity 1))))
+     (return 
+      (bquote (KAPPA & implicitVariables
+                     & (help-translate-loom-description-to-kif
+                        tree implicitVariables)))))
+   (LOGIC-EXCEPTION (e)
+     (print-stream STANDARD-ERROR (exception-message e))
+     (return NULL))) )
+
+(defun (translate-loom-sentence-to-kif OBJECT) ((tree OBJECT))
+  :public? TRUE
+  ;; Translate a Loom sentence into a KIF equivalent.
+  (exception-case
+      (return (loom-sentence-to-kif
+	       (eliminate-loom-keywords tree)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))) )
+
+(defun (translate-loom-assertions CONS) ((tree CONS) (retract? BOOLEAN))
+  :public? TRUE
+  ;; 'tree' represents a list of Loom sentences that are being
+  ;;     asserted or retracted.  Return a KIF/PowerLoom assertion.
+  (if (empty? (rest tree))
+    (setq tree (first tree))
+    (pushq tree (quote AND)))
+  (let ((verb (choose retract? (quote retract) (quote assert)))
+        (proposition
+         (translate-loom-sentence-to-kif tree)))
+    (if (defined? tree)
+      (return (bquote (& verb & proposition)))
+      (return NULL)) ))
+
+(defun (translate-loom-ask CONS) ((tree CONS))
+  :public? TRUE
+  ;; 'tree' represents a yes/no sentence.
+  ;; Return a KIF/PowerLoom 'ask'.
+  (let ((sentence (translate-loom-sentence-to-kif (second tree)))
+        (options (new PROPERTY-LIST :the-plist (rest (rest tree)))))
+    (foreach (keyword value) in options
+             do
+             (case keyword
+               (:3-valued-p
+                (ignore value)
+                (inform "Sorry, 3-valued 'ask' not yet implemented in PowerLoom." EOL
+                        "Please complain to your PowerLoom dealer." EOL))
+               (otherwise
+                (inform "Illegal or unimplemented option to 'ask': " keyword))))
+    (if (defined? sentence)
+      (return (bquote (ask & sentence)))
+      (return NULL)) ))
+
+(defun (translate-loom-retrieve CONS) ((tree CONS))
+  :public? TRUE
+  ;; 'tree' represents the variables, body, and options to
+  ;;   a Loom retrieve.
+  ;; Return a PowerLoom 'retrieve'.
+  (let ((variables (second tree))
+        (queryBody (translate-loom-sentence-to-kif (third tree)))
+        (options (new PROPERTY-LIST :the-plist (nth-rest tree 3)))
+        (nulls NIL))
+    (when (not (empty? options))
+      (inform "'loom::retrieve' options not yet implemented"))
+    (foreach i on (cast variables CONS)
+             do (pushq nulls (quote NULL)))
+    (return (bquote (consify (retrieve all & variables & queryBody)))) ))
+
+
+  ;;
+;;;;;; Translation of general Loom forms
+  ;;
+
+(defun (translate-one-loom-form CONS) ((tree OBJECT))
+  (typecase tree
+    (CONS 
+     (case (first tree)
+       ((PROGN EVAL-WHEN)
+	(let ((forms NIL)
+	      (translation CONS NULL))
+	  (foreach item in (rest tree)
+	      do (setq translation (translate-one-loom-form item))
+		 (when (defined? translation)
+		   (if (isa? (first translation) @CONS)
+		     (foreach subform in translation
+			 do (pushq forms subform))
+		     (pushq forms translation))))
+	  (return (reverse forms))))
+       ((ASK RETRIEVE TELL FORGET TELLM FORGETM)
+	(return (translate-loom-statement tree)))
+       ((CREATE CREATEM)
+        (destructively-unquote-top-level tree)
+        (return (translate-loom-statement tree)))
+       ((DEFCONCEPT DEFSET DEFRELATION DEFPROPERTY)
+	(return (translate-loom-definition tree)))
+       ((DEFCONTEXT ADD-VALUE SET-VALUE FADD-VALUE)
+	(warn "Translation of " (first tree) " is not implemented yet!")
+	(return NULL))
+       (CHANGE-CONTEXT
+	(return (translate-loom-context-change tree true)))
+       ((IN-CONTEXT IN-KB)
+	(return (translate-loom-context-change tree false)))
+       ((CC)
+	(if (defined? (second tree))
+	  (return (translate-loom-context-change tree false))
+	  (return NULL)))
+       (otherwise (return NULL))))
+    (otherwise (return NULL))))
+
+
+(defun (safe-get-next-s-expression OBJECT) ((iter S-EXPRESSION-ITERATOR))
+  (let ((continue? TRUE)
+	(result OBJECT NULL))
+    (while continue?
+      (exception-case 
+	  (progn 
+	    (when (next? iter)
+	      (setq result (value iter)))
+	    (setq continue? false))
+	(READ-EXCEPTION (e)
+	  (warn "Read Exception " (exception-message e) EOL))))
+    (return result) ))
+
+(defun destructively-unquote-top-level ((tree CONS))
+  (while (non-empty? tree)
+    (when (and (isa? (first tree) @CONS)
+               (eql? (quote QUOTE) (first (cast (first tree) CONS))))
+      (setf (first tree) (second (cast (first tree) CONS)))
+      (when (eql? (first tree) (quote NIL))
+        (setf (first tree) NIL)))
+    (setq tree (rest tree))))
+    
+(defun translate-loom-file ((input FILE-NAME) (output FILE-NAME))
+  :documentation
+  "Translate the Loom file `input' to PowerLoom and write the
+translation to the file `output'.  Note that this will only
+work for fairly vanilla Loom files that do not contain any
+Lisp-isms.  It might require to clean the Loom file manually
+before this translation will work."
+  :public? TRUE :command? TRUE
+  (special ((*printReadably?* TRUE)
+	    (*printPretty?* TRUE))
+    (with-input-file (in input)
+      (with-output-file (out output)
+	(let ((translation NIL)
+	      (iter (s-expressions in))
+	      (form (safe-get-next-s-expression iter))
+              (dialect-emitted? FALSE))
+	  (print-stream out ";; Automatic Translation for file " input 
+			EOL EOL)
+	  (while (defined? form)
+	    (setq translation (translate-one-loom-form form))
+	    (cond ((null? translation) NULL)
+		  ((empty? translation) NULL)
+		  ((isa? (first translation) @CONS)
+                   (setq dialect-emitted? TRUE)
+                   (print-stream out (bquote (in-dialect :KIF)) EOL EOL)
+		   (foreach subform in translation
+		       do (print-stream out subform EOL EOL)))
+		  (otherwise
+                   (when (and (not dialect-emitted?)
+                              (not (eql? (first translation) (quote IN-MODULE))))
+                     (setq dialect-emitted? TRUE)
+                     (print-stream out (bquote (in-dialect :KIF)) EOL EOL))
+		   (print-stream out translation EOL EOL)))
+	    (setq form (safe-get-next-s-expression iter))))))))
+
+
+  ;;
+;;;;;; Translation of Loom statements
+  ;;
+
+(defun (translate-loom-statement CONS) ((tree CONS))
+  :public? TRUE
+  ;; 'tree' represents a Loom statement.  Return the equivalent
+  ;;    PowerLoom statement.
+  (case (first tree)
+    (ASK (return (translate-loom-ask tree)))
+    (RETRIEVE (return (translate-loom-retrieve tree)))
+    ((TELL TELLM) (return (translate-loom-assertions (rest tree) FALSE)))
+    ((FORGET FORGETM) (return (translate-loom-assertions (rest tree) TRUE)))
+    ((CREATE CREATEM) 
+     (return (translate-loom-assertions 
+	      (cons-list (translate-loom-create-clause (rest tree)))
+	      TRUE)))
+    ))
+
+(defun (translate-loom-create-clause CONS) ((tree CONS))
+  (if (eq? (second tree) NIL)
+    (return (bquote (THING & (first tree))))
+    (return (bquote (& (second tree) & (first tree))))))
+
+
+  ;;
+;;;;;; Translation of Loom definitions
+  ;;
+
+(defun (guess-loom-definition-arity INTEGER) 
+       ((arity INTEGER) (definition OBJECT) (constraints CONS))
+  ;; We don't know the arity of the Loom description 'tree'.
+  ;; Find a term inside of it that determines its arity.
+  ;; If we can't tell, guess that its a binary relation.
+  (when (and (eql? arity -1)
+             (defined? definition))
+    (setq arity (compute-loom-description-arity definition)))
+  (when (eql? arity -1)
+    (foreach c in constraints
+             do
+             (setq arity (compute-loom-description-arity c))
+             (when (> arity 0)
+               (break))))
+  ;; arity isn't a concept, because we'd know for sure, so
+  ;;    guess that its a relation:
+  (when (eql? arity -1)
+    (setq arity 2))
+  (return arity) )
+
+(defun (conjoin-sentences OBJECT) ((sentences CONS))
+  ;; Helping function for 'translate-loom-definition'.
+  ;; Convert 'sentences' into a single proposition.
+  (setq sentences (remove sentences NIL))
+  (cond
+   ((nil? sentences)
+    (return NIL))
+   ((nil? (rest sentences))
+    (return (first sentences)))
+   (otherwise
+    (pushq sentences (quote AND))
+    (return sentences))) )
+
+(defun (translate-loom-partitions CONS) 
+       ((partitions OBJECT) (exhaustive? BOOLEAN) (parentConcept SYMBOL))
+  ;; Convert Loom partitions declarations into axioms.
+  ;; Expected syntax: '((<partitionName> (<c1> ... <cn>)) ...)'.
+  (let ((axioms NIL)
+	(partition-list (CONS OF CONS) NIL))
+    (when (not (cons? partitions))
+      (setq partitions (cons-list partitions)))
+    (if (cons? (first (cast partitions CONS)))
+	(setq partition-list partitions)
+        ;; make 'partitions' a list of partitions:
+      (foreach clause in (cast partitions CONS)
+	  do (pushq partition-list (cons-list clause))))
+    (foreach clause in partition-list
+             do
+             (let ((name (first clause))
+                   (concepts CONS (second clause))
+                   (localAxioms NIL))
+               (pushq localAxioms
+                      (bquote (mutually-disjoint-collection & name)))
+               (when (defined? concepts)
+                 (pushq localAxioms 
+                        (bquote (= & name (setof && concepts)))))
+               (when exhaustive?
+                 (pushq localAxioms
+                        (bquote (covering & name & parentConcept))))
+               (pushq axioms (conjoin-sentences (reverse localAxioms)))))
+    (return axioms) ))
+
+(defun (translate-loom-characteristics CONS) 
+       ((characteristics OBJECT) (name SYMBOL))
+  ;; Convert Loom characteristics into axioms.
+  (let ((axioms NIL))
+    (when (not (cons? characteristics))
+      (setq characteristics (cons-list characteristics)))
+    (foreach ch in (cast characteristics CONS)
+        do (case ch
+             (:single-valued
+              ;; DON'T NEED THIS BECAUSE WE CONVERT SV RELATIONS TO FUNCTIONS:
+              ;;(pushq axioms (bquote (single-valued & name)))
+              )
+             (:closed-world
+              (pushq axioms (bquote (closed & name))))
+             (:commutative
+              (pushq axioms (bquote (commutative & name))))
+             (:symmetric
+              (pushq axioms (bquote (symmetric & name))))
+             ((:clos-class :multiple-valued :hash-on-domains
+               :non-exported :perfect :closed-on-constants
+               :backward-chaining :monotonic :temporal)
+              NULL)
+             (otherwise
+              ;; :read-only :read-write
+              (inform "Skipping unimplemented relation characteristic: " ch EOL
+                        "   in Loom definition of: " name EOL))))
+    (return (conjoin-sentences axioms)) ))
+
+(defun (translate-loom-annotations CONS) ((annotations OBJECT) (name SYMBOL))
+  ;; Convert Loom annotations into axioms.
+  ;; Example:  (A i) --> (A <name> i)
+  (when (not (cons? annotations))
+    (setq annotations (cons-list annotations)))
+  (let ((axioms NIL))
+    (foreach term in (cast annotations CONS)
+             do
+             (when (not (cons? term))
+               (setq term (cons-list term)))
+             (let ((clause CONS term))
+               (pushq axioms
+                      (bquote (& (first clause) & name && (rest clause))))))
+    (return (conjoin-sentences axioms)) ))
+
+(defun (translate-loom-defaults CONS) ((default-tree OBJECT) (variables CONS))
+  ;; Convert Loom defaults into default implication axioms
+  ;; Examples: A => (A ?v)
+  (return (bquote (~> & (help-translate-loom-description-to-kif 
+			 default-tree variables)))))
+
+(defun (simplify-top-level-loom-keywords KEYWORD) ((keyword KEYWORD))
+  ;; Replace synonym keywords.
+  (case keyword
+    (:attributes (return :characteristics))
+    (:partition (return :partitions))
+    (:implies (return :constraints))
+    (:exhaustive-partition (return :exhaustive-partitions))
+    (otherwise (return keyword))) )
+
+(defun (translate-loom-definition CONS) ((tree CONS))
+  :public? TRUE
+  ;; Translate a Loom 'defconcept' or 'defrelation' into a PowerLoom
+  ;;    equivalent.
+  (let ((operator SYMBOL (first tree))
+        (name SYMBOL (second tree))
+	(docstring STRING-WRAPPER NULL)
+        (options PROPERTY-LIST NULL)
+        (arity  -1)
+        (definition OBJECT NULL)
+        (constraints NIL)
+	(defaults NIL)
+        (axioms NIL)
+        (kifDefinition OBJECT NULL)
+        (kifConstraint OBJECT NULL)
+        (kifAxiom OBJECT NULL))
+    ;; Test for and handle documentation string.
+    (if (and (defined? (third tree))
+	     (isa? (third tree) @STRING-WRAPPER))
+	(progn
+	  (setq docstring (third tree))
+	  (setq options (new PROPERTY-LIST :the-plist (rest (rest (rest tree))))))
+      (setq options (new PROPERTY-LIST :the-plist (rest (rest tree)))))
+    (when (member? (quote (DEFCONCEPT DEFSET)) operator)
+      (setq arity 1)
+      (setq operator (quote DEFCONCEPT)))
+    (when (eql? operator (quote DEFPROPERTY))
+      (setq operator (quote DEFRELATION))
+      (setq arity 1))
+    (foreach (keyword value) in options
+             do
+             (setq keyword (simplify-top-level-loom-keywords keyword))
+             (case keyword
+               (:is-primitive
+                (pushq constraints value))
+               (:is
+                (setq definition value))
+               (:constraints
+                (pushq constraints value))
+	       (:defaults
+		(pushq defaults value))
+               (:domain
+                (pushq constraints (bquote (domain & value)))
+                (when (< arity 0)
+                  (setq arity 2)))
+               (:domains
+                (pushq constraints (bquote (domains && (cast value CONS))))
+                (when (< arity 0)
+                  (setq arity (1+ (length (cast value CONS))))))
+               (:range
+                (pushq constraints (bquote (range & value)))
+                (when (< arity 0) ;; don't override arity from :domains or :arity
+                  (setq arity 2)))
+               (:arity
+                (setq arity (cast value INTEGER-WRAPPER)))
+               ((:partitions :exhaustive-partitions)
+                (foreach p in (translate-loom-partitions
+                               value (eql? keyword :exhaustive-partitions) name)
+                         do (pushq axioms p)))
+               (:in-partition
+                (pushq axioms (bquote (member-of & name & value))))
+               ((:characteristics :attributes)
+                (pushq axioms (translate-loom-characteristics value name)))
+               (:annotations
+                (pushq axioms (translate-loom-annotations value name)))
+               (:roles
+                (inform ":roles OPTION NOT YET IMPLEMENTED"))
+               ;; The 'name' keyword gets extracted elsewhere, so we skip it here:
+               (:name NULL)
+	       (:identifier
+		(inform "Note: Definition " name  " is also known as " value EOL)
+		;; Don't need to assert this, since it should come from
+		;; an equivalent definition.
+		;(unless (eq? name value)
+		;  (pushq axioms (bquote (synonym & name & value))))
+		)
+               (otherwise
+                (inform "Skipping unimplemented keyword: " keyword EOL
+                        "   in Loom definition: " tree EOL))))
+    (setq arity (guess-loom-definition-arity arity definition constraints))
+    (let ((variables (yield-implicit-variables arity))
+          ;; these variables are used to convert relations to functions:
+          ;; search characteristics for :single-valued option:
+          (characteristics (lookup options :characteristics))
+          (convertToFunction? 
+           (and (defined? characteristics)
+                (or (eql? characteristics :single-valued)
+                    (and (cons? characteristics)
+                         (member? (cast characteristics CONS)
+                                  :single-valued)))))
+          (resultClause NIL))
+      (when (not (nil? constraints))
+        (setq kifConstraint (help-translate-loom-description-to-kif 
+                             (conjoin-sentences constraints) variables)))
+      (foreach default in defaults 
+	  do (pushq axioms (translate-loom-defaults default variables)))
+      (when (not (nil? axioms))
+        (setq kifAxiom (conjoin-sentences axioms))
+        ;; tiny kludge to handle :single-valued case:
+        (when (nil? kifAxiom)
+          (setq kifAxiom NULL)))
+      (when (defined? definition)
+        (setq kifDefinition
+              (help-translate-loom-description-to-kif definition variables)))
+      (when convertToFunction?
+        (setq operator (quote deffunction))
+        (setq resultClause (bquote (:-> & (last variables))))
+        (setq variables (consify (but-last variables))))
+      (return
+       (bquote (& operator & name & variables
+                  && resultClause
+		  && (choose (defined? docstring)
+			     (bquote (:documentation & docstring))
+			     NIL)
+                  && (choose (defined? kifDefinition)
+                             (bquote (:<<=>> & kifDefinition)) 
+                             NIL)
+                  && (choose (defined? kifConstraint) 
+                             (bquote (:=>> & kifConstraint))
+                             NIL)
+                  && (choose (defined? kifAxiom) 
+                             (bquote (:axioms & kifAxiom))
+                             NIL))))) ))
+
+
+#|
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept A :is-primitive B)))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept A :is B)))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept A :is-primitive B :annotations (PERFECT (MONOTONIC)))))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept A
+             :is-primitive (and B (at-least 1 R) (the S C) (fillers R 2 3)))))))
+
+(eval
+ (lispify
+ (translate-loom-definition
+  (bquote (defconcept B :is (and C (all R B))
+            :constraints (satisfies (?x) (exists ?y (R ?x ?y))))))))
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defrelation R :is (and S (range A)) :domain B)))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept B :is (some R A))))))
+
+;; OOPS: ':closed-world' DOESN'T HAVE AN ARGUMENT.  WHAT IS THE SYNTAX???:
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defrelation R :arity 3 :closed-world)))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept A :is (and (some R B)
+                                  (same-as R (inverse S))
+                                  (> U V)
+                                  (relates between U V (inverse W))))))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defrelation R :is (inverse S) :range (all U C))))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept A :exhaustive-partitions ($P$ (B C)))))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept a :partitions ($A$))))))
+
+(eval
+ (lispify
+  (translate-loom-definition
+   (bquote (defconcept b :is-primitive a :in-partition $A$)))))
+
+|#
+
+  ;;
+;;;;;; Translation of miscellaneous Loom forms
+  ;;
+
+(defun (translate-loom-context-change CONS) ((tree CONS) (needsQuote? BOOLEAN))
+  (let ((contextForm (second tree)))
+    (typecase contextForm
+      (STRING-WRAPPER
+       (return (bquote (IN-MODULE & contextForm))))
+      (SYMBOL
+       (if needsQuote?
+	 ;; Hack: Suppress warning if encountering a save-context
+	 ;;  generated reset of the Loom context form
+	 (progn 
+	   (unless (string-eql? (symbol-name contextForm) "SAVEDCONTEXT")
+	     (warn "Can't translate " tree " with a non-constant argument"))
+	   (return NULL))
+	 (return (bquote (IN-MODULE & (symbol-name contextForm))))))
+      (CONS ;; Should be (QUOTE ...)
+       (return (translate-loom-context-change contextForm FALSE))))))
+
+			
+
+
+

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: walk.ste,v 1.276 2003/10/23 17:10:31 tar Exp
+;;; Version: walk.ste,v 1.290 2006/05/11 07:06:33 hans Exp
 
 ;;; Stella code walker.
 
@@ -322,21 +322,14 @@ less code size and memory consumption.")
 ;;;;;; Quote
   ;;
 
-;;; Quoted cons trees (cons tree constants) are stored in a global
-;;; hashtable indexed by their stringified representation.  On first
+;;; Quoted cons trees (cons tree constants) are stored in a memoization
+;;; table indexed by their stringified representation.  On first
 ;;; lookup the name gets unstringified and the result stored in the
-;;; hashtable.  Further lookups retrieve the unstringified version
+;;; table.  Further lookups retrieve the unstringified version
 ;;; directly.  Since quoted trees are not used very often, using
 ;;; a hashtable lookup scheme seems to be sufficient.  If a quoted
 ;;; tree is used in a loop, it should probably be stored in a local
 ;;; variable to avoid unnecessary lookups.
-
-(defglobal *quotation-table* (STRING-HASH-TABLE OF STRING CONS) NULL
-  :documentation "Stores quoted cons trees.")
-
-;; Quoted constants should be available very early on:
-(startup-time-progn :early-inits
-  (setq *quotation-table* (new STRING-HASH-TABLE)))
 
 (defun (name-quoted-tree STRING) ((tree CONS))
   ;; Return a string that can serve as a name for the quoted 'tree'.
@@ -348,16 +341,18 @@ less code size and memory consumption.")
 (defun (get-quoted-tree CONS) ((tree-name STRING) (moduleName STRING))
   :documentation "Return the quoted tree with name `tree-name'."
   :public? TRUE
-  (let ((quotedTree (lookup *quotation-table* tree-name)))
-    (when (defined? quotedTree)
-      (return quotedTree))
-    ;; This was the first lookup.  Unstringify 'tree-name' (make sure
-    ;; symbols wind up in the right module) and cache the result:
-    (special ((*module* (get-stella-module moduleName TRUE)))
-      (let ((tree CONS (unstringify tree-name)))
-        (setq quotedTree (permanentify-form (first tree)))
-        (insert-at *quotation-table* tree-name quotedTree)
-        (return quotedTree)))))
+  (return
+    (memoize (tree-name)
+             ;; keyed in on module updates, so we'll regenerate
+             ;; in case somebody cleared a module:
+             :timestamps :MODULE-UPDATE :max-values 200
+             (permanentify-form
+              (first
+               (cast
+                (unstringify-in-module
+                 tree-name
+                 (get-stella-module moduleName TRUE))
+                CONS))))))
 
 
   ;;
@@ -1736,8 +1731,8 @@ locate a coersion method.")
   (when (and (translating-code?)
              (or (null? (type-class self))
                  (eql? (type-class self) (type-class @UNKNOWN))) )
-    (walk-inform "Reference to undefined class "
-                 (symbol-name self))
+    (walk-warn "Reference to undefined class "
+               (symbol-name self))
     (setf (type-class self) (type-class @UNKNOWN)))
   (return self) )
 
@@ -1817,8 +1812,9 @@ locate a coersion method.")
       (warn-about-unknown-source-type tree)
       (if (and (eq? tree (quote NULL))
                (defined? targetBaseType))
+	  ;; cl-array-null
         (return
-          (type-to-walked-null-value-tree targetBaseType) targetType TRUE)
+          (type-to-walked-null-value-tree targetType targetBaseType) targetType TRUE)
         (return tree targetType TRUE)))
     (when (defined? realSourceType)
       ;; First coerce from 'realSourceType' to 'sourceType', since we might
@@ -1935,6 +1931,26 @@ locate a coersion method.")
         (setq targetType sourceType))
       (return (coerce-a-tree oExp sourceType targetType)))))
 
+(defun (compute-expression-type TYPE-SPEC) ((expression OBJECT) (wrap? BOOLEAN))
+  ;; Determine the type of `expression' by walking it and return the result.
+  ;; If `wrap?' is TRUE return the wrapped version of literal types.
+  ;; This is non-destructive and can handle VRLETs.  Assumes that it is called
+  ;;    during code walking with all the proper top-level data structures set up.
+  (let ((walkedTree
+         (walk-a-tree
+          (bquote (let ((x & (copy-cons-tree expression)))))))
+        (typeSpec
+         ;; UGLY AND BRITTLE: we key-in on the fact that the type of the first
+         ;; variable of the outermost `let' expression is what we want (this
+         ;; works for VRLETs and regular expressions alike):
+         (cons-tree-nth walkedTree 1 1 0 1)))
+    (if wrap?
+        (return
+          (choose (sub-type-spec-of? typeSpec @LITERAL)
+                  (type-to-wrapped-type (type-spec-to-base-type typeSpec))
+                  typeSpec))
+      (return typeSpec))))
+
 (defun (walk-without-type-tree OBJECT) ((tree OBJECT))
   ;; Return only one value, the canonicalized tree, on the assumption that
   ;;    the calling function already knows the type of 'tree'.
@@ -1990,7 +2006,7 @@ locate a coersion method.")
        (when (and warnOnAtom?
                   (defined? oTree)
                   (not (eql? oTree (quote NULL))))
-         (walk-inform "Expression found where statement expected: " tree))))
+         (walk-warn "Expression found where statement expected: " tree))))
     (return oTREE) ))
 
 (defun (eliminate-vrlet-statement CONS) ((tree CONS))
@@ -2365,89 +2381,13 @@ A NULL value indicates an incremental translation.")
       (KEYWORD (setq prefix "KWD-")))
     (return (concatenate prefix environmentName (symbol-name symbol))) ))
 
-#||
 (defun (yield-symbol-constant-name SYMBOL) ((symbol GENERALIZED-SYMBOL))
   ;; Convert 'symbol' representing a symbol/surrogate/keyword constant
   ;;    into a native language symbol/surrogate/keyword constant identifier.
-  (setq symbol (permanentify symbol))
-  (typecase symbol
-    (KEYWORD
-     (return (intern-symbol-in-module 
-	      (construct-symbol-constant-name symbol) *module* TRUE)))
-    (otherwise
-     (return (intern-derived-symbol 
-	      symbol (construct-symbol-constant-name symbol))))))
-
-(defun (create-startup-symbol SYMBOL) ((symbol GENERALIZED-SYMBOL))
-  ;; Create a startup-time form for defining a softcoded 'symbol'.
-  ;; Return the variable's name.
-  (let ((symbolModule
-         (choose (defined? (interned-in symbol))
-                 (interned-in symbol)
-                 *module*))
-        (symbolConstant (yield-symbol-constant-name symbol))
-        (symbolConstantName (symbol-name symbolConstant))
-        (symbolConstantTypeTree (yield-type-spec-tree (primary-type symbol)))
-        (lispPackage (lisp-package symbolModule))
-	(tree CONS NULL))
-    ;; Avoid "undefined special" warnings during incremental translation:
-    (when (incremental-translation?)
-      (verbatim
-          :common-lisp
-          "(CL:proclaim 
-             `(CL:special ,(CL:intern symbolConstantName lispPackage)))"
-        :otherwise NULL))
-    ;; Generate the symbol variable:
-    (setq tree
-      (bquote 
-       (defglobal & symbolConstant
-                  & symbolConstantTypeTree
-                  NULL
-		  :public? TRUE)))
-    (walk-auxiliary-tree tree)
-    ;; Generate the initialization code:
-    (setq tree
-      (bquote 
-       (startup-time-progn :symbols
-         (setq & symbolConstant
-               (safe-cast
-                (intern-rigid-symbol-wrt-module
-                 & (wrap-literal (symbol-name symbol))
-                 ;; Only supply a module if we really have to:
-                 & (choose (or (eql? symbolModule *module*)
-                               (keyword? symbol))
-                           (bquote NULL)
-                           (bquote
-                            (get-stella-module
-                             & (wrap-literal (module-full-name symbolModule))
-                             TRUE)))
-                 ;; Dereference the xxx-SYM's right here:
-                 & (wrap-literal
-                    (choose (keyword? symbol)
-                            KEYWORD-SYM
-                            (choose (surrogate? symbol)
-                                    SURROGATE-SYM
-                                    SYMBOL-SYM))))
-                & symbolConstantTypeTree)))))
-    (walk-auxiliary-tree tree)
-    (return symbolConstant)))
-||#
-
-(defun (yield-symbol-constant-name SYMBOL) ((symbol GENERALIZED-SYMBOL))
-  ;; Convert 'symbol' representing a symbol/surrogate/keyword constant
-  ;;    into a native language symbol/surrogate/keyword constant identifier.
-  (setq symbol (permanentify symbol))
-  (typecase symbol
-    (KEYWORD
-     (return (intern-symbol-in-module 
-	      (string-upcase (construct-symbol-constant-name symbol))
-	      *module*
-	      TRUE)))
-    (otherwise
-     (return (intern-symbol-in-module 
-	      (string-upcase (construct-symbol-constant-name symbol))
-	      *module* 
-	      TRUE)))))
+  (return (intern-symbol-in-module 
+           (construct-symbol-constant-name (permanentify symbol))
+           *module*
+           TRUE)))
 
 (defun (create-startup-symbol SYMBOL) ((symbol GENERALIZED-SYMBOL))
   ;; Create a startup-time form for defining a softcoded 'symbol'.
@@ -2571,6 +2511,8 @@ A NULL value indicates an incremental translation.")
   ;;    TO RUN; OTHERWISE INITIALIZATION OF SPECIALS MIGHT BE INCORRECT!
   (case self
     (NULL (return @UNKNOWN))
+    (TRUE (return @BOOLEAN))
+    (FALSE (return @BOOLEAN))
     (otherwise (return NULL))))
 
 (defun (constant-symbol? BOOLEAN) ((symbol SYMBOL))
@@ -3033,7 +2975,8 @@ A NULL value indicates an incremental translation.")
        (return
          (bquote
           (vrlet ((& answerVar & returnType
-                     & (type-to-null-value-tree (type slot))))
+                     & (type-to-walked-null-value-tree
+			(type-specifier slot) (type slot))))
             (foreach it on (dynamic-slots & objectRef)
                      where (eq? (key it) (bquote & (slot-name slot)))
                      do
@@ -3627,10 +3570,13 @@ A NULL value indicates an incremental translation.")
                 (setq variable (quote ILLEGAL-VARIABLE)))
                (otherwise
                 (setq variable (first decl))
-                (when (defined? (lookup-global-variable variable))
+                (when (or (defined? (lookup-global-variable variable))
+                          (constant-symbol? variable))
                   ;; QUESTION: Should we allow the re-binding of globals
                   ;;    that are not specials?
-                  (walk-error "Illegal binding of global or special variable "
+                  (walk-error (choose (constant-symbol? variable)
+                                      "Illegal binding of constant value "
+                                      "Illegal binding of global or special variable ")
                               "in `let' declaration:" EOL
                               "    " decl)
                   (setq variable (quote ILLEGAL-VARIABLE)))))
@@ -5530,6 +5476,19 @@ during bootstrap when only some class objects are defined.")
               (member? *current-stella-features*
                        :warn-about-missing-methods))))
 
+(defun (walk-type-spec-is-native-type? BOOLEAN) ((theType TYPE-SPEC))
+  ;; Called by `walk-undefined-slot-tree'.  Returns TRUE if TYPE-SPEC is
+  ;;    implemented via a native type in the target language.
+  (case (translator-output-language)
+    (:common-lisp 
+     (return (defined? (class-cl-native-type (type-spec-to-class theType)))))
+    (:cpp 
+     (return (defined? (class-cpp-native-type (type-spec-to-class theType)))))
+    (:java
+     (return (defined? (class-java-native-type (type-spec-to-class theType)))))
+    (otherwise
+     (return FALSE))))
+
 (defun (walk-undefined-slot-tree CONS TYPE)
     ((tree CONS) (firstArgType TYPE-SPEC) (warn? BOOLEAN))
   ;; Called by 'walk-call-slot-tree' to finish off processing of a call
@@ -5548,8 +5507,13 @@ during bootstrap when only some class objects are defined.")
     (when (and warn?
                ;; Don't warn about CL functions:
                (not (symbol-common-lisp? operatorName)))
-      (walk-error "Reference to undefined method or function named "
-                  operatorName EOL "   in the expression:" EOL "   " tree))
+      (if (or (eq? operatorName (quote NULL?))
+              (eq? operatorName (quote DEFINED?)))
+        (unless (walk-type-spec-is-native-type? type)
+          (inform "Using default native test for " operatorName 
+                  " in the expression:" EOL "  " tree))
+        (walk-error "Reference to undefined method or function named "
+                    operatorName EOL "   in the expression:" EOL "   " tree)))
     (return (bquote (SYS-CALL-METHOD & type && tree))
             @UNKNOWN) ))
 
@@ -5599,7 +5563,7 @@ during bootstrap when only some class objects are defined.")
                  (mv-setq (oTree oType)
                    (walk-call-slot-tree tree)))
                 ((eq? nofSubs nofMethods)
-                 (walk-inform
+                 (walk-warn
                   "Could not infer " methodName
                   " on abstract type " abstractType "," EOL
                   "   since the implementations of " methodName
@@ -5607,7 +5571,7 @@ during bootstrap when only some class objects are defined.")
                   "   subtypes of " abstractType
                   " are not all compatible"))
                 (otherwise
-                 (walk-inform
+                 (walk-warn
                   "Could not infer " methodName
                   " on abstract type " abstractType "," EOL
                   "   since " methodName " is only implemented on "
@@ -5814,9 +5778,9 @@ during bootstrap when only some class objects are defined.")
     
 ;;; TEMPORARY KLUDGE: REMOVE ONCE POWERLOOM COMMANDS HAVE BEEN FIXED (ALSO
 ;;; FIX RELATED CODE IN `walk-call-slot-tree'):
-    (walk-warn "Applying CONS-methods to &rest-arguments is deprecated." EOL
-               "   " tree EOL
-               " Use `foreach' or explicitly coerce with `coerce-&rest-to-cons'")
+    (walk-inform "Applying CONS-methods to &rest-arguments is deprecated." EOL
+                 "   " tree EOL
+                 " Use `foreach' or explicitly coerce with `coerce-&rest-to-cons'")
     (setq firstArgType
       (yield-listified-variable-arguments-type *methodBeingWalked*)))
   
@@ -6095,8 +6059,8 @@ during bootstrap when only some class objects are defined.")
              (most-specific-method? method))
          (return (defined? (inlinable-method-body method))))
         (otherwise
-         (walk-warn "Cannot inline method " method ", since there are" EOL
-                    " one or more methods that specialize it")
+         (walk-inform "Cannot inline method " method ", since there are" EOL
+                      " one or more methods that specialize it")
          (return FALSE))))
 
 (defun (most-specific-method? BOOLEAN) ((method METHOD-SLOT))
@@ -6637,7 +6601,7 @@ by actual definitions."
          ;; also simulate them in C++ and Java:
          (return
           (bquote (allocate & (type-to-symbol (type slot))))))))
-    (return (type-to-null-value-tree (type slot)))))
+    (return (type-to-walked-null-value-tree (type-specifier slot) (type slot)))))
 
 (defun (yield-constructor-attachment CONS) ((class CLASS) (classRef SYMBOL))
   ;; Return a parse tree fragment for code that fills the class-creator
@@ -7053,15 +7017,22 @@ accessors and catch-all methods are needed.")
           where (and (storage-slot? slot)
                      (native-slot? slot)
                      (eql? (native-slot-home slot class) class)
-                     (not (eql? (home-module class) (home-module slot))))
+                     (not (eql? (home-module class) (home-module slot)))
+                     (slot-name-conflict? slot class)
+                     )
           do (case (translator-output-language)
                (:common-lisp
                 (walk-warn "Defining slot " slot " outside the home module of"
                  EOL "   its owner class will be illegal in C++ and Java"))
                (otherwise
+                (walk-error "Slot " slot " is defined outside the home module of "
+                            EOL "   its owner class " class ", and the name of"
+                            EOL "   the slot conflicts with another slot.")
+                #|
                 (walk-error "Defining slot " slot " outside the home module of"
                             EOL "   its owner class is illegal in "
                             (translator-output-language-name))
+                |#
                 ;; discard any units we created:
                 (while (not (eql? (pop *translationUnits*) unit)))
                 (clear-translation-unit unit)
@@ -7264,8 +7235,10 @@ holding its expander function."
               (bquote
                (startup-time-progn :globals
                  (setq & (variable-name global) & initialValueTree))))
+	     ;; cl-array-null
              (setq initialValueTree
                (type-to-walked-null-value-tree
+		(variable-type global)
                 (type-spec-to-base-type (variable-type global)))))))
     (setf (code-register unit) initialValueTree)
     ;; Don't create variable objects for system-defined variables,
@@ -7562,9 +7535,10 @@ functions that would cause too much stress for some wimpy compilers).")
   ;; IMPORTANT:  This character may be used as key by the Java translation
   ;; software in deciding whether the class is public is not.  This is a
   ;; bit of a kludge, but it saves a slot that would otherwise be needed.
-  (if (system-startup-file? *currentFile*)
-    (return (string-capitalize (symbol-name function-name)))
-    (return (concatenate "_" (string-capitalize (symbol-name function-name))))))
+  (let ((base-name (java-translate-class-namestring (symbol-name function-name))))
+    (if (system-startup-file? *currentFile*)
+      (return base-name)
+      (return (concatenate "_" base-name)))))
 
 (defun create-startup-function-units ()
   ;; Create a translation unit for a startup function named 'startupFnName'
@@ -7699,6 +7673,7 @@ functions that would cause too much stress for some wimpy compilers).")
   ;; Walk a tree of the form `(signal-exception <exception>)'.
   ;; <exception> can't be a NATIVE-EXCEPTION, since in order to throw those
   ;;    in Java, we would need to declare it with a `throws' clause.
+  (setq *foundReturn?* TRUE)
   (mv-bind (expression its-type)
            (walk-expression-tree
             (second tree) @STELLA-ROOT-EXCEPTION (quote signal-exception) FALSE)
@@ -8233,7 +8208,7 @@ functions that would cause too much stress for some wimpy compilers).")
               (return (walk-a-tree (bquote (CAST NULL METHOD-CODE))))))
 ;;;	   (:java
 ;;;	    (when (subtype-of? type @LITERAL)
-;;;              (walk-inform "Cannot have methods on literals in "
+;;;              (walk-warn "Cannot have methods on literals in "
 ;;;                           (translator-output-language-name)
 ;;;                           ", hence, cannot generate" EOL
 ;;;                           " a method-code pointer for "
@@ -8546,10 +8521,10 @@ polymorphic, i.e., they can only be implemented by functions."
 
 (defun (yield-evaluator-wrapper-name SYMBOL) ((methodName SYMBOL))
   ;; Return the name of the evaluator wrapper for method 'methodName'.
-  (return
-    (intern-derived-symbol
-     methodName
-     (concatenate (symbol-name methodName) "-EVALUATOR-WRAPPER"))))
+  (let ((base-name (symbol-name methodName))
+        (suffix (choose (all-upper-case-string? base-name) 
+                        "-EVALUATOR-WRAPPER" "-Evaluator-Wrapper")))
+    (return (intern-derived-symbol methodName (concatenate base-name suffix)))))
 
 (defun (yield-argument-access-tree OBJECT)
     ((argumentsVariable SYMBOL) (index INTEGER) (restArgument? BOOLEAN))
@@ -8745,7 +8720,7 @@ evaluation strategies."
 	 NULL)))
     (return oTree)))
 
-(defun (evaluate-cons-tree OBJECT TYPE-SPEC)   ((tree CONS))
+(defun (evaluate-cons-tree OBJECT TYPE-SPEC) ((tree CONS))
   ;; Evaluate the cons tree 'tree'.
   (special ((*evaluationParentTree* *evaluationTree*)
             (*evaluationTree* tree))
@@ -8760,6 +8735,10 @@ evaluation strategies."
             (when (eq? (length arguments) 1)
               (return (value arguments) (primary-type (value arguments))))
             (evaluation-error "Illegal QUOTE expression"))
+           (PROGN
+             (foreach arg in arguments
+                 do (evaluate arg))
+             (return NULL @VOID))
            (otherwise
             (when (not (setq? operator (lookup-command operatorName)))
               (evaluation-error "Undefined operator: " operatorName)))))
@@ -8811,6 +8790,10 @@ evaluation strategies."
               ;;        since it assumes a single return value:
               (apply (function-code operator) arguments)
 	      (setq result (apply (function-code operator) arguments))))
+        (when (defined? result)
+          ;; return the actual dynamic return type instead of the static
+          ;;    function return type to facilitate coercion:
+          (setq returnType (primary-type result)))
         (return result returnType)))))
 
 (defun (evaluate-argument-tree OBJECT TYPE-SPEC)

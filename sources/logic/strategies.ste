@@ -1,0 +1,2171 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006     ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: strategies.ste,v 1.73 2006/05/10 22:41:54 hans Exp
+
+;;; Routines that implement alternate proof strategies for query processing
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Query machine for strategies
+  ;;
+
+(defun (continue-strategies-proofs KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Continue current or dispatch next strategy if moving down.
+  ;; Check to see if strategy has a restart (resume) procedure if moving up.
+  (let ((result KEYWORD NULL))
+    (case lastMove
+      (:DOWN
+       ;; if a choice point is set coming down, unwind:
+       (unwind-to-choice-point frame)
+       (clear (justifications frame))
+       (when (defined? (down frame))
+         (return :MOVE-DOWN)))
+      ((:UP-TRUE :UP-FAIL)
+       (setq result (resume-proof-strategy-after-subgoal frame lastMove))
+       (when (eql? result :FAILURE)
+         (setq result NULL))))
+    (loop
+      ;; could be :DOWN, or a :FAILURE after 'resume-xxx':
+      (when (null? result)
+        (setq result (continue-current-or-next-strategy frame)))
+      (case result
+        ((:FINAL-SUCCESS :CONTINUING-SUCCESS)
+         (when (and (defined? (proposition frame))
+                    (holds-by-default? frame)
+                    ;;; TO DO: FIGURE OUT HOW TO AVOID DOING THIS MULTIPLE TIMES
+                    ;;;    WHEN WE MOVE UP WITH A DEFAULT TRUE RESULT.
+                    (has-shallow-disproof? frame))
+           (when (trace-keyword? :GOAL-TREE)
+             ;; this still isn't quite right for all cases:
+             (let ((truthValue (truth-value frame))
+                   (default? (default-truth-value? truthValue)))
+               (print-vertical-bars (1+ (compute-frame-depth frame)))
+               (print "CLSH: truth=")
+               (if (true-truth-value? truthValue)
+                   (if default? (print "t") (print "T"))
+                   (if default? (print "f") (print "F")))
+               (print EOL)))
+           ;; undo any obsolete state we acquired:
+           (unwind-to-choice-point frame)
+           (cond
+            ((and (not (holds-by-default? frame))
+                  (all-arguments-bound? (proposition frame)))
+             ;; we had a strict disproof on a ground proposition, fail permanently:
+             (setq result :FAILURE))
+            (otherwise
+             ;; clear truth value and continue with current or next strategy:
+             (set-frame-truth-value frame NULL)
+             (clear (justifications frame))
+             (when (defined? (partial-match-frame frame))
+               (clear-frame-partial-truth (partial-match-frame frame)))
+             (cond ((defined? (down frame))
+                    (setq result :MOVE-DOWN))
+                   (otherwise
+                    (setq result NULL)
+                    (continue)))))))
+        (otherwise NULL))
+      ;; in case we haven't set the result truth value
+      ;;    or justification already, do it now:
+      (case result
+        ((:CONTINUING-SUCCESS :FINAL-SUCCESS)
+         (when (null? (truth-value frame))
+           (set-frame-truth-value frame TRUE-TRUTH-VALUE))
+         (when (and (partial-match-mode?)
+                    (not (defined-frame-partial-truth? frame)))
+           (set-frame-partial-truth
+            (partial-match-frame frame) TRUE-TRUTH-VALUE NULL NULL FALSE))
+         (when (and (record-justifications?)
+                    (null? (justification frame)))
+           (record-primitive-justification frame :UP-TRUE)))
+        ((:FAILURE :TERMINAL-FAILURE)
+         (if (partial-match-mode?)
+           (progn 
+             (when (not (defined-frame-partial-truth? frame))
+               (set-frame-partial-truth
+                (partial-match-frame frame)
+                (truth-value frame)
+                (choose (defined? (truth-value frame)) NULL 0.0)
+                NULL
+                (defined? (truth-value frame))))
+             (when (and (record-justifications?)
+                        (null? (justification frame)))
+               (record-primitive-justification frame :UP-FAIL)))
+           ;; Handle closed world in strict mode:
+           (when (and (unknown-truth-value? (truth-value frame))
+		      (null? (inference-cutoff-reason frame))
+                      (defined? (proposition frame))
+                      (closed-proposition? (proposition frame)))
+	     ;; Should this be DEFAULT-FALSE-TRUTH-VALUE?
+	     ;; No, for now since we treat closed world as a strict inference.
+             (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+             (when (and (record-justifications?)
+                        (null? (justification frame)))
+               (record-closed-not-justification frame :UP-FAIL)))))
+        (otherwise NULL))
+      (return result))))
+
+(defun clear-strategy-slots ((frame CONTROL-FRAME))
+  ;; Helping function for 'select-next-strategy'.
+  ;; Clear slots possibly used by the last strategy.
+  (when (defined? (iterator frame))
+    (setf (iterator frame) NULL))
+  (when (defined? (antecedents-rule frame))
+    (setf (antecedents-rule frame) NULL)) 
+  (when (defined? (proof-adjunct frame))
+    (setf (proof-adjunct frame) NULL)))
+
+(defun (select-next-strategy CONTROL-FRAME) ((frame CONTROL-FRAME))
+  ;; Update '(current-strategy frame)' with the next strategy to perform
+  ;;    (or the current one if one is still continuing).
+  ;; Return 'frame', which may have been replaced by a parallel frame.
+  (let ((strategy KEYWORD NULL))
+    (cond
+     ((defined? (current-strategy frame))
+      (setq strategy (current-strategy frame)))
+     ((eql? (state frame) :PARALLEL-STRATEGIES)
+      (setq strategy :SELECT-PARALLEL-THREAD))
+     (otherwise
+      (loop
+        (setq strategy (first (next-strategies frame)))
+        (when (null? strategy)
+          (return frame))
+        (setf (next-strategies frame) (rest (next-strategies frame)))
+        (when (filter-out-strategy? strategy frame)
+          (continue))
+        (when (parallel-strategy? strategy)
+          (setq frame (parallelize-control-frame frame))
+          (pushf (next-strategies frame) strategy)
+          (setq strategy :SELECT-PARALLEL-THREAD))
+        ;; make sure that old strategy slots don't leak into new strategy:
+        (clear-strategy-slots frame)
+        (break))))
+    (setf (current-strategy frame) strategy)
+    (return frame)) )
+
+(defun record-base-partial-match-truth ((frame CONTROL-FRAME) (result KEYWORD))
+  ;; <David - write a comment here>
+  (let ((pmResult 
+         (choose (or (eql? result :FAILURE)
+                     ;; success in r-p is really failure:
+                     (reverse-polarity? frame))
+                 :FAIL :TRUE)))
+    (when (and (defined? *queryiterator*)
+               (defined? (partial-match-strategy *queryiterator*)))
+      (set-base-partial-match-truth 
+       (partial-match-strategy *queryIterator*) (proposition frame)
+       pmResult)) ))
+
+(defun (continue-current-or-next-strategy KEYWORD) ((frame CONTROL-FRAME))
+  ;; Continue the current proof strategy, or if it fails (or is
+  ;;    exhausted) try another one, until we succeed for the final
+  ;;    time or run out of strategies.
+  ;; Tricky: Parallelization may cause 'frame' to be reassigned.
+  (let ((result KEYWORD NULL))
+    (loop
+      (setq frame (select-next-strategy frame))
+      (when (null? (current-strategy frame))
+        (trace-if :STRATEGIES EOL)
+        (if (non-empty? (justifications frame))
+          (return :FINAL-SUCCESS)
+          (return :FAILURE)))
+      (trace-if :STRATEGIES " " (current-strategy frame))
+      (when (trace-keyword? :STRATEGIES)
+        (let ((description (description frame)))
+          (when (and (defined? description)
+                     (named-description? description))
+            (print "(" (symbol-name (surrogate-value-inverse description)) ")"))))
+      (if (reverse-polarity? frame)
+        (special ((*reversePolarity?* TRUE))
+                 (setq result (execute-proof-strategy frame)))
+        (setq result (execute-proof-strategy frame)))
+      (case result
+        (:TERMINAL-FAILURE
+         ;; force failure of all remaining strategies for the current atomic goal:
+         (setf (next-strategies frame) NIL)
+         (setq result :FAILURE))
+        ((:MOVE-DOWN :MOVE-IN-PLACE :TIME-OUT)
+         (trace-if :STRATEGIES EOL)
+         (return result))
+        (otherwise NULL))
+      (record-base-partial-match-truth frame result)
+      (when (trace-keyword? :STRATEGIES)
+        (case result
+          (:FAILURE (print " "))
+          (otherwise (print EOL))))
+      (if (eql? result :FAILURE)
+        (setf (current-strategy frame) NULL)
+        (return result))) ))
+
+(defun (resume-proof-strategy-after-subgoal KEYWORD) 
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Situation: A subgoal spawned by the current proof has returned
+  ;;    from its computation.
+  ;; The default behavior propagates the success/failure of a subgoal as
+  ;;    the success/failure of the proof.  The continued existence of
+  ;;    a down frame is interpreted as evidence of a continuing success.
+  ;; Strategies have the option of intercepting and modifying the
+  ;;    default behavior here.
+  ;; Add to case statement here:
+  (let ((result KEYWORD NULL))
+    (case (current-strategy frame)
+      (:SPECIALIST
+       (setq result (continue-specialist-proof frame lastMove)))
+      (:ANTECEDENTS
+       (if (defined? (partial-match-frame frame))
+           (setq result
+             (continue-partial-antecedents-proof
+              (partial-match-frame frame) lastMove))
+         (setq result (continue-antecedents-proof frame lastMove))))
+      (:CLUSTERED-CONJUNCTION
+       (setq result (continue-clustered-conjunction-proof frame lastMove)))
+      (:CONDITIONAL-ANTECEDENT
+       (setq result (continue-conditional-antecedent-proof frame lastMove)))
+      (otherwise
+       ;; We succeeded with an atomic substrategy, propagate the truth value:
+       (propagate-frame-truth-value (result frame) frame)
+       (when (defined? (partial-match-frame (result frame)))
+         (propagate-frame-partial-truth
+          (partial-match-frame (result frame)) frame))
+       (case lastMove
+         (:UP-TRUE
+          (if (defined? (down frame))
+            (setq result :CONTINUING-SUCCESS)
+            (setq result :FINAL-SUCCESS)))
+         (:UP-FAIL
+          (if  (false-truth-value? (truth-value frame))         ; zzz
+            (setq result :TERMINAL-FAILURE)
+            (setq result :FAILURE))))))
+    (case result
+      (:CONTINUING-SUCCESS
+       (when (and *generate-all-proofs?*
+                  (eql? (state frame) :ATOMIC-GOAL)
+                  (not (partial-match-mode?))
+                  (not (new-bindings-since-last-choice-point? frame)))
+         ;; KLUDGE TO RECORD THE FACT THAT A SUCCESSFUL PROOF WAS FOUND:
+         (push (justifications frame) :DUMMY-JUSTIFICATION)
+         ;; try to find some more proofs:
+         (setq result :MOVE-DOWN)))
+      ((:FINAL-SUCCESS :TERMINAL-FAILURE)
+       ;; force failure of all remaining strategies for the current atomic goal:
+       (setf (next-strategies frame) NIL)
+       (setf (current-strategy frame) NULL)
+       (when (eql? result :TERMINAL-FAILURE)
+         (setq result :FAILURE)))
+      (:FAILURE
+       ;; make sure that strategy has cleaned up after itself:
+       (setf (current-strategy frame) NULL))
+      ((:MOVE-DOWN :MOVE-IN-PLACE) NULL))
+    (return result)) )
+
+(defun (filter-out-strategy? BOOLEAN) ((strategy KEYWORD) (frame CONTROL-FRAME))
+  ;; If there is a quick way to avoid applying strategy 'strategy',
+  ;;    return TRUE.
+  (case strategy
+    (:LOOKUP-GOAL-CACHES
+     (return
+      (or (and (not (check-for-cached-goals?
+                     (surrogate-to-description (relationRef (proposition frame))))))
+          (not (cache-query-results?)))))
+    (:SPECIALIST
+     (let ((proposition (proposition frame))
+           (description (get-description (relationRef proposition))))
+       (return (null? (lookup-specialist description)))))
+    (:MANUFACTURE-SKOLEM
+     (let ((description (get-description (relationRef (proposition frame)))))
+       (return (or (not (test-property? description PL-KERNEL/@TOTAL))
+                   (reverse-polarity? frame)))))
+    (otherwise (return FALSE))) )
+
+
+  ;;
+;;;;;; The Big Strategies Switch
+  ;;
+
+(defun (execute-proof-strategy KEYWORD) ((frame CONTROL-FRAME))
+  ;; Select a proof strategy interpreter for '(current-strategy frame)'
+  ;;    and apply it to 'frame'. 
+ ;(print EOL "EPS: " (current-strategy frame) "  " (proposition frame) "  " 
+ ;       (description frame) EOL)
+  (case (current-strategy frame)
+    (:SPECIALIST
+     (return (continue-specialist-proof frame :DOWN)))
+    (:LOOKUP-GOAL-CACHES
+     (return (try-goal-caches-proof frame)))
+    (:LOOKUP-ASSERTIONS
+     (return (try-lookup-ground-assertions-proof frame)))
+    (:SCAN-PROPOSITIONS
+     (return (try-scan-propositions-proof frame)))
+    (:SCAN-PARTIAL-PROPOSITIONS
+     (return (try-scan-partial-propositions-proof frame)))
+    (:SCAN-COLLECTION
+     (return (try-scan-collection-proof frame)))
+    (:SHALLOW-DISPROOF
+     (return (try-shallow-disproof frame)))
+    (:SCAN-FOR-VALUE-CLASH
+     (return (try-scan-for-value-clash-proof frame)))
+    (:MANUFACTURE-SKOLEM
+     (return (try-manufacture-skolem-proof frame)))
+    (:ALL-SUBGOAL-STRATEGIES
+     (return (try-subgoal-strategies-proof frame)))
+    (:ANTECEDENTS
+     (if (defined? (partial-match-frame frame))
+         (return
+           (continue-partial-antecedents-proof
+            (partial-match-frame frame) :DOWN))
+       (return (continue-antecedents-proof frame :DOWN))))
+    (:FULL-SUBQUERY
+     (return (try-full-subquery-proof frame)))
+    (:GOAL-COMPLEMENT
+     (return (try-goal-complement-proof frame)))
+    (:CONDITIONAL-ANTECEDENT
+     (return (continue-conditional-antecedent-proof frame :DOWN)))
+    (:FORWARD-GOALS
+     (return (try-forward-goals-proof frame)))
+    (:IMPLIES
+     (return (try-implies-proof frame)))
+    (:CONTAINED-BY
+     (return (try-contained-by-proof frame)))
+    (:EQUIVALENCE
+     (return (try-equivalence-proof frame)))
+    (:CLUSTERED-CONJUNCTION
+     (return (continue-clustered-conjunction-proof frame :DOWN)))
+    (:DISJUNCTIVE-IMPLICATION-INTRODUCTION
+     (return (try-disjunctive-implication-proof frame)))
+    (:UNIVERSAL-INTRODUCTION
+     (return (try-universal-introduction-proof frame)))
+    (:SUBSUMPTION-TEST
+     (return (try-subsumption-test frame)))
+    (:REFUTATION
+     (return (try-refutation-proof frame)))
+    (:SELECT-PARALLEL-THREAD
+     (return (try-parallel-thread-proof frame)))
+    ) )
+
+
+  ;;
+;;;;;; Parallel strategy machinery
+  ;;
+
+(defun (continue-parallel-strategies-proofs KEYWORD)
+       ((pFrame PARALLEL-CONTROL-FRAME) (lastMove KEYWORD))
+  ;; If moving down, try to find an existing thread or create a new one
+  ;;    to prove the goal in 'pFrame'.
+  ;; If moving up, perform tasks associated with exit of a parallel thread.
+  (case lastMove
+    (:DOWN
+     (when (defined? (down pFrame))
+       (enter-parallel-thread pFrame NULL)
+       (return :MOVE-DOWN))
+     (return (continue-current-or-next-strategy pFrame)))
+    (:UP-TRUE
+     (exit-parallel-thread pFrame)
+     (when (unbound-variables? pFrame)
+       ;; TO DO: TRANSFER BINDINGS FROM CHILD TO PARENT:
+       "NOT YET IMPLEMENTED")
+     (propagate-frame-truth-value (result pFrame) pFrame)
+     (if (defined? (down pFrame))
+       (return :CONTINUING-SUCCESS)
+       (return :FINAL-SUCCESS)))
+    (:UP-FAIL
+     (exit-parallel-thread pFrame)
+     (when (non-empty? (next-strategies pFrame))
+       ;; continue with remaining non-parallel strategies:
+       (setf (state pFrame) :STRATEGY)
+       (setf (current-strategy pFrame) NULL)
+       (return (continue-current-or-next-strategy pFrame)))
+     (propagate-frame-truth-value (result pFrame) pFrame)
+     (return :FAILURE))) )
+
+(defglobal *parallel-strategies* (LIST OF KEYWORD)
+  (list :DISJUNCTIVE-IMPLICATION-INTRODUCTION :UNIVERSAL-INTRODUCTION :REFUTATION)
+  :documentation "List of strategies (keywords) that fork a parallel
+control stack before executing.")
+
+(defun (parallel-strategy? BOOLEAN) ((strategy KEYWORD))
+  ;; Return TRUE if 'strategy' should be executed on a parallel
+  ;;    control stack.
+  (return (member? *parallel-strategies* strategy)) )
+
+;; NOTHING CALLS THIS:
+(defun (select-next-child-thread PARALLEL-THREAD)
+       ((pFrame PARALLEL-CONTROL-FRAME))
+  ;; Depending on priorities, we may select an existing child thread, or
+  ;;    we may return NULL, indicating that we prefer to create a new
+  ;;    strategy.
+  ;; TO DO: IMPLEMENT A FANCY SELECTION SCHEME HERE:
+  (return (first (child-threads pFrame))) )
+
+(defun (create-child-thread PARALLEL-THREAD) ((pFrame PARALLEL-CONTROL-FRAME))
+  ;; Create a new child thread for the first strategy in '(next-strategies pFrame)'.
+  ;; TO DO: FIGURE OUT HOW/WHERE binding stacks GET INITIALIZED.
+  (let  ((strategies (next-strategies pFrame))
+         (childThread (new PARALLEL-THREAD))
+         (downFrame (create-down-frame pFrame (proposition pFrame))))
+    (setf (state downFrame) :STRATEGY)
+    (setf (current-strategy downFrame) (first strategies))
+    (setf (next-strategies pFrame) (rest strategies))
+    (when (partial-match-mode?)
+      (create-and-link-partial-match-frame downFrame :STRATEGY))
+    (setf (top-control-frame childThread) downFrame)
+    (insert (child-threads pFrame) childThread)
+    (return childThread) ))
+
+(defun (try-parallel-thread-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Choose a child thread and move down into it.
+  ;; CURRENTLY, THIS DOESN'T CHOOSE ANYTHING; IT CREATES A NEW THREAD.
+  (let ((childThread (create-child-thread frame)))
+    (enter-parallel-thread frame childThread)
+    (return :MOVE-DOWN) ))
+
+
+  ;;
+;;;;;; Utility frame-manipulation functions
+  ;;
+
+(defun push-next-strategy ((frame CONTROL-FRAME) (strategy KEYWORD))
+  ;; Push a new strategy onto the front of those strategies attached to
+  ;;    the parent of 'frame'.
+  ;; Called by frames that have exhausted any local computations, and now
+  ;;    wish to spawn additional proof strategies.
+  (setf (next-strategies frame) 
+        (cons strategy (next-strategies frame))) )
+
+(defun (create-subgoal-frame CONTROL-FRAME) 
+       ((upFrame CONTROL-FRAME) (goal PROPOSITION) (strategy KEYWORD))
+  ;; Create a down 'frame' having 'goal' as its proposition to be proved.
+  ;; Assumes that 'upFrame' has a proof record.
+  (safety 3 (or (defined? strategy)
+                (and (defined? goal)
+                     (not (eql? goal (proposition upFrame))))) "Bad subgoal.")
+  (let ((downFrame (create-down-frame upFrame goal)))
+    (when (defined? strategy)
+      ;; convert 'downFrame' to a strategies frame:
+      (if (and (defined? goal)
+               (not (eql? goal (proposition upFrame))))
+        (setf (state downFrame) :ATOMIC-GOAL)
+        (setf (state downFrame) :STRATEGY))
+      (setf (current-strategy downFrame) strategy))
+    ;; computing polarity of downframe:
+    (setf (reverse-polarity? downFrame) (reverse-polarity? upFrame))
+    (return downFrame)) )
+
+
+  ;;
+;;;;;; :ATOMIC-GOAL proof strategies
+  ;;
+
+(defun (continue-specialist-proof KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Proof Strategy: If a specialist exists for the operator in
+  ;;   'proposition', apply it to the arguments.
+  ;; Note: The specialist decides whether failure should be final, or
+  ;;    if other proofs should be tried.
+  (let ((proposition (proposition frame))
+        (description (get-description (relationRef proposition)))
+        (specialistCode (lookup-specialist description))
+        (result KEYWORD
+                (choose (defined? specialistCode)
+                        (funcall specialistCode frame lastMove)
+                        :FAILURE)))
+    ;; if the specialist didn't assign a truth value, do it here:
+    (when (null? (truth-value frame))
+      (case result
+        ((:FINAL-SUCCESS :CONTINUING-SUCCESS)
+         (set-frame-truth-value frame TRUE-TRUTH-VALUE))
+        (otherwise NULL)))
+    (return result)))
+
+(defglobal *failed-goal-cutoffs* INTEGER 0)
+(defglobal *succeeded-goal-cutoffs* INTEGER 0)
+
+(defun (lookup-cached-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Short-cut proof using cached goals.
+  ;; Search cached goal(s) attached to 'frame' to see if a quick
+  ;;    failure or success is merited.
+  (when (or (and (not (check-for-cached-goals?
+                       (surrogate-to-description (relationRef (proposition frame))))))
+            (not (cache-query-results?)))
+    (return :FAILURE))
+  (let ((successOrFailure :FAILURE)
+        (cachedGoal (find-cached-goal frame successOrFailure)))
+    (when (null? cachedGoal)
+      (setq successOrFailure :SUCCESS)
+      (setq cachedGoal (find-cached-goal frame successOrFailure)))
+    (if (and (defined? cachedGoal)
+             (or (using-default-knowledge?)
+                 (strict-truth-value? (truth-value cachedGoal))))
+      (return
+       (finish-cached-goal-processing cachedGoal frame successOrFailure FALSE))
+      (return :FAILURE)) ))
+
+(defun (scan-cached-goals KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy:  If the current goal cache contains a proof or
+  ;;    known failure for the goal in `frame', immediately
+  ;;    return with the cached result.
+  ;; If the goal has unbound variables, try to generate bindings from
+  ;;    previously cached results.
+  ;; This proof strategy is invoked explicitly by other strategies
+  ;;    instead of using it as a general top-level strategy to improve
+  ;;    efficiency.  Actually, using it as a general strategy would
+  ;;    necessitate to change the current invocation mechanism.
+  ;; TO DO: - MAYBE OPTIMIZE HASHING SO THAT IT ISN'T PERFORMED TWICE
+  ;;          FOR FAILURE AND SUCCESS
+  (safety 3 (cache-query-results?) "Bug: Bad call to 'scan-cached-goals'.")
+  (let ((proposition (proposition frame))
+        (iterator (iterator frame))
+        (cachedGoal ATOMIC-GOAL-CACHE NULL)
+        (patternRecord (current-pattern-record *queryIterator*))
+        (ubStackOffset (top-unbinding-stack-offset patternRecord)))
+    (when (not (check-for-cached-goals?
+                (surrogate-to-description (relationRef proposition))))
+      (return :FAILURE))
+    (when (null? iterator)
+      (setq iterator
+        (setf (iterator frame) (all-cached-propositions frame))))
+    (while (next? iterator)
+      (setq cachedGoal (value iterator))
+      ;; This test is not redundant, since `next?' doesn't take variable
+      ;;    types into account - should it?
+      (when (forall arg in (arguments proposition)
+                as cachedBinding in (bindings cachedGoal)
+                always (bind-argument-to-value? arg cachedBinding TRUE))
+        (return
+          (finish-cached-goal-processing cachedGoal frame :SUCCESS TRUE)))
+      (unbind-variables-beginning-at patternRecord (1+ ubStackOffset)))
+    ;; Otherwise:
+    (return :FAILURE) ))
+
+(defun (finish-cached-goal-processing KEYWORD)
+       ((cachedGoal ATOMIC-GOAL-CACHE) (frame CONTROL-FRAME)
+        (successOrFailure KEYWORD) (continuing? BOOLEAN))
+  ;; Copy partial match score and justification from 'cachedGoal'
+  ;;    into 'frame'.
+  (setf (latest-positive-score *queryIterator*)
+        (positive-score cachedGoal))
+  ;; don't use `set-frame-truth-value' here to ignore polarity:
+  (setf (truth-value frame) (truth-value cachedGoal))
+  (when (defined? (partial-match-frame frame))
+    (set-frame-partial-truth
+     (partial-match-frame frame)
+     (truth-value cachedGoal) (positive-score cachedGoal) NULL TRUE))
+  (when (and (record-justifications?)
+             (defined? (justification cachedGoal)))
+    (setf (justification frame) (copy (justification cachedGoal))))
+  (when (and (trace-keyword? :GOAL-CACHES)
+             TRUE ; (not continuing?)
+             )
+    (special 
+     ((*printInFrame* frame)
+      (*prettyPrintLogicalForms?* FALSE))
+     (case successOrFailure
+       (:SUCCESS (print "USED CACHED SUCCESS+: "))
+       (:FAILURE (print "USED CACHED FAILURE-: ")))
+     (when (holds-by-default? frame)
+       (print "dflt"))
+     (print (choose (reverse-polarity? cachedGoal) "~" " ")
+            (proposition frame) EOL)))
+  (case successOrFailure
+    (:SUCCESS
+     (++ *succeeded-goal-cutoffs*)
+     (return (choose continuing? :CONTINUING-SUCCESS :FINAL-SUCCESS)))
+    (:FAILURE
+     (++ *failed-goal-cutoffs*)
+     (when (defined? (down frame))
+       (pop-frames-up-to (down frame)))
+     (return :TERMINAL-FAILURE))) )
+
+(defun (try-goal-caches-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Check to see if there is a goal cache that caches the result
+  ;;    of a previous proof.
+  (when (null? (iterator frame))           ; first time?
+    ;; we only call 'lookup-cached-proof' the first time through:
+    (let ((proposition (proposition frame))
+          (cachedResult (lookup-cached-proof frame)))
+      (when (not (eql? cachedResult :FAILURE))
+        (return cachedResult))
+      ;; check if we need to access a cache that contains variable bindings:
+      (when (or (all-arguments-bound? proposition)
+                (not (cache-query-results?))
+                (null? (get-goal-cache-list proposition)))
+        (return :FAILURE))))
+  (return (scan-cached-goals frame)) )
+
+(defun (try-lookup-ground-assertions-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Try to prove the proposition in 'frame' (or generate bindings for its
+  ;;    variables) using only ground assertions.
+  (case (kind (proposition frame))
+    (:ISA
+     ;; EXPERIMENT (BECAUSE "try-scan-collection-proof" CAN'T HANDLE
+     ;;    REVERSE POLARITY):
+     (when *reversePolarity?*
+       (return (try-scan-propositions-proof frame)))
+     (return (try-isa-proposition-proof frame)))
+    (otherwise
+     (return (try-scan-propositions-proof frame)))) )
+
+(defun (try-scan-propositions-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy:  If an argument is bound to an object having
+  ;;    backlinks to propositions, search for a true specializing proposition
+  ;;    that binds the remaining arguments.
+  ;; Return success if one of them specializes 'proposition'.
+  ;; Fails if none of the arguments to 'proposition' is a LOGIC-OBJECT.
+  (let ((proposition (proposition frame))
+        (allKeyArgumentsBound? FALSE)
+        (iterator (iterator frame))
+        (result :FAILURE))
+    (when (null? iterator) ;; first time?
+      ;; tricky: we only test if all arguments are bound on the
+      ;;    first pass through; if they are, then we either succeed
+      ;;    or fail on that first pass:
+      ;; TO DO: UPGRADE THIS TO UNDERSTAND UNIQUENESS KEYS:
+      (setq allKeyArgumentsBound?
+            (or (all-arguments-bound? proposition)
+                (all-key-arguments-bound? proposition)))
+      ;; allocate specializing propositions iterator:
+      (setq iterator (all-matching-propositions proposition))
+      (if (eql? iterator EMPTY-PROPOSITIONS-ITERATOR)
+          (setq iterator NULL) ;; :FAILURE
+        (setf (iterator frame) iterator))
+      ;; test whether we should also look for partial assertions containing
+      ;;    NULL arguments:
+      (when (and (partial-match-mode?)
+                 ;; only do this at the top level:
+                 (eql? (current-strategy frame) :LOOKUP-ASSERTIONS)
+                 ;; at least one argument must be non-NULL:
+                 (> (length (arguments proposition)) 1)
+                 (null-instance-propositions-exist?))
+        (push-next-strategy frame :SCAN-PARTIAL-PROPOSITIONS)))
+    ;;    Semantics note: We assume that it is OK for an 
+    ;;    asserted proposition to short-circuit a search for multiple
+    ;;    proofs, as long as it is a "direct" assertion:
+    (when (defined? iterator)
+      (while (next? iterator)
+        (when (arguments-unify-with-arguments? (value iterator) proposition)
+          (cond
+           ((and allKeyArgumentsBound?
+                 (or (not *generate-all-proofs?*)
+                     ;; For WhyNot we don't want to look for further proofs,
+                     ;; since if we succeeded via lookup, we can't improve that
+                     ;; via chaining - in fact we might actually fail which
+                     ;; gives very strange alternative explanations:
+                     (whynot-partial-match-mode?)))
+            (setq result :FINAL-SUCCESS)
+            (break))
+           (otherwise
+            (setq result :CONTINUING-SUCCESS)
+            (break))))))
+    (when (and (eql? result :FAILURE)
+               (reverse-polarity? frame)
+               ;; don't do this if we are called by `has-shallow-disproof?':
+               (not (eql? (current-strategy frame) :SHALLOW-DISPROOF))
+               (or (eql? (kind proposition) :FUNCTION)
+                   (single-valued-predicate? proposition))
+               (all-arguments-bound? proposition))
+      (push-next-strategy frame :SCAN-FOR-VALUE-CLASH))
+    (when (not (eql? result :FAILURE))
+      (let ((truthValue (propositions-iterator-truth-value iterator))
+            (weight (weight (cast (value iterator) PROPOSITION))))
+        (when (default-truth-value? truthValue)
+          ;; try to generate a strict proof:
+          (special ((*dontUseDefaultKnowledge?* TRUE))
+            (setq iterator (all-matching-propositions proposition))
+            (when (next? iterator)
+              (setq truthValue (propositions-iterator-truth-value iterator))
+              (setq weight (weight (cast (value iterator) PROPOSITION))))))
+        (setf (truth-value frame) truthValue)
+        (when (defined? (partial-match-frame frame))
+          (when (null? weight)
+            (setq weight 1.0))
+          (set-frame-partial-truth
+           (partial-match-frame frame)
+           truthValue
+           ;; the weight of the instantiating proposition scales the score of
+           ;;    its truth value (could be achieved with a custom truth value):
+           (* (positive-score truthValue) weight)
+           NULL TRUE))))
+    (return result) ))
+
+(defun (has-shallow-disproof? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; Return TRUE if there is a shallow disproof of the proposition in 'frame'.
+  (let ((iterator (iterator frame))
+        (proposition (proposition frame))
+        (truthValue (truth-value frame))
+        (hasDisproof? FALSE))
+    (setf (iterator frame) NULL)
+    (special ((*reversePolarity?* (not (reverse-polarity? frame))))
+      ;; CAREFUL: This might destructively change the iterator and the truth
+      ;;   value of the proposition - which is why we reset the iterator below:
+      (setf (reverse-polarity? frame) *reversePolarity?*)
+      (set-frame-truth-value frame NULL)
+      (when (and (whynot-partial-match-mode?)
+                 (eql? (kind proposition) :ISA))
+        ;; be more agressive about disproving type propositions (we could
+        ;;    do this in general but disjointness tests are a bit expensive):
+        ;; WE SHOULD ALSO DO THIS WITH THE ARGUMENT TYPES OF RELATIONS, E.G.,
+        ;;    (BROTHER-OF MYCAR APPLETREE) SHOULD BE FALSE.
+        (cond ((not *reversePolarity?*)
+               (setq hasDisproof?
+                 (eql? (try-isa-proposition-proof frame) :FINAL-SUCCESS)))
+              (otherwise
+               (let ((queriedType
+                      (get-description (operator proposition)))
+                     (instance
+                      (argument-bound-to (first (arguments proposition))))
+                     (assertedTypes NIL))
+                 (when (defined? instance)
+                   (special ((*reversePolarity?* FALSE))
+                     (setq assertedTypes (all-asserted-types instance)))
+                   (foreach type in assertedTypes
+                       where (disjoint-terms? type queriedType)
+                       do (setq hasDisproof? TRUE)
+                          ;; this will be inverted due to reverse polarity:
+                          (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+                          (break)))))))
+      (unless hasDisproof?
+        (setq hasDisproof?
+          (eql? (try-scan-propositions-proof frame) :FINAL-SUCCESS)))
+      (when (and (not hasDisproof?)
+                 *reversePolarity?*
+                 (or (eql? (kind (proposition frame)) :FUNCTION)
+                     (single-valued-predicate? (proposition frame))))
+        (setq hasDisproof?
+          (eql? (try-scan-for-value-clash-proof frame) :FINAL-SUCCESS)))
+      (setf (reverse-polarity? frame) (not (reverse-polarity? frame))))
+    ;; restore original `frame' state:
+    (unless hasDisproof?
+      (setf (truth-value frame) truthValue))
+    (setf (iterator frame) iterator)
+    (return hasDisproof?)))
+
+(defun (try-shallow-disproof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy:  Scan propositions with polarity reversed.  If the
+  ;;    the disproof succeeds, convert the return value to :TERMINAL-FAILURE.
+  ;; Otherwise, return :FAILURE (the disproof failed).
+  ;; Side-effect: Possibly push :SCAN-FOR-VALUE-CLASH strategy onto queue.
+  (let ((proposition (proposition frame)))
+    (cond
+     ((not (all-arguments-bound? proposition))
+      (return :FAILURE))
+     ((has-shallow-disproof? frame)
+      (let ((hasDefaultDisproof? (holds-by-default? frame)))
+        (when hasDefaultDisproof?
+          (set-frame-truth-value frame NULL))
+        ;; strict conflict causes terminal failure:
+        (return (choose hasDefaultDisproof? :FAILURE :TERMINAL-FAILURE))))
+     #| ;; now done directly in `has-shallow-disproof?':
+     ((and (eql? (kind proposition) :FUNCTION)
+           *reversePolarity?*)
+      (push-next-strategy frame :SCAN-FOR-VALUE-CLASH))
+      |#
+     )
+    ;; disproof fails:
+    (return :FAILURE) ))
+
+(defun (try-scan-for-value-clash-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy:  Polarity is reversed; search for :FUNCTION proposition
+  ;;    with a conflicting output argument.
+  (safety 3 *reversePolarity?*
+          "INTERNAL ERROR: try-scan-for-value-clash-proof: "
+          "polarity should be reversed, but isn't")
+  ;; Tricky: Temporarily convert to positive polarity so that the iterator
+  ;;    will match against TRUE-TVs rather than FALSE-TVs.
+  (special ((*reversePolarity?* FALSE)
+            (*dontUseDefaultKnowledge?* *dontUseDefaultKnowledge?*))
+    (let ((proposition (proposition frame))
+          (clashIterator (all-clashing-propositions proposition))
+          (truthValue
+           (choose (next? clashIterator)
+                   (propositions-iterator-truth-value clashIterator)
+                   NULL)))
+      (when (default-truth-value? truthValue)
+        ;; try to generate a strict clash:
+        (setq *dontUseDefaultKnowledge?* TRUE)
+        (setq clashIterator (all-clashing-propositions proposition))
+        (when (next? clashIterator)
+          (setq truthValue (propositions-iterator-truth-value clashIterator))))
+      ;; if we did find a clash, `truthValue' is positive and needs inversion:
+      (setf (truth-value frame) (invert-truth-value truthValue))
+      (return (choose (defined? truthValue) :FINAL-SUCCESS :FAILURE)))))
+
+(defun (try-manufacture-skolem-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Situation: 'proposition' is a :FUNCTION proposition.
+  ;; Proof strategy: If 'proposition' is total (and we aren't in
+  ;;    *reversePolarity?*) then create a new defining skolem representing
+  ;;    the value of 'slot' applied to 'arguments'; bind the last
+  ;;    argument of 'proposition' to that skolem, and return success.
+  (let ((proposition (proposition frame))
+        (description (get-description (relationRef proposition)))
+        (argumentValues NIL))
+    (when (or (not (test-property? description PL-KERNEL/@TOTAL))
+              (reverse-polarity? frame))
+      (return :FAILURE))
+    (foreach arg in (arguments proposition)
+             do (pushq argumentValues (argument-bound-to arg)))
+    ;; fail if last argument is bound, or if an input argument is unbound
+    ;;    note: 'argumentValues' occurs in reverse order:
+    (when (or (defined? (first argumentValues))
+              (exists value in (rest argumentValues) where (null? value)))
+      (return :FAILURE))
+    (let ((inputValues (reverse (rest argumentValues)))
+          (definingProposition 
+            (create-function-proposition (relationRef proposition) inputValues)))
+      (bind-variable-to-value?
+       (last-argument proposition) (last-argument definingProposition) TRUE)
+      (return :FINAL-SUCCESS)) ))
+
+
+  ;;
+;;;;;; Subgoal strategies proofs
+  ;;
+
+(defun (extract-subgoal-of-frame PROPOSITION) ((frame CONTROL-FRAME))
+  ;; Return the proposition subgoaled on by `frame' (which does not
+  ;;    always match the proposition or description of `frame', e.g.,
+  ;;    in complement proofs).
+  (while (not (eql? (state frame) :ATOMIC-GOAL))
+    (setq frame (up frame)))
+  (return (proposition frame)))
+
+(defun (extract-subgoal-description-of-frame DESCRIPTION) ((frame CONTROL-FRAME))
+  ;; Return a description representing the subgoal being proved
+  ;;    within 'frame'.
+  ;; Kludge: The description being proved may not match '(proposition frame)',
+  ;;    in which case that latter proposition is assumed to be supplying
+  ;;    external arguments that bind to the subgoal variables.
+  (when (defined? (description frame))
+    (return (description frame)))
+  (while (not (eql? (state frame) :ATOMIC-GOAL))
+    (setq frame (up frame)))
+  (return (get-description (relationRef (proposition frame)))) )
+
+(defun (find-external-arguments-for-subgoal ARGUMENTS-VECTOR) ((frame CONTROL-FRAME))
+  ;; Helping function for antecedents subgoaling.
+  ;; Run up the frame stack to find the proposition that supplies the
+  ;;    external arguments to the description for 'frame'.
+  (while (not (eql? (state frame) :ATOMIC-GOAL))
+    (setq frame (up frame)))
+  (let ((proposition (proposition frame))
+        (externalArguments (arguments (proposition frame))))
+    ;; if 'proposition' represents a tuple satisfying a description,
+    ;;    adjust 'externalArguments' accordingly:
+    (when (and (member-of-proposition? proposition)
+               (defined? (description frame))
+               (> (arity (description frame)) 1)
+               (isa? (first (arguments proposition)) @LIST))
+      (setq externalArguments
+            (copy-list-to-arguments-vector (first (arguments proposition)))))
+    (return externalArguments)) )
+
+(defun (try-subgoal-strategies-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy:  If the predicate or function of 'frame'
+  ;;    is attached to an inferable description or to a description 
+  ;;    that has antecedents, post strategies to subgoal on that description.
+  (let ((description (extract-subgoal-description-of-frame frame))
+        (reversePolarity? (reverse-polarity? frame))
+        (strategies NIL))
+    (when (choose reversePolarity?
+                  (exists p on (applicable-rules-of-description
+                                description :FORWARD TRUE))
+                  (inferable? description))
+      (pushq strategies :ANTECEDENTS))
+    ;; possibly subgoal on description complement:
+    ;; NOTE: THIS DOES NOT PICKUP SIMPLE CONTRAPOSITIVES WHERE THE COMPLEMENT
+    ;;    DESCRIPTION HASN'T BEEN CREATED (THOSE ARE HANDLED BY :ANTECEDENTS):
+    (when (and reversePolarity?
+               (defined? (get-inferable-complement-description description)))
+      (pushq strategies :GOAL-COMPLEMENT))
+    ;; TO DO: INVENT INDEX OF RELATIONS THAT HAVE ASSERTIONS WITH
+    ;;    FORWARD GOALS (SO THAT WE CAN FILTER HERE):
+    (let ((proposition (proposition frame)))
+      (when (and (defined? proposition)
+                 (all-arguments-bound? proposition)
+                 (defined? (find-matching-conceived-proposition proposition)))
+        (pushq strategies :FORWARD-GOALS)))
+    (foreach s in (reverse strategies)
+             do (push-next-strategy frame s))
+    (return :FAILURE) ))
+
+(defun establish-goal-cache ((frame CONTROL-FRAME))
+  ;; Called by 'continue-antecedents-proof'.
+  ;; A duplicate subgoal was detected at 'frame'.  Search for the
+  ;;    original goal, and link it to a goal cache.
+  (mv-bind (goalFrame restartFrame restartDepth)
+           (find-duplicated-goal frame)
+           (ignore restartFrame restartDepth)             
+           (when (and (defined? goalFrame)
+                      (null? (find-goal-cache goalFrame)))
+             (create-goal-cache? goalFrame))) )
+
+;; THIS IS PROBABLY OBSOLETE:
+(defun (check-for-duplicate-rule? BOOLEAN)
+    ((frame CONTROL-FRAME) (impliesProposition PROPOSITION))
+  ;; Called by 'continue-antecedents-proof'.
+  ;; Search previous control frames to see if the same rule has already
+  ;;    been applied to the same set of bindings.
+  (when (not (eql? *duplicate-subgoal-strategy* :DUPLICATE-))
+    (return FALSE))
+  (let ((previousFrame (up frame))
+        (goalBindings (yield-goal-bindings (proposition frame))))
+    (foreach i in (interval 1 *duplicate-rule-search-depth*)
+	do (ignore i)
+	   (when (null? previousFrame)
+	     (return FALSE))
+	   (when (and			; (eql? (state previousFrame) :STRATEGY)
+		  (eql? (antecedents-rule previousFrame)
+			impliesProposition)
+		  (forall b1 in goalBindings
+		    ;; CAUTION: BECAUSE OF CODE REWRITE, THIS
+		    ;;    COULD BE CHECKING THE WRONG KIND OF
+		    ;;    BINDINGS:
+		      as b2 in (yield-goal-bindings 
+				(proposition previousFrame))
+		      always (eql? b1 b2))
+		  (eql? (reverse-polarity? frame)
+			(reverse-polarity? previousFrame)))
+	     (trace-if :GOAL-CACHES "DUPLICATE RULE.  BINDINGS: " goalBindings EOL)
+	     (when FALSE
+	       ;; duplicate rule found -- create goal cache:
+	       (establish-goal-cache frame))
+	     (return TRUE))
+	   (setq previousFrame (up previousFrame))))
+  (return FALSE) )
+
+(defun (continue-antecedents-proof KEYWORD) 
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Proof Strategy:  Iterate over antecedents of the description
+  ;;   in '(description frame)', posting either more proof states on
+  ;;   the antecedents, or posting full-fledged subqueries on
+  ;;   antecedents that don't have a subrelation-link relationship
+  ;;   with the description.
+  (let ((iterator (iterator frame))
+        (firstTime? (null? iterator))
+        (reversePolarity? (reverse-polarity? frame)))
+    (case lastMove
+      (:UP-TRUE
+       (setf (truth-value frame)
+         (weaken-truth-value
+          (propagate-frame-truth-value (result frame) frame)
+          (truth-value (antecedents-rule frame))))
+       (when (record-justifications?)
+         (record-MODUS-PONENS-justification frame lastMove))
+       (return :CONTINUING-SUCCESS))
+      (otherwise NULL))
+    ;; if we are just beginning, initialize the antecedents iterator:
+    (when firstTime?
+      ;; allocate specializing propositions iterator:
+      (setq iterator
+            (allocate-antecedents-iterator
+             (extract-subgoal-description-of-frame frame)
+             (find-external-arguments-for-subgoal frame)
+             reversePolarity?))
+      (when (null? iterator)
+        (return :FAILURE))
+      (setf (iterator frame) iterator))
+    ;; look for another antecedent.  If found, post a proof state
+    ;;    to evaluate it.
+    (while (next? iterator)
+      (let ((impliesProposition PROPOSITION (value iterator))
+            (antecedentDescription 
+             DESCRIPTION
+             (choose reversePolarity?
+                     (second (arguments impliesProposition))
+                     (first (arguments impliesProposition)))))
+        ;; before using the rule 'impliesProposition', check the stack
+        ;;    for duplicate rule applied to the same goal bindings:
+        (when (check-for-duplicate-rule? frame impliesProposition)
+          (continue))                   ; skip to next antecedent rule
+        (when (not (true? impliesProposition))
+          (if (empty? (get-forward-goals impliesProposition))
+            (continue)                  ; skip to next rule
+            (progn
+              (create-conditional-antecedent-subframe
+               frame (proposition frame) impliesProposition)
+              (return :MOVE-DOWN))))
+        ;; ready to subgoal on the antecedent 'impliesProposition':
+        ;; record rule used to trigger subgoal (used by 'check-for-duplicate-rule?'
+        ;;    and by 'trace-goal-tree'):
+        (setf (antecedents-rule frame) impliesProposition)
+        (let ((downFrame (create-subgoal-frame frame NULL :FULL-SUBQUERY)))
+          (setf (description downFrame) antecedentDescription)
+          (return :MOVE-DOWN))))
+    ;; return failure:
+    (return :FAILURE) ))
+
+(defun (allocate-antecedents-iterator (ITERATOR OF PROPOSITION))
+    ((goalDescription DESCRIPTION) (externalArguments ARGUMENTS-VECTOR)
+     (reversePolarity? BOOLEAN))
+  ;; Return an iterator that produces :IMPLIES propositions having
+  ;;    '(description subqueryFrame)' in the consequent position (except
+  ;;    make it in the antecedent position if 'reversePolarity?'.
+  ;; Optimization: Bound variables are type-checked against variables in
+  ;;    the antecedents, pruning out any antecedents that don't pass.
+  (let ((antecedents NIL)
+        (antecedent LOGIC-OBJECT NULL)
+        (incompatibleArguments? BOOLEAN NULL))
+    ;; TO DO: MAYBE GIVE `applicable-rules-of-description' A `SPECIALIZE?'
+    ;;    ARGUMENT SO WE WON'T HAVE TO EXPLICITLY CHAIN THROUGH SUBRELATION
+    ;;    LINKS; THOSE WON'T FIND ANYTHING INTERESTING APART FROM CONNECTING
+    ;;    US TO THE NEXT LEVEL OF (MAYBE INTERESTING) RULES.
+    (foreach prop in (applicable-rules-of-description 
+                      goalDescription
+                      (choose reversePolarity? :FORWARD :BACKWARD)
+                      FALSE)
+        where (and (choose reversePolarity?
+                           (not (backward-only? prop))
+                           (not (forward-only? prop)))
+                   ;; Don't go reverse on complex antecedents (unless they
+                   ;;    are closed), since those are better handled by
+                   ;;    the contrapositive:
+                   (or (not reversePolarity?)
+                       (atomic-goal-description? (second (arguments prop)))
+                       (closed-term? (second (arguments prop)))))
+        do (setq antecedent (choose reversePolarity?
+                                    (second (arguments prop))
+                                    (first (arguments prop))))
+           (when (or (not (isa? antecedent @DESCRIPTION))
+                     ;; make sure variable-arity relations stick to one arity:
+                     (not (eql? (length externalArguments)
+                                (length (io-variables 
+                                         (cast antecedent DESCRIPTION))))))
+             (continue))
+           (setq incompatibleArguments? FALSE)
+           (foreach v in (io-variables (cast antecedent DESCRIPTION))
+               as arg in externalArguments
+               do (let ((argValue (argument-bound-to arg))
+                        (varValue (ground-value-of v)))
+                    (when (and (defined? argValue)
+                               (or (and (defined? varValue)
+                                        ;; Current head arg is a constant,
+                                        ;;    check whether it matches:
+                                        (not (eql? argValue varValue)))
+                                   (and (null? varValue)
+                                        (fails-antecedent-type-check?
+                                         v argValue))))
+                     (setq incompatibleArguments? TRUE)
+                     (break))))
+           (when (not incompatibleArguments?)
+             (pushq antecedents prop)))
+    (if (empty? antecedents)
+        (return NULL)
+      (return
+        (allocate-iterator
+          (optimize-order-of-applicable-rules
+           antecedents (not reversePolarity?)))))))
+
+(defun (optimize-order-of-applicable-rules (CONS OF PROPOSITION))
+    ((rules (CONS OF PROPOSITION)) (tail? BOOLEAN))
+  ;; Sort `rules' in order of increasing inferential complexity of their
+  ;;    antecedent description.  Which argument is considered to be the
+  ;;    antecedent depends on the value of `tail?'.
+  ;; Currently, we prefer rules that introduce fewer unbound variables
+  ;;    when chained across (e.g., a commutativity rule is preferred over
+  ;;    a transitivity rule).  More complex schemes that take dynamic
+  ;;    chaining/time complexity into account might be useful.
+  ;; Q: CAN THIS ALSO SPEED UP THE FAILURE CASE???
+  (let ((cursor rules)
+        (result NIL)
+        (antecedent DESCRIPTION NULL)
+        (antecedentIndex (choose tail? 0 1)))
+    ;; shortcut 0/1 element cases:
+    (when (empty? (rest rules))
+      (return rules))
+    ;; Sort rules by the number of top-level existentials in their antecedent
+    ;;    (this few-pass scheme should be faster in most cases than generating
+    ;;    a list of <cost, prop> pairs and sorting that via `sort')):
+    (foreach i in (interval 0 NULL)
+        do (while (non-empty? cursor)
+             (setq antecedent (nth (arguments (value cursor)) antecedentIndex))
+             (when (= (length (internal-variables antecedent)) i)
+               (pushq result (value cursor))
+               (setf (value cursor) NULL))
+             (setq cursor (rest cursor)))
+           (setq cursor (remove rules NULL))
+           (when (empty? cursor)
+             (break)))
+    (return (reverse result))))
+
+(defun (try-goal-complement-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Create a subgoal on the complement description of the goal in
+  ;;    'frame'.
+  (let ((description (extract-subgoal-description-of-frame frame))
+        (complement (get-inferable-complement-description description))
+        (downFrame (create-subgoal-frame frame NULL :ALL-SUBGOAL-STRATEGIES)))
+    (setf (description downFrame) complement)
+    (safety 3 *reversePolarity?* "BUG in polarity.")
+    ;; uninvert polarity:
+    (setf (reverse-polarity? downFrame) FALSE)
+    (return :MOVE-DOWN) ))
+
+(defun (try-forward-goals-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy:  Iterate over any forward goals attached to the
+  ;;   proposition in 'frame'.  If a forward goal is proved, then
+  ;;   the proposition is proved.
+  (let ((iterator (iterator frame)))
+    ;; if we are just beginning, initialize the antecedents iterator:
+    (cond
+     ((null? iterator)           ; first time?
+      (let ((baseProposition 
+             (find-matching-conceived-proposition (proposition frame)))
+            (forwardGoals (LIST OF FORWARD-GOAL-RECORD) NULL))
+        (when (null? baseProposition)
+          (return :FAILURE))
+        (setq forwardGoals (get-forward-goals baseProposition))
+        (cond
+         ((empty? forwardGoals)
+          (return :FAILURE))
+         ((and (nil? (rest forwardGoals))
+               (true? (forward-rule (first forwardGoals))))
+          ;; tricky: overlay with forward goal:
+          (create-subgoal-frame
+           frame (forward-goal (first forwardGoals)) NULL)
+          (return :MOVE-DOWN))
+         (otherwise
+          (setq iterator (allocate-iterator forwardGoals))
+          (setf (iterator frame) iterator)))))
+     (otherwise
+      (setq iterator (iterator frame))))
+    ;; look for next forward goal. If found, subgoal to evaluate it:
+    (when (next? iterator)
+      (let ((fwdGoalRec FORWARD-GOAL-RECORD (value iterator)))
+        (if (true? (forward-rule fwdGoalRec))
+          (create-subgoal-frame frame (forward-goal fwdGoalRec) NULL)
+          (create-conditional-antecedent-subframe
+           frame (forward-goal fwdGoalRec) (forward-rule fwdGoalRec)))
+        (return :MOVE-DOWN)))
+    (return :FAILURE) ))
+
+(defclass CONDITIONAL-ANTECEDENT-PROOF-ADJUNCT (PROOF-ADJUNCT)
+  ;; Stores 'provable-rule' and 'proposition' for use in a
+  ;;    :CONDITIONAL-ANTECEDENT proof.
+  :slots ((provable-rule :type PROPOSITION)
+          (goal :type PROPOSITION)
+          (phase :type KEYWORD :initially :FORWARD-RULE)))
+
+(defun (create-conditional-antecedent-subframe CONTROL-FRAME)
+       ((frame CONTROL-FRAME) (goal PROPOSITION) 
+        (provableRule PROPOSITION))
+  ;; Situation: We want to backchain on 'provableRule' to prove 'goal',
+  ;;    but 'provableRule' isn't known to be TRUE.
+  ;; First, we need to prove it true, and if that succeeds, then we
+  ;;    subgoal on 'goal'.
+  (let ((downFrame (create-subgoal-frame frame goal :CONDITIONAL-ANTECEDENT))
+        (proofAdjunct (new CONDITIONAL-ANTECEDENT-PROOF-ADJUNCT)))
+    (setf (proof-adjunct downFrame) proofAdjunct)
+    (setf (provable-rule proofAdjunct) provableRule)
+    (setf (goal proofAdjunct) goal)
+    (return downFrame) ))
+
+(defun (continue-conditional-antecedent-proof KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Try to prove the forward rule in 'proofAdjunct'.  If that
+  ;;    succeeds, use that rule to prove the proposition in 'proofAdjunct'.
+  (let ((proofAdjunct CONDITIONAL-ANTECEDENT-PROOF-ADJUNCT
+                      (proof-adjunct frame))
+        (provableRule (provable-rule proofAdjunct)))
+    (safety 3 (not (empty? (get-forward-goals provableRule)))
+            "BUG: Failed to screen forward goals")
+    (case lastMove
+      (:DOWN
+       ;; try to prove 'provableRule', using only the :FORWARD-GOALS
+       ;;    strategy:
+       (create-subgoal-frame frame provableRule :FORWARD-GOALS)
+       (return :MOVE-DOWN))
+      (:UP-TRUE
+       (when (eql? (phase proofAdjunct) :ORIGINAL-GOAL)
+         (setf (truth-value frame)
+           (weaken-truth-value
+            (propagate-frame-truth-value (result frame) frame)
+            (truth-value provableRule)))
+         (return (select-proof-result TRUE (defined? (down frame)) FALSE)))
+       ;; we have just proved the truth of 'provableRule':
+       (safety 3 (not (world-state? *context*)) 
+               "BUG in asserting infered forward rule.")
+       (assign-truth-value provableRule (truth-value (result frame)))
+       (safety 3 (eql? (proposition frame) (goal proofAdjunct))
+               "BUG in conditional antecedent proof record")
+       (let ((downFrame (create-subgoal-frame
+                         frame (proposition frame) :ANTECEDENTS)))
+         (setf (iterator downFrame)
+               (allocate-iterator (cons-list provableRule)))
+         (setf (phase proofAdjunct) :ORIGINAL-GOAL)
+         (return :MOVE-DOWN)))
+      (:UP-FAIL
+       (propagate-frame-truth-value (result frame) frame)       ; zzz propagate TV?
+       (return :FAILURE))) ))
+
+(defun (try-full-subquery-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy: Allocate a new :PATTERN frame based on the description
+  ;;    in 'frame'.  If bindings are generated for that description,
+  ;;    transfer them back to the arguments of the proposition in the
+  ;;    original control frame.
+  (let ((description (description frame))
+        (externalArguments (find-external-arguments-for-subgoal frame)))
+    ;; check for arity mismatch (only happens with variable-arity predicates:
+    ;; TO DO: FIGURE OUT HOW TO OPTIONALLY FORK PARALLEL QUERY STACKS HERE:
+    (when (overlay-with-pattern-frame? frame description externalArguments)
+      (return :MOVE-IN-PLACE))
+    (when (and (null? (partial-match-frame frame))
+               (partial-match-mode?))
+      ;; we just came here on a down move and failed immediately - link up
+      ;; here, since we special-cased this strategy in 
+      ;; `CONTROL-FRAME.continue-partial-strategies-proofs':
+      (create-and-link-partial-match-frame frame :ATOMIC-GOAL))
+    (return :FAILURE)))
+
+  ;;
+;;;;;; Collection membership proofs
+  ;;
+
+;;;; TO DO: ADAPT THESE TO BE ABLE TO DEAL WITH DEFAULTS!!!
+
+(defun (extract-collection-argument NAMED-DESCRIPTION) ((proposition PROPOSITION))
+  ;; Helping function that extracts  collection
+  ;;    argument from an :ISA or MEMBER-OF proposition.
+  (case (kind proposition)
+    (:ISA 
+     (return (get-description (relationRef proposition))))
+    ;; must be a MEMBER-OF proposition:
+    (otherwise 
+     (return (argument-bound-to (nth (arguments proposition) 1))))) )
+
+(defun (try-isa-proposition-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Evaluate the ISA or 'member-of'proposition with respect
+  ;;    to its argument (which must be bound).
+  ;; TO DO: FIX THIS TO DO SOMETHING SIMILAR TO `try-scan-propositions-proof'
+  ;;    TO PROPERLY DEAL WITH DEFAULT TRUTH VALUES!  ALSO, THINK ABOUT A WAY
+  ;;    WHERE WE COULD USE A NATIVE TEST (E.G., `ISA?' IN CYC) INSTEAD OF
+  ;;    TRYING TO DO THIS INFERENCE OURSELVES BY PAGING IN A LOT OF SUPER
+  ;;    COLLECTIONS FOR THE CASE WHERE WE DON'T HAVE AN EXACT MATCH.
+  (let ((proposition (proposition frame))
+        (arguments (arguments proposition))
+        (memberArg (nth arguments 0))
+        (member (argument-bound-to memberArg))
+        (scanIsaPropositions?
+         (or *generate-all-proofs?*
+             *reversePolarity?*)))
+    (when-cyc-kludges-enabled
+     ;; when we run WhyNot use the faster test, otherwise we could page in
+     ;;    tons of stuff:
+     (unless *reversePolarity?*
+       (setq scanIsaPropositions? FALSE)))
+    (when (null? member)
+      (return (try-scan-collection-proof frame)))
+    (when (isa? member @LITERAL-WRAPPER)
+      (let ((surrogate (relationRef proposition))
+            (success? (logical-subtype-of? (logical-type member) surrogate)))
+        (when *reversePolarity?*
+          (setq success? (not success?)))
+        (when success?
+          (return :FINAL-SUCCESS))
+        ;; Be careful here and don't fail if we have backlinked literal wrappers
+        ;; that might be subtypes of some literal type, e.g., `(MY-INTEGER 999)':
+        (unless (instance-has-backlinks? member)
+          ;; we have an un-backlinked literal, no type propositions can be found for it:
+          (return :FAILURE))))
+    (when scanIsaPropositions?
+      ;; scan ISA propositions one at a time:
+      (return (try-scan-propositions-proof frame)))
+    ;; otherwise: this code is equivalent to but faster than a call to
+    ;;    `try-scan-propositions-proof':
+    (let ((collection (extract-collection-argument proposition)))
+      (if (test-isa? member (surrogate-value-inverse collection))
+          (return :FINAL-SUCCESS)
+        (return :FAILURE)))))
+
+(defun (try-scan-collection-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Scan collection elements generated by '(iterator frame)'.
+  ;; If the member argument (a variable) of '(proposition frame)'
+  ;;    can bind to one of the elements, keep the binding and
+  ;;    return :CONTINUING-SUCCESS.
+  ;; This is designed to work for both ISA and 'member-of' propositions.
+  (let ((proposition (proposition frame))
+        (arguments (arguments proposition))
+        (memberArg (nth arguments 0))
+        (iterator (iterator frame)))
+    (when (null? iterator)              ; first time?
+      (let ((collection (extract-collection-argument proposition))
+            (members LIST NULL))
+        (let ((collectDirectMembersOnly? (inferable? collection)))
+          ;; tricky: if 'collection' is not inferable, then we won't subgoal
+          ;;    on it, so we need to run down the isa hierarchy here.  On the
+          ;;    other hand, if we are going to subgoal later on anyhow, then
+          ;;    to minimize collection of duplicates, we only collect directly
+          ;;    asserted members here:
+          (setq members (asserted-collection-members
+                         collection collectDirectMembersOnly?))
+  ;; THIS IS ALMOST SURELY GOING SOMEWHERE ELSE:
+          ;; record the current size of the extension:
+          (when (not collectDirectMembersOnly?)
+            (update-observed-cardinality collection (length members))))
+        (when (null? members)
+          (return :FAILURE))
+        (setq iterator (allocate-iterator members))
+        (setf (iterator frame) iterator)))
+    (while (next? iterator)
+      (when (bind-variable-to-value?
+             memberArg (value-of (value iterator)) TRUE)
+        (return :CONTINUING-SUCCESS)))
+    (return :FAILURE) ))
+
+
+  ;;
+;;;;;; :IMPLIES proposition proofs
+  ;;
+
+;; TO DO: FIGURE OUT IF THIS CAN BE GENERAL -- BETTER THAN
+;;    'inferable?' BECAUSE IT KNOWS ABOUT REVERSE POLARITY:
+(defun (inferable-description? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' is a description such that membership in it is
+  ;;    inferable.
+  ;; Like 'inferable?', but also considers complements.
+  ;; Called by 'try-implies-proof' to prune spawning of proof strategies
+  (when (null? self)
+    (return FALSE))
+  (typecase self
+    (DESCRIPTION
+     (when (and *reversePolarity?*
+                (defined? (get-inferable-complement-description self)))
+       (setq self (relative-complement self)))
+     (return (inferable? self)))
+    (otherwise (return FALSE))) )
+
+(defun (try-implies-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Evaluate the IMPLIES proposition 'self' with respect to the
+  ;;    current set of variable bindings.
+  ;; A specialist handled the easy cases.
+  ;; We employ three (count 'em, three) different proof strategies here.
+  ;; It would be more elegant to invoke them as keyword strategies, but
+  ;;    at present there is no other situation where we need to
+  ;;    recursively invoke multiple strategies, so no special mechanism
+  ;;    has been established to do that (yet).
+  (let ((proposition (proposition frame))
+        (subCollectionArg (first (arguments proposition)))
+        (superCollectionArg (second (arguments proposition)))
+        (subCollection (argument-bound-to subCollectionArg))
+        (superCollection (argument-bound-to superCollectionArg)))
+    (when (or (null? subCollection)
+              (null? superCollection))
+      ;; specialist already handled this case:
+      (return :FAILURE))
+    ;; both arguments are bound:
+    ;; possibly perform simple enumeration proof:
+    (when (and (not (inferable-description? subCollection))
+               (not (inferable-description? superCollection))
+               (or (closed-term? subCollection)
+                   (reverse-polarity? frame)))
+      ;; Prove that all members of 'sub' belong to 'super':
+      ;; If *reversePolarity?*, succeed if a member of the subcollection
+      ;;    is provably not in the supercollection.
+      (case (try-simple-contained-by-proof subCollection superCollection
+                                           (reverse-polarity? frame))
+        (:FINAL-SUCCESS
+         (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+         (return :FINAL-SUCCESS))
+        (:TERMINAL-FAILURE
+         (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+         (return :TERMINAL-FAILURE))
+        (otherwise NULL)))
+    ;; possibly try subsumption proof
+    (when (and (isa? subCollection @DESCRIPTION)
+               (isa? superCollection @DESCRIPTION))
+      (push-next-strategy frame :SUBSUMPTION-TEST))
+    ;; possibly try contained-by proof:
+    (when (closed-term? subCollection)
+      (push-next-strategy frame :CONTAINED-BY))
+    (return :FAILURE) ))
+
+(defun (try-simple-contained-by-proof KEYWORD) ((subCollection OBJECT)
+                                                (superCollection OBJECT)
+                                                (reversePolarity? BOOLEAN))
+  ;; Helping function for 'try-implies-proof'.
+  ;; Return :FINAL-SUCESS if each member of the non-inferable, closed
+  ;;    collection 'subcollection' is also a member of the non-iferable
+  ;;    collection 'superCollection'; if not and 'superCollection' is
+  ;;    also closed, return :TERMINAL-FAILURE.
+  ;; If reversePolarity?, succeed if a member of the subcollection
+  ;;    is provably not in the supercollection; if no such member is found
+  ;;    and 'superCollection' is also closed, return :TERMINAL-FAILURE.
+  (special ((*reversePolarity?* FALSE))
+    ;; HAIRY: Both `asserted-collection-members' and `member-of-collection?'
+    ;;    respond to `*reversePolarity?*', but when we collect members of the
+    ;;    subcollection in reverse polarity, we still want the actual members,
+    ;;    while when we test for non-membership in the supercollection, we
+    ;;    want `*reversePolarity?*' to matter.  This accounted for some
+    ;;    subtle bugs and the somewhat complex logic used in here:
+    (let ((members (asserted-collection-members subCollection FALSE)))
+      (setq *reversePolarity?* reversePolarity?)
+      (when (defined? members)
+        (if reversePolarity?
+            (if (exists m in members
+                    where (member-of-collection?
+                           (value-of m) superCollection))
+                (return :FINAL-SUCCESS)
+              (when (closed-term? superCollection)
+                (return :TERMINAL-FAILURE)))
+          ;; iterate over members of a CLOSED subCollection:
+          (if (forall m in members
+                  always (member-of-collection?
+                          (value-of m) superCollection))
+              (return :FINAL-SUCCESS)
+            (when (closed-term? superCollection)
+              (return :TERMINAL-FAILURE)))))
+      (return :FAILURE))))
+  
+(defun (try-contained-by-proof KEYWORD) ((upFrame CONTROL-FRAME))
+  ;; Situation: One or both of 'subCollection' and 'superCollection' (below) 
+  ;;    is a description that requires backtracking for its evaluation.
+  ;; Proof Strategy:
+  ;; Generate a :CONTAINED-BY control frame to compute whether all members
+  ;;    of 'subCollection' satisfy 'superCollection'.
+  (let ((upProposition (proposition upFrame))
+        (subCollection (argument-bound-to (first (arguments upProposition))))
+        (superCollection (argument-bound-to (second (arguments upProposition))))
+        (containedByProp (create-proposition (quote CONTAINED-BY) 2))
+        (description (choose (isa? subCollection @DESCRIPTION)
+                             (cast subCollection DESCRIPTION)
+                             (cast superCollection DESCRIPTION)))
+        (arity (arity description))
+        (bridgeArguments (new LIST))
+        (containedByFrame (create-down-frame upFrame containedByProp)))
+    (when (reverse-polarity? upFrame)
+      ;; punt for now until we get more serious about finding counter examples:
+      (return :FAILURE))
+    (foreach i in (interval 0 NULL)
+        as vbl in (io-variables description)
+        do (let ((bridgeVbl (new PATTERN-VARIABLE)))
+             (setf (bound-to-offset bridgeVbl) i)
+             (setf (skolem-name bridgeVbl) (skolem-name vbl))
+             (setf (skolem-type bridgeVbl) (skolem-type vbl))
+             (insert-last bridgeArguments bridgeVbl)))
+    (setf (state containedByFrame) :CONTAINED-BY)
+    (setf (proposition containedByFrame) containedByProp)
+    (setf (nth (arguments containedByProp) 0) 
+          (create-contained-by-argument subCollection bridgeArguments))
+    (setf (nth (arguments containedByProp) 1)
+          (create-contained-by-argument superCollection bridgeArguments))
+    (create-pattern-record containedByFrame NULL NULL)
+    (activate-pattern-record (pattern-record containedByFrame) arity)
+    (return :MOVE-DOWN) ))
+
+(defun (create-contained-by-argument PROPOSITION)
+    ((collection OBJECT) (bridgeArgs LIST))
+  ;; Helping function for 'try-contained-by-proof'.
+  ;; Create an ISA or MEMBER proposition conceiving 'bridgeArguments'
+  ;;    as a member of 'collection'.
+  (let ((proposition PROPOSITION NULL)
+        (theCollection collection)
+        (arity 1))
+    (typecase collection
+      (NAMED-DESCRIPTION
+       (cond ((class? collection)
+              ;; `collection' describes a class, build an ISA proposition:
+              (setq proposition (create-proposition (quote ISA) 1))
+              (setf (operator proposition)
+                (surrogate-value-inverse collection))
+              (setf (first (arguments proposition)) (first bridgeArgs))
+              (return proposition))
+             (otherwise
+              (setq proposition
+                (create-proposition (quote PREDICATE) (arity collection)))
+              (setf (operator proposition)
+                (surrogate-value-inverse collection))
+              (foreach arg in bridgeArgs
+                  as i in (interval 0 NULL)
+                  do (setf (nth (arguments proposition) i) arg))
+              (return proposition))))
+      (DESCRIPTION
+       (setq arity (arity collection))
+       ;; instantiate any external variables if necessary - somehow, we
+       ;;    should really figure out how to do this via the binding stack:
+       (setq theCollection (instantiate-external-bindings collection)))
+      (otherwise NULL))
+    (setq proposition (create-proposition (quote PREDICATE) 2))
+    (setf (relationref proposition) PL-KERNEL/@MEMBER-OF)
+    (setf (first (arguments proposition))
+      (choose (> arity 1) bridgeArgs (first bridgeArgs)))
+    (setf (second (arguments proposition)) theCollection)
+    (return proposition)))
+
+(defun (continue-contained-by-proof KEYWORD) 
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; '(state frame)' is :CONTAINED-BY or :ITERATIVE-FORALL.
+  ;; Continue to generate bindings for an antecedent description and then
+  ;;    test them in a consequent goal.
+  (case lastMove
+    (:DOWN
+     (when (eql? (state frame) :CONTAINED-BY)
+       (reset-current-pattern-record frame :LOCAL))
+     (safety 3 (and (eql? (argument-cursor frame) 0)
+                    (null? (down frame)))
+             "Bug in :CONTAINED-BY logic")
+     ;; tricky: we need to create '(down frame)' before moving
+     ;;    down so we can set the '(back frame)' pointer: 
+     (create-down-frame frame (nth (arguments (proposition frame)) 0))
+     ;; record pointer from :CONTAINED-BY frame to tail frame:
+     (setf (back frame) (down frame))
+     (return :MOVE-DOWN))    ; create tail subquery
+    (:UP-TRUE
+     (case (argument-cursor frame)
+       (0                      ; tail generated new binding(s)
+        (setf (down frame) NULL)       ; force creation of new head frame
+        (setf (argument-cursor frame) 1)
+        (return :MOVE-DOWN))           ; evaluate head subquery
+       (1                      ; successful head subquery
+        (when (defined? (down frame))          ; pop head frame(s)
+          (pop-frames-up-to (down frame)))
+        (if (eql? (state (back frame)) :POPPED)        ; tail is finished?
+          (progn
+            ;; what about defaults?
+            (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+            (return :FINAL-SUCCESS))
+          (progn
+            (setf (down frame) (back frame))
+            (setf (argument-cursor frame) 0)
+            (return :MOVE-DOWN))))))         ; evaluate tail subquery
+    (:UP-FAIL
+     (case (argument-cursor frame)
+       (0                      ; successful termination of tail subquery
+        (safety 3 (eql? (state (back frame)) :POPPED)
+                "INTERNAL ERROR: Failed to pop antecedent frame.")
+        ;; what about defaults?
+        (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+        (return :FINAL-SUCCESS))
+       (1                      ; failure of head subquery
+        (let ((parent (up frame))
+              (parentGoal (proposition parent)))
+          (when (and (eql? (kind parentGoal) :IMPLIES)
+                     (closed-term? (second (arguments parentGoal))))
+            ;; supercollection was closed, fail completely:
+            ;; what about defaults?
+            (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+            ;; minor kludge: we can't return :TERMINAL-FAILURE here, since
+            ;;    this returns directly to the state machine, so we fake
+            ;;    that behavior by curtailing any remaining strategies:
+            (setf (next-strategies parent) NIL))
+          (when (not (eql? (state (back frame)) :POPPED))
+            (pop-frames-up-to (back frame))) ; pop tail frame(s)
+          (return :FAILURE)))))))
+
+(defun (try-subsumption-test KEYWORD) ((frame CONTROL-FRAME))
+  ;; Proof Strategy: Apply a structural subsumption test between
+  ;;    the arguments to the :IMPLIES proposition for 'frame'.
+  (let ((proposition (proposition frame))
+        (subCollectionArg (first (arguments proposition)))
+        (superCollectionArg (second (arguments proposition)))
+        (subCollection DESCRIPTION (argument-bound-to subCollectionArg))
+        (superCollection DESCRIPTION (argument-bound-to superCollectionArg)))
+    (when (reverse-polarity? frame)
+      ;; punt for now until we get more serious about finding counter examples:
+      (return :FAILURE))
+    (when (and (defined? subCollection)
+               (defined? (external-variables subCollection)))
+      (if (exists var in (external-variables subCollection)
+              where (not (argument-bound? var)))
+          (return :FAILURE)
+        (setq subCollection (instantiate-external-bindings subCollection))))
+    (when (and (defined? superCollection)
+               (defined? (external-variables superCollection)))
+      (if (exists var in (external-variables superCollection)
+              where (not (argument-bound? var)))
+          (return :FAILURE)
+        (setq superCollection
+          (instantiate-external-bindings superCollection))))
+    (let ((truthValue
+           (description-specializes-description? subCollection superCollection)))
+      ;; HERE IT WOULD BE GREAT TO HAVE JUSTIFICATIONS ATTACHED TO TRUTH
+      ;;    VALUES SO WE COULD LINK IT INTO THE CURRENT PROOF.
+      (set-frame-truth-value frame truthValue)
+      (if (true-truth-value? truthValue)
+          (return :FINAL-SUCCESS)
+        (return :FAILURE)))))
+
+  ;;
+;;;;;; Equivalence proof
+  ;;
+
+(defun (try-equivalence-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Evaluate the equivalence (equality) proposition '(proposition frame)'
+  ;;    with respect to the current set of variable bindings.
+  ;; If both arguments are bound, return :FINAL-SUCCESS if they are equal.
+  ;; If exactly one argument is bound, bind the other to it.
+  ;; If none are bound, return :FAILURE.
+  ;; COMMENT: IF THE CALL TO 'collapse-variable-value-chains' STAYS INTACT,
+  ;;    THIS FUNCTION SHOULD BE A NO-OP (IT SHOULD ALWAYS SUCCEED),
+  ;;    BECAUSE FAILURE SHOULD BE TRIGGERED BY A PRIOR ATTEMPT TO EQUATE
+  ;;    THE TWO ARGUMENTS.
+  ;; TO DO: INTRODUCE SUBSUMPTION MATCH FOR CASE OF REVERSE POLARITY.
+  (let ((arguments (arguments (proposition frame)))
+        (firstArg (nth arguments 0))
+        (firstValue (argument-bound-to firstArg))
+        (secondArg (nth arguments 1))
+        (secondValue (argument-bound-to secondArg))
+        (success? FALSE))
+    (when (reverse-polarity? frame)
+      (cond
+       ((or (null? firstValue)
+            (null? secondValue))
+        (return :FAILURE))
+       ((or (skolem? firstValue)
+            (skolem? secondValue))
+        ;; TO DO: FORK A WORLD, BIND ONE TO THE OTHER, AND LOOK FOR A CLASH.
+        (return :FAILURE))
+       ((eql? firstValue secondValue)
+        (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+        (return :TERMINAL-FAILURE))
+       (otherwise
+        (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+        (return :FINAL-SUCCESS))))
+    (if (defined? firstValue)
+      (if (defined? secondValue)
+        (setq success? (eql? firstValue secondValue))
+        (setq success? (bind-variable-to-value? secondArg firstValue TRUE)))
+      (if (defined? secondValue)
+        (setq success? (bind-variable-to-value? firstArg secondValue TRUE))
+        (setq success? FALSE)))
+    (return (choose success? :FINAL-SUCCESS :FAILURE)) ))
+
+(defclass CLUSTERED-CONJUNCTION-PROOF-ADJUNCT (PROOF-ADJUNCT)
+  ;; Stores continuation (down) frames for each individual conjunct cluster
+  ;;    (in a traditional AND this is handled by extra AND frames with
+  ;;    back pointers).
+  :slots ((cluster-frames :type (VECTOR OF CONTROL-FRAME))))
+
+(defun (continue-clustered-conjunction-proof KEYWORD) 
+       ((andFrame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Try to prove the clustered conjunction contained within the frame
+  ;;    'andFrame'.
+  ;; Each conjunct is proven in a separate subgoal whose failure or success
+  ;;    is handled by `continue-clustered-conjunction-proof'.  Since the conjuncts
+  ;;    represent independent clusters, total failure of any one conjunct (i.e.,
+  ;;    it couldn't generate any bindings at all) means immediate failure, since
+  ;;    generating a new binding in a previous conjunct cannot make the current
+  ;;    conjunct succeed.
+  (let ((state (state andFrame))
+        (adjunct CLUSTERED-CONJUNCTION-PROOF-ADJUNCT (proof-adjunct andFrame))
+        (proposition (proposition andFrame))
+        (arguments (VECTOR OF PROPOSITION) (arguments proposition))
+        (nofArguments (length arguments))
+        (downFrame CONTROL-FRAME NULL))
+    (when (partial-match-mode?)
+      ;; Fool partial matcher into thinking that this is an AND:
+      (setf (state andFrame) :AND)
+      ;;;;; ADAPT THIS TO NEW SCHEME ;;;;;
+      (setq lastMove (old-interpret-AND-scores andFrame lastMove))
+      (setf (state andFrame) state))
+    (case lastMove
+      (:DOWN
+       (when (null? adjunct)
+         (setq adjunct
+               (new CLUSTERED-CONJUNCTION-PROOF-ADJUNCT
+                    :cluster-frames (new VECTOR :array-size nofArguments)))
+         (setf (proof-adjunct andFrame) adjunct))
+       (setq downFrame (nth (cluster-frames adjunct) (argument-cursor andFrame)))
+       (if (null? downFrame)
+           (create-subgoal-frame
+            andFrame (nth arguments (argument-cursor andFrame)) NULL)
+         (setf (down andFrame) downFrame))
+       (return :MOVE-DOWN))
+      (:UP-TRUE
+       (setf (truth-value andFrame)
+         (choose (null? (truth-value andFrame))
+                 (truth-value (result andFrame))
+                 (conjoin-truth-values
+                  (truth-value andFrame)
+                  (truth-value (result andFrame)))))
+       (when (record-justifications?)
+         (record-AND-INTRODUCTION-justification andFrame lastMove))
+       ;; Record the down pointer for the current conjunct.  This also records
+       ;;    that the current conjunct evaluated successfully at least once:
+       (setf (nth (cluster-frames adjunct) (argument-cursor andFrame))
+         (down andFrame))
+       (cond
+        ((= (1+ (argument-cursor andFrame)) nofArguments)
+         ;; We evaluated all conjuncts successfully.
+         ;; Look for the most recent (rightmost) conjunct with possibly more
+         ;;    bindings.  If found reset the `argument-cursor' and return
+         ;;    :CONTINUING-SUCCESS, otherwise, return :FINAL-SUCCESS:
+         (foreach i in (interval 1 nofArguments)
+             where (defined? (nth (cluster-frames adjunct) (- nofArguments i)))
+             do (setf (argument-cursor andFrame) (- nofArguments i))
+                (setf (down andFrame)
+                  (nth (cluster-frames adjunct) (argument-cursor andFrame)))
+                (return :CONTINUING-SUCCESS))
+         (setf (down andFrame) NULL)
+         (return :FINAL-SUCCESS))
+        (otherwise
+         (++ (argument-cursor andFrame))
+         ;; evaluate next cluster:
+         (setq downFrame
+           (nth (cluster-frames adjunct) (argument-cursor andFrame)))
+         (if (null? downFrame)
+             (create-subgoal-frame
+              andFrame (nth arguments (argument-cursor andFrame)) NULL)
+           (setf (down andFrame) downFrame))
+         (return :MOVE-DOWN))))
+      (:UP-FAIL
+       ;; we failed, determine whether we need to backtrack or not:
+       (when (partial-match-mode?)
+         ;; We only backtrack in a clustered conjunction in strict query mode:
+         (setf (down andFrame) NULL)
+         (set-frame-truth-value andFrame NULL)
+         (return :TERMINAL-FAILURE))
+       (when (null? (nth (cluster-frames adjunct) (argument-cursor andFrame)))
+         ;; This conjunct didn't succeed at least once.  If it is a bonafide
+         ;;    cluster, don't backtrack, since it doesn't share any variables
+         ;;    with any of the previous subgoals.  If it is a non-cluster
+         ;;    residue goal (e.g., an :OR), however, we do need to backtrack:
+         (case (kind (nth arguments (argument-cursor andFrame)))
+           ((:AND :FUNCTION :PREDICATE :IMPLIES)
+            ;; this goal was a bonafide cluster, fail terminally:
+            (setf (down andFrame) NULL)
+            (set-frame-truth-value andFrame NULL)
+            (return :TERMINAL-FAILURE))
+           ;; backtrack for non-cluster residue goals:
+           (otherwise NULL)))
+       ;; We need to backtrack, pop goal and try to generate new bindings:
+       (setf (nth (cluster-frames adjunct) (argument-cursor andFrame)) NULL)
+       (foreach i in (interval 1 (argument-cursor andFrame))
+           where (defined? (nth (cluster-frames adjunct)
+                                (- (argument-cursor andFrame) i)))
+           do (setf (argument-cursor andFrame) (- (argument-cursor andFrame) i))
+              ;; evaluate next cluster:
+              (setf (down andFrame)
+                (nth (cluster-frames adjunct) (argument-cursor andFrame)))
+              (return :MOVE-DOWN))
+       (setf (down andFrame) NULL)
+       (set-frame-truth-value andFrame NULL)
+       (return :TERMINAL-FAILURE)))))
+
+
+  ;;
+;;;;;; Proofs that use hypothetical worlds
+  ;;
+
+(defun (push-monotonic-world WORLD) ()
+  ;; Create a hypothetical world and mark it as monotonic?.
+  (let ((world (push-world)))
+    (setf (monotonic? world) TRUE)
+    (return world) ))
+
+(defun (try-disjunctive-implication-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Execute a non-unit-resolution proof of a disjunctive proposition.
+  ;; Proof Strategy (modification of one due to Len Schubert):
+  ;;    (1) Spawn a world and move into it.
+  ;;    (2) Let P be the first non-negated disjunct (if all disjuncts are 
+  ;;        negated, let P be the first disjunct).  Assume the negation of
+  ;;        all disjuncts but P within that world. If a clash results, return
+  ;;        success.  However, if a disjunct with unbound arguments exists,
+  ;;        set P to that disjunct.
+  ;;    (3) Try to prove the truth of P within that world.
+  ;;    (4) Pop the world.
+  (let ((parallelThread (current-parallel-thread *queryIterator*))
+        (parallelFrame PARALLEL-CONTROL-FRAME
+                       (up (top-control-frame parallelThread))))
+    (let ((disjunctiveProp (proposition frame))
+          (disjuncts (VECTOR OF PROPOSITION) (arguments disjunctiveProp))
+          (subgoalDisjunct (first disjuncts)))
+      (if (unbound-variables? parallelFrame)
+        ;; set 'subgoalDisjunct' to the disjunct with unbound arguments:
+        (progn
+          (setq subgoalDisjunct NULL)
+          (foreach d in disjuncts
+              where (not (all-arguments-bound? d))
+              do (when (defined? subgoalDisjunct)
+                   ;; give up if there are two or more disjuncts with
+                   ;;    unbound arguments (OR REWRITE THE CODE TO HANDLE IT):
+                   (return :FAILURE))
+                 (setq subgoalDisjunct d)))
+        ;; clobber initial 'subgoalDisjunct' with a positive disjunct,
+        ;;    if one exists:
+        (foreach d in disjuncts
+                 where (not (eql? (kind d) :NOT))
+                 do 
+                 (setq subgoalDisjunct d)
+                 (break)))
+      (enter-hypothetical-world parallelFrame)
+      (exception-case
+       (let ((negatedTruthValue? (reverse-polarity? frame))
+             (assumption PROPOSITION NULL))
+         (foreach disj in disjuncts
+             where (not (eql? disj subgoalDisjunct))
+             do (setq assumption
+                  (recursively-fasten-down-propositions
+                   (choose (not negatedTruthValue?)
+                           (inherit-proposition
+                            disj (new ENTITY-MAPPING))
+                           (conjoin-propositions
+                            (inherit-as-top-level-proposition
+                             disj (new ENTITY-MAPPING))))
+                   FALSE))
+                ;; PROBLEM: THIS PRINTS OUT ONE LINE TOO EARLY:
+                ;; TO DO: ADD INDENTING:
+                (trace-if :GOAL-TREE EOL
+                          "  Assume that " assumption " is "
+                          (choose negatedTruthValue? "true" "false")
+                          "." EOL EOL)
+                (assign-truth-value assumption negatedTruthValue?)))
+       (CLASH ()
+	 (return :FINAL-SUCCESS)))
+      (safety 3 (null? (down frame)) "Bug in disjunction")
+      ;; no clash resulted. Try to prove first truth of 'subgoalDisjunct':
+      (foreach d in disjuncts
+               as i in (interval 0 NULL)
+               where (eql? d subgoalDisjunct)
+               do 
+               (setf (argument-cursor frame) i)
+               (break))
+      (return :MOVE-DOWN)) ))
+
+;;; Holds names of anonymous objects to avoid (unlikely) accidental clashes;
+;;; the only minor problem with this approach is that the anonymous surrogates
+;;; survive after a clear-module operation which is a potential memory leak.
+
+(defglobal *pl-anonymous-module* MODULE (get-stella-module "PL-ANONYMOUS" TRUE))
+
+(defun (create-anonymous-instance LOGIC-OBJECT) ((prefix STRING) (skolem? BOOLEAN))
+  ;; Create a unique anonymous instance in the current module whose
+  ;;    name is gensym'ed off `prefix' and interned into PL-ANONYMOUS.
+  ;; If `skolem?' create a SKOLEM object instead of a normal LOGIC-OBJECT.
+  (let ((instanceName
+         (intern-symbol-in-module
+          (yield-unique-gensym-name prefix *pl-anonymous-module*)
+          *pl-anonymous-module*
+          TRUE))
+        (instance LOGIC-OBJECT
+                  (choose skolem?
+                          (create-skolem NULL instanceName)
+                          (create-logic-instance (symbol-to-type instanceName) NULL))))
+    (setf (hypothesized-instance? instance) TRUE)
+    (return instance)))
+
+(defun (create-hypothesized-instance LOGIC-OBJECT) ((prefix STRING))
+  ;; Create an anonymous skolem for introduction into a hypothetical world.
+  ;; We use a skolem here to avoid unintentional clashes upon assertion due
+  ;;    to the unique names assumption.  This could happen, for example, with
+  ;;    a definition such as the following:
+  ;;      (defconcept c (?x) :<=> (= ?x the-only-member))
+  ;;    Now, if we make a hypothetical assertion such as
+  ;;      (c anonymous-123)
+  ;;    we would get a clash if `anonymous-123' were a normal object.  Using
+  ;;    a skolem avoids this problem, since it can be equated to other objects.
+  (let ((instance (create-anonymous-instance prefix TRUE)))
+    (setf (hypothesized-instance? instance) TRUE)
+    (return instance)))
+
+(defun (try-universal-introduction-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; 'frame' points to a :FORALL proposition.
+  ;; Strategy: Fork a world, bind each universally-quantified variable
+  ;;     to a newly-created skolem, inherit the antecedent onto the world
+  ;;     and assert it to be true, and then query the consequent.
+  ;; WHY ARE WE NOT USING THE SUBSUMPTION TEST MACHINERY HERE?  THIS WOULD
+  ;;     CUT DOWN ON THE NUMBER OF DIFFERENT STRATEGIES THAT DO VERY SIMILAR
+  ;;     THINGS - ONLY PROBLEM IS THAT WE HAVE TO GENERATE DESCRIPTIONS OF
+  ;;     EUQAL ARITY TO CALL A SUBSUMPTION TEST.
+  (let ((parallelThread (current-parallel-thread *queryIterator*))
+        (parallelFrame PARALLEL-CONTROL-FRAME
+                       (up (top-control-frame parallelThread))))
+    (enter-hypothetical-world parallelFrame)
+    (let ((forallProp (proposition frame))
+          (antecedent (nth (arguments forallProp) 0))
+          (consequent (nth (arguments forallProp) 1)))
+      (safety 3 (not (argument-bound? (first (io-variables forallProp))))
+              "Need to call 'create-choice-point'")
+      (foreach v in (io-variables forallProp)
+               do
+               (let ((skolem (create-hypothesized-instance "anonymous")))
+                 (when (defined? (skolem-type v))
+                   (assert-member-of-proposition 
+                    skolem (get-description (skolem-type v))))
+                 (bind-variable-to-value? v skolem FALSE)))
+      (exception-case
+       (foreach prop in (inherit-as-top-level-proposition antecedent NULL)
+                do
+                (recursively-fasten-down-propositions prop FALSE)
+                (assign-truth-value prop TRUE))
+       (CLASH ()
+	 (return :FINAL-SUCCESS)))
+      (create-down-frame frame consequent)
+      (return :MOVE-DOWN)) ))
+
+(defun (try-refutation-proof KEYWORD) ((frame CONTROL-FRAME))
+  ;; Strategy: Fork a world, assume the negation of the current goal,
+  ;;    forward propagate.  Return success if a clash occurs.
+  (let ((parallelThread (current-parallel-thread *queryIterator*))
+        (parallelFrame PARALLEL-CONTROL-FRAME
+                       (up (top-control-frame parallelThread))))
+    (when (unbound-variables? parallelFrame)
+      (return :FAILURE))
+    (enter-hypothetical-world parallelFrame)
+    (exception-case
+     (let ((negatedTruthValue? (reverse-polarity? frame)))
+       (foreach prop in (inherit-as-top-level-proposition (proposition frame) NULL)
+                do
+                ;; PROBLEM: THIS PRINTS OUT ONE LINE TOO EARLY:
+                ;; TO DO: ADD INDENTING:
+                (trace-if :GOAL-TREE EOL
+                          "  Assume that " prop " is "
+                          (choose negatedTruthValue? "true" "false")
+                          "." EOL)
+                (recursively-fasten-down-propositions prop FALSE)
+                (assign-truth-value prop negatedTruthValue?)))
+     (CLASH () 
+       (return :FINAL-SUCCESS)))
+    (return :FAILURE) ))
+
+
+  ;;
+;;;;;; Reflexes
+  ;;
+
+
+;;; These reflexes provide short-cuts to the strategy-based proof architecture.
+;;; A "reflex" is a proof having less baggage (needing less state) than a
+;;;    strategy proof.
+
+(defun (continue-FORALL-proof KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Strategies:
+  ;;    (1) If the variables in the FORALL antecedent all belong to closed
+  ;;        collections, iterate over their extensions checking to see that
+  ;;        each satisfies the consequent.
+  ;;    (2) Try universal entailment.
+  ;; TO DO: TURN THE ITERATIVE STRATEGY INTO AN EXPLICIT (KEYWORD) STRATEGY.
+  (ignore lastMove)
+  (cond
+   ((or (reverse-polarity? frame)
+        (forall var in (io-variables (proposition frame))
+                always (closed-term? (get-description (logical-type var)))))
+    (setf (state frame) :ITERATIVE-FORALL)
+    (return :MOVE-IN-PLACE))
+   (otherwise
+    (case (keyword (current-inference-level))
+      ((:NORMAL :REFUTATION)
+       (overlay-with-strategy-frame frame :UNIVERSAL-INTRODUCTION)
+       (return :MOVE-IN-PLACE))
+      (otherwise
+       (return :FAILURE))))) )
+
+(defun (continue-EXISTS-proof KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Drop through :EXISTS and evaluate its proposition.
+  (case lastMove
+    (:DOWN (return :MOVE-DOWN))
+    (:UP-TRUE
+     (let ((result (result frame)))
+       (when (defined? (partial-match-frame result))
+         (propagate-frame-partial-truth (partial-match-frame result) frame))
+       (propagate-frame-truth-value result frame)
+       (when (record-justifications?)
+         (record-EXISTENTIAL-INTRODUCTION-justification frame lastMove))
+       (if (null? (down frame))
+           (return :FINAL-SUCCESS)
+         (return :CONTINUING-SUCCESS))))
+    (:UP-FAIL
+     (let ((result (result frame)))
+       (when (defined? (partial-match-frame result))
+         (propagate-frame-partial-truth (partial-match-frame result) frame))
+       (propagate-frame-truth-value result frame)
+       (if (null? (down frame))
+           (return :FAILURE)
+         (error
+          "Failed subgoal of 'exists' didn't remove itself from stack."))))))
+
+(defun (continue-CONSTANT-proof KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Evaluate the truth value of '(proposition frame)'.
+  (ignore lastMove)
+  (let ((proposition (proposition frame)))
+    (setf (truth-value frame) (truth-value proposition))
+    (when (and (record-justifications?)
+               (null? (justification frame)))
+      (record-goal-justification frame
+                                 (new PRIMITIVE-STRATEGY
+                                      :strategy :CONSTANT-PROPOSITION)))
+    (if (reverse-polarity? frame)
+      (if (false? proposition)
+        (return :FINAL-SUCCESS)
+        (return :FAILURE))
+      (if (true? proposition)
+        (return :FINAL-SUCCESS)
+        (return :FAILURE))) ))
+
+(startup-time-progn
+  (define-explanation-phrase :constant-proposition :technical
+    "trivially")
+  (define-explanation-phrase :constant-proposition :lay
+    "trivially"))
+
+(defslot CONTROL-FRAME inference-cutoff-reason :type KEYWORD)
+
+(defun register-inference-cutoff ((frame CONTROL-FRAME) (reason KEYWORD))
+  ;; Register an inference cutoff `reason' on `frame' and all interested
+  ;;    parents of `frame' (currently, only :FAIL frames are interested).
+  (while (defined? frame)
+    (case (state frame)
+      (:FAIL (setf (inference-cutoff-reason frame) reason))
+      (otherwise NULL))
+    (setq frame (up frame))))
+
+(defun (continue-FAIL-proof KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Interpret negation-as-failure operator.
+;; ITS OK IF THERE ARE UNBOUND ARGUMENT VARIABLES THAT CORRESPOND TO
+;;    INTERNAL (EXISTENTIALLY QUANTIFIED) VARIABLES.  HOW TO TEST FOR
+;;    UNBOUND IO-VARIABLES???  ANYHOW, THIS SAFETY TEST IS TOO STRONG: -rmm
+;  (safety 3 (all-arguments-bound? (proposition frame))
+;          "Bug: 'fail' applied to proposition with unbound arguments.")
+  (when (reverse-polarity? frame)
+    (error ":FAIL not implemented for negative polarity."))
+  (case lastMove
+    (:DOWN
+     ;; prepare to unbind all choices made during eval of :FAIL:
+     (create-choice-point frame)
+     (setf (inference-cutoff-reason frame) NULL)
+     (return :MOVE-DOWN))
+    (:UP-TRUE
+     (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+     (unbind-variables-beginning-at 
+      (current-pattern-record *queryIterator*)
+      (choice-point-unbinding-offset frame))
+     (when (defined? (down frame))
+       (pop-frames-up-to (down frame)))
+     (return :FAILURE))
+    (:UP-FAIL
+     (let ((result :FINAL-SUCCESS))
+       (cond ((defined? (inference-cutoff-reason frame))
+              ;; Somewhere in the proof we experienced a cutoff (timeout or
+              ;;    depth violation), therefore, we return UNKNOWN, otherwise,
+              ;;    FAIL goals could behave differently dependent on where/
+              ;;    when they are encountered in a proof.  To take resources
+              ;;    into account, we could make use of a resource-bounded
+              ;;    `provable' relation, for example,
+              ;;       (fail (provable (foo bar) :timeout 2.0))
+              (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+              (setq result :FAILURE))
+             (otherwise
+              (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+              (when (record-justifications?)
+                (if (eq? (kind (proposition (up frame))) :NOT)
+                  (record-CLOSED-NOT-justification frame lastMove)
+                  (record-FAIL-justification frame lastMove)))))
+       (unbind-variables-beginning-at 
+        (current-pattern-record *queryIterator*)
+        (choice-point-unbinding-offset frame))
+       (return result)))))
+
+(defmethod (continue-partial-FAIL-proof KEYWORD) ((self CONTROL-FRAME)
+                                                  (lastMove KEYWORD))
+  ;; Called instead of `continue-FAIL-proof' if we are in partial match
+  ;;    mode to compute partial match scores and success or failure.
+  ;; Wraps around `continue-FAIL-proof' to create an "advised" version.
+  ;;    Real work is done by methods defined on associated partial match frames.
+  (let ((pmf (partial-match-frame self)))
+    (when (null? pmf)
+      (create-and-link-partial-match-frame self :FAIL))
+    (return
+      (continue-partial-FAIL-proof (partial-match-frame self) lastMove))))
+
+
+  ;;
+;;;;;; PROBABLY OBSOLETE Default reasoning
+  ;;
+
+;; ADD TO 'resume-proof-strategy-after-subgoal':
+; (:DEFEAT-DEFAULT
+;      (return (continue-to-defeat-default-proof frame lastMove)))
+
+;; THIS DEFAULT STRATEGY MAY NEVER BE USED (HANS THINKS ITS TOO COSTLY)
+;; SERIOUS BUG: THIS PROOF DOESN'T KNOW HOW TO DEAL WITH GENERATORS:
+;(defun (continue-to-defeat-default-proof KEYWORD) 
+;       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+;  ;; An atomic goal has been proved by default.  Try to disprove it
+;  ;;    (or strengthen it).
+;  (let ((proposition (proposition frame)))
+;    (when (eql? lastMove :DOWN)         ; first time here?
+;      (setf (iterator frame)
+;            (allocate-iterator
+;             (cons-list :INITIAL :DEFAULT-FALSE :STRICT-TRUE :STRICT-FALSE))))
+;    (while (next? (iterator frame))
+;      (let ((phase (value (iterator frame)))
+;            (downFrame CONTROL-FRAME NULL))
+;        (case phase
+;          (:INITIAL
+;            (setq downFrame (create-down-frame frame proposition))
+;            (setf (reverse-polarity? downFrame) (not (reverse-polarity? downFrame)))
+;            (return :MOVE-DOWN))
+;          (:DEFAULT-FALSE
+;           (when (eql? lastMove :UP-FAIL)
+;             (return :FINAL-SUCCESS))
+;           ;; default true has been defeated:
+;           (setf (holds-by-default? frame) FALSE)
+;           ;; look for strict proof:
+;           (setq *dontUseDefaultKnowledge?* TRUE)
+;           (setq downFrame (create-down-frame frame proposition))
+;           (return :MOVE-DOWN))
+;          (:STRICT-TRUE
+;           (when (eql? lastMove :UP-FAIL)
+;             ;; default true and default false cancel each other out:
+;             (return :FAILURE))
+;           ;; we proved strict truth; look for a possible contradiction:
+;           (setq *dontUseDefaultKnowledge?* TRUE)
+;           (setq downFrame (create-down-frame frame proposition))
+;           (setf (reverse-polarity? downFrame) (not (reverse-polarity? downFrame)))
+;           (return :MOVE-DOWN))
+;          (:STRICT-FALSE
+;           ;; reset *dontUseDefaultKnowledge?* to TRUE
+;           ;;    (vaguely tricky: we wouldn't have called this strategy if
+;           ;;    default reasoning were disabled originally):
+;           (setq *dontUseDefaultKnowledge?* FALSE)
+;           ;; strict true succeeded on previous iteration:
+;           (case lastMove
+;             (:UP-TRUE 
+;              (inform
+;               EOL "CONTRADICTION: Discovered strict arguments for" EOL
+;               "    " proposition EOL "and its negation." EOL)
+;              (return :FAILURE))
+;             (:UP-FALSE
+;              ;; strict true is uncontested:
+;              (return :FINAL-SUCCESS))))))) ))

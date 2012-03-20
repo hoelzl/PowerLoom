@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: methods.ste,v 1.85 2003/04/18 21:15:19 hans Exp
+;;; Version: methods.ste,v 1.88 2006/05/11 07:06:18 hans Exp
 
 ;;; Procedures that define Stella method objects (method-slots).
 
@@ -247,11 +247,14 @@ FLOAT."
   (let ((typeSpec (new PARAMETRIC-TYPE-SPECIFIER))
         (parameterTypeSpec TYPE-SPEC NULL)
         (cursor typeSpecTree)
-        (baseType (popq cursor))
+        (baseType (typify (popq cursor)))
+        (realBaseTypeSpec (real-type-specifier baseType))
+        (definedBaseType? (not (eql? baseType realBaseTypeSpec)))
         (operator (popq cursor))
         (arrayType? FALSE))
-    (setf (specifier-base-type typeSpec)
-          (verify-type (typify baseType)))
+    (when definedBaseType?
+      (setq baseType (type-spec-to-base-type realBaseTypeSpec)))
+    (setf (specifier-base-type typeSpec) (verify-type baseType))
     (when (array-type-specifier? typeSpec)
       (when (eql? operator (quote SIZE))
        (setq operator (popq cursor)))
@@ -275,6 +278,25 @@ FLOAT."
              (return (yield-parametric-type-specifier (bquote (UNKNOWN OF)))))
         collect parameterTypeSpec
         into (specifier-parameter-types typeSpec))
+    (when definedBaseType?
+      (typecase realBaseTypeSpec
+        (PARAMETRIC-TYPE-SPECIFIER
+         ;; check whether the parameter types are compatible:
+         (unless (and (= (length (specifier-parameter-types realBaseTypeSpec))
+                         (length (specifier-parameter-types typeSpec)))
+                      (forall parType in (specifier-parameter-types typeSpec)
+                        as rParType in (specifier-parameter-types realBaseTypeSpec)
+                        ;; use less stringent test here to deal with class finalization
+                        ;; issues; we can't check later, since we can't record that
+                        ;; we expanded a defined base type:
+                        always (optimistic-subtype-of?
+                                (type-spec-to-base-type parType)
+                                (type-spec-to-base-type rParType))))
+           (walk-error "Parameter types of " typeSpecTree " are incompatible " EOL
+                       " with parameter types of defined type "
+                       (first typeSpecTree))
+           (return (yield-parametric-type-specifier (bquote (UNKNOWN OF))))))
+        (otherwise NULL)))
     (return typeSpec) ))
 
 (defun (parse-array-dimensions-spec (LIST OF INTEGER-WRAPPER))

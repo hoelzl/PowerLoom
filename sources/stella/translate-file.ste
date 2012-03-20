@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: translate-file.ste,v 1.94 2003/10/23 17:08:02 tar Exp
+;;; Version: translate-file.ste,v 1.101 2006/05/14 06:52:41 hans Exp
 
 ;;; Generic translator for Stella files.
 
@@ -318,12 +318,16 @@ to a local directory containing sources, natives, or binaries.")
 
 (defglobal *OS* KEYWORD (operating-system)
   :documentation "The operating system we are running on.  Currently,
-either :UNIX, :WINDOWS, or :MAC.")
+either :UNIX, :WINDOWS, or :MAC.  Note that on the Mac OS X, the
+OS can be either :UNIX or :MAC, depending on which file naming 
+conventions are being observed by the software.")
 
 (defun (operating-system KEYWORD) ()
   ;; Try to figure out what operating system we are running on.
+  ;; For lisp, all of
+  ;;   Allegro, Lispworks, CLISP, openmcl, MCL, cmucl, sbcl
+  ;;   on Unix have the :UNIX keyword is in *FEATURES*.
   ;; This needs improvement:
-  ;; - we can use `(CL:software-version)' in Lisp
   ;; - we can use `System.getProperty("os.name")' or
   ;;   `System.getProperty("file.separator")' in Java.
   (cond ((or (probe-file? "C:\\AUTOEXEC.BAT")
@@ -331,8 +335,9 @@ either :UNIX, :WINDOWS, or :MAC.")
              (probe-file? "C:\\BOOT.INI"))
          ;; problem: these files might reside on different drives
          (return :WINDOWS))
-        ((or (probe-file? "/usr")
-             (probe-file? "/etc"))
+        ((verbatim :common-lisp "(CL:MEMBER :UNIX CL:*FEATURES*)"
+		   :otherwise (or (probe-file? "/usr")
+				  (probe-file? "/etc")))
          (return :UNIX))
         (otherwise
          (return :MAC))))
@@ -342,6 +347,8 @@ either :UNIX, :WINDOWS, or :MAC.")
   ;;    the operating system we are running on.
   (let ((separator CHARACTER #\?))
     (verbatim 
+        :common-lisp "(CL:LET ((NAME (CL:NAMESTRING (CL:MAKE-PATHNAME :DIRECTORY '(:ABSOLUTE \"foo\")))))
+                        (CL:SETQ SEPARATOR (CL:CHAR NAME (CL:1- (CL:LENGTH NAME)))))"
         :java "separator = java.io.File.separatorChar;"
         :otherwise
         (when (defined? *OS*) ;; guard against bootstrap failure
@@ -668,42 +675,38 @@ running in Lisp, which allows us to depend on the native
   ;; QUESTION: IS THERE A SIMPLER WAY TO DO THE SAME THING?  -rmm
   (unless (running-as-lisp?)
     (error "Shouldn't call COMPUTE-COMMON-LISP-FILE-EXTENSION unless running in Lisp"))
-  (let ((suffix STRING NULL)
-        (dummyPathName STRING NULL))
-    (cond ((use-cl-structs?)
-	   (setq suffix ".slisp"))
-	  ((use-vector-structs?)
-	   (setq suffix ".vslisp"))
-	  (otherwise 
-	   (setq suffix ".lisp")))
-
-    ;; This is used to map ".lisp" into ".lsp" for lisp systems where it is
-    ;; appropriate.
-    (verbatim
-     :common-lisp
-     "(cl:let* ((lispType 
+  (let ((suffix STRING NULL))
+    (case type
+      (:lisp-binary 
+       (setq suffix 
+	     (verbatim :common-lisp
+		       "(cl:pathname-type (cl:compile-file-pathname \"foo.lisp\"))"
+		       :otherwise NULL))
+       
+       (cond ((use-cl-structs?)
+	      (setq suffix (concatenate "s" suffix)))
+	     ((use-vector-structs?)
+	      (setq suffix (concatenate "vs" suffix)))
+	     (otherwise 
+	      NULL)))
+      (:lisp
+       (cond ((use-cl-structs?)
+	      (setq suffix ".slisp"))
+	     ((use-vector-structs?)
+	      (setq suffix ".vslisp"))
+	     (otherwise 
+	      (setq suffix ".lisp")))
+	 ;; This is used to map ".lisp" into ".lsp" for lisp systems where it is
+	 ;; appropriate.
+	 (verbatim
+	   :common-lisp
+	   "(cl:let* ((lispType 
                   (CL:pathname-type (CL:concatenate 'CL:string \"dummy\" suffix)))
                  (dummyPath
                   (CL:make-pathname :name \"f\" :type lispType)))
-         (cl:setq dummyPathName (CL:namestring dummyPath)))"
-     :otherwise NULL)
-    
-    (when (eq? type :lisp-binary)
-      (cond ((use-cl-structs?)
-             (setq dummyPathName "f.sfasl"))
-            ((use-vector-structs?)
-             (setq dummyPathName "f.vsfasl"))
-            (otherwise
-             ;; let the compiler tell us what to use:
-             (verbatim
-               :common-lisp
-               " (cl:setq dummyPathName 
-                    (CL:namestring (cl:compile-file-pathname dummyPathName)))"
-               :otherwise NULL))))
-
-    ;; Extract just the extension.  The filename was set to "f" in the
-    ;; first verbatim clause.
-    (return (subsequence dummyPathName 1 NULL)) ))
+         (cl:setq suffix (CL:SUBSEQ (CL:namestring dummyPath) 2)))"
+	   :otherwise NULL)))
+    (return (concatenate "." suffix)) ))
 
 (defun (default-common-lisp-file-extension STRING) ((type KEYWORD))
   ;; Return an appropriate Common Lisp extension.
@@ -718,7 +721,7 @@ running in Lisp, which allows us to depend on the native
     (:lisp-binary
      (case *OS*
        (:mac
-	(return ".pfsl"))
+	(return ".cfsl"))
        (:windows
 	(return ".fas"))
        (otherwise
@@ -953,7 +956,8 @@ running in Lisp, which allows us to depend on the native
       (if (or (null? file1-date)
 	      (null? file2-date))
 	(return NULL)
-	(return (time-greater? file1-date file2-date))))))
+        ;; allow equal times as well, since we might get only 1-sec resolution:
+	(return (greater-equal? file1-date file2-date))))))
 
 (defun (stella-need-to-translate? BOOLEAN) ((file OBJECT) (language KEYWORD))
   ;; TRUE if 'sourceFile' needs to be translated.
@@ -999,11 +1003,8 @@ running in Lisp, which allows us to depend on the native
   ;;    home module of one of its translated objects.
   ;; Alternatively, we could store this module information in the units list.
   (foreach unit in fileUnits
-      where (defined? (the-object unit))
-      do (case (category unit)
-           ((STARTUP-TIME-PROGN VERBATIM) NULL)
-           (otherwise
-            (return (home-module (the-object unit))))))
+      where (defined? (tu-home-module unit))
+      do (return (tu-home-module unit)))
   (return *module*))
 
 (defun (concatenate-system-units (LIST OF TRANSLATION-UNIT))

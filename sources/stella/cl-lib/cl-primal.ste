@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cl-primal.ste,v 1.109 2003/10/01 16:49:06 tar Exp
+;;; Version: cl-primal.ste,v 1.120 2006/05/16 18:29:06 tar Exp
 
 ;;; Common-Lisp implementations of various primitive (:native?)
 ;;;    STELLA functions, plus some additonal Lisp-specific support.
@@ -55,7 +55,16 @@
   ;;
 
 (verbatim :common-lisp
-  (CL:defvar NULL :null_value))
+  (CL:defconstant NULL :null_value))
+
+(verbatim :common-lisp
+  (CL:defconstant TRUE CL:T))
+
+(verbatim :common-lisp
+  (CL:defconstant FALSE CL:NIL))
+
+(defconstant CL-NIL LISP-CODE
+  (verbatim :common-lisp (CL:or)))
 
 (verbatim :common-lisp
   "(CL:defvar NULL-STRING (cl:make-string 1 :initial-element (CL:code-char 0)))")
@@ -63,8 +72,45 @@
 (verbatim :common-lisp
   "(CL:defvar NULL-NATIVE-VECTOR (cl:vector))")
 
-(defconstant CL-NIL LISP-CODE
-  (verbatim :common-lisp (CL:or)))
+;; values for cl-array-null 
+;; NOTE:  Any change to the set of supported null values also needs
+;;        to change the type declaration function LOOKUP-CL-TYPE-FROM-STELLA-TYPE
+;;        in file cl-translate.ste
+;; NOTE:  Changes will also have to be made to LISP-NULL-ARRAY-SYMBOL-STRING
+;;        in file primal.ste
+(verbatim :common-lisp
+  "(CL:defvar NULL-1D-ARRAY NULL-NATIVE-VECTOR)")
+
+(verbatim :common-lisp
+  "(CL:defvar NULL-2D-ARRAY (cl:make-array '(0 0)))")
+
+(verbatim :common-lisp
+  "(CL:defvar NULL-3D-ARRAY (cl:make-array '(0 0 0)))")
+
+(verbatim :common-lisp
+  "(CL:defvar NULL-4D-ARRAY (cl:make-array '(0 0 0 0)))")
+
+(verbatim :common-lisp
+  "(CL:defvar NULL-5D-ARRAY (cl:make-array '(0 0 0 0 0)))")
+
+;; NOTE: This cannot declare the type of "value", because it is possible
+;; that it will be called with a non-specialized NULL value for those
+;; arrays of rank greater than 5.  We could just ignore them if we really
+;; wanted to get speed, since they are likely to be exceedingly rare in
+;; Stella code.
+(verbatim :common-lisp
+  "(CL:defun null-array? (value)
+    (CL:TYPECASE value
+      (CL:ARRAY    
+        (CL:CASE (CL:ARRAY-RANK value)
+          (1 (CL:eq value NULL-1D-ARRAY))
+          (2 (CL:eq value NULL-2D-ARRAY))
+          (3 (CL:eq value NULL-3D-ARRAY))
+          (4 (CL:eq value NULL-4D-ARRAY))
+          (5 (CL:eq value NULL-5D-ARRAY))
+          (CL:t (CL:eq value NULL))))
+      (CL:t (CL:eq value NULL))))")
+
 
 (verbatim :common-lisp
   "#-:lispworks
@@ -90,6 +136,7 @@
 ;;;;;; 'null?' and 'defined?':
   ;;
 
+;;; NULL?
 (verbatim :common-lisp
   (CL:defmethod null? ((value CL:T))
     ;; Return true if "value" equals NULL.
@@ -126,6 +173,13 @@
     (CL:eq value NULL-NATIVE-VECTOR)))
 
 (verbatim :common-lisp
+  (CL:defmethod null? ((value CL:ARRAY))
+    (CL:declare (CL:inline null-array?))
+    ;; Return true if "value" does not equal NULL.
+    (null-array? value)))
+
+;;; DEFINED?
+(verbatim :common-lisp
   (CL:defmethod defined? ((value CL:T))
     ;; Return true if "value" does not equal NULL.
     (CL:not (CL:eq value NULL))))
@@ -159,6 +213,12 @@
   (CL:defmethod defined? ((value CL:VECTOR))
     ;; Return true if "value" does not equal NULL.
     (CL:not (CL:eq value NULL-NATIVE-VECTOR))))
+
+(verbatim :common-lisp
+  (CL:defmethod defined? ((value CL:ARRAY))
+    (CL:declare (CL:inline null-array?))
+    ;; Return true if "value" does not equal NULL.
+    (CL:not (null-array? value))))
 
   ;;
 ;;;;;; Equality tests:
@@ -219,11 +279,8 @@
 |#
 (defun (round INTEGER) ((n NUMBER))
   (return (CL:values (CL:floor (+ n 0.5)))))
-
-(defun (exp FLOAT) ((x FLOAT))
-  :public? TRUE
-  :documentation "The natural exponentiation function e^x."
-  (return (CL:exp x)))
+(defun (truncate INTEGER) ((n NUMBER))
+  (return (CL:values (CL:truncate n))))
 
 (defun (integer-length INTEGER) ((arg INTEGER))
   :public? TRUE
@@ -299,6 +356,23 @@ entire string."
       (CL:or (CL:position character string :start start)
              NULL-INTEGER))))
 
+
+(defmethod (last-position INTEGER)
+    ((string STRING) (character CHARACTER) (end INTEGER))
+  :documentation "Return the last position of 'character' within 'string' (counting
+from zero); or return NULL if 'character' does not occur within 'string'.
+If 'end' was supplied as non-NULL, only consider the substring ending
+at 'end', however, the returned position will always be relative to the
+entire string."
+  :public? TRUE
+  (if (null? end)
+      (setq end (length string))
+      (setq end (+ end 1)))
+  (return
+    (verbatim :common-lisp
+      (CL:or (CL:position character string :end end :from-end cl:t)
+             NULL-INTEGER))))
+
 (defun (string-search INTEGER) ((string STRING)
                                 (substring STRING)
                                 (start INTEGER))
@@ -365,16 +439,20 @@ and ending up to but not including position 'end', counting from zero.  An
 		      (new-unhandled-exception 
 		       (cl:format nil "Unstringify: Caught unhandled exception ~A.~%" c)))))))))))
 
-(defun (integer-to-string STRING) ((integer INTEGER))
-  :documentation "Return a string representation of 'integer'."
+(defun (integer-to-string-in-base STRING) ((integer INTEGER) (base INTEGER))
   :public? TRUE
+  :documentation "Return a string representation of `integer' in `base'.
+Helping function for `integer-to-string' and `integer-to-hex-string'"
   ;; We don't use `CL:format' here for speed.
-  ;; TO DO: MAKE THIS TRHEAD SAFE BY ALLOCATING A NEW BUFFER EVERYTIME.
+  ;; TO DO: MAKE THIS THREAD SAFE BY ALLOCATING A NEW BUFFER EVERYTIME.
+  ;;        REQUIRED IN CLISP WHICH ENFORCES READ-ONLY CHARATERISTIC FOR
+  ;;        CONSTANT STRINGS.
   (return
     (verbatim
       :common-lisp
-      "(CL:let ((buffer \"                                \")
-                (table \"0123456789\")
+      "(CL:let ((buffer #+:CLISP (CL:make-string 32 :initial-element #\\Space)
+                        #-:CLISP \"                                \")
+                (table \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\")
                 (index 32)
                 (digit 0)
                 (negativeP CL:NIL))
@@ -389,7 +467,7 @@ and ending up to but not including position 'end', counting from zero.  An
            (CL:loop while (CL:> integer 0)
                do (CL:decf index)
                   (CL:multiple-value-setq (integer digit)
-                    (CL:floor integer 10))
+                    (CL:floor integer base))
                   (CL:setf (CL:aref buffer index)
                     (CL:aref table digit)))
            (CL:when negativeP
@@ -397,13 +475,23 @@ and ending up to but not including position 'end', counting from zero.  An
              (CL:setf (CL:aref buffer index) \#\\-))
            (CL:subseq buffer index 32))))")))
 
+(defun (integer-to-string STRING) ((integer INTEGER))
+  :documentation "Return a string representation of `integer'."
+  :public? TRUE
+  (return (integer-to-string-in-base integer 10)))
+
+(defun (integer-to-hex-string STRING) ((integer INTEGER))
+  :documentation "Return a hex string representation of 'integer'."
+  :public? TRUE
+  (return (integer-to-string-in-base integer 16)))
+
 (defun (float-to-string STRING) ((float FLOAT))
   :documentation "Return a string representation of 'float'."
   :public? TRUE
+  ;; NOTE: in ACL we could use `EXCL::FLONUM-TO-STRING' for extra speed:
   (return
     (verbatim :common-lisp
       "(CL:let ((CL:*read-default-float-format* 'CL:double-float))
-         ;; NOTE: in ACL we could use `EXCL::FLONUM-TO-STRING' for extra speed:
          (CL:with-output-to-string (s)
            (CL:prin1 float s)))")))
 
@@ -445,6 +533,50 @@ float and return the result."
 ;;;    by a YACC parser that walked an ASCII file and converted
 ;;;    CStar code into a cons forest.
 
+(defun (cl-symbol-to-stella-symbol GENERALIZED-SYMBOL) ((name STRING))
+  ;; 'name' is the symbol name of a Lisp symbol representing a STELLA
+  ;;    symbol (possibly qualified with a STELLA module).
+  ;; Convert `name' into an appropriate STELLA symbol.  Unfortunately,
+  ;;    since we've lost all symbol escape information when going
+  ;;    through the Lisp reader, some dwiming is required, since we
+  ;;    don't have all the information to do (always proper) module
+  ;;    name parsing, symbol/surrogate determination as in stella/|@foo|, etc.
+  (let ((module *module*)
+        (bareName name))
+    (when (qualified-stella-name? name)
+      (mv-setq (module bareName)
+        ;; NOTE: this might generate read errors for certain escaped symbols
+        ;; which we could avoid by using `compute-context-or-module-from-pathname'
+        ;; for parsing - let's wait and see how this works out:
+        (compute-module-and-bare-name name))
+      (when (eql? bareName "")
+        (if (or (eql? module *module*)
+                (eql? module *root-module*))
+            ;; special-case the division '/' symbol;
+            (return
+              (intern-rigid-symbol-wrt-module "/" *stella-module* SYMBOL-SYM))
+          (signal-read-error "Empty symbol name encountered"))))
+    ;; NOTE: (1) upcasing is relative to the current module, not the symbol
+    ;;           module (otherwise, how would we interpret the module portion?)
+    ;;       (2) we don't upcase here and rely on the LISP reader for upcasing,
+    ;;           otherwise, we can't have case-escaped symbols such as stella/|Foo|
+    ;;           that would result into appropriate mixed-case STELLA symbols,
+    ;;           since we don't have the escape information anymore at this point.
+    ;(when (not (case-sensitive? *module*))
+    ;  (setq bareName (string-upcase bareName)))
+    (cond ((keyword-name? bareName)
+           ;; it might be ok, since it could have been escaped, but we are
+           ;;    conservative here, since we don't know:
+           (signal-read-error "Illegal read syntax: " name))
+          ((surrogate-name? bareName)
+           ;; again, the @ might have been escaped but we assume it wasn't:
+           (return (intern-rigid-symbol-wrt-module
+                    (subsequence bareName 1 NULL-INTEGER)
+                    module SURROGATE-SYM)))
+          (otherwise
+           (return
+             (intern-rigid-symbol-wrt-module bareName module SYMBOL-SYM))))))
+
 (defun (stella-code-to-cons-tree OBJECT) ((stellaCode LISP-CODE))
   "Translate 'stellaCode' into a Stella parse tree
 for which Lisp conses have been replaced by STELLA conses,
@@ -473,14 +605,8 @@ and literals have been replaced by wrapped literals."
 	     ;; Exclude imported symbols such as 'SETQ' and 'SETF':
 	     (not (eq? (CL:find-symbol name "STELLA") stellaCode)))
 	(return (intern-common-lisp-symbol name)))
-       ((qualified-name? name)		; contains #\/ ?
-	(return (intern-qualified-name name FALSE)))
-       ((surrogate-name? name)		; prefixed by #\@ ?
-	(return (intern-rigid-symbol-case-sensitively
-                 (cl:subseq name 1) SURROGATE-SYM FALSE)))
        (otherwise
-	(return (intern-rigid-symbol-case-sensitively name SYMBOL-SYM FALSE)))) ))
-
+	(return (cl-symbol-to-stella-symbol name))))))
    ((CL:integerp stellaCode)
     (return (wrap-literal (safe-cast stellaCode INTEGER))))
    ((CL:floatp stellaCode)

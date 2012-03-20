@@ -1,0 +1,2077 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: descriptions.ste,v 1.95 2006/05/11 07:05:08 hans Exp
+
+;;; Named and unnamed descriptions and related support.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(defslot RELATION description :type NAMED-DESCRIPTION
+  :documentation "Maps a relation (class or slot or table) to a
+primitive description.")
+
+
+  ;;
+;;;;;; Utility methods on STELLA RELATIONs
+  ;;
+
+(defun (direct-superrelations (ITERATOR OF (LIKE self))) ((self RELATION))
+  :documentation "Return direct super classes/slots of 'self'."
+  (typecase self
+    (CLASS (return (direct-super-classes self)))
+    (SLOT (return (allocate-iterator (slot-direct-supers self))))) )
+
+(defun (slot-column-types (CONS OF TYPE)) ((self SLOT) (count INTEGER))
+  ;; Generate types of all arguments and return types of 'self',
+  ;;    except if the last return type is BOOLEAN, don't return that one.
+  ;; If 'count' is supplied as non-NULL, it should represent the actual
+  ;;    number of arguments supplied to 'self'.  This information is
+  ;;    only used when deciding how many types to return for the case of
+  ;;    variable arity slots -- more than 'count' types may be generated.
+  ;; If 'count' is NULL and 'self' has variable arity, then exactly one
+  ;;    type is returned for the last input argument.
+  ;; Note: Wrapped types get unwrapped.
+  (typecase self
+    (STORAGE-SLOT
+     (let ((domain (slot-owner self))
+           (range (slot-base-type self))
+           (typesList (CONS OF TYPE)
+                      (choose (boolean-type? range)
+                              (cons-list domain)
+                              (cons-list domain range))))
+       (return typesList)))
+    (otherwise
+     (let ((typeSpecifiers
+            (choose (isa? self @METHOD-SLOT)
+                    (method-parameter-type-specifiers (cast self METHOD-SLOT))
+                    (relation-parameter-type-specifiers (cast self TABLE))))
+           (typesList NIL)
+           (variableTypes NIL)
+           (returnTypes NIL)
+           (returnType (unwrap-wrapped-type (slot-base-type self))))
+       (when (and (defined? returnType)
+                  (not (boolean-type? returnType)))
+         (pushq returnTypes returnType))
+       (if (null? (arity self))
+         (let ((variableArgumentsType
+                (extract-parameter-type
+                 (cast (last typeSpecifiers) PARAMETRIC-TYPE-SPECIFIER)
+                 (quote ANY-VALUE))))
+           (foreach tSpec in (but-last typeSpecifiers)
+                    collect (unwrap-wrapped-type (type-spec-to-base-type tSpec))
+                    into typesList)
+           (if (null? count)
+               (setq count 1)
+             (setq count
+               (- count (+ (length typesList) (length returnTypes)))))
+           (foreach i in (interval 1 count)
+	       do (ignore i)
+		  (pushq variableTypes variableArgumentsType))
+           (setq typesList (concatenate typesList variableTypes)))
+         (foreach tSpec in typeSpecifiers
+                  collect (unwrap-wrapped-type (type-spec-to-base-type tSpec))
+                  into typesList))
+       (setq typesList (concatenate typesList returnTypes))
+       (return typesList)))) )
+
+
+  ;;
+;;;;;; 'get-description'
+  ;;
+
+;;; A surrogate for a description that has no corresponding CLASS or SLOT
+;;;    points directly at the description.  Otherwise, a description is obtained
+;;;    by first locating the class or slot pointed to by a surrogate, and
+;;;    then retrieving the description from the class or slot.
+
+(defconstant FAKE-IO-VARIABLES VARIABLES-VECTOR
+  (new VARIABLES-VECTOR :array-size 0)
+  :documentation "Installed in a description with undetermined arity.")
+
+(defun (create-description DESCRIPTION) ((arity INTEGER) (named? BOOLEAN))
+  :public? TRUE
+  ;; Create a new blank description.
+  ;; Allocate an io-variables vector of length 'arity' (a NULL
+  ;;    value causes allocation of FAKE-IO-VARIABLES.
+  (enforce-code-only)
+  (let ((description 
+         (choose named? (new NAMED-DESCRIPTION) (new DESCRIPTION))))
+    (setf (io-variables description)
+          (choose (defined? arity)
+                  (new VARIABLES-VECTOR :array-size arity)
+                  FAKE-IO-VARIABLES))
+    ;; commented until we invent a better timestamp to memoize `get-instance'
+    ;;    (:KB-UPDATE and :META-KB-UPDATE should only be bumped when absolutely
+    ;;    necessary, since many memoized computations depend on them):
+    ;(bump-memoization-timestamp :KB-UPDATE)
+    ;(bump-memoization-timestamp :META-KB-UPDATE)
+    (return description) ))
+
+(defmethod (description-name SYMBOL) ((self DESCRIPTION))
+  :documentation "Return the name of the description `self', if it has one."
+  :public? TRUE
+  (return NULL) )
+
+(defmethod (description-name SYMBOL) ((self NAMED-DESCRIPTION))
+  :documentation "Return the name of the description `self'."
+  :public? TRUE
+  (return (object-name self)))
+
+(defun create-base-relation-for-polymorphic-description 
+       ((description DESCRIPTION))
+  ;; 'description' denotes a polymorphic relation.  A 'base-relation'
+  ;;    is its non-polymorphic cousin.
+  ;; If 'description' does not yet have a base relation, create one.
+  (let ((surrogate (intern-surrogate-in-module
+                    (symbol-name (description-name description))
+                    (home-context description) TRUE))
+        (relation (surrogate-value surrogate)))
+    (when (null? relation)
+      (special ((*evaluationMode* :EXTENSIONAL-ASSERTION)
+                (*fillingConstraintPropagationQueues?* FALSE))
+       (assert-isa-proposition
+        (create-logic-instance surrogate PL-KERNEL/@RELATION)
+        PL-KERNEL/@POLYMORPHIC))) ))
+
+(defconstant SYSTEM-DEFINED-ARGUMENT-NAMES (CONS OF SYMBOL)
+  (bquote (?x1 ?x2 ?x3 ?x4 ?x5 ?x6 ?x7 ?x8 ?x9 ?x10
+               ?x11 ?x12 ?x13 ?x14 ?x15 ?x16 ?x17 ?x18 ?x19 ?x20
+               ?x21 ?x22 ?x23 ?x24 ?x25 ?x26 ?x27 ?x28 ?x29 ?x30
+               ?x31 ?x32 ?x33 ?x34 ?x35 ?x36 ?x37 ?x38 ?x39 ?x40
+               ?x41 ?x42 ?x43 ?x44 ?x45 ?x46 ?x47 ?x48 ?x49 ?x50
+               ?x51 ?x52 ?x53 ?x54 ?x55 ?x56 ?x57 ?x58 ?x59 ?x60
+               ?x61 ?x62 ?x63 ?x64 ?x65 ?x66 ?x67 ?x68 ?x69 ?x70
+               ?x71 ?x72 ?x73 ?x74 ?x75 ?x76 ?x77 ?x78 ?x79 ?x80
+               ?x81 ?x82 ?x83 ?x84 ?x85 ?x86 ?x87 ?x88 ?x89 ?x90
+               ?x91 ?x92 ?x93 ?x94 ?x95 ?x96 ?x97 ?x98 ?x99 ?x100
+               ))
+  :public? TRUE)
+
+(defun (yield-system-defined-parameter-name SYMBOL)
+    ((index INTEGER) (referenceObject OBJECT))
+  ;; Return a system-defined parameter name for parameter `index'
+  ;;    0-based) interned into the same module as `referenceObject'.
+  (if (< index 100)
+      (return
+        (intern-symbol-in-module
+         (symbol-name (nth SYSTEM-DEFINED-ARGUMENT-NAMES index))
+         (home-module referenceObject)
+         TRUE))
+    (return
+      (intern-symbol-in-module
+       (concatenate "?X" (integer-to-string (1+ index)))
+       (home-module referenceObject)
+       TRUE))))
+
+(defun ensure-description-body ((description DESCRIPTION))
+  ;; If 'description' is a blank named description, create a primitive
+  ;;    definition for it.
+  ;; Called when:
+  ;;    (1) Forming a complement description from a 'blank' one;
+  ;;    (2) Optimizing a query.
+  (when (and (or (null? (proposition description))
+                 (eql? (proposition description) TRUE-PROPOSITION))
+             (isa? description @NAMED-DESCRIPTION))
+    (materialize-primitive-description-body description)) )
+
+(defun materialize-primitive-description-body ((description NAMED-DESCRIPTION))
+  ;; Situation: 'description' has no internal proposition.  Create
+  ;;    one for it.
+  (let ((native? (defined? (native-relation description)))
+        (name (choose native?
+                      (intern-symbol-in-module
+                       (name (native-relation description))
+                       (home-module (native-relation description))
+                       TRUE)
+                      (description-name description)))
+        (variableTypes (io-variable-types description))
+        (arity (length variableTypes))
+        (tree CONS NULL)
+        (variables NIL)
+        (arguments NIL))
+    ;; collect io-variable declarations:
+    (foreach i on (interval 1 arity)
+        as name in SYSTEM-DEFINED-ARGUMENT-NAMES
+        collect name into variables)
+    (setq arguments (copy-cons-list variables))
+    (when (and native? (> arity 1))
+      ;; For native slots such as INTEGER-INTERVAL.INTERVAL-LOWER-BOUND
+      ;;    we need a first-argument type to find them:
+      ;; EEKH, I THOUGHT WE HAD ELIMINATED THE STELLA `ISA' SYNTAX FOR TYPES.
+      ;; TO DO: GET RID OF IT EVENTUALLY....
+      (setf (first variables)
+        (bquote (ISA & (first variables)
+                     & (type-to-symbol (first variableTypes))))))
+    (setq tree (bquote (KAPPA & variables (& name && arguments))))
+    (special ((*logic-dialect* :KIF)
+              (*logicVariableTable* NIL)
+              (*termUnderConstruction* tree)
+              ;; avoid logging the dummy description itself:
+              (*evaluationMode* :DESCRIPTION)
+              (*context* (home-context description)))
+      (let ((sacrificialDescription (evaluate-DESCRIPTION-term tree FALSE)))
+        (setf (io-variables description)
+          (io-variables sacrificialDescription))
+        (setf (proposition description)
+          (proposition sacrificialDescription))
+        ;; Make sure the dummy gets cleaned up from backlink indices:
+        (setf (deleted? sacrificialDescription) TRUE)))))
+
+(defun (create-primitive-description NAMED-DESCRIPTION) 
+       ((ioVariableNames (LIST OF SYMBOL))
+        (ioVariableTypes (LIST OF TYPE)) (variableArity? BOOLEAN)
+        (class? BOOLEAN) (function? BOOLEAN) (module MODULE))
+  ;; Create a description for a named relation.
+  (when (> (length ioVariableTypes) (length SYSTEM-DEFINED-ARGUMENT-NAMES))
+    (error "PowerLoom can't handle relations with arity > "
+           (length SYSTEM-DEFINED-ARGUMENT-NAMES) EOL))
+  (within-module module
+    (let ((description NAMED-DESCRIPTION (create-description NULL TRUE)))
+      ;; fill in description fields:
+      (setf (io-variable-names description) ioVariableNames)
+      (setf (io-variable-types description) ioVariableTypes)
+      (special ((*fillingConstraintPropagationQueues?* FALSE)
+                ;; make sure we use assertion mode for proper backlinking:
+                (*evaluationMode* :EXTENSIONAL-ASSERTION))
+       (cond
+        (class?
+         (link-originated-proposition
+          description
+          (assert-isa-proposition description PL-KERNEL/@CONCEPT)))
+        (function?
+         (link-originated-proposition
+          description
+          (assert-isa-proposition description PL-KERNEL/@FUNCTION)))
+        (otherwise
+         (link-originated-proposition
+          description
+          (assert-isa-proposition description PL-KERNEL/@RELATION))))
+       (when variableArity?
+         (link-originated-proposition
+          description
+          (assert-property description PL-KERNEL/@VARIABLE-ARITY)))
+       (return description)))) )
+    
+(defun link-stella-relation-and-description ((self RELATION) (description NAMED-DESCRIPTION))
+  ;; Doubly-link relation 'self' and 'description'.
+  (setf (description self) description)
+  (setf (native-relation description) self)
+  ;; add backlink to surrogate:
+  (typecase self
+    (CLASS (setf (surrogate-value-inverse description) 
+                 (class-logical-type self)))
+    (SLOT (setf (surrogate-value-inverse description) (slot-slotref self))))
+  (when (polymorphic-relation? self)
+    (create-base-relation-for-polymorphic-description description))
+  (return) )
+
+(defun (create-description-for-stella-relation NAMED-DESCRIPTION) ((self RELATION))
+  ;; The class or slot 'self' has been referenced within the logic.
+  ;; Create a named description for it.
+  ;; Also, create description(s) on super-relations, and assert
+  ;;    IMPLIES relations between 'self' and supers.
+  (safety 3 (null? (description self))
+          "INTERNAL ERROR: Native relation " self
+          " already has an associated PowerLoom description "
+          (description self))
+  ;; ensure descriptions for all supers (except non-logic classes):
+  (foreach super in (direct-superrelations self)
+           where (and (defined? super)
+                      (or (not (isa? super @CLASS))
+                          (logic-class? super)))
+           do (get-description super))
+  (let ((description NAMED-DESCRIPTION NULL)
+        (homeModule MODULE NULL))
+    (typecase self
+      (CLASS (setq homeModule (home-module (class-logical-type self))))
+      (SLOT (setq homeModule (home-module self))))
+    ;; determine where to create the corresponding PowerLoom relation: if the
+    ;;    home-module of the native relation is a sub of PL-KERNEL, create it
+    ;;    where the native relation lives; otherwise, create it in PL-KERNEL
+    ;;    (maybe those should always go there?):
+    (unless (visible-from? *pl-kernel-module* homeModule)
+      (setq homeModule *pl-kernel-module*))
+    (typecase self
+      (CLASS
+       (when (not (logic-class? self))
+         (signal-proposition-error 
+          "Can't use the class " self " as a logic class because it" EOL
+          "   does not inherit the top-level class THING."))
+       (setq description
+             (create-primitive-description
+              NIL-LIST (list (class-logical-type self))
+              FALSE TRUE FALSE homeModule)))
+      (SLOT
+       ;; descriptions attach only to the most general among an
+       ;;    equivalent set of slots:
+       (let ((slotRef (slot-slotref self))
+             (superSlotRef (most-general-equivalent-slotref slotRef)))
+         (when (not (eql? slotRef superSlotRef))
+           (setq self (cast (surrogate-value superSlotRef) SLOT))
+           (when (defined? (description self))
+             (return (description self)))))
+       (setq description
+             (create-primitive-description
+              NIL-LIST
+              (new LIST :the-cons-list (slot-column-types self NULL))
+              FALSE                     ; VARIABLE ARITY NOT HANDLED YET
+              FALSE
+              (not (boolean-type? (slot-base-type self)))
+              homeModule))))
+    ;; doubly-link 'self' and 'description':
+    (link-stella-relation-and-description self description)
+    (finalize-superrelation-links self)
+    (ensure-description-body description)
+    (return description) ))
+
+(defun (surrogate-to-description NAMED-DESCRIPTION) ((self SURROGATE))
+  ;; Fastest way to produce a (named) description from a surrogate.
+  (let ((surrogateValue (surrogate-value self)))
+    (when (null? surrogateValue)
+      (return NULL))
+    (if (isa? surrogateValue @NAMED-DESCRIPTION)
+      (return surrogateValue)
+      (return (get-description self))) ))
+    
+(defun (get-description NAMED-DESCRIPTION) ((self OBJECT))
+  :public? TRUE
+  ;; Return a description for the class or slot referenced by 'self'.
+  ;; If no description exists, create one on-the-fly.
+  (typecase self
+    (NAMED-DESCRIPTION (return self))
+    (SURROGATE (return (SURROGATE.get-description self)))
+    (SYMBOL (return (get-description (symbol-to-surrogate self))))
+    (STRING (return (STRING.get-description self)))
+    (CLASS (return (CLASS.get-description self)))
+    (SLOT (return (SLOT.get-description self)))
+    (otherwise (return NULL))) )  
+
+(defun (SURROGATE.get-description NAMED-DESCRIPTION) ((self SURROGATE))
+  ;; This is the main 'get-description' that gets called by
+  ;;    all of the others.
+  ;; Return a description for the class or slot referenced by 'self'.
+  ;; If no description exists, create one on-the-fly.
+  ;; Also, create description(s) on super-relations, and assert
+  ;;    IMPLIES relations between 'self' and supers.
+  (let ((value (surrogate-value self))
+        (store OBJECT-STORE NULL))
+    (cond
+     ((defined? value)
+      (typecase value
+        (NAMED-DESCRIPTION (return value))
+        (RELATION
+         (cond
+          ((defined? (description value))
+           (return (description value)))
+          (otherwise
+           (return (create-description-for-stella-relation value)))))
+        ;; 'self' points to an object that does not have a description:
+        (otherwise
+         (return NULL))))
+     ((defined? (setq store (home-object-store self)))
+      (return (fetch-relation store self)))
+     (otherwise
+      (return NULL) ))))
+
+(defun (STRING.get-description NAMED-DESCRIPTION) ((self STRING))
+  ;; Return a description for the class or slot named 'self'.
+  ;; Note: A 'slot' is referenced by a dotted pair of names.
+  ;; CAUTION: There is a hole here: If a STELLA function has name 'self',
+  ;;    it return a description here unless something else triggers
+  ;;    creation of its description.
+  (let ((surrogate (lookup-surrogate self))
+        (store OBJECT-STORE NULL))
+    (cond
+     ((defined? surrogate)
+      (return (get-description surrogate)))
+     ((defined? (setq store (object-store *module*)))
+      (return (fetch-relation store self)))
+     (otherwise
+      (return NULL)))))
+
+(defun (CLASS.get-description NAMED-DESCRIPTION) ((self CLASS))
+  ;; Return a description for 'self' if 'self' is a logic class.
+  (cond
+   ((defined? (description self))
+    (return (description self)))
+  ((not (logic-class? self))
+   (unless *suppressNonlogicObjectWarning?*
+     (inform "Reference to non-logic class: " (name self) EOL
+	     "Class must inherit 'THING' to be used by PowerLoom's logic." EOL))
+   (return NULL))
+  (otherwise
+   (return (get-description (class-logical-type self))))) )
+
+(defun (SLOT.get-description NAMED-DESCRIPTION) ((self SLOT))
+  (cond
+   ((defined? (description self))
+    (return (description self)))
+   ((defined? (slot-slotref self))
+    (return (get-description (slot-slotref self))))
+   (otherwise
+    ;; create surrogate; then create description:
+    (return (get-description
+             (lookup-slotref (slot-owner self) (slot-name self)))))) )
+
+(defun (ensure-deferred-description SURROGATE) ((self SURROGATE))
+  ;; If `self' names a relation whose description has not yet been generated
+  ;;    since it comes from an object store, ensure its description is created.
+  ;; Return `self'.
+  (when (and (null? (surrogate-value self))
+             (defined? (home-object-store self)))
+    ;; try to page it in:
+    (get-description self))
+  (return self))
+
+(defun (logic-class? BOOLEAN) ((self CLASS))
+  :documentation "Return TRUE if the class 'self' or one of its
+supers supports indices that record extensions referenced by
+the logic system. Also return true for literal classes."
+  (when (or (defined? (description self))
+            (exists c in (class-all-super-classes self)
+                    where (or (defined? (description c))
+                              (eql? c (type-class @THING))))
+            (eql? self (type-class @THING))
+            (subclass-of? self (type-class @LITERAL))
+            (eql? self (type-class @PROPOSITION)))
+    (return TRUE))
+  (when (not (class-finalized? self))
+    (let ((badSupers (collect-bad-super-classes (class-type self) (list))))
+      (if (empty? badSupers)
+        (signal-proposition-warning
+         "Could not determine whether " self " is a logic class, "
+         "because it is not finalized.")
+        (signal-proposition-warning
+         "Could not determine whether " self " is a logic class, "
+         "because it is not finalized." EOL
+         "   It has these undefined or bad supers: "
+         (the-cons-list badSupers)))))
+  (return FALSE))
+
+
+  ;;
+;;;;;; Utility description functions
+  ;;
+
+(defun (variable-arity-domain-types-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for variable arity domain types iterator.
+  (let ((nestedIterator (iterator-nested-iterator self)))
+    (if (and (defined? nestedIterator)
+             (next? nestedIterator))
+      (setf (slot-value self value) (value nestedIterator))
+      (progn
+        (setf (iterator-nested-iterator self) NULL)
+        (setf (slot-value self value) (iterator-object self))))
+    (return TRUE) ))
+
+(defun (wrap-iterator-for-variable-arity ITERATOR) ((iterator ITERATOR))
+  (let ((allPurposeIterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-next-code allPurposeIterator)
+          (the-code :function variable-arity-domain-types-next?))
+    (setf (iterator-nested-iterator allPurposeIterator) iterator)
+    (return allPurposeIterator)))
+
+(defun (all-domain-types ITERATOR) ((self NAMED-DESCRIPTION))
+  ;; Generate a type for each domain of 'self'.
+  ;; Skip the last type if 'self' is a function.
+  (let ((iterator
+         (choose (function-description? self)
+                 (but-last (io-variable-types self))
+                 (allocate-iterator (io-variable-types self)))))
+    (if (variable-arity? self)
+      (return (wrap-iterator-for-variable-arity iterator))
+      (return iterator)) ))
+
+(defun (all-argument-types ITERATOR) ((self NAMED-DESCRIPTION))
+  ;; Generate a type for each argument of 'self'.
+  (if (variable-arity? self)
+    (return (wrap-iterator-for-variable-arity
+             (allocate-iterator (io-variable-types self))))
+    (return (allocate-iterator (io-variable-types self)))) )
+
+
+  ;;
+;;;;;; Declaring logic variables (scoped skolems)
+  ;;
+
+
+;;; Given a symbol, *logicVariableTable* is used to search for the skolem
+;;;    (representing a logic variable) currently bound to that symbol.
+;;; We don't actually use a table -- we just maintain a stack of all skolems
+;;;    that are lexically bound, and search for the first skolem whose name
+;;;    matches the input symbol.
+;;; IF WE WANT TO GENERATE SKOLEM NAMES DIFFERENT FROM EXISTENTIAL
+;;;    VARIABLES THAT FIRST INTRODUCE THEM, THEN WE HAVE TO GENERALIZE
+;;;    THIS TABLE TO RECORD name/skolem PAIRS, RATHER THAN JUST A LIST
+;;;    OF SKOLEMS:
+
+(defspecial *logicVariableTable* (CONS OF SKOLEM) NULL
+  :documentation "Table mapping logic variable names to variables or skolems.
+Used during construction of a proposition or description.")
+
+(defun push-logic-variable-binding ((variable SKOLEM))
+  ;; Push <variable> onto *logicVariableTable*.
+  ;; CAUTION: We explicitly permit the variables with the same name in the
+  ;;    table, and rely on the fact that 'lookup' will always 
+  ;;    return the value of the most recently pushed entry.
+  (when (anonymous-variable? variable)
+    (signal-proposition-error "Illegal nameless variable '?' found in list of
+quantified variables." EOL "   Quantified variables must have names."))
+  (pushq *logicVariableTable* variable) )
+
+(defun pop-logic-variable-binding ()
+  ;; Pop the first variable in the cons list *logicVariableTable*.
+  (let ((headCons *logicVariableTable*))
+    (setq *logicVariableTable* (rest headCons))
+    (free headCons) ))
+
+(defun pop-logic-variable-bindings ((variables (CONS OF SKOLEM)))
+  ;; Pop all variable bindings in the list 'variables'.
+  ;; Can't iterate over 'variables' directly, since
+  ;;    'pop-logic-variable-binding' destructively modifies it:
+  (foreach i in (interval 1 (length variables))
+           do
+           (ignore i)
+           (pop-logic-variable-binding)) )
+
+(defun (lookup-logic-variable-binding OBJECT) ((variableName SYMBOL))
+  ;; Scan *logicVariableTable* for a variable named 'variableName'.
+  ;; If found, return the corresponding value.
+  (when (defined? *logicVariableTable*)
+    (foreach vbl in *logicVariableTable*
+             where (eql? (skolem-name vbl) variableName)
+             do (return vbl)))
+  (return NULL) )
+
+;;; The declaration of a skolem variable is paired with one of the operators
+;;     'ISA' or 'IN', from which a primary type is inferred.  Any additional 
+;;;    ISA and/or IN relationships are attached to the newly-created skolem.
+
+(defspecial *variableTypePropositions* (CONS OF PROPOSITION)
+  :documentation "List of propositions extracted from parsing
+a list of quantified, typed variables.")
+
+(defun parse-one-variable-declaration 
+       ((vDec OBJECT) (localDeclarations (LIST OF PATTERN-VARIABLE)))
+  ;; Helping function for 'parse-logic-variable-declarations'.
+  ;; 'tree' must be of the form '?x' or '(ISA ?x C)'.
+  ;; Push a typed variable or skolem into 'localDeclarations'.
+  ;; Slightly tricky: 'localDeclarations' is collected to make it easy
+  ;;    to detect duplicate local declarations.
+  (let ((variableName SYMBOL NULL)
+        (isaTree CONS NULL)
+        (variable PATTERN-VARIABLE NULL))
+    (typecase vDec
+      (CONS
+       (setq variableName (second vDec))
+       (setq isaTree vDec))
+      (SYMBOL
+       (setq variableName vDec)))
+    ;; if a variable is declared twice locally, 
+    (foreach v in localDeclarations
+             where (eql? (skolem-name v) variableName)
+             do (setq variable v))
+    (when (null? variable)
+      ;; create a new pattern variable
+      (setq variable (create-variable NULL variableName TRUE)))
+    (push-logic-variable-binding variable)
+    (insert-last localDeclarations variable)
+    ;; tricky: FIRST create variable and push it onto the list of
+    ;;    variable declarations.  THEN create the ISA proposition, which
+    ;;    will bind to the newly-created variable:
+    (when (defined? isaTree)
+      (let ((proposition (build-top-level-proposition isaTree FALSE)))
+        (when (null? proposition)      ; must have been a parsing error
+          (signal-proposition-error "Error in declarations"))
+        ;; if 'proposition' is not TRUE-PROPOSITION, mark it as a 
+        ;;    variable type declaration:
+        (when (eql? (kind proposition) :ISA)
+          (setf (variable-type? proposition) TRUE)
+          (update-skolem-type (first (arguments proposition)) (relationRef proposition))
+          (pushq *variableTypePropositions* proposition)))) ))
+
+(defun (parse-logic-variable-declarations (CONS OF PATTERN-VARIABLE)) ((tree OBJECT))
+  ;; Create a cons list of typed variables according to the
+  ;;    declarations in 'tree'.
+  ;; Side-effect: Push each variable onto *logicVariableTable*.
+  ;; Side-effect: Push any newly-created propositions onto
+  ;;    *variableTypePropositions*.
+  (let ((consTree CONS (choose (isa? tree @CONS) tree (cons-list tree)))
+        (declarations (new (LIST OF PATTERN-VARIABLE))))
+    (foreach term in consTree
+             do (parse-one-variable-declaration term declarations))
+    (return (the-cons-list declarations)) ))
+      
+;;; A description corresponds to a class/set or an n-ary predicate.
+(defun (help-build-quantified-proposition (CONS OF SKOLEM) PROPOSITION PROPOSITION)
+       ((tree CONS) (convertTypesToConstraints? BOOLEAN))
+  ;; 'tree' has the form
+  ;;      '(<quantifier> <variable declarations>
+  ;;                     <where proposition [<always proposition>]'
+  ;;    where <quantifier> is either FORALL,EXISTS, SETOFALL, or KAPPA.
+  ;; Parse <variable declarations> into a list of variables or skolems,
+  ;;    parse proposition, and return three values:
+  ;;    (1) a cons list of variables,
+  ;;    (2) a proposition representing the WHERE clause
+  ;;    (3) optionally, a proposition representing an ALWAYS clause
+  ;; If `convertTypesToConstraints?', all variable types are converted into
+  ;;    corresponding constraint propositions (note, this is now done
+  ;;    globally for better uniformity, and since variable types have lost
+  ;;    lost their reason of existence due to the demise of polymorphism
+  ;;    in PowerLoom - before we needed them for disambiguation).
+  ;; The special variable *variableTypePropositions* is filled by
+  ;;    'parse-logic-variable-declarations'.
+  ;; Quantified variables are be instantiated as
+  ;;    PATTERN-VARIABLEs and all newly-built top-level
+  ;;    propositions will be conjoined into one single proposition.
+  (special ((*variableTypePropositions* NIL))
+   (let ((quantifier (first tree))
+         (antecedentClause (third tree))
+         (consequentClause (fourth tree))
+         (variables (CONS OF SKOLEM) NULL)
+         (antecedentProposition PROPOSITION NULL)
+         (consequentProposition PROPOSITION NULL))
+     (setq variables (parse-logic-variable-declarations (second tree)))
+     (when (defined? antecedentClause)
+       (setq antecedentProposition (build-proposition antecedentClause)))
+     (when (defined? consequentClause)
+       (setq consequentProposition (build-proposition consequentClause)))
+     (pop-logic-variable-bindings variables)
+     (when convertTypesToConstraints?
+       (when (non-empty? *variableTypePropositions*)
+         (when (defined? antecedentProposition)
+           (pushq *variableTypePropositions* antecedentProposition))
+         (setq *variableTypePropositions*
+               (remove-duplicates (reverse *variableTypePropositions*)))
+         (setq antecedentProposition 
+               (conjoin-propositions *variableTypePropositions*))))
+     (return variables antecedentProposition consequentProposition) )))
+
+(defun (build-quantified-proposition (CONS OF SKOLEM) PROPOSITION PROPOSITION)
+       ((tree CONS) (convertTypesToConstraints? BOOLEAN))
+  ;;
+  ;; Description mode insures that correct things happen
+  ;;    with function terms inside of existentially-quantified
+  ;;    assertions.
+  ;; BUG: DESCRIPTION MODE REQUIRES ARGUMENTS TO BE PRE-DECLARED.  FOR
+  ;;    ASSERTED EXISTENTIALS, THIS IS BAD NEWS.
+  ;;
+  ;; TO DO: USING '*evaluationMode*' BENDS THE SEMANTICS TO GENERATE VARIABLES
+  ;;    INSTEAD OF SKOLEMS.  INVENT NEW MODE???
+  (case (first tree)
+    (EXISTS
+     ;; TO DO: FIGURE OUT HOW *NOT* USE USE DESCRIPTION MODE HERE, TO AVOID
+     ;;    BUG MENTIONED ABOVE:
+     (special ((*evaluationMode* :DESCRIPTION))
+       (return (help-build-quantified-proposition
+                tree convertTypesToConstraints?))))
+    (otherwise
+     (special ((*evaluationMode* :DESCRIPTION))
+       (return (help-build-quantified-proposition
+                tree convertTypesToConstraints?))))) )
+
+(defun (copy-cons-list-to-variables-vector VARIABLES-VECTOR) ((consList CONS))
+  ;; Create a vector of typed variables according to the declarations in
+  ;;    'tree'.
+  ;; LOW TO DO: ':size' ISN'T YET LEGAL:
+  (when (empty? consList)
+    (return ZERO-VARIABLES-VECTOR))
+  (let ((vector (new VARIABLES-VECTOR :array-size (length consList))))
+    (foreach t in consList
+             as i in (interval 0 NULL)
+             do (setf (nth vector i) t))
+    (return vector) ))
+
+
+  ;;
+;;;;;; 'equivalent-formulae?'
+  ;;
+
+(deftype ENTITY-MAPPING (KEY-VALUE-LIST OF OBJECT OBJECT)
+  :documentation "Used to keep track of copied or substituted variables
+and propositions within 'copy-description', etc.  This needs to be a
+subtype of DICTIONARY.  KEY-VALUE-LIST is a good choice for most cases,
+however, for very high-arity relations and descriptions we do get bad performance
+during copying and equivalence checking and KEY-VALUE-MAP (though more
+heavy-weight) would be the better option.")
+
+(defun (equivalent-holds-proposition? BOOLEAN) ;; HOLDS-KLUDGE
+       ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Helping function for 'equivalent-propositions?'.
+  ;; Handles the case when 'self' is a HOLDS relation within a
+  ;;    description embedded within a query.
+  ;; Return TRUE if 'self' maps to 'other'.
+  (return
+   (and (equivalent-formulae?
+         (nth (arguments self) 0) (operator other) mapping)
+        (eql? (1- (length (arguments self))) (length (arguments other)))
+        (forall i1 in (interval 1 NULL)
+                as arg2 in (arguments other)
+                always (equivalent-formulae? 
+                        (nth (arguments self) i1) arg2 mapping)))) )
+
+(defun (equivalent-commutative-propositions? BOOLEAN)
+       ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Helping function for equivalent-propositions?'.
+  ;; Return TRUE if 'self' is a duplicate of the proposition 'other'.
+  ;; The duplicate test for AND and OR propositions must consider all
+  ;;    permutations of arguments.
+  (return
+   (and (eql? (operator self) (operator other))
+        (eql? (length (arguments self)) (length (arguments other)))
+        ;; BUG?: This test fails if 'self' has duplicate args,
+        ;; e.g., '(OR P P)' would be considered a duplicate of
+        ;; '(OR P R)'.  Does normalization take care of this?
+        (forall arg1 in (arguments self)
+                always
+                (exists arg2 in (arguments other)
+                        where (equivalent-formulae? arg1 arg2 mapping))))) )
+
+(defun (equivalent-propositions? BOOLEAN) 
+       ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Helping function for 'equivalent-formulae?'.
+  ;; Return TRUE if 'self' is a duplicate of the proposition 'other'.
+  (when (eql? self other)
+    (return TRUE))
+  (when (not (eql? (kind self) (kind other)))
+    (return FALSE))
+  (case (kind self)
+    ((:AND :OR :EQUIVALENT)
+     (return (equivalent-commutative-propositions? self other mapping)))
+    (otherwise
+     (case (kind self)
+       ((:FORALL :EXISTS)
+        (let ((ioVars1 (io-variables self))
+              (ioVars2 (io-variables other)))
+          (unless (= (length ioVars1) (length ioVars2))
+            (return FALSE))
+          (when (null? mapping)
+            (setq mapping (new ENTITY-MAPPING)))
+          ;;; TO DO: this is too restrictive, and will make us miss equivalences
+          ;;; where variables are listed in different order; instead we should allow
+          ;;; variables to bind to other variables - similar to unification; however
+          ;;; to fix this right we also need to upgrade checking of commutative props
+          ;;; to do something more similar to full subgraph isomorphism - ouch:
+          (foreach v1 in ioVars1
+              as v2 in ioVars2
+              do (insert-at mapping v1 v2))))
+       (otherwise NULL))
+     ;; TO DO: UPGRADE TO TEST FOR COMMUTATIVE PREDICATE:
+     (return (or (and (eql? (operator self) (operator other))
+                      (forall arg1 in (arguments self)
+                              as arg2 in (arguments other)
+                              always (equivalent-formulae? arg1 arg2 mapping))
+                      (eql? (length (arguments self))
+                            (length (arguments other))))
+                 (and (defined? mapping) ;; HOLDS-KLUDGE
+                      (eql? (operator self) PL-KERNEL/@HOLDS)
+                      (equivalent-holds-proposition? self other mapping)))))) )
+
+(defun (equivalent-function-propositions? BOOLEAN)
+    ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Return TRUE if `self' and `other' are equivalent function propositions,
+  ;;    i.e., they are identical up to their skolem output argument.
+  (when (and (eql? (kind self) :FUNCTION)
+             (eql? (kind other) :FUNCTION))
+    (when (null? mapping)
+      (setq mapping (new ENTITY-MAPPING)))
+    ;; slightly inefficient, otherwise we'd have to duplicate the logic above:
+    (insert-at mapping (last-argument self) (last-argument other))
+    (return (equivalent-propositions? self other mapping)))
+  (return FALSE))
+
+(defun (equivalent-descriptions? BOOLEAN)
+       ((self DESCRIPTION) (other DESCRIPTION) (mapping ENTITY-MAPPING))
+  ;; Helping function for 'equivalent-formulae?'.
+  ;; Return TRUE if 'self' is a duplicate of the proposition 'other'.
+  (when (eql? self other)
+    (return TRUE))
+  ;; look for fast exit:
+  (when (and (defined? (description-name self))
+             (defined? (description-name other)))
+    (return FALSE))
+  (when (not (eql? (arity self) (arity other)))
+    (return FALSE))
+  (cond
+   ((named-description? self)
+    ;; assumes that different primitive descriptions can't be equivalent:
+    (return FALSE))
+   (otherwise
+    (when (null? mapping)
+      (setq mapping (new ENTITY-MAPPING)))
+    ;; OPTIMIZATION: IF 'mapping' GETS TOO BIG (FROM TOO MANY NESTED DESCRIPTIONS)
+    ;;    THEN 'POP' ENTRIES UPON RETURN FROM NESTED DESCRIPTION:
+    (foreach v1 in (io-variables self)
+             as v2 in (io-variables other)
+             do (insert-at mapping v1 v2))
+    ;; THIS IS NOT VERY GENERAL, BUT WITHOUT IT, WE MESS UP ON EXACT MATCHES:
+    (foreach v1 in (internal-variables self)
+             as v2 in (internal-variables other)
+             do (insert-at mapping v1 v2))
+    (return (equivalent-formulae? (proposition self) (proposition other) mapping)))) )
+
+(defun (equivalent-enumerations? BOOLEAN) ((self COLLECTION) (other COLLECTION))
+  ;; Return TRUE if the members of 'self' and 'other' are the same.
+  (typecase self
+    ((SET LIST)
+     (return (and (eql? (length self) (length other))
+                  (forall m in self always (member? other m)))))
+    (otherwise (return FALSE))) )
+
+(defun (equivalent-formulae? BOOLEAN)
+       ((self OBJECT) (other OBJECT) (mapping ENTITY-MAPPING))
+  ;; Return TRUE if 'self' is equivalent to 'other', using a (shallow)
+  ;;    structural equivalence test.
+  (let ((surrogateValue OBJECT NULL))
+    (when (isa? self @SURROGATE)
+      (setq surrogateValue (surrogate-value (cast self @SURROGATE)))
+      (when (defined? surrogateValue)
+        (setq self surrogateValue)))
+    (when (isa? other @SURROGATE)
+      (setq surrogateValue (surrogate-value (cast other @SURROGATE)))
+      (when (defined? surrogateValue)
+        (setq other surrogateValue))))
+  ;; do this first, so we don't run into infinite `equal?' loops; also don't
+  ;;    call `equal?' here, since the mapping does already record equalities:
+  (when (and (defined? mapping)
+             (or (eql? other (lookup mapping self))
+                 (eql? self (lookup mapping other))))
+    (return TRUE))
+  (when (equal? self other)
+    (return TRUE))
+  (when (defined? mapping)
+    (when (and *unify-propositions?*
+               ;; during unification we allow variables to be bound to values:
+               (or (variable? self)
+                   (variable? other)))
+      (when (null? *queryIterator*)
+        (insert-at mapping self other)
+        (return TRUE))
+      (let ((value1 (argument-bound-to self))
+            (value2 (argument-bound-to other)))
+        (cond ((or (null? value1)
+                   (null? value2))
+               ;; at least one variable was unbound:
+               (insert-at mapping self other)
+               (return TRUE))
+              (otherwise
+               (return (equal? value1 value2)))))))
+  (when (not (eql? (primary-type self) (primary-type other)))
+    (return FALSE))
+  (typecase self
+    (PROPOSITION (return (equivalent-propositions? self other mapping)))
+    (DESCRIPTION (return (equivalent-descriptions? self other mapping)))
+    ((SET LIST) (return (equivalent-enumerations? self other)))
+    (otherwise (return FALSE))) )
+
+(defun (same-and-unique-arguments? BOOLEAN) ((variables VARIABLES-VECTOR) (arguments VECTOR))
+  ;; Helping function for 'find-duplicate-named-description'.
+  ;; Test whether `variables' and `arguments' are `equal?' and that there
+  ;;    are no duplicates in `variables'; duplicates can arise in descriptions
+  ;;    with top-level equivalences, e.g., `(kappa (?x ?y) (and (r ?x ?y) (= ?x ?y)))'
+  ;;    becomes `(kappa (?x ?x) (r ?x ?x)' which is not the same as `r'.
+  (when (equal? variables arguments)
+    (let ((count 0))
+      (foreach v in variables
+          do (foreach v2 in variables
+                 where (eql? v v2)
+                 do (++ count)))
+      (return (and (= count (length variables))))))
+  (return FALSE))
+
+(defspecial *unify-propositions?* BOOLEAN FALSE)
+
+(defun (unify-propositions? BOOLEAN) 
+    ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Unify `self' and `other' if `mapping' was supplied as non-NULL, otherwise,
+  ;;    this is equivalent to calling `equivalent-propositions?'.
+  ;; Return TRUE if the propositions were unifiable and insert the necessary
+  ;;    variable substitutions into `mapping'.
+  ;; Note that this does not actually compute an MGU but simply a mapping that
+  ;;    converts `self' into `other'.
+  ;; THIS NEEDS SOME CLEANUP BY FACTORING OUT THE REQUIRED FUNCTIONALITY FROM
+  ;;    `EQUIVALENT-PROPOSITIONS?' AND FRIENDS TO AVOID THE SPECIAL VARIABLE KLUDGE:
+  (special ((*unify-propositions?* TRUE))
+    (return (equivalent-propositions? self other mapping))))
+  
+
+  ;;
+;;;;;; Strategies for finding duplicate descriptions
+  ;;
+
+(defun (named-description? BOOLEAN) ((self DESCRIPTION))
+  :documentation
+  "Return TRUE if 'self' is the description of a named class or relation."
+  :public? TRUE
+  (return (defined? (surrogate-value-inverse self))) )
+
+(defmethod (find-duplicate-named-description LOGIC-OBJECT) ((self DESCRIPTION))
+  ;; If 'self' has a name, return 'self'.
+  ;; Otherwise, if its definition consists of a single predicate (ignoring
+  ;;    any variable type declarations), or the negation of a predicate,
+  ;;    return the description for that predicate (or its negation).
+  ;; BUG?: FOR CASE OF MATCH WITH n-ary RELATION, DOESN'T CHECK THAT
+  ;;    ARGUMENT TYPES MATCH.
+  (when (named-description? self)
+    (return self))
+  (let ((proposition (proposition self)))
+    (case (kind proposition)
+      (:AND
+       (let ((onlyGoal PROPOSITION NULL))
+         (foreach arg in (arguments proposition)
+                  do
+                  (cond
+                   ((and (variable-type? (cast arg PROPOSITION))
+                         ;; tricky: we skip type declarations if 'self'
+                         ;;    is a relation (including a unary relation),
+                         ;;    since domain types are implicit:
+;; THIS DOESN'T WORK FOR PROPERTIES: -rmm
+;; SEEMS TO BE OK FOR CONCEPTS:
+;                         (or (> (arity self) 1)
+;                             (and (isa? self @NAMED-DESCRIPTION)
+;                                  (not (class-description?
+;                                        (cast self NAMED-DESCRIPTION)))))
+                         )
+                    NULL)
+                   ((defined? onlyGoal)
+                    (return NULL))
+                   (otherwise
+                    (setq onlyGoal arg))))
+         (when (and (defined? onlyGoal)
+                    (same-and-unique-arguments? 
+                     (io-variables self) 
+                     (choose (eql? (kind onlyGoal) :NOT)
+                             (arguments (cast (first (arguments onlyGoal)) PROPOSITION))
+                             (arguments onlyGoal))))
+           (return (extract-goal-description onlyGoal NULL)))))
+      (:NOT
+       (when (same-and-unique-arguments?
+              (io-variables self) 
+              (arguments (cast (first (arguments proposition)) PROPOSITION)))
+         (return (extract-goal-description proposition NULL))))
+      (otherwise
+       (when (same-and-unique-arguments? (io-variables self) (arguments proposition))
+         (return (extract-goal-description proposition NULL)))))
+    (return NULL) ))
+
+;;; FIGURE OUT: COMPLEMENT DESCRIPTIONS NOW WIND UP IN THE STRUCTURED OBJECT
+;;; TABLE; IS THAT WHERE THEY SHOULD BE?
+
+(defun (find-duplicate-complex-description DESCRIPTION) ((self DESCRIPTION))
+  ;; Return a duplicate (or equivalent) of 'self' if there is one.
+  ;; If not, add 'self' to `*structured-objects-index*'.
+  (let ((index (wrap-integer (proposition-hash-index (proposition self))))
+        (bucket (lookup *structured-objects-index* index))
+        (homeModule (base-module (home-context self)))
+        (mapping (new ENTITY-MAPPING)))
+    (when (null? bucket)
+      (insert-at *structured-objects-index* index (list self))
+      (return NULL))
+    (remove-deleted-members bucket)
+    (when (and (defined? (external-variables self))
+               (defined? *queryIterator*))
+      ;; mildly tricky: if 'self' has external variables, then the
+      ;; duplicate search will fail unless they are all bound (carried over
+      ;; from `find-duplicate-description-with-constant-reference' but
+      ;; probably obsolete - this case only exercised in `argument-bound-to'):
+      (setq mapping (new ENTITY-MAPPING))
+      (foreach v in (external-variables self)
+          do (insert-at mapping v (first-defined (argument-bound-to v) v))))
+    (foreach d in bucket
+        where (and (isa? d @DESCRIPTION)
+                   (equivalent-descriptions? self d mapping)
+                   (subcontext? homeModule (base-module (home-context d))))
+        do (return d))
+    (push bucket self)
+    (return NULL) ))
+
+(defun (find-duplicate-description DESCRIPTION) ((self DESCRIPTION))
+  ;; If `self' is a duplicate of an existing description return
+  ;;    the duplicate; return NULL otherwise.
+  ;; (1) If 'self' is equivalent to a named description, return the
+  ;;     named one;
+  ;; (2) If another unnamed description has equivalent structure,
+  ;;     return that one.
+  (if (named-description? self)
+      (return NULL)
+    (return
+      (first-defined
+       (find-duplicate-named-description self)
+       (find-duplicate-complex-description self)))))
+
+
+  ;;
+;;;;;; Flattening nested FUNCTION propositions
+  ;;
+
+(defun (contains-nested-argument? BOOLEAN) ((proposition PROPOSITION))
+  ;; Called by 'normalize-proposition'.
+  ;; Return TRUE if some argument in '(arguments proposition)' itself contains
+  ;;    a function proposition as an argument.
+  ;; Assumes that we won't encounter a :FUNCTION argument (or if we do, it
+  ;;    itself contains no nested arguments).
+  (case (kind proposition)
+    ((:ISA :FUNCTION :PREDICATE :EQUIVALENT :IMPLIES)
+     (foreach term in (arguments proposition)
+              do
+              (typecase term
+                (PATTERN-VARIABLE
+                 (when (defined? (defining-proposition term))
+                   (return TRUE)))
+                (otherwise NULL))))
+    (otherwise NULL))
+  (return FALSE) )
+
+(defun (expand-if-proposition PROPOSITION) ((ifProposition PROPOSITION))
+  ;; Called by 'help-collect-flattened-arguments'.
+  ;; 'ifProposition' has the form '(IF test trueValue falseValue valueVariable)'.
+  ;; Return a proposition of the form
+  ;;    '(or (and test (= valueVariable trueValue))
+  ;;         (and (not test) (= valueVariable falseValue)))'.
+  (let ((arguments (arguments ifProposition))
+        (testProp (nth arguments 0))
+        (negatedTestProp (create-proposition (quote NOT) 1))
+        (trueValue (nth arguments 1))
+        (falseValue (nth arguments 2))
+        (valueVariable PATTERN-VARIABLE (last-argument ifProposition))
+        (trueEquivalence
+         (create-equivalence-proposition valueVariable trueValue))
+        (falseEquivalence
+         (only-if (defined? falseValue)
+                  (create-equivalence-proposition valueVariable falseValue))))
+    ;; cut tie to original if proposition:
+    (setf (defining-proposition valueVariable) NULL)
+    (if (defined? falseValue)
+      (progn
+        (setf (nth (arguments negatedTestProp) 0)
+              (choose (isa? testProp @PATTERN-VARIABLE)
+                      testProp
+                      (shallow-copy-proposition testProp)))
+        (return (disjoin-propositions
+                 (cons-list
+                  (conjoin-two-propositions testProp trueEquivalence)
+                  (conjoin-two-propositions negatedTestProp falseEquivalence)))))
+      (return
+       (conjoin-two-propositions testProp trueEquivalence))) ))
+
+(defun help-collect-flattened-arguments
+       ((self PROPOSITION) (flattenedArguments (LIST OF PROPOSITION))
+        (existsVariables (LIST OF PATTERN-VARIABLE)))
+  ;; Helping function for 'collect-flattened-arguments'.
+  ;; 'arguments' contains the terms within an atomic proposition.
+  ;; Recursively descend adding more arguments to 'flattenedArguments'
+  ;;    (in reverse order).
+  ;; 'self' is a :PREDICATE, :ISA, :EQUIVALENT, or :FUNCTION proposition.
+  (foreach term in (arguments self)
+           do (typecase term
+                (PATTERN-VARIABLE
+                 (let ((functionArg (defining-proposition term)))
+                   (when (and (defined? functionArg)
+                              (not (member? existsVariables term)))
+                     (push existsVariables term)
+                     (help-collect-flattened-arguments
+                      functionArg flattenedArguments existsVariables)
+                     (if (eql? (operator functionArg) @PROPOSITION.IF)
+                       (push flattenedArguments 
+                             (expand-if-proposition functionArg))
+                       (push flattenedArguments functionArg)))))
+                (otherwise NULL))) )
+
+(defun (yield-flattened-arguments (LIST OF PROPOSITION)) 
+       ((proposition PROPOSITION) (existsVariables (LIST OF PATTERN-VARIABLE)))
+  ;; Return a list containing 'proposition' and all :FUNCTION propositions
+  ;;    whose output variables appear as arguments to 'proposition'
+  ;;    (recursively).
+  ;; IF propositions are also flattened, usually converted to :ORs.
+  ;; Side-effect: Fill 'existsVariables' with variables that take the
+  ;;    place of the flattened terms.
+  ;; 'proposition' is a :PREDICATE, :ISA, or :EQUIVALENT proposition.
+  (let ((flattenedArguments (new (LIST OF PROPOSITION))))
+    (help-collect-flattened-arguments 
+     proposition flattenedArguments existsVariables)
+    (push flattenedArguments proposition)
+    (reverse existsVariables)
+    (return (reverse flattenedArguments)) ))
+
+(defun (flatten-nested-function-arguments PROPOSITION) ((proposition PROPOSITION))
+  ;; Called by 'build-proposition'.
+  ;; 'proposition' is a :PREDICATE, :ISA, or :EQUIVALENT proposition
+  ;;     that contains one or more variable arguments representing the
+  ;;     output of :FUNCTION propositions.
+  ;; Return an EXISTS proposition declaring those propositions.
+  (let ((existsProposition (create-proposition (quote EXISTS) 1))
+        (existsVariables (new (LIST OF PATTERN-VARIABLE)))
+        (flattenedPropositions
+         (yield-flattened-arguments proposition existsVariables))
+        (andProposition 
+         (create-proposition (quote AND) (length flattenedPropositions))))
+    ;; complete AND proposition containing the flattened propositions:
+    (foreach prop in flattenedPropositions
+             as i in (interval 0 NULL)
+             do
+             (setf (nth (arguments andProposition) i) prop))
+    ;; remove 'defining-proposition' links pointing to flattened propositions:
+    (foreach vbl in existsVariables
+             do (setf (defining-proposition vbl) NULL))
+    ;; complete EXISTS proposition containing the AND proposition:
+    (setf (io-variables existsProposition)
+          (copy-cons-list-to-variables-vector (the-cons-list existsVariables)))
+    (free existsVariables)
+    (setf (nth (arguments existsProposition) 0) andProposition)
+    (return existsProposition) ))
+
+
+  ;;
+;;;;;; Normalizing variable-value chains inside descriptive propositions
+  ;;
+
+;;; For descriptive propositions used in IMPLIES and FORALL rules, we want
+;;; to pre-evaluate any top-level equivalences and then substitute the
+;;; representative variables throughout for efficiency.  Since this can
+;;; cause further re-normalization, it needs to be done before fastening
+;;; and duplicate checking, otherwise it would destructively change propositions
+;;; stored in the new duplicate index which would prevent us to find duplicates.
+;;; These functions should potentially move into `normalize.ste' now.
+
+;;; Examples:
+#|
+;;; Note that for KAPPA's it is ok to have identical variables:
+STELLA(10): (conceive
+             (kappa (?x ?y)
+               (and (r1 ?x ?y)
+                    (= ?x ?y))))
+|d|(KAPPA (?x ?x) (R1 ?x ?x))
+STELLA(38):
+
+STELLA(11): (conceive
+              (kappa (?x ?y)
+                (and (> ?y ?x) (< ?y ?x) (= ?x ?y))))
+|d|(KAPPA (?x ?x) (AND (> ?x ?x) (< ?x ?x)))
+
+;;; Here we should improve printing:
+STELLA(12): (conceive
+             (forall (?x ?y)
+               (=> (and (= ?x ?y)
+                        (exists ?z (= ?y ?z)))
+                   (>= ?x ?y))))
+|P?|(FORALL (?y ?y)
+   (<= (>= ?y ?y)
+       TRUE))
+
+;;; The constant prevents the elimination of the equivalence:
+STELLA(13): (conceive
+             (=> (and (relation ?x)
+                      (relation ?y)
+                      (= ?y foo))
+                 (r1 ?x ?y)))
+|P?|(FORALL (?x ?y//FOO)
+   (<= (R1 ?x ?y//FOO)
+       (AND (RELATION ?x) (RELATION ?y//FOO) (= ?y//FOO FOO))))
+STELLA(40): 
+|#
+
+(defun collapse-value-of-chains-for-io-variables ((ioVariables VARIABLES-VECTOR))
+  ;; Called by 'normalize-top-level-descriptive-proposition'.
+  ;; Rebind members of 'ioVariables' to their innermost variable values.
+  ;; Note that this might generate duplicate entries which is ok as long
+  ;;    as the users of rules and descriptions are aware of it (we might
+  ;;    still need to fix printing in some cases to not confuse users).
+  (let ((tightestVariable PATTERN-VARIABLE NULL))
+    (foreach vbl in ioVariables
+        as i in (interval 0 NULL)
+        where (not (eql? vbl (innermost-variable-of vbl)))
+        do (setq tightestVariable (innermost-variable-of vbl))
+           (setf (nth ioVariables i) tightestVariable)
+           (setf (skolem-name tightestVariable) (skolem-name vbl))
+           (setf (variable-value-inverse tightestVariable) NIL))))
+
+(defun (remove-nulls-in-variables-vector VARIABLES-VECTOR)
+       ((ioVariables VARIABLES-VECTOR))
+  ;; Return a shorter vector copied from 'ioVariables' with NULLs eliminated.
+  (when (not (member? ioVariables NULL))
+    (return ioVariables))
+  (let ((newVblList NIL)
+        (result VARIABLES-VECTOR NULL))
+    (foreach vbl in ioVariables
+             where (defined? vbl)
+             collect vbl into newVblList)
+    (setq result (copy-cons-list-to-variables-vector newVblList))
+    (return result) ))
+
+#|
+;;; There are still some unresolved issues with tightening and
+;;; simplification of equalities in descriptions and rules:
+
+ISSUE 1: - THIS IS OK AND DOES THE RIGHT THING (APART FROM PRINTING):
+STELLA(73): (get-rules case-match)
+(|P|(FORALL (?x ?x)
+   (<= (CASE-MATCH ?x ?x)
+       TRUE)))
+
+ISSUE 2: `verify-forall-propositions' is too aggressive here:
+STELLA(33): (conceive
+             (=> (and (= ?list1 NIL)
+                      (= ?list2 ?result))
+                 (= (append ?list1 ?list2) ?result)))
+WARNING: Potentially problematic implication rule, consequent variable(s) 
+   (?list2 ?list2) that are not restricted by the antecedent: 
+|uP|(forall (?list1 ?list2 ?list2)
+   (<= (= (APPEND ?list1//NIL ?list2) ?list2)
+       (= ?list1//NIL NIL)))
+|P|(FORALL (?list1//NIL ?list2 ?list2)
+   (<= (= (APPEND ?list1//NIL ?list2) ?list2)
+       (= ?list1//NIL NIL)))
+|#
+
+(defun tighten-argument-bindings ((proposition PROPOSITION)
+                                  (ioVariables VARIABLES-VECTOR))
+  ;; 'proposition' is a top-level descriptive proposition.
+  ;; Rebind all proposition arguments to point to the inner-most object
+  ;;    in a variable-value chain.
+  ;; Note: In a description there are no objects of type 'SKOLEM'.
+  (let (;(useInnermostVariable? (eql? (kind proposition) :EQUIVALENT))
+        )
+    ;; Over-tightening arguments in an equality causes problems,
+    ;;    e.g., (= ?x//42 42) becomes (= 42 42) and we lose the
+    ;;    origin of the binding for ?x and the equivalence proposition
+    ;;    needed for certain forward inferences.  So, we special case 
+    ;;    equivalence - TRICKY: this is done by only looking for
+    ;;    innermost variables for io-variable arguments, in which
+    ;;    case the `arg' and its `value' are different which
+    ;;    preserves the corresponding equivalence proposition:
+    ;; THIS STILL NEEDS SOME WORK IN CONJUNCTION WITH COLLAPSING CHAINS
+    ;;    TO NOT BE TOO AGGRESSIVE IN SIMPLIFICATION AND ELIMINATION OF
+    ;;    EQUIVALENCES...
+    (foreach arg in (arguments proposition)
+        as i in (interval 0 NULL)
+        do (typecase arg
+             (PATTERN-VARIABLE
+              (let ((value (choose (and (defined? ioVariables)
+                                        (member? ioVariables arg))
+                                   (innermost-variable-of arg)
+                                   (innermost-of arg))))
+                (when (and (not (eql? value arg))
+                           ;; NOT YET, NEEDS SOME MORE THOUGHT:
+                           ;(not (eql? (kind proposition) :EQUIVALENT))
+                           )
+                  ;; we found a chain to a more-specific binding:
+                  (setf (nth (arguments proposition) i) value)) ))
+             (PROPOSITION
+              (tighten-argument-bindings arg ioVariables))
+             (otherwise NULL)))
+    (when (defined? (io-variables proposition))
+      ;; nullify and then eliminate any quantified variables bound to other ones:
+      (let ((quantifiedVariables (io-variables proposition)))
+        (foreach vbl in quantifiedVariables
+            as i in (interval 0 NULL)
+            where (not (eql? vbl (innermost-variable-of vbl)))
+            do (setf (nth quantifiedVariables i) NULL))
+        (setf (io-variables proposition)
+          (remove-nulls-in-variables-vector quantifiedVariables))
+        ;; renormalize to remove empty EXISTS or FORALL and other odd cases:
+        (normalize-proposition proposition)))))
+
+(defun equate-top-level-equivalences ((proposition PROPOSITION))
+  ;; Called by 'normalize-top-level-descriptive-proposition' to pre-evaluate
+  ;;    top-level EQUIVALENT propositions within a description or FORALL.
+  ;; Also tries to pre-evaluate functions.
+  ;; NOTE: this is now called with an unfastened `proposition' which means
+  ;;    that evaluations that depend on backlinks will fail - shouldn't
+  ;;    be much of a problem for descriptive propositions.
+  (let ((arguments (arguments proposition)))
+   (case (kind proposition)
+     (:EQUIVALENT
+      (safety 3 (description-mode?) "BUG: Not in description mode.")
+      (equate-values (innermost-of (first arguments))
+                     (innermost-of (second arguments))))
+     (:AND
+       (foreach arg in arguments
+                do (equate-top-level-equivalences arg)))
+      (:EXISTS
+       (equate-top-level-equivalences (first arguments)))
+      (:FUNCTION
+       (evaluate-FUNCTION-proposition proposition))
+     (otherwise NULL))))
+
+
+  ;;
+;;;;;; Building descriptions
+  ;;
+
+(defun collect-all-variables
+       ((self PROPOSITION) (collection (LIST OF PATTERN-VARIABLE)) (beenThere LIST))
+  ;; Called by 'compute-internal-variables'.
+  ;; Fill 'collection' with the set of all variables that appear
+  ;;    within 'self'.
+  (insert beenThere self)
+  (foreach arg in (arguments self)
+      do (typecase arg
+           (PATTERN-VARIABLE (insert-new collection arg))
+           (PROPOSITION
+            (unless (member? beenThere arg)
+              (collect-all-variables arg collection beenThere)))
+           (otherwise NULL))) )
+
+(defun compute-internal-variables ((self DESCRIPTION))
+  ;; Find the set of all variables in '(proposition self)' that are not
+  ;;    io-variables, and store it in the slot '(internal-variables self)'.
+  (let ((collection (new (LIST OF PATTERN-VARIABLE)))
+        (beenThere (new LIST)))
+    (collect-all-variables (proposition self) collection beenThere)
+    (foreach vbl in (io-variables self)
+             do (remove collection vbl))
+    (when (defined? (external-variables self))
+      (foreach vbl in (external-variables self)
+               do (remove collection vbl)))
+    (setf (internal-variables self)
+          (copy-cons-list-to-variables-vector (the-cons-list collection)))
+    (free collection)
+    (free beenThere)) )
+
+(defspecial *externalVariables* CONS
+  :documentation "Used by 'evaluate-DESCRIPTION-term' for collecting
+a list of variables declared external to the description in which they
+are referenced.")
+
+(defun collect-external-variables ((proposition PROPOSITION))
+  ;; Called by 'evaluate-DESCRIPTION-term' AFTER (local) io-variables
+  ;;    have been computed and popped from *logicVariableTable*.
+  ;; Collect all variables in *logicVariableTable* that occur
+  ;;    in 'proposition'.
+  ;; If we are in a top-level description, exit is immediate:
+  (foreach arg in (arguments proposition)
+      do (typecase arg
+           (PATTERN-VARIABLE
+            (when (and (member? *logicVariableTable* arg)
+                       (not (member? *externalVariables* arg)))
+              (pushq *externalVariables* arg)))
+           (PROPOSITION
+            (collect-external-variables arg))
+           (otherwise NULL))) )
+
+(defun (finish-building-description DESCRIPTION)
+       ((description DESCRIPTION) (checkForDuplicate? BOOLEAN))
+  ;; Called by 'evaluate-DESCRIPTION-term' and 
+  ;;    'construct-description-from-forall-proposition'.
+  (let ((proposition (proposition description)))
+    (normalize-proposition proposition)
+    ;; eliminate top-level exists:
+    (when (eql? (kind proposition) :EXISTS)
+      (setq proposition (first (arguments proposition)))
+      (setf (proposition description) proposition))
+    ;; an error is signaled if not all references can be resolved:
+    (resolve-unresolved-slot-references description)
+    (update-skolem-type-from-isa-assertions proposition)
+    ;; set variable-value links, evaluate functions and re-normalize:
+    (normalize-top-level-proposition proposition (io-variables description))
+    ;; we don't look for duplicate substructures here (just like for quantified
+    ;; propositions), since we look for whole duplicate descriptions later:
+    (recursively-fasten-down-propositions proposition TRUE)
+    ;; compute 'internal-variables':
+    ;;    (depends on previous computation of external variables):
+    (compute-internal-variables description)
+    ;; possibly replace with preexisting duplicate:
+    (when checkForDuplicate?
+      (let ((duplicateDescription (find-duplicate-description description)))
+        (when (defined? duplicateDescription)
+          (setq description duplicateDescription))))
+;; JUST AN IDEA SO FAR  -rmm
+;  (finalize-enumeration description)
+    (return description)))
+
+(defun (evaluate-DESCRIPTION-term DESCRIPTION)
+       ((term CONS) (checkForDuplicate? BOOLEAN))
+  ;; Create a DESCRIPTION and assign it the io variables and proposition
+  ;;    defined by 'term'.
+  ;; If 'checkForDuplicate?' check to see if the description
+  ;;    corresponds to an existing description (or collection); if so,
+  ;;    discard the new description and return the original.
+  (let ((description (create-description NULL FALSE)))
+    (case (first term)
+      (THE-ONLY (setf (iota? description) TRUE))
+      (otherwise NULL))
+    (special ((*descriptionUnderConstruction* description)
+              (*evaluationMode* :DESCRIPTION)
+              (*variableIdCounter* *variableIdCounter*))
+     (mv-bind (ioVars proposition unused)
+         ;; Descriptions form little universes whose propositions are treated
+         ;; like top-level assertions, but the backlink machinery makes
+         ;; sure that these "assertions" won't be found as part of the ABOX.
+         (build-quantified-proposition term TRUE)
+      (ignore unused)
+      ;; copy io variables into description:
+      (setf (io-variables description)
+            (copy-cons-list-to-variables-vector ioVars))
+      ;; check for non-local variables referenced within 'description':
+      (when (non-empty? *logicVariableTable*)
+        (special ((*externalVariables* NIL))
+         (collect-external-variables proposition)
+         (when (non-empty? *externalVariables*)
+           (setf (external-variables description)
+                 (copy-cons-list-to-variables-vector *externalVariables*)))))
+      (setf (proposition description) 
+            (choose (defined? proposition) proposition TRUE-PROPOSITION)))
+     (return (finish-building-description description checkForDuplicate?)))))
+
+
+  ;;
+;;;;;; Description complements
+  ;;
+
+(defun (remove-variable-type-propositions (CONS OF PROPOSITION))
+       ((proposition PROPOSITION))
+  ;; Remove all variable types from arguments to 'proposition'.
+  ;; Return a list of removed declarations.
+  ;; Called by 'get-complement-of-goal-description'.
+  (case (kind proposition)
+    (:AND
+     (let ((typeDeclarations (CONS OF PROPOSITION) NIL)
+           (goalProposition PROPOSITION NULL))
+       (foreach arg in (arguments proposition)
+                do
+                (cond
+                 ((variable-type? (cast arg PROPOSITION))
+                  (pushq typeDeclarations arg))
+                 ((defined? goalProposition)
+                  (safety 3 FALSE "Bug in goal description complementing."))
+                 (otherwise
+                  (setq goalProposition arg))))
+       (overlay-proposition proposition goalProposition)
+       (return typeDeclarations)))
+    ((:ISA :PREDICATE :FUNCTION :NOT) (return NIL))
+    (otherwise
+     (safety 3 FALSE "Bug in goal description complementing.")))
+  (return NIL))
+
+(defspecial *recursiveGetComplementArgument* NAMED-DESCRIPTION NULL
+  :documentation "Used to prevent infinite looping.")
+
+(defun (get-complement-of-goal-description DESCRIPTION) ((self NAMED-DESCRIPTION))
+  ;; Find or create a description representing the relative complement of
+  ;;    'self'.
+  ;; 'self' is either a a system-defined relation description or its
+  ;;    complement.  Therefore, its an:ISA or a :NOT, or an :AND of
+  ;;    variable type propositions plus a goal proposition.
+  (let ((complement (relative-complement self)))
+    (when (defined? complement)
+     (return complement))
+    (when (eql? self *recursiveGetComplementArgument*)
+      ;; avoid infinite recursion:
+      (return NULL))
+    (within-module (home-module self)
+      (let ((declarations NIL)
+            (variables NIL)
+            (clauses NIL))
+        (foreach v in (io-variables self)
+            as type in (io-variable-types self)
+            do
+              (if (or (null? type)
+                      (class-description? self))
+                  (pushq declarations (skolem-name v))
+                (pushq declarations 
+                       (bquote (& (skolem-name v) & (surrogate-to-symbol type)))))
+            collect (skolem-name v) into variables)
+        (setq declarations (reverse declarations))
+        (setq clauses (bquote ((not (& (description-name self) && variables)))))
+        ;; the negation of a class is relative to its parent classes:
+        (when (class-description? self)
+          (foreach p in (all-direct-superrelations self TRUE)
+              do (pushq clauses
+                        (bquote (& (description-name p) & (first variables))))))
+        (special ((*recursiveGetComplementArgument* self))
+          (setq complement
+            (conceive-term (bquote (kappa & declarations (and && clauses))))))
+        (when (null? complement)
+          (signal-proposition-warning "Couldn't conceive goal complement for" EOL
+                                      (bquote (kappa & declarations (and && clauses))))
+          (return NULL))
+        (setf (relative-complement self) complement)
+        (setf (relative-complement complement) self)
+        (derive-deferred-contrapositive-satellite-rules self)
+        (return complement) ))))
+
+
+  ;;
+;;;;;; 'collect-free-variables'
+  ;;
+
+(defun collect-free-variables
+       ((self OBJECT) (collection (LIST OF PATTERN-VARIABLE))
+        (quantifiedVars LIST) (beenThere LIST))
+  ;; Fill 'collection' with the set of all variables that appear
+  ;;    unquantified within 'self'.
+  ;; Called by 'top-level-existential-variables'.
+  ;; This is the object version of `collect-undeclared-variables'.
+  ;; IMPORTANT: this collects free variables in the order they are
+  ;;    encountered which is relied upon by `create-forward-chaining-index'.
+  (typecase self
+    (PATTERN-VARIABLE
+     (when (and (not (member? quantifiedVars self))
+                (not (member? collection self)))
+       (insert-last collection self))) ;; insert at end to preserve order
+    (PROPOSITION
+     (unless (member? beenThere self)  ;; protect against structure cycles
+       (case (kind self)
+         ((:FORALL :EXISTS)
+          (foreach v in (io-variables self) do (insert quantifiedVars v)))
+         (otherwise NULL))
+       (insert beenThere self)
+       (foreach arg in (arguments self)
+                do (collect-free-variables
+                    arg collection quantifiedVars beenThere))))
+    (DESCRIPTION
+     (foreach v in (io-variables self)
+         do (insert quantifiedVars v))
+     (foreach v in (top-level-existential-variables self)
+         do (insert quantifiedVars v))
+     (collect-free-variables 
+      (proposition self) collection quantifiedVars beenThere))
+    (otherwise NULL)) )
+
+(defun (top-level-existential-variables (CONS OF PATTERN-VARIABLE))
+       ((self DESCRIPTION))
+  ;; Compute a list of variables in the description 'self' that are implicitly
+  ;;    existentially-quantified at top level.
+  ;; CAUTION: Called within 'finish-building-description' before 'self'
+  ;;    is finished (so 'internal-variables' may not have been computed yet).
+  (let ((quantifiedVariables (new (LIST OF PATTERN-VARIABLE)))
+        (beenThere (new LIST))
+        (collection (new (LIST OF PATTERN-VARIABLE))))
+    (foreach v in (io-variables self) do (insert quantifiedVariables v))
+    (when (defined? (external-variables self))
+      (foreach v in (external-variables self) do (insert quantifiedVariables v)))
+    (when (null? (proposition self))
+      ;; situation: 'self' has no proposition, meaning that its 'primitive'.
+      ;;    therefore, it has no free variables:
+      (return (the-cons-list quantifiedVariables)))
+    (collect-free-variables
+     (proposition self) collection quantifiedVariables beenThere)
+    (free quantifiedVariables)
+    (free beenThere)
+    (return (the-cons-list collection)) ))
+
+(defun (top-level-existential-variable? BOOLEAN)
+    ((variable PATTERN-VARIABLE) (description DESCRIPTION))
+  ;; Return TRUE if `variable' is a top-level existentially quantified
+  ;;    variable in `description'.
+  (return
+    (and (not (member? (io-variables description) variable))
+         (member? (internal-variables description) variable)
+         (free-variable? variable (proposition description)))))
+
+(defun (free-variable? BOOLEAN)
+    ((variable PATTERN-VARIABLE) (proposition PROPOSITION))
+  ;; Return TRUE if `variable' is not quantified by `proposition'
+  ;;    or any of its arguments.
+  (case (kind proposition)
+    ((:FORALL :EXISTS)
+     (when (member? (io-variables proposition) variable)
+       (return FALSE)))
+    (otherwise NULL))
+  (return
+    (forall arg in (arguments proposition)
+      where (isa? arg @PROPOSITION)
+      always (free-variable? variable arg))))
+
+
+  ;;
+;;;;;; Type inference
+  ;;
+
+(defun (most-specific-types (LIST OF TYPE)) ((types (LIST OF TYPE)))
+  ;; Destructively remove all but the most specific types
+  ;;    in 'types'.
+  (when (null? (rest types))
+    (return types))
+  (let ((cursor1 (the-cons-list types))
+        (cursor2 CONS NULL)
+        (value1 OBJECT NULL)
+        (value2 OBJECT NULL))
+    (while (not (nil? cursor1))
+      (setq value1 (value cursor1))
+      (when (defined? (value cursor1))
+        (setq cursor2 (rest cursor1))
+        (while (not (nil? cursor2))
+          (setq value2 (value cursor2))
+          (when (defined? value2)
+            (if (logical-subtype-of? value1 value2)
+              (setf (value cursor2) NULL)
+              (when (logical-subtype-of? value2 value1)
+                (setf (value cursor1) NULL)
+                ;; skip onto next value in OUTER loop:
+                (break))))
+          (setq cursor2 (rest cursor2))))
+      (setq cursor1 (rest cursor1))))
+  (remove types NULL)
+  (return types) )
+
+(deftype VARIABLE-TYPE-TABLE
+         (KEY-VALUE-LIST OF PATTERN-VARIABLE (LIST OF TYPE)))
+
+(defspecial *addedNewType?* BOOLEAN FALSE
+  :documentation "Used by 'infer-variable-types'.")
+
+(defun add-variable-type 
+       ((variable PATTERN-VARIABLE) (newType TYPE)
+        (table VARIABLE-TYPE-TABLE) (visibleVariables (CONS OF PATTERN-VARIABLE)))
+  ;; Add the type 'newType' to the 'table' entry for 'variable'.
+  ;; Maintain only the most specific types for each variable.
+  ;; If typeInferenceQueue' is defined and a new, more specific type
+  ;;    is entered, push the entry onto the type-inference queue.
+  (when (not (member? visibleVariables variable))
+    (return))
+  (let ((types (lookup table variable)))
+    (if (null? types)
+      (insert-at table variable (list newType))
+      (progn
+        (foreach t in types
+                 do
+                 (when (logical-subtype-of? t newType)
+                   (return))                ; 'newType' is old news
+                 (when (logical-subtype-of? newType t)
+                   (remove types t)
+                   ;; tricky: destructive operation requires that we abandon
+                   ;;    the foreach.  Use recursion to continue:
+                   (add-variable-type variable newType table visibleVariables)
+                   (return)))
+        ;; 'newType' is more specific, so add it:
+        (insert types newType)))
+    (setq *addedNewType?* TRUE) ))
+
+(defun (infer-predicate-from-operator-and-types OBJECT)
+       ((operator OBJECT) (types (LIST OF TYPE)))
+  ;; Called by 'infer-types-from-one-proposition' and 'resolve-one-slot-reference'.
+  ;; CAUTION: We don't flag the case where multiple most-specific
+  ;;    slots can be inferred.
+  (typecase operator
+    (SURROGATE
+     (if (isa? (surrogate-value operator) @SLOT)
+       (let ((slot SLOT (surrogate-value operator)))
+         ;; tricky: 'slot' must be defined; otherwise, 'operator' would
+         ;;    have been a symbol.  Use 'slot' to get symbolic name:
+         (setq slot (infer-predicate-from-operator-and-types
+                     (slot-name slot) types))
+         (if (defined? slot)
+           (return slot)
+           (return (surrogate-value operator))))
+       ;; there is no slot ('operator' points to a LOGIC-OBJECT or DESCRIPTION):
+       (return (surrogate-value operator))))
+    (SYMBOL
+     (let ((slotRef SLOTREF NULL))
+       (foreach type in types
+                where (isa? (surrogate-value type) @CLASS)
+                do (setq slotRef (lookup-slotref type operator))
+                (when (defined? slotRef)
+                  (return (surrogate-value slotRef)))
+                ;; maybe try again to handle methods defined on wrapped types:
+                (when (logical-subtype-of-literal? type)
+                  (setq type (type-to-wrapped-type type))
+                  (setq slotRef (lookup-slotref type operator))
+                  (when (defined? slotRef)
+                    (return (surrogate-value slotRef)))))))
+    (otherwise NULL))
+  (return NULL) )
+
+(defun infer-types-from-one-proposition
+       ((proposition PROPOSITION) (table VARIABLE-TYPE-TABLE)
+        (visibleVars (CONS OF PATTERN-VARIABLE)))
+  ;; Helping function used by 'infer-types-from-propositions'.
+  ;; Infer types of variables other than the first argument from
+  ;;    'proposition'.
+  (when (eql? (length (arguments proposition)) 0)
+    (return))
+  (let ((arguments (arguments proposition))
+        (firstArg (first arguments)))
+    (case (kind proposition)
+      (:ISA
+       (when (isa? firstArg @PATTERN-VARIABLE)
+         (add-variable-type firstArg (relationRef proposition) table visibleVars)))
+      ((:PREDICATE :FUNCTION)
+       (let ((predicate OBJECT NULL))
+         (typecase firstArg
+           (PATTERN-VARIABLE
+            (let ((types (lookup table firstArg)))
+              (when (defined? types)
+                (setq predicate
+                      (infer-predicate-from-operator-and-types
+                       (operator proposition) types)))))
+           (SURROGATE
+            (let ((value (surrogate-value firstArg))
+                  (types (new (LIST OF TYPE))))
+              (when (and (defined? value)
+                         (isa? value @LOGIC-OBJECT))
+                (foreach d in (all-asserted-types value)
+                         collect (surrogate-value-inverse d) into types)
+                (setq types (most-specific-types types))
+                (setq predicate (infer-predicate-from-operator-and-types
+                                 (operator proposition) types)))))
+           (otherwise
+            ;; assumes that the attempt to compute a slot having a literal
+            ;;    as its first argument has already been attempted:
+            (let ((operator (operator proposition)))
+              (when (and (isa? operator @SURROGATE)
+                         (isa? (surrogate-value (cast operator SURROGATE)) @SLOT))
+                (setq predicate (slotref-slot (cast operator SURROGATE)))))))
+         (when (defined? predicate)
+           (typecase predicate
+             (NAMED-DESCRIPTION
+              (cond
+                 ((defined? (io-variable-types predicate))
+                  (foreach arg in arguments
+                       as type in (io-variable-types predicate)
+                       where (isa? arg @PATTERN-VARIABLE)
+                       do (add-variable-type arg type table visibleVars)))
+                 (otherwise
+                  ;; FIGURE OUT HOW TO ELICIT TYPES FROM io-variables???
+                  NULL)))
+             (SLOT
+              (foreach arg in arguments
+                       as columnType in (slot-column-types
+                                         predicate (length arguments))
+                       where (isa? arg @PATTERN-VARIABLE)
+                       do (add-variable-type arg columnType table visibleVars)))
+             (LOGIC-OBJECT
+                ;; TO DO: FIGURE OUT HOW TO PULL TYPES FROM A LOGIC-OBJECT:
+              "NOT YET IMPLEMENTED")))))
+      (:EQUIVALENT
+       ;; ignores arguments beyond the second:
+       (let ((secondArg (nth arguments 1)))
+         (when (isa? firstArg @PATTERN-VARIABLE)
+           (if (isa? secondArg @PATTERN-VARIABLE)
+             (foreach t in (map-NULL-to-NIL-LIST (lookup table secondArg))
+                      do (add-variable-type firstArg t table visibleVars))
+             (add-variable-type
+              firstArg (logical-type secondArg) table visibleVars)))
+         (when (isa? secondArg @PATTERN-VARIABLE)
+           (if (isa? firstArg @PATTERN-VARIABLE)
+             (foreach t in (map-NULL-to-NIL-LIST (lookup table firstArg))
+                      do (add-variable-type secondArg t table visibleVars))
+             (add-variable-type
+              secondArg (logical-type firstArg) table visibleVars)))))
+      (otherwise NULL)) ))
+
+(defun infer-types-from-propositions
+       ((proposition PROPOSITION) (table VARIABLE-TYPE-TABLE)
+        (visibleVars (CONS OF PATTERN-VARIABLE)))
+  ;; Visit 'proposition' and propositions nested within it, inferring
+  ;;   new variable types and inserting them into 'table'.
+  (let ((arguments (arguments proposition)))
+    (case (kind proposition)
+      (:AND
+       (foreach arg in arguments
+                do (infer-types-from-propositions arg table visibleVars)))
+      (:OR
+       (foreach arg in arguments
+                do (infer-types-from-propositions arg table NIL)))
+      ((:ISA :PREDICATE :FUNCTION :EQUIVALENT)
+       (infer-types-from-one-proposition proposition table visibleVars))
+      (:FORALL
+       (setq visibleVars NIL)
+       (foreach v in (io-variables proposition)
+                do (pushq visibleVars v))
+       (infer-types-from-propositions (first arguments) table visibleVars)
+       ;; Tricky: This is a bit of a cheat: Strictly speaking only the
+       ;;    first argument should contribute types to 'visibleVars'.
+       ;;    We let types "leak" in from the second argument, because
+       ;;    it seems more intuitive.  Because we are using the
+       ;;    types only to resolve slot references, this is reasonably
+       ;;    safe; whereas this would be considered UNSOUND for the
+       ;;    the purpose of inferring variable types:
+       (infer-types-from-propositions (second arguments) table visibleVars))
+      (:EXISTS
+       (foreach v in (io-variables proposition)
+                do (pushq visibleVars v))
+       (infer-types-from-propositions (first arguments) table visibleVars))
+      (otherwise NULL)) ))
+  
+(defun (infer-variable-types-in-proposition VARIABLE-TYPE-TABLE)
+       ((proposition PROPOSITION) (visibleVariables (CONS OF PATTERN-VARIABLE)))
+  ;; Return a table of variables paired with lists of types.
+  (let ((variableTypesTable (new VARIABLE-TYPE-TABLE)))
+    (special ((*addedNewType?* FALSE))
+     (loop
+       (setq *addedNewType?* FALSE)
+       ;; visit all propositions.  Foreach one, infer types of 
+       ;;    proposition arguments:
+       (infer-types-from-propositions
+        proposition variableTypesTable visibleVariables)
+       (when (not *addedNewType?*)
+         (return variableTypesTable))) )))
+
+(defun (infer-variable-types-in-description VARIABLE-TYPE-TABLE)
+       ((description DESCRIPTION))
+  ;; Return a table of variables pairs with lists of types.
+  ;; TO DO: FIGURE OUT WHAT HAPPENS IF 'description' IS NESTED --
+  ;;    WHAT DO WE KNOW ABOUT THE TYPES OF EXTERNAL VARIABLES???
+  (let ((visibleVariables (CONS OF PATTERN-VARIABLE) NIL))
+    (foreach v in (io-variables description)
+             do (pushq visibleVariables v))
+    (foreach v in (top-level-existential-variables description)
+             do (pushq visibleVariables v))
+    (return (infer-variable-types-in-proposition
+             (proposition description) visibleVariables)) ))
+      
+(defun (collect-unresolved-slot-references (CONS OF PROPOSITION))
+       ((self PROPOSITION))
+  ;; Helping function for 'resolve-unresolved-slot-references'.
+  ;; Recursively scan propositions at or in 'self' looking for
+  ;;    undefined predicate operators.
+  (let ((unresolvedSlotReferences NIL))
+    (when (and (member? (quote (:PREDICATE :FUNCTION)) (kind self))
+               (isa? (operator self) @SYMBOL))
+      (pushq unresolvedSlotReferences self))
+    (foreach arg in (arguments self)
+             where (isa? arg @PROPOSITION)
+             do
+             (foreach u in (collect-unresolved-slot-references arg)
+                      do (pushq unresolvedSlotReferences u)))
+    (return unresolvedSlotReferences) ))
+
+(defun (resolve-one-slot-reference? BOOLEAN) 
+       ((proposition PROPOSITION) (variableTypesTable VARIABLE-TYPE-TABLE))
+  ;; Helping function for 'resolve-unresolved-slot-references'.
+  ;; Return TRUE if the slot could be successfully resolved.
+  (let ((firstArgument (first (arguments proposition)))
+        (predicate OBJECT NULL))
+    (typecase firstArgument
+      (PATTERN-VARIABLE
+       (let ((types (lookup variableTypesTable firstArgument)))
+         (when (defined? types)
+           (setq predicate (infer-predicate-from-operator-and-types
+                            (operator proposition)
+                            (lookup variableTypesTable firstArgument))))))
+      (LOGIC-OBJECT
+       (let ((rootType (safe-logical-type firstArgument)))
+         (when (defined? rootType)
+           (setq predicate (infer-predicate-from-operator-and-types 
+                            (operator proposition) (list rootType))))))
+      (otherwise NULL))
+    (when (defined? predicate)
+      (typecase predicate
+        (SLOT
+         (let ((returnType (unwrap-wrapped-type (slot-base-type predicate))))
+           (when (not (boolean-type? returnType))
+             ;; convert from :PREDICATE to :FUNCTION:
+             (setf (kind proposition) :FUNCTION)
+             (when (variable? (last-argument proposition))
+               (let ((lastArgument PATTERN-VARIABLE (last-argument proposition)))
+                 (update-skolem-type lastArgument returnType))))
+           (setf (relationRef proposition)
+                 (most-general-equivalent-slotref (slot-slotref predicate)))
+           ;; now we can finally evaluate 'proposition':
+           (evaluate-new-proposition proposition)
+           (return TRUE)))
+        (otherwise
+         "NOT YET IMPLEMENTED")))
+    (return FALSE)))
+                      
+(defun resolve-unresolved-slot-references ((formula OBJECT))
+  ;; Called by 'finish-building-description' and 
+  ;;    'build-top-level-proposition'.
+  ;; Situation: 'formula' contains one or more predicates or
+  ;;    functions whose slot references are undetermined.
+  ;; Now that backlinks exist, perform additional type inference
+  ;;    hoping to resolve the references.
+  ;; TO DO: CONSIDER RIPPING OUT THE POLYMORPHISM HERE (PROBABLY
+  ;;    MEANS THAT ALL OF THE TYPE INFERENCE IS UNNECESSARY) -rmm
+  (let ((proposition PROPOSITION NULL)
+        (unresolvedPropositions (CONS OF PROPOSITION) NULL)
+        (variableTypesTable VARIABLE-TYPE-TABLE NULL)
+        (unresolvablePropositions (CONS OF PROPOSITION) NIL))
+    (typecase formula
+      (DESCRIPTION (setq proposition (proposition formula)))
+      (PROPOSITION (setq proposition formula)))
+    (setq unresolvedPropositions 
+          (collect-unresolved-slot-references proposition))
+    (when (empty? unresolvedPropositions)
+      (return))
+    (typecase formula
+      (DESCRIPTION
+       (setq variableTypesTable
+             (infer-variable-types-in-description formula)))
+      (PROPOSITION
+       (setq variableTypesTable
+             (infer-variable-types-in-proposition formula NIL))))
+    (foreach prop in unresolvedPropositions
+             where (and (symbol? (operator prop))
+                        (not (resolve-one-slot-reference?
+                              prop variableTypesTable)))
+             collect prop into unresolvablePropositions)
+    (when (non-empty? unresolvablePropositions)
+      ;; couldn't resolve one or more slot references, signal an error:
+      (foreach p in unresolvablePropositions
+               do
+               (complain-about-undeclared-reference p)
+               (create-dummy-relation p))) ))
+
+(defun create-dummy-relation ((waywardProposition PROPOSITION))
+  ;; Create a logic object to stand-in for the as yet undefined 
+  ;;    class/relation/function.
+  (let ((fakeVariableTypes (new LIST))
+        (symbolRef SYMBOL (operator waywardProposition))
+        (relationRef (symbol-to-surrogate symbolRef))
+        (description NAMED-DESCRIPTION NULL))
+    (foreach i on (interval 1 (length (arguments waywardProposition)))
+             do (push fakeVariableTypes @THING))
+    (setq description
+          (create-primitive-description 
+           NIL-LIST fakeVariableTypes FALSE
+           (eql? (kind waywardProposition) :ISA)
+           (eql? (kind waywardProposition) :FUNCTION)
+           (home-context relationRef)))
+    ;; replace symbol operator with surrogate operator:
+    (setf (relationRef waywardProposition) relationRef)
+    ;; link description and surrogate:
+    (bind-logic-object-to-surrogate symbolRef description)
+    (setf (undeclared? description) TRUE)))
+
+(defun (defined-relation? BOOLEAN) ((self NAMED-DESCRIPTION))
+  ;; Helping function for 'call-list-undefined-relations')
+  ;; Maybe this should be exposed as a PowerLoom relation so we could
+  ;;    use queries to find undefined relations.
+  (return (and (not (undeclared? self))
+               (or (defined? (stringified-source self))
+                   ;; don't pick up things like INTEGER:
+                   (defined? (native-relation self))))))
+
+(defun (list-undefined-relations (CONS OF NAMED-DESCRIPTION))
+    ((module NAME) (local? BOOLEAN))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Return a list of as yet undefined concepts and relations in `module'.
+These relations were defined by the system, since they were referenced
+but have not yet been defined by the user.  If `module' is NULL look in
+the current module.  If `local?' only look in `module' but not in any
+modules it inherits."
+  (let ((theModule (coerce-to-module module TRUE)))
+    (when (defined? theModule)
+      (when (null? module)
+        (setq theModule NULL)))
+    (when (null? theModule)
+      (setq theModule *module*))
+    (return (call-list-undefined-relations theModule local?))))
+
+(defun (call-list-undefined-relations CONS) ((module MODULE) (local? BOOLEAN))
+  :documentation "Callable version of `list-undefined-relations' (which see)."
+  :public? TRUE
+  ;;; IMPROVE THIS TO AVOID THE ASK QUERY.
+  (let ((undefined NIL))
+    (finalize-objects)
+    (foreach term in (all-named-terms module local?)
+        do (typecase term
+             (NAMED-DESCRIPTION
+              (when (not (defined-relation? term))
+                (pushq undefined term)))
+             (LOGIC-OBJECT
+              (within-module (choose (null? module)
+                                     (home-module term)
+                                     module)
+                (when (apply-ask (?x)
+                                 (PL-KERNEL/RELATION ?x)
+                                 (term))
+                  (pushq undefined term))))
+             (otherwise NULL)))
+    (return undefined)))
+
+(defun complain-about-undeclared-reference ((waywardProposition PROPOSITION))
+  ;; Helping function for 'resolve-unresolved-slot-references'.
+  ;; Complain about proposition containing unresolved reference.
+  (if (descriptive? waywardProposition)
+    (signal-proposition-error 
+     "Undeclared predicate or function reference: " (operator waywardProposition))
+    ;; this is fixable, so its only a warning:
+    (signal-proposition-warning 
+     "Undeclared predicate or function reference: " (operator waywardProposition))) )
+
+
+   ;;
+;;;;;; 'all-named-descriptions'
+  ;;
+
+(defun (all-named-descriptions-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all named descriptions.
+  (let ((cursor (iterator-integer self))
+        (surrogate SURROGATE NULL)
+        (surrogateValue OBJECT NULL)
+        (description NAMED-DESCRIPTION NULL))
+    (while (< cursor (iterator-second-integer self))
+      (setq surrogate (nth *surrogate-array* cursor))
+      (when (defined? surrogate)
+        (setq surrogateValue (surrogate-value surrogate))
+        (when (defined? surrogateValue)
+          (unless (selected-meta-object? self (home-module surrogateValue))
+            (setq surrogateValue NULL))))
+      (setq description NULL)
+      (when (defined? surrogateValue)
+        (typecase surrogateValue
+          (CLASS
+           ;; skip class synonyms:
+           (when (eql? (class-type (safe-cast surrogateValue CLASS)) surrogate)
+             (setq description (description surrogateValue))))
+          (RELATION
+           (setq description (description surrogateValue)))
+          (NAMED-DESCRIPTION
+           (setq description surrogateValue))
+          (otherwise NULL)))
+      (when (defined? description)
+        (setf (slot-value self value) description)
+        (setf (iterator-integer self) (+ cursor 1))
+        (return TRUE))
+      (setq cursor (+ cursor 1)))
+    (return FALSE) ))
+
+(defun (all-named-descriptions (ITERATOR OF NAMED-DESCRIPTION))
+       ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all named descriptions visible from 'module'.
+If 'local?', return only named descriptions interned in 'module'.
+If 'module' is null, return all named descriptions interned everywhere."
+  :public? TRUE
+  (return
+   (allocate-all-meta-objects-iterator
+    (1+ (top-symbol-offset *surrogate-array*))
+    (the-code :function all-named-descriptions-next?)
+    module local?)) )
+

@@ -1,0 +1,858 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: kif-in.ste,v 1.54 2006/05/11 07:05:15 hans Exp
+
+;;; Translation of KIF parse trees to logical STELLA parse trees.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;;  Translating KIF to Logical STELLA
+  ;;
+
+;;; Translating KIF presents two problems:
+;;;    (1) KIF is untyped, so we must infer the type of each KIF variable.
+;;;    (2) KIF syntax does not distinguish between concept and property
+;;;        predications -- only the former can be used to infer variable types.
+;;; Idea: We invent the notion of an "UNTYPED STELLA" language wherein
+;;;    variable typing is optional, and concept membership has the same
+;;;    syntax as a property test.
+;;; Strategy:
+;;;    First, we a convert KIF parse tree to an UNTYPED PREFIX STELLA tree.
+;;;    Then, we convert an UNTYPED PREFIX STELLA tree to an ordinary PREFIX STELLA
+;;;    tree.
+;;; Rationale:  By first converting to UNTYPED STELLA, the procedure that
+;;;    infers variable types can be applied logics other than KIF.  We choose
+;;;    to translate to PREFIX STELLA because that form is easier to parse
+;;;    subsequently ("prefix STELLA" refers to the form that FOREACH processing
+;;;    uses internally that eliminates infix symbols such as IN, WHERE, etc.).
+
+(deftype PARSE-TREE OBJECT)
+
+(defun (question-mark-symbol? BOOLEAN) ((symbol OBJECT))
+  ;; Return TRUE if 'symbol' is prefixed by a question mark.
+  (return (and (symbol? symbol)
+               (eql? (nth (symbol-name (cast symbol SYMBOL)) 0) #\?))) )
+
+(defun (sequence-variable-symbol? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' is a KIF sequence variable.
+  ;; NOT YET IMPLEMENTED (VARIOUS UPDATES REQUIRED TO MAKE THIS REAL).
+  (ignore self)
+  (return FALSE))
+
+(defglobal *automatic-instance-character* CHARACTER #\$
+  :documentation "Character that identifies variables representing
+instances named by the system.")
+
+(defun (automatic-instance-symbol? BOOLEAN) ((symbol OBJECT))
+  ;; Return TRUE if 'symbol' is prefixed by the automatic-instance
+  ;;    character
+  (return (and (symbol? symbol)
+               (eql? (nth (symbol-name (cast symbol SYMBOL)) 0)
+                     *automatic-instance-character*))) )
+
+(defun (kif-symbol-to-stella-symbol GENERALIZED-SYMBOL) ((symbol SYMBOL))
+  ;; Convert 'symbol' from a KIF symbol into a STELLA symbol.
+  ;; ?<symbol> --> ?<symbol>;
+  ;; $<symbol> --> $<symbol>;
+  ;; <symbol> --> @<symbol>.
+  (if (or (question-mark-symbol? symbol)
+          (automatic-instance-symbol? symbol))
+    (return symbol)
+    (return
+     ;; tricky: 'symbol-to-surrogate' is smart about creating surrogates in
+     ;;    the proper home context:
+     (coerce-to-bound-or-local-surrogate symbol))))
+
+(defun (kif-variable-to-stella-variable SYMBOL) ((variable OBJECT))
+  ;; 'variable' is a KIF atom that should be a symbol prefixed with a question mark.
+  (typecase variable
+    (SYMBOL
+     (when (not (question-mark-symbol? variable))
+       (signal-parsing-error "Missing question mark on KIF variable: " variable))
+     (return (kif-symbol-to-stella-symbol variable)))
+    (otherwise
+     (signal-parsing-error "Illegal value in KIF expression where symbol expected " variable))) )
+
+(defun (kif-variable-declaration? BOOLEAN) ((tree OBJECT))
+  ;; Return TRUE if 'tree' is a typed or untyped KIF variable declaration.
+  (typecase tree
+    (CONS
+     (case (length tree)
+       (1 (return (question-mark-symbol? (first tree))))
+       (2 (return (and (question-mark-symbol? (first tree))
+                       (symbol? (second tree))
+                       (not (question-mark-symbol? (second tree))))))
+       (otherwise (return FALSE))))
+    (SYMBOL
+     (when (question-mark-symbol? tree)
+       ;; We have an untyped declaration:
+       (return TRUE)))
+    (otherwise
+     (return FALSE)))
+  (return FALSE))
+
+(defun (one-kif-variable-declaration-to-stella OBJECT) ((tree OBJECT))
+  ;; Destructively convert a KIF variable declaration to a STELLA declaration.
+  (when (not (kif-variable-declaration? tree))
+    (signal-parsing-error "Illegal KIF variable declaration: " tree))
+  (typecase tree
+    (CONS
+     ;; (<x> <t>) --> '(ISA <x> <t>)'.
+     (setf (first tree) (kif-variable-to-stella-variable (first tree)))
+     (if (defined? (second tree))
+       (progn
+         (setf (second tree) (kif-symbol-to-stella-symbol (second tree)))
+         (return (bquote (ISA && tree))))
+       (return (kif-variable-to-stella-variable (first tree)))))
+    (otherwise
+     (return (kif-variable-to-stella-variable tree)))))
+
+(defun (stella-variable-declarations? BOOLEAN) ((tree OBJECT))
+  ;; Help function for 'kif-variable-declarations-to-stella'.
+  ;; Catch case when stella declaration leaks back into kif side
+  ;;    of a transformation
+  (typecase tree
+    (CONS
+     (when (or (eql? (first tree) (quote ISA))
+               (and (cons? (first tree))
+                    (eql? (first (cast (first tree) CONS)) (quote ISA))))
+       (return TRUE)))
+    (otherwise NULL))
+  (return FALSE) )
+
+(defun (kif-variable-declarations-to-stella CONS) 
+       ((tree OBJECT) (error? BOOLEAN))
+  ;; Convert the variable declaration(s) in 'tree' into a list of ISA
+  ;;    declarations.
+  ;; ANSI KIF declarations always have to be lists of the form '(<varspec>+)'
+  ;;    where '<varspec>' is either a single variable symbol or a variable/
+  ;;    type pair of the form '(<var> <type>)'.  However, KIF 3.0 also allows
+  ;;    atomic (untyped) declarations of the form '<var>'.
+  ;; Somewhat merging ANSI KIF and KIF 3.0 we now also allow atomic typed
+  ;;    declarations and use this function to convert atomic declarations
+  ;;    into a list.
+  ;; If 'tree' is illegal and 'error?', signal an error.  Otherwise, return NULL.
+  (cond
+   ((stella-variable-declarations? tree)
+    (return tree))
+   ((kif-variable-declaration? tree)
+    ;; must be '?x', or '(?x)' or '(?x T)':
+    (return (bquote (& (one-kif-variable-declaration-to-stella tree)))))
+   ((and (cons? tree)
+         (forall d in (cast tree CONS)
+                 always (kif-variable-declaration? d)))
+    ;; must be '((?x ...) ...)':
+    (foreach it on (cast tree CONS)
+           do (setf (value it)
+                    (one-kif-variable-declaration-to-stella (value it))))
+    (return tree))
+   (otherwise
+    (when error?
+      (signal-parsing-error "Illegal declaration syntax: " tree))
+    (return NULL))) )
+
+
+;;; Quantified terms:
+
+(defun (kif-quantifier-symbol? BOOLEAN) ((self SYMBOL))
+  ;; Return TRUE if `self' is a KIF quantifier.
+  (case self
+    ((EXISTS FORALL SETOFALL KAPPA THE)
+     (return TRUE))
+    (otherwise
+     (return FALSE))))
+
+(defun (kif-the-to-stella-the-only CONS) ((tree CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(THE <term> <sentence>)'.
+  ;; '<term>' can be any term, not just a '<varspec>'.
+  ;; Return a STELLA equivalent.
+  (setq tree (kif-setofall-to-stella-setofall tree))
+  (setf (first tree) (quote THE-ONLY))
+  (return tree))
+
+(defun (kif-setofall-to-stella-setofall CONS) ((tree CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(SETOFALL <term> <sentence>)'.
+  ;; '<term>' can be any term, not just a '<varspec>'.
+  ;; Return a STELLA equivalent.
+  (when (not (or (eql? (length tree) 3)
+                 (eql? (length tree) 2)))
+    (signal-parsing-error "Illegal " (first tree) " tree: " tree))
+  (let ((declarations
+         (kif-variable-declarations-to-stella (second tree) FALSE)))
+    (cond
+     ((null? declarations)
+      (setq declarations (kif-term-to-untyped-stella-term (second tree))));foo
+     ((> (length declarations) 1)
+      (signal-parsing-error "Too many declarations in SETOFALL expression")))
+    (setf (second tree) declarations))
+  (when (defined? (third tree))
+    (setf (third tree)
+          (kif-sentence-to-untyped-stella-sentence (third tree))))
+  (return tree) )
+
+(defun (kif-kappa-to-stella-kappa CONS) ((tree CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(KAPPA <varspec> <sentence>*)' or
+  ;;     '(KAPPA (<varspec>*) <sentence>*)'.
+  ;; Return a STELLA equivalent.
+  ;; NOTE: The '(KAPPA <varspec> <sentence>*)' syntax is not legal KIF 3.0,
+  ;;    but it is supported for uniformity with quantified sentence syntax.
+  ;; TO DO: Figure out how to handle '(KAPPA () ...)'.
+  (when (not (>= (length tree) 2))
+    (signal-parsing-error "Illegal KAPPA tree: " tree))
+  (let ((sentences (rest (rest tree))))
+    (setf (second tree) 
+          (kif-variable-declarations-to-stella (second tree) TRUE))
+    (foreach it on sentences
+             do (setf (value it)
+                  (kif-sentence-to-untyped-stella-sentence (value it))))
+    (case (length sentences)
+      (0 (setf (rest (rest tree)) (bquote (TRUE))))
+      (1 (setf (third tree) (third tree)))
+      (otherwise
+       (setf (rest (rest tree)) (bquote ((AND && sentences))))))
+    (return tree)))
+
+(defun (kif-lambda-to-stella-kappa CONS) ((tree CONS))
+  ;; Convert a LAMBDA into a KAPPA.
+  (let ((valueVariable (gensym "?v"))
+        (variables CONS (second tree))
+        (term (third tree))
+        (openQuantifier?
+         (and (eql? (length variables) 2)
+              (not (question-mark-symbol? (second variables))))))
+    (when openQuantifier?
+      (setq variables (bquote (& variables))))
+    (return (bquote (kappa (&& variables & valueVariable)
+                           (= & valueVariable & term)))) ))
+
+(defun (kif-cond-to-if CONS) ((conditions CONS))
+  ;; Convert a 'COND' term into nested 'IF' terms.
+  ;;    '(cond (t1 v1) ... (tn vn))' =>
+  ;;    '(if t1 v1 (if t2 v2 (... (if tn vn))))'.
+  ;; Note: Upon first call, the 'COND' has already been removed.
+  (if (nil? conditions)
+    (return NIL)
+    (progn
+      (when (not (and (cons? (first conditions))
+                      (not (nil? (second (cast (first conditions) CONS))))))
+        (signal-parsing-error "Illegal condition in 'COND': " (first conditions)))
+      (let ((firstCondition (CONS OF CONS) (first conditions))
+            (valueTerm (kif-cond-to-if (rest conditions))))
+        (when (not (nil? valueTerm))
+          (setq valueTerm (cons-list valueTerm)))
+        (return
+         (bquote (if & (first firstCondition) & (second firstCondition)
+                     && valueTerm)))))) )
+
+
+;;; Sentences:
+
+(defun (kif-invert-sentence OBJECT) ((tree OBJECT))
+  ;; Invert `tree' as `(NOT <sentence>)' but avoid double negations.
+  (if (and (cons? tree)
+             (eql? (first (cast tree CONS)) (quote NOT)))
+      (return (second (cast tree CONS)))
+    (return (bquote (NOT & tree)))))
+
+(defun (kif-implies-to-or-not CONS) ((tree CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(=> <sentence>* <sentence>)' or
+  ;;     '(<= <sentence> <sentence>*)'.
+  ;; Return a sentence of the form '(or (not (and <sentence>*)) <sentence>)'.
+  (when (< (length tree) 2)
+    (signal-parsing-error "Illegal implication tree: " tree))
+  (case (first tree)
+    (<=
+     ;; flip arguments and pretend that the operator is '=>':
+     (setf (rest tree) (reverse (rest tree))))
+    (otherwise NULL))
+  (change-kif-expressions-to-stella-expressions (rest tree) FALSE)
+  (setf (first tree) (quote OR))
+  (case (length tree)
+    (2 (return (second tree)))
+    (3
+     (setf (second tree) (kif-invert-sentence (second tree)))
+     (return tree))
+    (otherwise
+     (setf (rest tree) (reverse (rest tree)))
+     (setf (rest (rest tree))
+       (bquote ((AND && (reverse (rest (rest tree)))))))
+     (setf (rest tree) (reverse (rest tree)))
+     (setf (second tree) (kif-invert-sentence (second tree)))
+     (return tree))))
+
+(defun (kif-biconditional-to-two-implies CONS) ((tree CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(<=> <sentence>*)'.
+  ;; Return a KIF expression of the form
+  ;;     '(and (=> <sentence>*) (<= <sentence>*)
+  (when (> (length tree) 3)
+    (signal-parsing-error "Too many arguments to <=>: " tree))
+  ;; convert bi-directional implication into 'AND' of two unidirectional
+  ;;    implications:
+  (let ((copy (copy-cons-tree tree))
+        (arrow (first tree))
+        (forwardArrow (quote =>))
+        (backwardArrow (quote <=)))
+    (case arrow
+      (<=>> (setq forwardArrow (quote =>>)))
+      (<<=> (setq backwardArrow (quote <<=)))
+      (<<=>> (setq forwardArrow (quote =>>))
+             (setq backwardArrow (quote <<=)))
+      (<~> (setq forwardArrow (quote ~>))
+           (setq backwardArrow (quote <~)))
+      (<~>> (setq forwardArrow (quote ~>>))
+            (setq backwardArrow (quote <~)))
+      (<<~> (setq forwardArrow (quote ~>))
+            (setq backwardArrow (quote <<~)))
+      (<<~>> (setq forwardArrow (quote ~>>))
+             (setq backwardArrow (quote <<~)))
+      (otherwise NULL))
+    (setf (first copy) forwardArrow)
+    (setf (first tree) backwardArrow)
+    (return (bquote (AND & tree & copy)))) )
+
+(defun (kif-exists-to-stella-exists CONS) ((tree CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(exists <varspec> <sentence>)' or
+  ;;     '(exists (<varspec>+) <sentence>)'.
+  ;; Return a STELLA equivalent.
+  (when (or (< (length tree) 3)
+            (> (length tree) 4))
+    (signal-parsing-error "Illegal EXISTS tree: " tree))
+  (let ((sentence1 (kif-sentence-to-untyped-stella-sentence (third tree)))
+        (sentence2 (kif-sentence-to-untyped-stella-sentence (fourth tree))))
+    (setf (second tree)
+          (kif-variable-declarations-to-stella (second tree) TRUE))
+    (when (defined? sentence2)
+      (return (bquote (EXISTS & (second tree)
+                              (AND & sentence1 & sentence2)))))
+    (setf (third tree) sentence1)
+    (return tree)))
+
+(defun (kif-three-argument-forall-to-stella-forall CONS)
+       ((tree CONS) (declarations CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(forall <varspec> <sentence> <sentence>)' or
+  ;;     '(forall (<varspec>+) <sentence> <sentence>)'.
+  ;; The STELLA equivalent looks much the same.
+  (let ((antecedent (kif-sentence-to-untyped-stella-sentence (third tree)))
+        (consequent (kif-sentence-to-untyped-stella-sentence (fourth tree))))
+    (return
+     (bquote (FORALL & declarations & antecedent & consequent))) ))
+
+(defun (kif-two-argument-forall-to-stella-forall CONS)
+       ((tree CONS) (declarations CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(forall <varspec> <sentence>)' or
+  ;;     '(forall (<varspec>+) <sentence>)'.
+  ;; The STELLA equivalent substitutes TRUE for the missing antecedent.
+  (let ((sentence (kif-sentence-to-untyped-stella-sentence (third tree))))
+    (typecase sentence
+      (CONS
+       (case (first sentence)
+         (AND
+          (let ((foralls NIL))
+            (foreach conjunct in (rest sentence)
+                     do
+                     (pushq foralls
+                            (bquote (forall & (copy-cons-tree (second tree))
+                                            & conjunct))))
+            (return
+             (kif-sentence-to-untyped-stella-sentence
+              (bquote (and && foralls))))))
+         (OR
+          (let ((antecedent (kif-invert-sentence (second sentence)))
+                (consequent (third sentence)))
+            ;; We have a WHERE and an ALWAYS clause:
+            (return
+             (bquote (FORALL & declarations & antecedent & consequent)))))
+         (FORALL
+          ;; transfer variables in outer FORALL to inner FORALL:
+          (foreach v in declarations
+                   do (setf (second sentence)
+                            (cons v (cast (second sentence) CONS))))
+          (return sentence))
+         (ABOUT
+          ;; migrate 'about' from inside to outside of FORALL:
+          (return 
+           (bquote 
+            (ABOUT & (kif-sentence-to-untyped-stella-sentence
+                      (bquote (FORALL & declarations & (second sentence))))
+                   && (rest (rest sentence))))))
+         (otherwise NULL)))
+      (otherwise NULL))
+    ;; We only have an ALWAYS clause:
+    (return
+     (bquote (FORALL & declarations TRUE & sentence))) ))
+
+(defun (kif-forall-to-stella-forall CONS) ((tree CONS))
+  ;; 'tree' is a KIF expression of the form
+  ;;     '(forall <varspec> <sentence>)' or
+  ;;     '(forall (<varspec>+) <sentence>)'.
+  ;; Return a STELLA equivalent.
+  (when (or (< (length tree) 3)
+            (> (length tree) 4))
+    (signal-parsing-error "Illegal FORALL tree: " tree))
+  (let ((declarations
+         (kif-variable-declarations-to-stella (second tree) TRUE)))
+    (case (length tree)
+      (3 (return (kif-two-argument-forall-to-stella-forall
+                  tree declarations)))
+      (4 (return (kif-three-argument-forall-to-stella-forall
+                  tree declarations))))) )
+
+(defun (kif-predication-to-stella-predication CONS) ((tree CONS))
+  ;; Destructively translate a KIF predicate 'tree' into a Stella predicate.
+  ;; Predicates of the form '(C x)' where C is the name of a class
+  ;;    will betranslated into '(isa x C)'.
+  (let ((operator (kif-operator-to-internal-stella (first tree)))
+        (arguments (rest tree)))
+    (setf (first tree) operator)
+    (change-kif-expressions-to-stella-expressions arguments TRUE)
+    (return tree)))
+
+(defun (help-transform-kif-function CONS) ((arg1 OBJECT) (arg2 OBJECT))
+  ;; Helping function for 'kif-equality-to-stella-equality'.
+  ;; Return a transformed term or NULL, indicating that no transformation
+  ;;    took place.
+  (when (not (cons? arg1))
+    (typecase arg2
+      (CONS
+       (when (not (term-kif-special-form? (first arg2)))
+         (return (bquote (&& arg2 & arg1)))))
+      (otherwise NULL)))
+  (return NULL) )
+
+(defun (kif-equality-to-stella-equality CONS) ((tree CONS))
+  ;; Transform a clause like '(= ?y (f ?x))' into '(f ?x ?y), for the case
+  ;;    when ?y is a variable or a constant (but not a compound expression).
+  (when (eql? (length tree) 3)          ; two-argument '='?
+    (let ((functionTree CONS NULL)
+          (arg1 (second tree))
+          (arg2 (third tree)))
+      (when (or (setq? functionTree (help-transform-kif-function arg1 arg2))
+                (setq? functionTree (help-transform-kif-function arg2 arg1)))
+        (when (cons? (first functionTree))
+          (setq functionTree (cons (quote PL-KERNEL/VALUE) functionTree)))
+        (setf (first functionTree) 
+              (kif-operator-to-internal-stella (first functionTree)))
+        (change-kif-expressions-to-stella-expressions (rest functionTree) TRUE)
+        (return functionTree))))
+  (change-kif-expressions-to-stella-expressions (rest tree) TRUE)
+  (return tree) )
+
+(defun (kif-operator-to-internal-stella SYMBOL) ((operator SYMBOL))
+  ;; Convert a KIF operator to a symbol used internally by STELLA.
+  ;; Obsolete.
+  (return operator))
+
+(defun (internal-stella-operator-to-kif SYMBOL) ((operator SYMBOL))
+  ;; Convert an internal STELLA operator to a KIF operator.
+  ;; Obsolete.
+  (return operator) )
+
+(defun change-kif-expressions-to-stella-expressions
+       ((expressions CONS) (terms? BOOLEAN))
+  ;; Destructively substitute a STELLA expression for each KIF expression
+  ;;    in 'expressions'.
+  (foreach it on expressions
+           do (setf (value it)
+                    (choose terms?
+                            (kif-term-to-untyped-stella-term
+                             (value it))
+                            (kif-sentence-to-untyped-stella-sentence
+                             (value it))))))
+
+(defglobal *annotation-translation-table* (CONS OF CONS)
+  (bquote
+   ((<<= <= (:direction :backward))
+    (=>> => (:direction :forward))
+    (<~ <= (:confidence-level :DEFAULT))
+    (~> => (:confidence-level :DEFAULT))
+    (<<~ <= (:confidence-level :DEFAULT :direction :backward))
+    (~>> => (:confidence-level :DEFAULT :direction :forward))
+    )))
+
+(defun (canonicalize-annotation CONS) ((tree CONS))
+  ;; Convert a sugar-coated version of an annotation into an'about' clause.
+  (let ((operator (first tree)))
+    (when (eql? operator :about)
+      (setf (first tree) (quote about))
+      (return tree))
+    (foreach entry in *annotation-translation-table*
+             where (eql? operator (first entry))
+             do
+             (setf (first tree) (second entry))
+             (return 
+              (bquote (about & tree &&
+                             (copy-cons-tree (cast (third entry) CONS))))))
+    (error "`" operator "' not found in *ANNOTATION-TRANSLATION-TABLE*")))
+
+(defun (kif-sentence-to-untyped-stella-sentence OBJECT) ((tree OBJECT))
+  ;; Destructively transform the KIF parse tree 'tree' which is assumed to
+  ;;    represent a sentence into an equivalent untyped STELLA tree.
+  ;; QUESTION: WE DON'T SEEM TO HANDLE MODALS PROPERLY (WE INCORRECTLY
+  ;;    PARSE THEIR ARGUMENTS AS TERMS RATHER THAN SENTENCES).
+  (when (null? tree)
+    (return NULL))
+  (typecase tree
+    (CONS
+     (let ((operator (first tree)))
+       (when (isa? operator @CONS)
+         (return (kif-predication-to-stella-predication
+                  (bquote (PL-KERNEL/HOLDS && tree)))))
+       (when (not (symbol? operator))
+         (signal-parsing-error "Bad first argument in KIF sentence: " operator EOL
+                               "   Operator must be a symbol or an expression"))
+       (case operator
+         ((AND OR NOT FAIL)
+          (change-kif-expressions-to-stella-expressions (rest tree) FALSE)
+          (return tree))
+         ((=> <=) (return (kif-implies-to-or-not tree)))
+         ((<=> <=>> <<=> <<=>> <~> <~>> <<~> <<~>>)
+          (return (kif-sentence-to-untyped-stella-sentence
+                   (kif-biconditional-to-two-implies tree))))
+         (EXISTS (return (kif-exists-to-stella-exists tree)))
+         (FORALL (return (kif-forall-to-stella-forall tree)))
+         (= (return (kif-equality-to-stella-equality tree)))
+         (about
+          (setf (second tree) 
+                (kif-sentence-to-untyped-stella-sentence (second tree)))
+          (return tree))
+         ((:about <<= =>> <~ ~> <<~ ~>>)
+          (return (kif-sentence-to-untyped-stella-sentence
+                   (canonicalize-annotation tree))))
+         (otherwise
+          (return (kif-predication-to-stella-predication tree))))))
+    (SYMBOL (return (kif-symbol-to-stella-symbol tree)))
+    (STRING-WRAPPER
+     (signal-parsing-error "Illegal term in sentence position: " tree))
+    (otherwise
+     (return tree))))
+
+(defglobal *kif-sentence-operators* (CONS OF SYMBOL)
+  (quote (AND OR NOT FAIL EXISTS FORALL => <= <=> =)))
+
+(defglobal *kif-term-operators* (CONS OF SYMBOL)
+  (quote (THE SETOFALL KAPPA LAMBDA COND IF
+              ;; these two aren't really special forms, but
+              ;;    we want them to be terms, not sentences:
+              SETOF LISTOF)))
+
+(defun (term-kif-special-form? BOOLEAN) ((operator OBJECT))
+  ;; Return TRUE if 'term' is a special form.
+  (return (memb? *kif-term-operators* operator)) )
+
+(defun (kif-term-to-untyped-stella-term OBJECT) ((tree OBJECT))
+  ;; Destructively transform the KIF parse tree 'tree' which is assumed to
+  ;;    represent a term into an equivalent untyped STELLA tree.
+  (typecase tree
+    (SYMBOL
+     ;; assume 'atom' is a term (not TRUE or FALSE):
+     (return (kif-symbol-to-stella-symbol tree)))
+    (CONS
+     (let ((operator (first tree)))
+       (when (isa? operator @CONS)
+         (return 
+          (kif-term-to-untyped-stella-term (bquote (PL-KERNEL/VALUE && tree)))))
+       (when (not (symbol? operator))
+         (signal-parsing-error "Bad first argument in KIF term: " operator EOL
+                               "   Operator must be a symbol or an expression"))
+       (cond
+        ((member? *kif-sentence-operators* operator)
+         (return (kif-sentence-to-untyped-stella-sentence tree)))
+        ((term-kif-special-form? operator)
+         (case operator
+           (THE (return (kif-the-to-stella-the-only tree)))
+           (SETOFALL (return (kif-setofall-to-stella-setofall tree)))
+           (KAPPA (return (kif-kappa-to-stella-kappa tree)))
+           (LAMBDA (return (kif-term-to-untyped-stella-term
+                            (kif-lambda-to-stella-kappa tree))))
+           (IF
+             ;; parse the first argument to IF as a proposition (sentence):
+             (setf (second tree)
+                   (kif-sentence-to-untyped-stella-sentence (second tree)))
+             (change-kif-expressions-to-stella-expressions
+              (rest (rest tree)) TRUE)
+             (return tree))
+           (COND (return (kif-term-to-untyped-stella-term
+                          (kif-cond-to-if (rest tree)))))
+           ((SETOF LISTOF)
+            (change-kif-expressions-to-stella-expressions (rest tree) TRUE)
+            (return tree))))
+        (otherwise
+         (setf (first tree) (kif-operator-to-internal-stella operator))
+         (change-kif-expressions-to-stella-expressions (rest tree) TRUE)
+         (return tree)))))
+    (otherwise
+     (return tree))))
+
+
+  ;;
+;;;;;; Top level KIF to STELLA
+  ;;
+
+(defun (kif-variable? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' is a question mark symbol.
+  (return (question-mark-symbol? self)) )
+
+(defun (extract-variables-from-declarations CONS) ((declarations OBJECT))
+  ;; Return a list of KIF ? variables found in 'declarations'.
+  (let ((result NIL))
+    (typecase declarations
+      (CONS
+       (foreach item in declarations
+                do
+                (typecase item
+                  (CONS
+                   (if (kif-variable? (first item))
+                     (pushq result (first item))
+                     (signal-parsing-error
+                      "Non-variable " (first item) " found where ?variable expected")))
+                  (otherwise
+                   (when (kif-variable? item)
+                     (pushq result item))))))
+      (otherwise
+       (if (kif-variable? declarations)
+         (pushq result declarations)
+         (signal-parsing-error
+          "Non-variable " declarations " found where ?variable expected"))))
+    (return (reverse result)) ))
+
+(defun collect-undeclared-variables
+       ((tree OBJECT) (declaredVariables CONS)
+        (undeclaredVariables (LIST OF SYMBOL)))
+  ;; Called by 'wrap-kif-with-forall'.
+  ;; Fill 'undeclaredVariables' with undeclared variables found in 'tree'.
+  (typecase tree
+    (CONS
+     (let ((operator (first tree)))
+       (typecase operator
+         (CONS
+          (collect-undeclared-variables
+           operator declaredVariables undeclaredVariables)
+          (foreach arg in (rest tree)
+                   do (collect-undeclared-variables
+                       arg declaredVariables undeclaredVariables)))
+         (SYMBOL
+          (case operator
+            ((EXISTS FORALL)
+             ;; augment list of declared variables:
+             (foreach v in (extract-variables-from-declarations (second tree))
+                      do (pushq declaredVariables v))
+             (foreach arg in (rest (rest tree))
+                      do (collect-undeclared-variables
+                          arg declaredVariables undeclaredVariables)))
+            ((SETOFALL KAPPA LAMBDA THE) NULL)
+            ;; we don't look inside of these quantifiers for undeclared variables.
+            (otherwise
+             (foreach arg in (rest tree)
+                      do (collect-undeclared-variables
+                          arg declaredVariables undeclaredVariables)))))
+         (otherwise NULL))))              ; illegal syntax
+    (SYMBOL
+     (when (and (question-mark-symbol? tree)
+                (not (member? declaredVariables tree)))
+       ;; collect undeclared variable:
+       (when (not (member? undeclaredVariables tree))
+         (insert-last undeclaredVariables tree))))
+    (otherwise NULL)) )
+
+(defun (wrap-kif-with-forall OBJECT) ((tree OBJECT) (declaredVariables CONS))
+  ;; Situation: 'tree' is a top-level KIF expression.
+  ;; If 'tree' contains undeclared variables, wrap a FORALL around it
+  ;;    containing those variables.
+  (typecase tree
+    (CONS
+     (when (symbol? (first tree))
+       (case (first tree)
+         (AND
+          ;; distribute FORALLs across conjuncts in top-level AND:
+          (let ((sentences NIL))
+            (foreach conjunct in (rest tree)
+                collect (wrap-kif-with-forall conjunct declaredVariables) 
+                into sentences)
+            (return (bquote (AND && sentences)))))
+         (<=>
+          (return (wrap-kif-with-forall
+                   (kif-biconditional-to-two-implies tree) declaredVariables)))
+         (otherwise NULL))))
+    (otherwise NULL))
+  (let ((undeclaredVariables (new LIST)))
+    (collect-undeclared-variables tree declaredVariables undeclaredVariables)
+    (case (length undeclaredVariables)
+      (0
+       (free undeclaredVariables)
+       (return tree))
+      (1
+       (return (bquote (forall & (first undeclaredVariables) & tree))))
+      (otherwise
+       (return
+         (bquote
+          (forall & (transientify-form (the-cons-list undeclaredVariables))
+            & tree))))) ))
+
+(defun (kif-expression-to-untyped-stella-expression OBJECT) ((tree OBJECT))
+  ;; Destructively modify the KIF parse tree 'tree' to an untyped STELLA tree.
+  (typecase tree
+    (CONS
+     (when (symbol? (first tree))
+       (case (first tree)
+         ((THE SETOFALL KAPPA)
+          (return (kif-term-to-untyped-stella-term tree)))
+         (otherwise NULL))))
+    (otherwise NULL))
+  (setq tree (wrap-kif-with-forall tree NIL))
+  (return (kif-sentence-to-untyped-stella-sentence tree)))
+
+
+  ;;
+;;;;;; Converting from infix STELLA to prefix STELLA
+  ;;
+
+(defun (convert-to-prefix-proposition-tree OBJECT) ((tree OBJECT))
+  ;; Destructively convert embedded instances of infix syntax to prefix syntax.
+  (typecase tree
+    (CONS
+     (let ((operator SYMBOL (first tree)))
+       (if (kif-quantifier-symbol? operator)
+         (setq tree (infix-to-prefix-quantification-tree tree))
+         (foreach it on (rest tree)
+                  where (cons? (value it))
+                  do
+                  (setf (value it)
+                        (convert-to-prefix-proposition-tree (value it)))))
+       (return tree)))
+    (otherwise (return tree))) )
+
+(defun (infix-to-prefix-quantification-tree CONS) ((tree CONS))
+  ;; Convert from infix quantification 'tree' to prefix quantification tree.
+  ;; Output syntax has the form
+  ;;    '(<quantifier> <declarations> <whereTest>)',
+  ;; unless we have a FORALL, in which case the output syntax is
+  ;;    '(FORALL <declarations> [<whereTest> | TRUE] <alwaysTest>)'.
+  (let ((quantifier (first tree))
+        (generatorsClause CONS NULL)
+        (whereClause PARSE-TREE NULL)
+        (alwaysClause PARSE-TREE NULL)
+        (residue (rest tree))   ; start at generators clause
+        (oTree CONS NULL))
+    (mv-setq (generatorsClause residue)
+             (extract-generators-clause residue))
+    (when (null? generatorsClause)
+      (return NULL))
+    (mv-setq (whereClause residue)
+             (extract-option-and-residue (quote WHERE) residue))    
+    (mv-setq (alwaysClause residue)
+             (extract-option-and-residue (quote ALWAYS) residue))
+    (setq oTree
+          (bquote
+           (& quantifier
+            & (convert-to-prefix-proposition-tree generatorsClause)
+            && (choose (defined? whereClause)
+                 (bquote
+                  (& (convert-to-prefix-proposition-tree whereClause)))
+                 (quote (TRUE)))
+            && (choose (defined? alwaysClause)
+                 (bquote
+                  (& (convert-to-prefix-proposition-tree alwaysClause)))
+                 NIL))))
+    (when (non-empty? residue)
+      (signal-parsing-error "Extra expressions at the end of quantified expression"))
+    (return oTree) ))
+
+
+  ;;
+;;;;;; Top-level logic dialect conversions
+  ;;
+
+(defspecial *logic-dialect* KEYWORD :KIF
+  :documentation "Indicates the current dialect of logic used to phrase
+queries, assertions, and definitions." )
+
+(defun (standardize-logical-parse-tree OBJECT) ((tree OBJECT))
+  ;; Convert 'tree' from whatever dialect of logic it is in into
+  ;;    a prefix STELLA parse tree.
+  ;; TO DO: INSERT CATCH FOR THROW FROM 'parsing-error' SOMEWHERE.
+  (let ((standardizedTree OBJECT NULL))
+    (case *logic-dialect*
+      (:KIF
+       (setq standardizedTree
+         (kif-expression-to-untyped-stella-expression tree)))
+      (:STELLA
+       (setq standardizedTree
+         (convert-to-prefix-proposition-tree tree)))
+      (:PREFIX-STELLA
+       (setq standardizedTree tree))
+      (:MELD
+       "NOT YET IMPLEMENTED")
+      (:LOOM
+       (setq standardizedTree
+         (kif-expression-to-untyped-stella-expression tree))
+       "NOT YET IMPLEMENTED"))
+      (return standardizedTree)))
+
+(defun (in-dialect KEYWORD) ((dialect NAME))
+  :documentation "Change the current logic dialect to `dialect'.
+Currently supported dialects are `KIF', `STELLA', and `PREFIX-STELLA'.
+The STELLA dialects are not recommended for the construction of knowledge
+bases, they are mainly used internally by PowerLoom."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (typecase dialect
+    (SYMBOL
+     (setq *logic-dialect* (keywordify dialect)))
+    (STRING
+     (setq *logic-dialect* (keywordify (wrapper-value dialect))))
+    (KEYWORD
+     (setq *logic-dialect* dialect))
+    (otherwise
+     (warn "IN-DIALECT: Illegal dialect specification: " dialect)))
+  (return *logic-dialect*))

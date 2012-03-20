@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,14 +40,17 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cl-setup.lisp,v 1.52 2003/07/30 00:34:49 tar Exp
+;;; Version: cl-setup.lisp,v 1.56 2006/05/11 07:06:36 hans Exp
 
 ;;; Common-Lisp package setup and boot support.
 
 (in-package "CL-USER")
 
 
-(eval-when (compile load eval)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (unless (>= (integer-length most-positive-fixnum) 24)
+    (error "The maximum fixnum size of this lisp implementation (~D)~%is too small.  It must be at least 24 bits."
+	   (integer-length most-positive-fixnum)))
   (unless (find-package "STELLA")
     (make-package "STELLA" :use NIL))
   ;; Make it more convenient to call functions that take floats
@@ -77,6 +80,9 @@
     (require :OPENTRANSPORT)))
 #+Lispworks
 (require "comm")
+#+:SBCL
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-bsd-sockets))
 
 
 (in-package "STELLA")
@@ -103,9 +109,12 @@
      NIL NIL-LIST NULL-STRING-WRAPPER NULL-CODE-WRAPPER
      NULL-FLOAT NULL-STRING NULL-CHARACTER NULL-NATIVE-VECTOR))
 
+;; These need to be set here to avoid bootstrapping problems
+;; when compiling the code in a fresh lisp.
 ;; Set these via 'CL:setq' so we'll avoid multiple definitions:
 (CL:setq NULL :null_value)
 (CL:setq NULL-INTEGER CL:MOST-NEGATIVE-FIXNUM)
+(CL:setq NULL-FLOAT CL:MOST-NEGATIVE-DOUBLE-FLOAT)
 (CL:setq TRUE CL:t)
 (CL:setq FALSE CL:nil)
 
@@ -619,7 +628,17 @@
   (ccl::open-tcp-stream host port)
   #+Lispworks
   (comm:open-tcp-stream host port)
-  #-(or :allegro :MCL :Lispworks)
+  #+:CLISP
+  (socket:socket-connect port host)
+  #+:CMUCL
+  (extensions:connect-to-inet-socket host port :stream)
+  #+:SBCL
+  (cl:let ((s (cl:make-instance 'sb-bsd-sockets:inet-socket :type :stream
+                          :protocol :tcp))
+	   (host (sb-bsd-sockets:host-ent-address (sb-bsd-sockets:get-host-by-name host))))
+    (sb-bsd-sockets:socket-connect s host port)
+    (sb-bsd-sockets:socket-make-stream s :input cl:t :output cl:t :buffering :none))
+  #-(or :allegro :MCL :Lispworks :CLISP :CMUCL :SBCL)
   (CL:error "Don't know how to open a network stream in this Lisp dialect")
   )
 
@@ -659,6 +678,7 @@
     #+:EXCL (tpl::zoom-print-stack-1 stream 20)
     #+:MCL  (ccl:print-call-history)
     #+:CMU  (debug:backtrace)
+    #+:SBCL (sb-debug:backtrace)
     ))
 
 ;;; %%translate-logical-pathname
@@ -826,7 +846,8 @@
   #+Lispworks (MP:MAKE-LOCK)
   #+MCL       (CCL:MAKE-LOCK)
   #+CMUCL     (MULTIPROCESSING:MAKE-LOCK)
-  #-(or Allegro Lispworks MCL CMUCL) 'NO-LOCK)
+  #+SBCL      (SB-THREAD:MAKE-MUTEX)
+  #-(or Allegro Lispworks MCL CMUCL SBCL) 'NO-LOCK)
 
 (cl:defmacro with-process-lock (lock CL:&body forms)
   ;; Macro to synchronize a body of code based on a lock.  Conditionalized
@@ -835,8 +856,9 @@
     #+Lispworks MP:WITH-LOCK
     #+MCL       CCL:WITH-LOCK-GRABBED
     #+CMUCL     MULTIPROCESSING:WITH-LOCK-HELD
-    #+(or Allegro Lispworks MCL CMUCL) (,lock)
-    #-(or Allegro Lispworks MCL CMUCL) CL:PROGN
+    #+SBCL      SB-THREAD:WITH-RECURSIVE-LOCK
+    #+(or Allegro Lispworks MCL CMUCL SBCL) (,lock)
+    #-(or Allegro Lispworks MCL CMUCL SBCL) CL:PROGN
     ,@forms))
 
   ;;
@@ -849,7 +871,11 @@
 	    #+:EXCL(EXCL::*REDEFINITION-WARNINGS* CL:NIL)
 	    #+:LUCID(USER::*REDEFINITION-ACTION* CL:NIL)
 	    #+:TI(TICL::INHIBIT-FDEFINE-WARNINGS CL:T)
-	    #+:LISPWORKS(LISPWORKS::*REDEFINITION-ACTION* CL:NIL))
+	    #+:LISPWORKS(LISPWORKS::*REDEFINITION-ACTION* CL:NIL)
+	    #+:CLISP(CLOS::*WARN-IF-GF-ALREADY-CALLED* CL:NIL)
+	    #+:CLISP(CLOS::*GF-WARN-ON-REPLACING-METHOD* CL:NIL)
+	    #+:CLISP(CUSTOM:*SUPPRESS-CHECK-REDEFINITION* CL:T)
+	    )
      ,@forms ))
 
 (cl:defmacro with-undefined-function-warnings-suppressed (CL:&body forms)

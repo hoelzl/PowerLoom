@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,13 +40,20 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: java-translate.ste,v 1.60 2003/10/17 17:09:00 tar Exp
+;;; Version: java-translate.ste,v 1.70 2006/05/11 07:06:11 hans Exp
 
 ;;; Routines for translating Stella parse trees into Java trees.
 
 (in-package "STELLA")
 
 (in-module "/STELLA")
+
+(defglobal *java-true-string-wrapper* STRING-WRAPPER (wrap-literal "true")
+  :public? FALSE
+  :documentation "Wrapped true string, used to reduce consing.")
+(defglobal *java-false-string-wrapper* STRING-WRAPPER (wrap-literal "false")
+  :public? FALSE
+  :documentation "Wrapped false string, used to reduce consing.")
 
 
 (defun (java-yield-flotsam-class-name STRING) ((mod MODULE))
@@ -561,11 +568,13 @@
   ;; TO DO: Optimize to not allocate a new string when the case of
   ;;    'symbol' is already correct.
   (let ((module (interned-in symbol))
-        (name (symbol-name symbol)))
+        (name (symbol-name symbol))
+        (all-upper? (all-upper-case-string? name))
+        (caps-break-keyword (choose all-upper? :clever :yes)))
     (when (null? module)
       (setq module *module*))
     (when (or (case-sensitive? module)
-	      (not (eq? (compute-symbol-escape-code name false) :unescaped)))
+              (not all-upper?))
       (return 
 	(make-matching-name-full name
 				 :no :no "- "
@@ -579,12 +588,12 @@
 					:upcase "_")))
       (:lowercase 
        (return (make-matching-name-full name
-					:clever :clever "- "
+					caps-break-keyword :clever "- "
 					"" "" "" ""
 					:titlecaseX "")))
       (:capitalized 
        (return (make-matching-name-full name
-					:clever :clever "- "
+					caps-break-keyword :clever "- "
 					"" "" "" ""
 					:titlecase ""))) )))
 
@@ -720,13 +729,20 @@
   ;; Convert a string representing a class name to a Java class name.
   ;; Capitalize, and substitute forbidden characters and check for
   ;;   name conflicts.
-  (let ((translatedName (java-substitute-forbidden-characters
-			 (make-matching-name-full 
-			  nameString
-			  :clever :clever "- "
-			  "" "" "" ""
-			  :titlecase "")
-			 :capitalized)))
+  (let ((translatedName STRING NULL))
+    (if (all-upper-case-string? nameString)
+      (setq translatedName (make-matching-name-full 
+                            nameString
+                            :clever :clever "- "
+                            "" "" "" ""
+                            :titlecase ""))
+      (setq translatedName (make-matching-name-full 
+                            nameString
+                            :clever :clever "- "
+                            "" "" "" ""
+                            :preserve "")))
+    (setq translatedName 
+          (java-substitute-forbidden-characters translatedName :capitalize))
     (if (defined? (java-lookup-reserved-word-table translatedName))
 	(return
 	  (wrap-literal
@@ -798,6 +814,17 @@
     ;; that are copied as part of the system?
     (return false)))
 
+(defun (class-name-conflicts-with-slot-name? BOOLEAN) ((defining-class CLASS)
+						       (java-class-name STRING))
+  ;; Return `true' if there is a slot on `defining-class' whose Java name conflicts
+  ;; with `java-class-name'.
+  (when (defined? defining-class)
+    (foreach slot in (class-slots defining-class)
+       where (and (storage-slot? slot)
+		  (equal? java-class-name (java-translate-name (slot-name slot))))
+       do (return true)))
+  (return false))
+
 (defun (omit-java-package-prefix? BOOLEAN) ((module MODULE) (stella-class-name STRING))
   ;; Returns true if the java prefix for "java-class-name" in "module" does not
   ;;    need to be included.
@@ -806,7 +833,7 @@
   ;;    if "module" is visible from the current module and "java-class-name" is
   ;;    unique in all modules visible from the current one.
   ;; PROBLEM:  STELLA CLASS NAMES CAN BE EASILY CHECKED USING SYMBOLS, BUT
-  ;;           THAT WON'T WORK FOR THE CATCHALL CLASS USED FOR FUNCIONS.  IT
+  ;;           THAT WON'T WORK FOR THE CATCHALL CLASS USED FOR FUNCTIONS.  IT
   ;;           IS CURRENTLY ONLY AVAILABLE AS A STRING, SO THAT WOULD MEAN
   ;;           HAVING TO CHECK THE JAVA NAMES OF ALL CLASSES FOR A MATCH!
   ;; SOLUTION? WOULD MEMOIZATION BE A HELP FOR THIS?  SHOULD THE TRANSLATOR
@@ -820,6 +847,18 @@
 
 (defun (java-translate-type-spec STRING-WRAPPER) ((type-spec TYPE-SPEC))
   ;; Translate a type specifier to a Java type.
+  (return (java-translate-type-spec-helper type-spec false)))
+
+(defun (java-translate-type-spec-for-function STRING-WRAPPER) ((type-spec TYPE-SPEC))
+  ;; Translate a type specifier to a Java type for static method invocation.
+  ;; This differs from the general `java-translate-type-spec' in that there
+  ;;   is a special check to see that the type name is not hidden by a slot name.
+    (return (java-translate-type-spec-helper type-spec true)))
+
+(defun (java-translate-type-spec-helper STRING-WRAPPER) ((type-spec TYPE-SPEC) (function? BOOLEAN))
+  ;; Translate a type specifier to a Java type.  If `function?' then also
+  ;;    do a check for name conflicts with instance names in the class that
+  ;;    is being defined.
   ;; For now, convert parameteric types to their base types
   (let ((final-type TYPE null)
 	(type-name STRING ""))
@@ -836,11 +875,18 @@
 	 ;; Do a double-dereference to get a class's true name
 	 (setq final-Type (class-type (type-class type-Spec)))
 	 (setq type-name (java-translate-class-namestring (type-name final-Type)))
-	 (if (omit-java-package-prefix? (home-module final-Type) (type-name final-Type))
-	     (return type-name)
-	     (return (concatenate 
+	 (cond ((not (omit-java-package-prefix? (home-module final-Type) (type-name final-Type)))
+		(return (concatenate 
 		       (java-package-prefix (home-module final-Type) ".")
-		       type-name))))))) ))
+		       type-name)))
+	       ((and function? 
+		     (class-name-conflicts-with-slot-name? *CURRENT-JAVA-OUTPUT-CLASS*
+							   type-name))
+		(return (concatenate 
+		       (java-package-prefix (home-module final-Type) ".")
+		       type-name)))
+	       (otherwise
+		(return type-name))))))) ))
 
 (defun (java-translate-array-type STRING-WRAPPER) ((arrayType PARAMETRIC-TYPE-SPECIFIER))
   ;; Translate `arrayType' into an appropriate Java type.
@@ -897,6 +943,8 @@
 		     void volatile while
               ;; Added in Java 1.4
                      assert
+	      ;; Added in Java 1.5
+                     enum
 		     ))
      do (insert-at
          table
@@ -1217,132 +1265,62 @@
 		      (JAVA_STATEMENTS 
 		       && body))))))) ))
 
-(defun (java-translate-argument-list-iterator CONS) ((iteratorBindings (CONS OF CONS))
-						     (cursorBindings (CONS OF CONS))
-						     (body CONS))
-  ;; Translate an iterator over a variable-length parameter list
-
-  (let ((cursorVar (first (first cursorBindings)))
-	(cursorType (second (first cursorBindings)))
-	(dummyArg (fourth (cast (third (first iteratorBindings)) CONS)))
-	(iteratorConstructor OBJECT NULL)
-	(declarations 
-	 (bquote ((& (wrap-literal "Enumeration") 
-		   & (java-translate-a-tree (bquote arg_enum)))
-		  (& (java-translate-type-spec cursorType)
-		   & (java-translate-a-tree cursorVar))))))
-
-    ;; The first parameter is a dummy parameter for the variable-length
-    ;;   arguments- skip it
-    (foreach binding in (rest iteratorBindings)   ; collect iterator bindings
-             do
-	     (setq iteratorConstructor 
-	       (java-translate-a-tree (third (cast binding CONS))))
-	     (setf (third binding) NULL) ; clip before gc
-	     collect (bquote (& (java-translate-type-spec
-				 (second (cast binding CONS)))
-				& (java-translate-a-tree (first (cast binding
-								     CONS)))
-				& iteratorConstructor))
-	     into declarations)
-
-    (return (bquote
-	     (JAVA_BLOCK & declarations
-			(JAVA_STATEMENTS 
-			 (JAVA_ASSIGN
-			  (JAVA_IDENT
-			   & (java-translate-name (bquote arg_enum)))
-			  (JAVA_METHOD_CALL
-			   (JAVA_IDENT & (wrap-literal ""))
-			   (JAVA_IDENT
-			    & (java-translate-name (bquote elements)))
-			   & (java-translate-a-tree dummyArg)
-			   (JAVA_ACTUALS)))
-			 (JAVA_WHILE 
-			  (JAVA_METHOD_CALL
-			   (JAVA_IDENT & (wrap-literal ""))
-			   (JAVA_IDENT
-			    & (wrap-literal "hasMoreElements"))
-			   (JAVA_IDENT
-			    & (java-translate-name (bquote arg_enum)))
-			   (JAVA_ACTUALS))
-			  (JAVA_PROGN
-			   (JAVA_STATEMENTS
-			    (JAVA_ASSIGN 
-			     & (java-translate-a-tree cursorVar)
-			     (JAVA_CAST
-			      (JAVA_METHOD_CALL
-			       (JAVA_IDENT & (wrap-literal ""))
-			       (JAVA_IDENT
-				& (wrap-literal "nextElement"))
-			       (JAVA_IDENT
-				& (java-translate-name 
-				   (bquote arg_enum)))
-			       (JAVA_ACTUALS))
-			      & (java-translate-type-spec @OBJECT)))
-			    && body ))) )))) ))
-
 (defun (java-translate-foreach-tree CONS) ((tree CONS))
-  ;; Translate a SYS-FOREACH tree.
-  ;; Tree has the form
+  ;; Translate a SYS-FOREACH tree of the form:
   ;;    (SYS-FOREACH ((<iterVar> <type> <constructor expression>)*)
-  ;;                 ((<cursorVar> <type> <next expression>)*)
-  ;;                 <continuation test> <body>)
+  ;;                 (<value expression>*)
+  ;;                 (<bump expression>*)
+  ;;                 <continuation test>
+  ;;                 <body>*)
   (special ((*java-loop-name* (local-gensym "LOOP"))
 	    (*java-loop-name-used?* FALSE))
     (let ((iteratorBindings (CONS OF CONS) (second tree))
-	  (cursorBindings (CONS OF CONS) (third tree))
-	  (continuationTest (java-translate-a-tree (fourth tree)))
-	  (body (java-translate-list-of-trees (nth-rest tree 4)))
-	  (declarations NIL)
+          (valueTrees (CONS OF CONS) (third tree))
+          (nextTrees (CONS OF CONS) (fourth tree))
+          (continuationTest (java-translate-a-tree (fifth tree)))
+	  (body (java-translate-list-of-trees (nth-rest tree 5)))
+	  (declarations (CONS OF CONS) NIL)
+          (valueAssignments NIL)
 	  (nextAssignments NIL)
-	  (iteratorConstructor OBJECT NULL))
-      (setf (nth-rest tree 4) NIL)	; clip before gc
-      (when (eql? (second (cast (first iteratorBindings) CONS))
-		  @LISP-CONS-ITERATOR)
-	(return
-	  (java-translate-argument-list-iterator iteratorBindings cursorBindings
-						 body)))
-      (foreach binding in iteratorBindings ; collect iterator bindings
-	  do
-	    (setq iteratorConstructor (java-translate-a-tree (third binding)))
-	    (setf (third binding) NULL)	; clip before gc
-	  collect (bquote (& (java-translate-type-spec
-			      (second (cast binding CONS)))
-			     & (java-translate-a-tree (first (cast binding
-								   CONS)))
-			     & iteratorConstructor))
-	  into declarations)
-      (foreach binding in cursorBindings
-	  do				; collect next assigns
-	    (pushq nextAssignments (java-translate-a-tree (third binding)))
-	    (setf (third binding) NULL)	; clip before gc
-	    (unless (duplicate-cursor-variable? (first binding) iteratorBindings)
-	      (pushq declarations
-		     (bquote (& (java-translate-type-spec
-				 (second (cast binding CONS)))
-				& (java-translate-a-tree (first 
-							  (cast binding CONS)))
-				& (java-translate-a-tree
-				   (type-to-walked-null-value-tree
-				    (type-spec-to-base-type
-				     (second binding)))))))))
-			      
+	  (variables NIL))
+      ;; process iterator clauses:
+      (foreach binding in iteratorBindings
+          collect (cons-list
+                   (java-translate-type-spec (second binding))
+                   (java-translate-a-tree (first binding))
+                   (java-translate-a-tree (third binding)))
+          into declarations)
+      ;; Process value assignment clauses:
+      (foreach tree in valueTrees
+          collect (java-translate-a-tree tree) into valueAssignments)
+      ;; Process iterator bump trees:
+      (foreach tree in nextTrees
+          collect (java-translate-a-tree tree) into nextAssignments)
+      ;; Collect variables from declarations (copied from C++ but not used by
+      ;;    Java translation, since we can't just list them in the for initializer):
+      (foreach decl in declarations
+          collect (second decl) into variables)
       (if *java-loop-name-used?*
-	  (return
-	    (bquote (JAVA_BLOCK & declarations
-				(JAVA_STATEMENTS
-				 (JAVA_NAMED_STATEMENT
-				  & (java-translate-a-tree *java-loop-name*)
-				  (JAVA_FOREACH & continuationTest
-						& (reverse nextAssignments)
-						& body))))))
-	  (return
-	    (bquote (JAVA_BLOCK & declarations
-				(JAVA_STATEMENTS
-				 (JAVA_FOREACH & continuationTest
-					       & (reverse nextAssignments)
-					       & body)))))) )))
+          (return
+            (bquote
+             (JAVA_BLOCK & declarations
+                         (JAVA_STATEMENTS
+                          (JAVA_NAMED_STATEMENT
+                           & (java-translate-a-tree *java-loop-name*)
+                           (JAVA_FOREACH & variables
+                                         & continuationTest
+                                         & valueAssignments
+                                         & nextAssignments
+                                         & body))))))
+        (return
+          (bquote
+           (JAVA_BLOCK & declarations
+                       (JAVA_STATEMENTS
+                        (JAVA_FOREACH & variables
+                                      & continuationTest
+                                      & valueAssignments
+                                      & nextAssignments
+                                      & body)))))))))
 
 
 (defun (java-translate-let-tree CONS) ((tree CONS))
@@ -1677,7 +1655,7 @@
       (return
 	(bquote (JAVA_FUNCTION_CALL
 		 (JAVA_IDENT
-		  & (java-translate-type-spec typeSpec))
+		  & (java-translate-type-spec-for-function typeSpec))
 		 (JAVA_IDENT
 		  & (java-translate-name 
 		     (yield-constructor-name (type-spec-to-class typeSpec))))
@@ -1983,6 +1961,10 @@
 ;		  (java-package-prefix (home-module f) ".")
 ;		  (java-translate-class-namestring (method-startup-classname f)))
 ;		 (java-translate-function-name f)))
+	((method-constructor? f)
+	 (return (java-yield-fully-qualified-type-name
+		  (first (method-return-type-specifiers f)))
+		 (java-translate-function-name f)))
 	(otherwise
 	 (return (java-yield-fully-qualified-type-name owner)
 		 (java-translate-function-name f)))) )
@@ -2200,7 +2182,7 @@
 	    (JAVA_IDENT & (wrap-literal "find_java_method"))
 	    (JAVA_ACTUALS & (wrap-literal className)
 			  & (wrap-literal functionName)
-			  & (java-translate-param-type-specifications fn NULL))))))
+			  & (java-translate-param-type-specifications fn (slot-owner fn)))))))
       (:method
        (setq fn (lookup-slot (type-class (cast (third tree) SURROGATE))
 			     (cast (fourth tree) SYMBOL)))
@@ -2313,9 +2295,9 @@
    ;; To have native boolean constants:
   (unless definition?
     (when (eq? nameSymbol (quote TRUE))
-      (return (wrap-literal "true")))
+      (return *java-true-string-wrapper*))
     (when (eq? nameSymbol (quote FALSE))
-      (return (wrap-literal "false"))))
+      (return *java-false-string-wrapper*)))
 
   (let ((rawName (java-substitute-forbidden-characters
 		  (java-change-case nameSymbol :uppercase) :uppercase))
@@ -2470,8 +2452,10 @@
   ;; Create a name for overloaded function based on the original name
   ;;   and a method's type
   (return
-    (intern-symbol
-     (concatenate (symbol-name classType) "_" (symbol-name functionName)))) )
+    (intern-symbol-in-module
+     (concatenate (symbol-name classType) "_" (symbol-name functionName))
+     (overloaded-function-name-module functionName classType)
+     TRUE)) )
 
 (defmethod (java-translate-method-name STRING-WRAPPER) ((method METHOD-SLOT))
   ;; Create a name for the Java method defined by `method'.
@@ -2548,10 +2532,10 @@
 	     (return (concatenate (java-package-prefix (home-module function) ".")
 				  raw-class-name))))
 	  ((method-constructor? function)
-	   (return (java-translate-type-spec
+	   (return (java-translate-type-spec-for-function
 		    (first (method-return-type-specifiers function)))))
 	  (otherwise
-	   (return (java-translate-type-spec
+	   (return (java-translate-type-spec-for-function
 		    (first (method-parameter-type-specifiers function)))))) ))
 
 (defun (java-translate-function-call CONS) ((tree CONS) (method METHOD-SLOT))

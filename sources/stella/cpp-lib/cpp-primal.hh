@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: cpp-primal.hh,v 1.42 2003/04/18 21:15:59 hans Exp
+// Version: cpp-primal.hh,v 1.51 2006/05/16 06:42:59 hans Exp
 
 // Native C++ support for STELLA
 
@@ -47,6 +47,7 @@
 // System libraries that need to be visible to all translated STELLA files:
 #include <string.h>
 #include <iostream>
+#include <iomanip>
 #include <fstream>
 #include <sstream>
 #include <stdarg.h>
@@ -62,6 +63,23 @@
 // Garbage collector declarations
 #include "stella/cpp-lib/gc.hh"
 
+// Make sure these constants are defined.
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+
+#ifdef __MINGW32__
+// Make MinGW happy by providing these declarations, since `random()'
+// is not POSIX (but BSD); -liberty will supply it but there doesn't
+// seem to be an include file we can use:
+extern "C" {
+long int random();
+void srandom(unsigned int);
+}
+#endif
 
 namespace stella {
 
@@ -134,6 +152,9 @@ int floor(int n);
 int floor(double n);
 int round(int n);
 int round(double n);
+int truncate(int n);
+int truncate(double n);
+
 
 char* makeString(int size, char initialElement);
 char* stringConcatenate(char* string1, char* string2);
@@ -147,12 +168,15 @@ char* mutableStringSubstitute(char* self, char newchar, char oldchar);
 boolean stringMemberP(char* self, char character);
 char* stringRest(char* self);
 int stringPosition(char* string, char character, int start);
+int stringLastPosition(char* string, char character, int end);
 int stringSearch(char* string, char* substring, int start);
 char* stringSubsequence(char* string, int start, int end);
 char* mutableStringSubsequence(char* string, int start, int end);
 char* ostringstream_to_c_string(std::ostringstream* stream);
 char* stringify(Object* expression);
 char* integerToString(int i);
+char* integerToHexString(int i);
+char* integerToStringInBase(int i, int base);
 char* floatToString(double f);
 char* formatFloat(double f, int n);
 int stringToInteger(char* string);

@@ -1,0 +1,1095 @@
+; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: normalize.ste,v 1.42 2006/05/11 07:05:24 hans Exp
+
+;;; Normalization of propositions
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(defun (search-control-proposition? BOOLEAN) ((self PROPOSITION))
+  ;; Return TRUE if `self' is some kind of search-control proposition.
+  ;; TO DO: Annotate these with an appropriate meta relation.
+  (case (operator self)
+    ((PL-KERNEL/@CUT PL-KERNEL/@BOUND-VARIABLES
+      PL-KERNEL/@FORK PL-KERNEL/@QUERY)
+     (return TRUE))
+    (otherwise
+     (return FALSE))))
+
+(defun (duplicate-and-or-arguments? BOOLEAN) ((prop1 PROPOSITION)
+                                              (prop2 PROPOSITION))
+  ;; Return TRUE if `prop1' and `prop2' are redundant duplicates if
+  ;;    used as arguments in a conjunction or disjunction.
+  ;; Search-control arguments such as CUT might look identical but mean
+  ;;    different things if referenced at different locations.
+  (return (and (equivalent-propositions? prop1 prop2 NULL)
+               (not (or (search-control-proposition? prop1)
+                        (search-control-proposition? prop2))))))
+
+(defun collect-flat-conjuncts
+    ((self PROPOSITION) (flatConjuncts (LIST OF PROPOSITION)))
+  ;; Helping function for 'conjoin-propositions'.
+  ;; Collect 'self' or its conjuncts into 'flatConjuncts', and
+  ;;    remove dependents links.
+  ;; Don't collect TRUE and duplicate propositions.
+  (case (kind self)
+    (:AND
+     (foreach arg in (arguments self)
+         do (collect-flat-conjuncts arg flatConjuncts))
+     (return))
+    (:CONSTANT
+     (when (eql? (operator self) @TRUE)
+       (return)))
+    (otherwise
+     (clear (dependent-propositions self))))
+  (unless (exists prop in flatConjuncts
+              where (duplicate-and-or-arguments? prop self))
+    (push flatConjuncts self)))
+
+;; NOW THAT 'overlay-proposition' DOESN'T MODIFY ITS SECOND ARGUMENT,
+;;    THIS FUNCTION IS OBSOLETE:  -rmm
+(defun overlay-with-constant-proposition
+       ((self PROPOSITION) (constantProposition PROPOSITION))
+  ;; Destructively replace 'self' by 'constantProposition'.
+  ;; Tricky: We actually can't overlay 'self' with a constant (because
+  ;;    it might be destructively modified later on), so we make a copy 
+  ;;    of the constant and overlay using it.
+  (let ((overlay (create-proposition (quote CONSTANT) 0)))
+    (setf (operator overlay) (operator constantProposition))
+    (setf (truth-value overlay) (truth-value constantProposition))
+    (overlay-proposition self overlay)) )
+
+(defun (conjoin-propositions PROPOSITION) ((conjuncts (CONS OF PROPOSITION)))
+  ;; Return a proposition representing the conjunction of 'conjuncts'.
+  ;; Nested AND propositions are de-nested (normalized).
+  ;; Non-destructive.
+  (let ((flatConjuncts (new (LIST OF PROPOSITION)))
+        (result PROPOSITION NULL))
+    (foreach c in conjuncts
+             do (collect-flat-conjuncts c flatConjuncts))
+    (reverse flatConjuncts)
+    (case (length flatConjuncts)
+      (0 
+       ;; tricky: create new empty proposition, overlay TRUE on top
+       ;;    of it, and return the copy:
+       (let ((proposition (create-proposition (quote CONSTANT) 0)))
+         (overlay-with-constant-proposition proposition TRUE-PROPOSITION)
+         (return proposition)))
+      (1 (return (first flatConjuncts)))
+      (otherwise NULL))
+    (setq result (create-proposition (quote AND) (length flatConjuncts)))
+    (setf (arguments result)
+          (copy-list-to-arguments-vector flatConjuncts))
+    (when (descriptive? (first flatConjuncts))
+      (setf (descriptive? result) TRUE))
+    (return result) ))
+
+(defun (conjoin-two-propositions PROPOSITION) ((prop1 PROPOSITION) (prop2 PROPOSITION))
+  ;; Return a proposition representing the conjunction of 'prop1' and
+  ;;    'prop2'.
+  (cond
+   ((null? prop1) (return prop2))
+   ((null? prop2) (return prop1))
+   ((duplicate-and-or-arguments? prop1 prop2)
+    (return prop1))
+   (otherwise
+    (let ((andProposition (create-proposition (quote AND) 2)))
+      (setf (nth (arguments andProposition) 0) prop1)
+      (setf (nth (arguments andProposition) 1) prop2)
+      (when (descriptive? prop1)
+        (setf (descriptive? andProposition) TRUE))
+      (return andProposition)))) )
+
+(defun collect-flat-disjuncts
+    ((self PROPOSITION) (flatDisjuncts (LIST OF PROPOSITION)))
+  ;; Helping function for 'disjoin-propositions'.
+  ;; Collect 'self' or its disjuncts into 'flatDisjuncts', and
+  ;;    remove dependents links.
+  ;; Do not collect duplicate disjuncts.
+  (case (kind self)
+    (:OR
+     (foreach arg in (arguments self)
+         do (collect-flat-disjuncts arg flatDisjuncts))
+     (free self))
+    (otherwise
+     (unless (exists prop in flatDisjuncts
+                 where (duplicate-and-or-arguments? prop self))
+       (push flatDisjuncts self)
+       (clear (dependent-propositions self))))))
+
+(defun (disjoin-propositions PROPOSITION) ((disjuncts (CONS OF PROPOSITION)))
+  ;; Return a proposition representing the disjunction of 'disjuncts'.
+  ;; Nested OR propositions are de-nested (normalized).
+  (when (empty? disjuncts)
+    (return FALSE-PROPOSITION))
+  (let ((flatDisjuncts (new (LIST OF PROPOSITION)))
+        (result PROPOSITION NULL))
+    (foreach c in disjuncts
+             do (collect-flat-disjuncts c flatDisjuncts))
+    (reverse flatDisjuncts)
+    (case (length flatDisjuncts)
+      (0 ;; tricky: create new empty proposition, overlay FALSE on top
+         ;;    of it, and return the copy:
+        (let ((proposition (create-proposition (quote CONSTANT) 0)))
+          (overlay-with-constant-proposition proposition FALSE-PROPOSITION)
+          (return proposition)))
+      (1 (return (first flatDisjuncts)))
+      (otherwise NULL))
+    (setq result (create-proposition (quote OR) (length flatDisjuncts)))
+    (setf (arguments result)
+          (copy-list-to-arguments-vector flatDisjuncts))
+    (when (descriptive? (first flatDisjuncts))
+      (setf (descriptive? result) TRUE))
+    (return result) ))
+
+(defun (rename-logic-variable-apart PATTERN-VARIABLE)
+    ((variable PATTERN-VARIABLE) (destructive? BOOLEAN))
+  ;; Rename `variable' into a new variable with identical properties but
+  ;;    unique name within the current top-level proposition and return
+  ;;    the result.
+  ;; If `destructive?', don't create a new variable object but simply
+  ;;    change its name.  This is useful if we know that we have different
+  ;;    variable objects but need to rename one of them in order to keep
+  ;;    the distinction during printing, etc.
+  (within-module (home-module variable)
+    (let ((newName (local-gensym (symbol-name (skolem-name variable)))))
+      (unless destructive?
+        (setq variable (copy-variable variable (new ENTITY-MAPPING))))
+      (setf (skolem-name variable) newName)
+      (return variable))))
+
+
+  ;;
+;;;;;; 'normalize-proposition'
+  ;;
+
+;;; CAUTION: 'overlay-proposition' doesn't try to maintain backlinks, under
+;;;    the supposition that the propositions it is passed have not yet been
+;;;    fastened.
+(defun overlay-proposition ((self PROPOSITION) (overlayingProp PROPOSITION))
+  ;; Destructively replace 'self' by 'overlayingProp'.
+  ;; Used to eliminate a NOT, or simplify AND or OR.
+  ;; Tricky: We are careful NOT to modify 'overlayingProp' since it may
+  ;;    be structure-shared in multiple places.
+  (setf (kind self) (kind overlayingProp))
+  (setf (operator self) (operator overlayingProp))
+  ;; only :CONSTANTs should have truth values set:
+  (setf (truth-value self) (truth-value overlayingProp))
+  ;; copy partial-match related information:
+  (setf (weight self) (weight overlayingProp))
+  (setf (neural-network self) (neural-network overlayingProp))
+  (setf (arguments self) (copy (arguments overlayingProp)))
+  (when (defined? (io-variables overlayingProp))
+    (setf (io-variables self) (copy (io-variables overlayingProp))))
+  (when (variable-type? overlayingProp)
+    (setf (variable-type? self) TRUE))
+  (when (descriptive? overlayingProp)
+    (setf (descriptive? self) TRUE)) )
+
+(defun normalize-EXISTS-proposition ((self PROPOSITION))
+  ;; Normalize an EXISTS proposition.
+  (let ((whereProposition PROPOSITION (nth (arguments self) 0)))
+    (special ((*evaluationMode* :DESCRIPTION))
+      (normalize-proposition whereProposition))
+    (when (eql? (kind whereProposition) :EXISTS)
+      ;; collapse nested :EXISTS into a single :EXISTS:
+      ;; copy arguments of 'whereProposition' into 'self' and destroy 
+      ;;    'whereProposition'.  Also copy variables.
+      (let ((combinedArgs NIL))
+        (foreach vbl in (io-variables self)
+                 collect vbl into combinedArgs)
+        (foreach vbl in (io-variables whereProposition)
+                 collect vbl into combinedArgs)
+        (setf (io-variables self) 
+              (copy-cons-list-to-variables-vector combinedArgs))
+        (setf (arguments self) (arguments whereProposition))
+        (setf (deleted? whereProposition) TRUE)))
+    (when (or (empty? (io-variables self))
+              ;; special case of where prop not referencing any exists variable:
+              (eql? (kind whereProposition) :CONSTANT))
+      ;; handle empty EXISTS which could be the result of variable tightening:
+      (overlay-proposition self whereProposition))))
+
+(defun (migrate-consequent-goals-to-antecedent? BOOLEAN) ((self PROPOSITION))
+  ;; Situation: The antecedent of the FORALL proposition 'self' is TRUE.
+  ;; If its consequent is an OR, try transfering negated goals from consequent
+  ;;    into antecedent.
+  ;; Return TRUE if the result leaves both the antecedent and consequent
+  ;;    filled with (positive) goals.
+  (let ((antecedent PROPOSITION NULL)
+        (consequent PROPOSITION (nth (arguments self) 1))
+        (positiveGoals NIL)
+        (negatedGoals NIL))
+    (when (not (eql? (kind consequent) :OR))
+      (return FALSE))
+    (foreach arg in (arguments consequent)
+             do
+             (let ((disjunct PROPOSITION arg))
+               (if (eql? (kind disjunct) :NOT)
+                 (pushq negatedGoals (first (arguments disjunct)))
+                 (pushq positiveGoals disjunct))))
+    (when (and (non-empty? positiveGoals)
+               (non-empty? negatedGoals))
+      (setq antecedent (conjoin-propositions (reverse negatedGoals)))
+      (setq consequent (disjoin-propositions (reverse positiveGoals)))
+      (normalize-proposition antecedent)
+      (normalize-proposition consequent)
+      (setf (nth (arguments self) 0) antecedent)
+      (setf (nth (arguments self) 1) consequent)
+      (return TRUE))
+    (return FALSE) ))
+
+(defun flatten-nested-forall-proposition ((self PROPOSITION))
+  ;; The consequent of the :FORALL proposition 'self' is another :FORALL
+  ;;    proposition.  Move the inner universal variables to the outer
+  ;;    FORALL and renormalize.
+  (let ((ioVariables NIL)
+        (outerAntecedent (nth (arguments self) 0))
+        (nestedForall PROPOSITION (nth (arguments self) 1))
+        (innerAntecedent (nth (arguments nestedForall) 0))
+        (innerConsequent (nth (arguments nestedForall) 1)))
+    (foreach v in (io-variables self)
+             do (pushq ioVariables v))
+    (foreach v in (io-variables nestedForall)
+             do (pushq ioVariables v))
+    (setf (io-variables self)
+          (copy-cons-list-to-variables-vector (reverse ioVariables)))
+    (setf (nth (arguments self) 0)
+          (conjoin-two-propositions outerAntecedent innerAntecedent))
+    (setf (nth (arguments self) 1) innerConsequent)
+    (normalize-proposition (nth (arguments self) 0)) ))
+
+(defun normalize-FORALL-proposition ((self PROPOSITION))
+  ;; If the head and tail of 'self' are atomic (ignoring goals derived
+  ;;    from type declarations) convert :FORALL into equivalent :IMPLIES.
+  (let ((antArg (nth (arguments self) 0))
+        (cqArg (nth (arguments self) 1))
+        (antecedent PROPOSITION NULL)
+        (consequent PROPOSITION NULL))
+    (when (or (variable? antArg)
+              (variable? cqArg))
+      ;; punt, since follow-on processes like inference can't yet
+      ;;    deal with propositional variables in compound propositions:
+      (signal-proposition-error
+       "Can't yet handle propositional variables within FORALL"))
+    (setq antecedent antArg)
+    (setq consequent cqArg)
+    (special ((*evaluationMode* :DESCRIPTION))
+      (normalize-proposition antecedent)
+      (normalize-proposition consequent))
+    (when (eql? (kind antecedent) :CONSTANT)
+      (case (operator antecedent)
+        (@TRUE
+         (when (migrate-consequent-goals-to-antecedent? self)
+           (return)))
+        (@FALSE
+         (overlay-with-constant-proposition self TRUE-PROPOSITION)
+         (return))))
+    (case (kind consequent)
+      (:FORALL
+       ;; collapse two FORALLs into one:
+       (when (not (natural-deduction-mode?))
+         (flatten-nested-forall-proposition self)))
+      (:CONSTANT
+       (case (operator consequent)
+         (@FALSE
+          ;; example '(<= FALSE (r ?x))' --> '(not (r ?x))':
+          (overlay-proposition self antecedent)
+          (invert-proposition self)
+          (return))
+         (@TRUE
+          (overlay-with-constant-proposition self TRUE-PROPOSITION)
+          (return))))
+      (otherwise NULL))
+    (when (empty? (io-variables self))
+      ;; handle empty FORALL which could be the result of variable tightening:
+      (setq antecedent (invert-proposition antecedent))
+      (overlay-proposition
+       self (disjoin-propositions (cons-list antecedent consequent)))
+      (normalize-proposition self)
+      (return))
+    (let ((impliesProposition (derive-implies-from-forall self)))
+      (when (defined? impliesProposition)
+        (overlay-proposition self impliesProposition))) ))
+
+(defun normalize-NOT-proposition ((self PROPOSITION))
+  ;; If possible, invert the argument of 'self'.  Otherwise,
+  ;;    leave the NOT in place, and normalize its argument.
+  ;; If the argument of 'self' is satisfies 'variable-type?', overlay
+  ;;    'self' with FALSE-PROPOSITION.
+  (let ((argument (first (arguments self)))
+        (proposition PROPOSITION NULL))
+    (when (variable? argument)
+      ;; punt, since follow-on processes like inference can't yet
+      ;;    deal with propositional variables in compound propositions:
+      (signal-proposition-error
+       "Can't yet handle propositional variables within negations"))
+    (setq proposition argument)
+    (when (eql? (kind proposition) :EQUIVALENT)
+      (normalize-proposition proposition))
+    (case (kind proposition)
+      ((:ISA :PREDICATE :FUNCTION)
+       ;; the NOT stays where it is:
+       (if (variable-type? proposition)
+         (overlay-with-constant-proposition self FALSE-PROPOSITION)
+         (normalize-proposition proposition)))
+      (:CONSTANT
+       ;; slightly tricky: We can't overlay 'self' with TRUE-PROPOSITION
+       ;;    or FALSE-PROPOSITION, so we have to make up a new constant
+       ;;    on the fly:
+       (case (operator proposition)
+         (@TRUE (overlay-with-constant-proposition self FALSE-PROPOSITION))
+         (@FALSE (overlay-with-constant-proposition self TRUE-PROPOSITION))
+         (otherwise NULL))) ;; the NOT stays where it is
+      (otherwise
+       ;; eliminate NOT proposition:
+       (invert-proposition proposition)
+       (overlay-proposition self proposition)))) )
+
+(defun normalize-AND-proposition ((self PROPOSITION))
+  ;; Eliminate nested ANDs, migrate EXISTS outside of ANDs, and
+  ;;    eliminate TRUE conjuncts.
+  ;; Designed to retain the order of conjuncts.
+  (let ((otherProps NIL)
+        (conjoin? FALSE)
+        (existsVariables (CONS OF PATTERN-VARIABLE) NIL))
+    (foreach arg in (arguments self)
+        do (when (variable? arg)
+             ;; punt, since follow-on processes like inference can't yet
+             ;;    deal with propositional variables in compound propositions:
+             (signal-proposition-error
+              "Can't yet handle propositional variables within conjunctions"))
+           (let ((conjunct PROPOSITION arg))
+             (normalize-proposition conjunct)
+             (case (kind conjunct)
+               (:EXISTS
+                (foreach v in (io-variables conjunct)
+                    do (when (exists var in existsVariables
+                                 where (variable-eql? (skolem-name var)
+                                                      (skolem-name v)))
+                         ;; We need to rename apart, since even though the
+                         ;;    variable objects are different, we will lose
+                         ;;    this distinction during stringification, etc.
+                         (rename-logic-variable-apart v TRUE))
+                    collect v into existsVariables)
+                (pushq otherProps (first (arguments conjunct)))
+                (setq conjoin? TRUE))
+               (:AND
+                (pushq otherProps conjunct)
+                (setq conjoin? TRUE))
+               (:CONSTANT
+                (cond
+                 ((eql? (operator conjunct) @TRUE)
+                  (setq conjoin? TRUE)
+                  (pushq otherProps conjunct))
+                 ((eql? (operator conjunct) @FALSE)
+                  (overlay-with-constant-proposition self FALSE-PROPOSITION)
+                  (return))))
+               (otherwise
+                (if (and (not conjoin?)
+                         (exists prop in otherProps
+                             where (duplicate-and-or-arguments?
+                                    prop conjunct)))
+                    ;; We need to eliminate a duplicate:
+                    (setq conjoin? TRUE)
+                  (pushq otherProps conjunct))))))
+    (setq otherProps (reverse otherProps))
+    (when (non-empty? existsVariables)
+      (let ((existsProposition (create-proposition (quote EXISTS) 1)))
+        (setf (io-variables existsProposition)
+              (copy-cons-list-to-variables-vector existsVariables))
+        (setf (nth (arguments existsProposition) 0)
+              (conjoin-propositions otherProps))
+        (overlay-proposition self existsProposition))
+      (return))
+    (when (or conjoin? (<= (length otherProps) 1))
+      (overlay-proposition self (conjoin-propositions otherProps))) ))
+
+(defun normalize-OR-proposition ((self PROPOSITION))
+  ;; De-nest ORs and eliminate FALSE disjuncts.
+  (let ((propositions NIL)
+        (disjoin? FALSE))
+    (foreach arg in (arguments self)
+        do (when (variable? arg)
+             ;; punt, since follow-on processes like inference can't yet
+             ;;    deal with propositional variables in compound propositions:
+             (signal-proposition-error
+              "Can't yet handle propositional variables within disjunctions"))
+           (let ((disjunct PROPOSITION arg))
+             (normalize-proposition disjunct)
+             (case (kind disjunct)
+               (:OR
+                (pushq propositions disjunct)
+                (setq disjoin? TRUE))
+               (:CONSTANT
+                (cond
+                 ((eql? (operator disjunct) @FALSE)
+                  (setq disjoin? TRUE))
+                 ((eql? (operator disjunct) @TRUE)
+                  (overlay-with-constant-proposition self TRUE-PROPOSITION)
+                  (return))
+                 (otherwise
+                  (if (member? propositions disjunct)
+                      ;; We need to eliminate a duplicate:
+                      (setq disjoin? TRUE)
+                    (pushq propositions disjunct)))))
+               (otherwise
+                (if (and (not disjoin?)
+                         (exists prop in propositions
+                             where (duplicate-and-or-arguments?
+                                    prop disjunct)))
+                    ;; We need to eliminate a duplicate:
+                    (setq disjoin? TRUE)
+                  (pushq propositions disjunct))))))
+    (when (or disjoin? (<= (length propositions) 1))
+      (overlay-proposition self (disjoin-propositions propositions))) ))
+
+(defun help-normalize-predicate-proposition
+    ((self PROPOSITION) (relationRef SURROGATE) (predicateArguments VECTOR))
+  ;; Situation: 'relationRef' refers to a function instead of a predicate.
+  ;; Create a new function proposition, and an equivalence proposition, and
+  ;;    then overlay 'self' with a conjunction of those two propositions.
+  (let ((outputArgument (last predicateArguments))
+        (inputArguments NIL)
+        (functionProp PROPOSITION NULL)
+        (equivalenceProp PROPOSITION NULL))
+    (foreach i in (interval 0 (- (length predicateArguments) 2))
+        collect (nth predicateArguments i) into inputArguments)
+    (setq functionProp        
+          (find-or-create-function-proposition relationRef inputArguments))
+    (setq equivalenceProp
+          (create-equivalence-proposition
+           (last (arguments functionProp)) outputArgument))
+    (overlay-proposition self equivalenceProp)
+    (normalize-proposition self) ))
+
+(defun normalize-holds-proposition ((self PROPOSITION))
+  ;; If the relation argument of the HOLDS-proposition `self' is not a
+  ;;    a variable (e.g., a relation name, ground function term or KAPPA),
+  ;;    then convert 'self' into an ordinary proposition.
+  (let ((holdsArguments (arguments self))
+        (relationTerm (nth holdsArguments 0))
+        (nofArguments (1- (length holdsArguments)))
+        (surrogate (evaluate-relation-term relationTerm self))
+        (predicateArguments (new VECTOR :array-size nofArguments))
+        (description DESCRIPTION NULL))
+    (when (and (null? surrogate)
+               (not (isa? relationTerm @DESCRIPTION)))
+      (return))
+    (foreach i in (interval 1 nofArguments)
+        do (setf (nth predicateArguments (1- i)) (nth holdsArguments i)))
+    (cond
+     ((defined? surrogate)
+      (setq description (evaluate-predicate surrogate (nth holdsArguments 1)))
+      (cond ((class? description)
+             (setf (kind self) :ISA))
+            ((function? description)
+             (help-normalize-predicate-proposition
+              self (surrogate-value-inverse description) predicateArguments)
+             (return)))
+      (setf (operator self) (surrogate-value-inverse description))
+      (setf (arguments self) predicateArguments)
+      (normalize-proposition self)
+      (return))
+     (otherwise
+      ;; we have a description as the relation argument:
+      (setq description relationTerm)
+      (unless (= (arity description) nofArguments)
+        (signal-proposition-error "Arity violation in HOLDS proposition: " self))
+      (overlay-proposition
+       self
+       (conjoin-propositions
+        (inherit-description-propositions predicateArguments description)))
+      (normalize-proposition self)))))
+
+(defun normalize-predicate-proposition ((self PROPOSITION))
+  ;; If the operator of 'self' is PL-KERNEL/@HOLDS and if the first argument
+  ;;    is not a variable, then convert 'self' into an ordinary proposition.
+  ;; If the operator of 'self' is THING, eliminate 'self'.
+  (when (eql? (operator self) PL-KERNEL/@HOLDS)
+    (normalize-holds-proposition self)
+    ;; if we eliminated the HOLDS, return:
+    (unless (eql? (operator self) PL-KERNEL/@HOLDS)
+      (return)))
+  (when (eql? (operator self) @THING)
+    (overlay-proposition self TRUE-PROPOSITION)
+    (return))
+  (foreach clause in (arguments self)
+      where (isa? clause @PROPOSITION)
+      do (normalize-proposition clause)) )
+
+(defun (compute-relation-term-surrogate SURROGATE)
+    ((skolem SKOLEM) (proposition PROPOSITION))
+  ;; `skolem' is a function output that denotes a relation that is the
+  ;;    first argument to the VALUE or HOLDS proposition `proposition'
+  ;;    (e.g., stemming from an `(assert ((fn a) b))').
+  ;; Generate a surrogate to stand for that relation,
+  ;;    constructed from the names of the operator and arguments
+  ;;    of its defining proposition.
+  ;; Side-effect: Generate a description for the new surrogate.
+  (let ((functionProp (defining-proposition skolem))
+        (string (stringify (generate-function-as-term functionProp)))
+        (surrogate SURROGATE NULL)
+        (arity 0)
+        (argumentNames LIST NULL)
+        (argumentTypes LIST NULL)
+        (description NAMED-DESCRIPTION NULL))
+    (setq surrogate
+      (intern-derived-surrogate (relationRef functionProp) string))
+    (when (defined? (surrogate-value surrogate))
+      (return surrogate))
+    (cond ((test-property? skolem PL-KERNEL/@VARIABLE-ARITY)
+           (setq arity -1))
+          ((defined? (access-binary-value skolem PL-KERNEL/@ARITY))
+           (setq arity (access-binary-value skolem PL-KERNEL/@ARITY)))
+          (otherwise
+           ;; use arity implied by proposition arguments:
+           (setq arity (1- (length (arguments proposition))))))
+    ;; Assemble description parameter names and types - for now, be lazy
+    ;;    about types and simply use @THING, hoping that type constraints
+    ;;    have been asserted explicitly; alterternatively, we could key in
+    ;;    on DOMAIN/RANGE/NTH-DOMAIN assertions:
+    (cond ((= arity -1)
+           ;; variable arity:
+           (setq argumentNames
+             (list (yield-system-defined-parameter-name 1 skolem)))
+           (setq argumentTypes (list @THING)))
+          (otherwise
+           (setq argumentNames (new LIST))
+           (setq argumentTypes (new LIST))
+           (foreach i in (interval 0 (1- arity))
+               do (insert argumentNames
+                          (yield-system-defined-parameter-name i skolem))
+                  (insert argumentTypes @THING))
+           (reverse argumentNames)
+           (reverse argumentTypes)))
+    ;; Create a proper description object, try to guess as good as we can
+    ;;    whether it is a class or function:
+    (setq description
+      (create-primitive-description 
+       argumentNames
+       argumentTypes
+       (< arity 0)
+       (or (eql? (logical-type skolem) PL-KERNEL/@CLASS)
+           (class? skolem))
+       (or (eql? (logical-type skolem) PL-KERNEL/@FUNCTION)
+           (eql? (operator proposition) PL-KERNEL/@VALUE)
+           (function? skolem))
+       (home-context surrogate)))
+    (setf (surrogate-value surrogate) description)
+    (setf (surrogate-value-inverse description) surrogate)
+    (ensure-description-body description)
+    (return surrogate) ))
+
+;; TO DO: THE TRANSFORMATION FROM 'expression' TO SURROGATE LOSES ALL
+;;    POINTERS TO 'expression'.  INVENT RELATION THAT MAPS SURROGATE
+;;    (OR ITS RELATION) BACK TO 'expression'.
+(defun (evaluate-relation-term SURROGATE) ((relationTerm OBJECT)
+                                           (proposition PROPOSITION))
+  ;; `relationTerm' is the relation argument of the VALUE or HOLDS
+  ;;    proposition `proposition'.
+  ;; If 'relationTerm' evaluates to a constant relation, return
+  ;;    a surrogate that represents that relation.
+  (typecase relationTerm
+    (SURROGATE (return relationTerm))
+    (PATTERN-VARIABLE (return NULL))
+    (SKOLEM
+     (when (not (function-output-skolem? relationTerm))
+       ;; not sure what we should do here, but we could never do anything with
+       ;;   such an assertion, since the relation skolem wouldn't be findable:
+       (return NULL))
+     ;; We have a function term denoting a relation, e.g., stemming from an
+     ;;    assertion such as `(assert ((fn a) b))':
+     (let ((arguments (arguments (defining-proposition relationTerm)))
+           (relationTermSurrogate SURROGATE NULL)
+           (relationTermValue (value-of relationTerm)))
+       (when (exists arg in arguments
+                 where (isa? arg @PATTERN-VARIABLE))
+         (return NULL))
+       (when (not (eql? relationTermValue relationTerm))
+         ;; The function had a value (e.g., `(holds (inverse parent) Fred)'),
+         ;;    use it as the relation:
+         (return (evaluate-relation-term relationTermValue proposition)))
+       (setq relationTermSurrogate
+         (compute-relation-term-surrogate relationTerm proposition))
+       (transfer-propositions-and-backlinks
+        relationTerm (value-of relationTermSurrogate))
+       ;; replace skolem output by surrogate:
+       (setf (nth arguments (1- (length arguments))) relationTermSurrogate)
+       (return relationTermSurrogate)))
+    (NAMED-DESCRIPTION
+     (return (surrogate-value-inverse relationTerm)))
+    (otherwise (return NULL))) )
+           
+(defun (normalize-VALUE-function PROPOSITION) ((self PROPOSITION))
+  ;; The operator of 'self' is PL-KERNEL/@VALUE.
+  ;; If the first argument to 'self' is or can be transformed into
+  ;;    a surrogate/description, convert 'self' into an ordinary
+  ;;    function with one fewer argument.  Keep the same output skolem.
+  ;; Check for identical function.  If found, return the duplicate.
+  ;;    Otherwise, return self.
+  (let ((functionSurrogate
+         (evaluate-relation-term (first (arguments self)) self))
+        (newArgumentCount (1- (length (arguments self))))
+        (newProposition PROPOSITION NULL)
+        (duplicate PROPOSITION NULL))
+    (when (null? functionSurrogate)
+      ;; can't evaluate first argument into a constant:
+      (return self))
+    (setq newProposition (create-proposition 
+                          (quote function) newArgumentCount))
+    (setf (relationRef newProposition) functionSurrogate)
+    ;; copy arguments into shorter proposition:
+    (foreach i in (interval 1 newArgumentCount)
+             do
+             (setf (nth (arguments newProposition) (1- i))
+                   (nth (arguments self) i)))
+    (when (skolem? (last-argument self))
+      (setf (defining-proposition (cast (last-argument self) SKOLEM))
+        newProposition))
+    (unless (description-mode?)
+      (setq duplicate (find-duplicate-function-proposition newProposition))
+      (when (defined? duplicate)
+        (setq newProposition duplicate)))
+    (return newProposition) ))
+
+(defun normalize-EQUIVALENT-proposition ((self PROPOSITION))
+  ;; If the arguments to 'self' are the same, replace it by TRUE;
+  ;; If they are different but cannot be equated, replace it by FALSE.
+  (let ((firstArg (first (arguments self)))
+        (secondArg (second (arguments self))))
+    (cond
+     ((eql? firstArg secondArg)
+      (overlay-with-constant-proposition self TRUE-PROPOSITION))
+     ((or
+       ;; list of equatable objects taken from `equate-values':
+       (skolem? firstArg)
+       (skolem? secondArg)
+       (collection? firstArg)
+       (collection? secondArg)))
+     (otherwise
+      (overlay-with-constant-proposition self FALSE-PROPOSITION)))))
+
+(defun (shallow-copy-proposition PROPOSITION) ((self PROPOSITION))
+  ;; Make a copy of 'self' that shares the same arguments.
+  (let ((copy (create-proposition (quote AND) 0)))
+    (when (descriptive? self)
+      (setf (descriptive? copy) TRUE))
+    (when (dont-optimize? self)
+      (setf (dont-optimize? copy) TRUE))
+    (overlay-proposition copy self)
+    (return copy) ))
+
+(defun normalize-proposition ((self PROPOSITION))
+  ;; Convert 'self' to negation normal form, moving NOTs inward
+  ;;    until they reach an atomic proposition.
+  ;; Run 'simplify-proposition' afterwards to clean up any TRUEs
+  ;;    or FALSES created as a by-product of normalization.
+  (when (not (unfastened? self))
+    (return))
+  (when (contains-nested-argument? self)
+    ;; very tricky: we need to copy 'self' because flattening returns
+    ;;    a proposition containing 'self' nested within it.  Calling
+    ;;    'overlay-proposition' kills us if we don't do this copy:
+    (let ((proposition (shallow-copy-proposition self)))
+      (setq proposition (flatten-nested-function-arguments proposition))
+      (overlay-proposition self proposition)))
+  (case (kind self)
+    (:AND (normalize-AND-proposition self))
+    (:OR (normalize-OR-proposition self))
+    (:NOT (normalize-NOT-proposition self))
+    ((:ISA :PREDICATE) (normalize-predicate-proposition self))
+    (:FUNCTION
+     (foreach clause in (arguments self)
+              where (isa? clause @PROPOSITION)
+              do (normalize-proposition clause)))
+    (:EXISTS (normalize-EXISTS-proposition self))
+    (:FORALL (normalize-FORALL-proposition self))
+    (:EQUIVALENT (normalize-EQUIVALENT-proposition self))
+    ((:IMPLIES :FAIL :COLLECT-INTO :CONSTANT)
+     NULL)) )
+
+(defun normalize-top-level-proposition ((self PROPOSITION)
+                                        (ioVariables VARIABLES-VECTOR))
+  ;; Normalize a top-level proposition `self'.
+  ;; If `ioVariables' are given, it is assumed that they are from the
+  ;;    description that has `self' as its proposition.
+  (normalize-proposition self)
+  (when (or (eql? (kind self) :FORALL)
+            (defined? ioVariables))
+    (normalize-top-level-descriptive-proposition self ioVariables)))
+
+(defun normalize-top-level-descriptive-proposition ((self PROPOSITION)
+                                                    (ioVariables VARIABLES-VECTOR))
+  ;; Normalize top-level descriptive propositions from a description (if
+  ;;   `ioVariables' is non-NULL) or a FORALL rule.
+  ;; Evaluates top-level equivalences, collapes resulting variable value chains
+  ;;   and simplifies and re/normalizes the result if necessary.
+  ;; This used to be done after propositions were fastened down, however, since
+  ;;   it causes further structural changes it messes up the new duplicate
+  ;;   detection mechanism; so, now we do this as part of normalization so that
+  ;;   all structural changes are performed before we look for a duplicate.
+  ;;   This means that any evaluations done by `equate-top-level-equivalences'
+  ;;   that depend on backlinks will fail - however, this doesn't seem to hurt us.
+  (cond ((and (null? ioVariables)
+              (eql? (kind self) :FORALL))
+         (special ((*evaluationMode* :DESCRIPTION))
+           (let ((proposition PROPOSITION NULL))
+             (setq ioVariables (io-variables self))
+             (foreach i in (interval 0 1)
+                 do (setq proposition (nth (arguments self) i))
+                    (exception-case
+                        (equate-top-level-equivalences proposition)
+                      (CLASH (e)
+                        (print-stream STANDARD-ERROR (exception-message e) EOL)))
+                    (tighten-argument-bindings proposition ioVariables)
+                    (simplify-proposition proposition))))
+         ;; THIS IS STILL POTENTIALLY TOO RADICAL BUT SEEMS TO WORK SO FAR:
+         (collapse-value-of-chains-for-io-variables ioVariables))
+        ((defined? ioVariables)
+         ;; we have a top-level description proposition:
+         (special ((*evaluationMode* :DESCRIPTION))
+           (exception-case
+               (equate-top-level-equivalences self)
+             (CLASH (e)
+               (print-stream STANDARD-ERROR (exception-message e) EOL)))
+           (tighten-argument-bindings self ioVariables)
+           (simplify-proposition self)
+           (collapse-value-of-chains-for-io-variables ioVariables)))))
+
+
+  ;;
+;;;;;; 'invert-proposition'
+  ;;
+
+(defun invert-atomic-proposition ((self PROPOSITION))
+  ;; 'self' is an :ISA, :FUNCTION, :PREDICATE or :EQUIVALENT proposition.
+  ;; Destructively replace 'self' by a :NOT proposition containing
+  ;;    'self' as its argument.
+  ;; TO DO: CONSIDER ADDING :NOT-EQUIVALENT OPERATOR:  
+  (let ((newAtomicProposition
+         (create-proposition (quote NOT) 1))
+        (newNotArguments (arguments newAtomicProposition))
+        (newNotProposition self))
+    (setf (nth newNotArguments 0) newAtomicProposition)
+    ;; copy slots from 'self' into 'newAtomicProposition':
+    (setf (kind newAtomicProposition) (kind self))
+    (setf (operator newAtomicProposition) (operator self))
+    (setf (arguments newAtomicProposition) (arguments self))
+    (when (variable-type? self)
+      (setf (variable-type? self) NULL)
+      (setf (variable-type? newAtomicProposition) TRUE))
+    (when (descriptive? self)
+      (setf (descriptive? newAtomicProposition) TRUE))
+    ;; fill in slots in 'newNotProposition':
+    (setf (kind newNotProposition) :NOT)
+    (setf (operator newNotProposition) @NOT)
+    ;; swap arguments:
+    (setf (arguments newNotProposition) newNotArguments) ))
+
+(defun invert-EXISTS-proposition ((self PROPOSITION))
+  ;; Convert EXISTS to FORALL proposition.
+  (let ((whereProposition PROPOSITION (nth (arguments self) 0))
+        (newArguments (new ARGUMENTS-VECTOR :array-size 2)))
+    (free (arguments self))
+    (normalize-proposition whereProposition)
+    (setq whereProposition (safely-invert-proposition whereProposition))
+    ;; BUG: WE NEED AN ANTECEDENT SOMETIMES:
+    (setf (kind self) :FORALL)
+    (setf (operator self) @FORALL)
+    (setf (nth newArguments 0) TRUE-PROPOSITION)
+    (setf (nth newArguments 1) whereProposition)
+    (setf (arguments self) newArguments)
+    (normalize-proposition self) ))
+
+(defun invert-FORALL-proposition ((self PROPOSITION))
+  ;; Convert FORALL to EXISTS proposition.
+  (let ((antecedent PROPOSITION (nth (arguments self) 0))
+        (consequent PROPOSITION (nth (arguments self) 1))
+        (newArguments (new ARGUMENTS-VECTOR :array-size 1)))
+    (free (arguments self))
+    (normalize-proposition antecedent)
+    (normalize-proposition consequent)
+    (setq consequent (safely-invert-proposition consequent))
+    (setf (kind self) :EXISTS)
+    (setf (operator self) @EXISTS)
+    (setf (nth newArguments 0)
+          (conjoin-two-propositions antecedent consequent))
+    (setf (arguments self) newArguments)
+    (normalize-proposition self) ))
+
+(defun (extract-proposition PROPOSITION)
+    ((self DESCRIPTION) (mapping ENTITY-MAPPING))
+  ;; Extract a copy of `self's proposition with respect to `mapping'.
+  ;; Recreate explicit `exists' propositions if there were internal
+  ;;    variables.
+  (let ((proposition (proposition self))
+        (existentials
+         (choose (non-empty? (internal-variables self))
+                 (top-level-existential-variables self)
+                 NIL))
+        (existsProposition
+         (choose (non-empty? existentials)
+                 (create-proposition (quote EXISTS) 1)
+                 NULL)))
+    (when (defined? existsProposition)
+      (setf (io-variables existsProposition)
+        (copy-variables-vector
+         (copy-cons-list-to-variables-vector existentials)
+         mapping)))
+    ;; remove the prop->copy mapping to avoid structure sharing in case
+    ;;    we are called again with the same source description:
+    (setq proposition (copy-proposition proposition mapping))
+    (remove-at mapping (proposition self))
+    (when (defined? existsProposition)
+      (setf (nth (arguments existsProposition) 0) proposition)
+      (setq proposition existsProposition))
+    (return proposition)))
+
+(defun invert-IMPLIES-proposition ((self PROPOSITION))
+  ;; Convert IMPLIES to EXISTS proposition.
+  ;; Example: `(not (subset-of A B))' becomes
+  ;;          `(exists ?x (and (A ?x) (not (B ?x))))'.
+  ;;          `(not (implies R S))' becomes
+  ;;          `(exists (?x ?y) (and (A ?x ?y) (not (B ?x ?y))))'.
+  ;; Exception: If one of the arguments of 'self' is not a description, then
+  ;;    return 'self' wrapped inside of a negation.
+  (let ((arguments (arguments self))
+        ;; Need to special-case surrogate arguments:
+        (arg1Value (choose (surrogate? (nth arguments 0))
+                           (get-description (cast (nth arguments 0) SURROGATE))
+                           (nth arguments 0)))
+        (arg2Value (choose (surrogate? (nth arguments 1))
+                           (get-description (cast (nth arguments 1) SURROGATE))
+                           (nth arguments 1))))
+    (when (not (and (isa? arg1Value @DESCRIPTION)
+                    (isa? arg2Value @DESCRIPTION)))
+      ;; treat IMPLIES as if it were atomic:
+      (invert-atomic-proposition self)
+      (return))
+    (let ((subset DESCRIPTION arg1Value)
+          (superset DESCRIPTION arg2Value)
+          (subsetProp PROPOSITION NULL)
+          (supersetProp PROPOSITION NULL)
+          (mapping (new ENTITY-MAPPING))
+          (newArguments (new ARGUMENTS-VECTOR :array-size 1)))
+      (setf (kind self) :EXISTS)
+      (setf (operator self) @EXISTS)
+      ;; Copy io-variables and map subset variables onto them:
+      (setf (io-variables self)
+            (copy-variables-vector (io-variables subset) mapping))
+      ;; Also map superset variables onto new io-variables:
+      (foreach ioVar in (io-variables self)
+               as supVar in (io-variables superset)
+               do (insert-at mapping supVar ioVar))
+      ;; We have to copy the propositions (1) to avoid structure sharing with
+      ;;    propositions of primitive descriptions, and (2) to make them share
+      ;;    the io-variables quantified in the `exists':
+      (setq subsetProp (extract-proposition subset mapping))
+      (setq supersetProp (extract-proposition superset mapping))
+      ;; kludge: 'extract-proposition' may have copied 'variable-type?':
+      (setf (variable-type? supersetProp) NULL)
+      (invert-proposition supersetProp)
+      (setf (nth newArguments 0)
+            (conjoin-two-propositions subsetProp supersetProp))
+      (setf (arguments self) newArguments)
+      (normalize-proposition self) )))
+
+(defun (invert-proposition PROPOSITION) ((self PROPOSITION))
+  ;; Destructively modify 'self' to represent the negation of 'self'.
+  ;; CAUTION: Since we can't destructively invert TRUE or FALSE, we need
+  ;;    to return an inverted proposition for those cases.  Callers that
+  ;;    know that they are not called with a constant proposition may
+  ;;    safely ignore the return value.
+  (case (kind self)
+    ((:ISA :PREDICATE :FUNCTION :EQUIVALENT)
+     (invert-atomic-proposition self))
+    (:AND
+     (let ((argumentCount (length (arguments self))))
+       (simplify-proposition self)
+       ;; if TRUE arguments were pruned, check for possibility that
+       ;;    'self' is no longer an :AND proposition:
+       (when (< (length (arguments self)) argumentCount)
+         (return (invert-proposition self))))
+     (setf (kind self) :OR)
+     (setf (operator self) @OR)
+     (foreach i in (interval 0 (1- (length (arguments self))))
+         do (setf (nth (arguments self) i)
+              (safely-invert-proposition (nth (arguments self) i)))))
+    (:OR
+     (setf (kind self) :AND)
+     (setf (operator self) @AND)
+     (foreach i in (interval 0 (1- (length (arguments self))))
+         do (setf (nth (arguments self) i)
+              (safely-invert-proposition (nth (arguments self) i)))))
+    (:NOT
+     (overlay-proposition self (first (arguments self)))
+     (normalize-proposition self))
+    (:EXISTS
+     (if (function-induced-exists? self)
+         ;; TO DO: THIS INCORRECT KLUDGE NEEDS TO GO AWAY ONCE WE DECIDED
+         ;;        ON THE CORRECT WAY TO TREAT NON-TOTAL FUNCTIONS.
+         (embed-negation-within-function-induced-exists self)
+       (invert-EXISTS-proposition self)))
+    (:FORALL (invert-FORALL-proposition self))
+    (:IMPLIES (invert-IMPLIES-proposition self))
+    (:CONSTANT
+     ;; We can't destructively modify constant propositions such as TRUE
+     ;;    or FALSE, thus, we have to return the inverted version instead:
+     (case (operator self)
+       (@TRUE (return FALSE-PROPOSITION))
+       (@FALSE (return TRUE-PROPOSITION))))
+    (:FAIL
+     ;; pretend that :FAIL is atomic:
+     (invert-atomic-proposition self)))
+  (return self))
+
+(defun (safely-invert-proposition PROPOSITION) ((self PROPOSITION))
+  ;; Make a copy of 'self', invert the copy, and return a pointer to it.
+  ;; Called by 'invert-proposition' so that we can safely invert 'self'
+  ;;    when it might be structure-shared.
+  (let ((copy (shallow-copy-proposition self)))
+    (invert-proposition copy)
+    (return copy) ))
+
+
+  ;;
+;;;;;;
+  ;;
+
+     
+;;; Tricky because the context mechanism must be respected.
+
+;;; KEEP FOR IDEAS:
+
+;;; Negation transformations:
+;;;    (not TRUE) ==> FALSE
+;;;    (not FALSE) ==> TRUE
+;;;    (not (not P)) ==> P
+;;;    (not (and P1 ... Pk)) ==> (or (not P1) ... (not (Pk)))
+;;;    (not (or P1 ... Pk)) ==> (and (not P1) ... (not (Pk)))
+;;;    (not (implies S1 S2)) ==> (exists (<tuple> in S1) 
+;;;                                        (not (<tuple> in S2)))
+
+;;; Disjunction transformations:
+;;;    (or P1 ... Pk FALSE) ==> (or P1 ... Pk)
+;;;    (or P1 ... Pk TRUE) ==> TRUE
+;;;    (or P) ==> P
+;;;    (or) ==> FALSE
+;;;    (or P1 ... Pk (or Q1 ... Qj)) ==> (or P1 ... Pk Q1 ... Qj)
+
+;;; Conjunction transformations:
+;;;    (and P1 ... Pk TRUE) ==> (and P1 ... Pk)
+;;;    (and P1 ... Pk FALSE) ==> FALSE
+;;;    (and P) ==> P
+;;;    (and) ==> TRUE
+;;;    (and P1 ... Pk (and Q1 ... Qj)) ==> (and P1 ... Pk Q1 ... Qj)
+
+
+;;; Canonicalization rules
+
+
+  ;;
+;;;;;; Canonicalizing implies expressions
+  ;;
+
+#|
+;;; (all r Q):
+;;; Immediate Transform:
+(forall (a in A) where (P a) always (Q a))
+(implies (setofall a in A where (P a)) (setofall a in A where (Q a)))
+
+;;; Deferred transform:
+;;; (all r Q):
+(forall ((a in A) (b in B)) where (member b (r a)) always (Q b))
+(forall ((a in A) (b in (r a))) always (Q b))
+;;; within elaborated A:
+   (implies (r a) Q)
+
+|#
+
+
+
+;---------------------------------------------------------------
+
+;; TO DO:
+;;    UPGRADE OPTIMIZER TO UNDERSTAND WHEN OBJECTS DON'T HAVE BACKLINKS.
+;;    UPGRADE OPTIMIZER TO USE REVERSE INDICES (BACKLINKS) FOR THE
+;;       RANGE OF A FUNCTION.
+;;    PUSH :ISA PROPOSITIONS ON EXTENSIONLESS CLASSES INTO RESIDUE.
+
+;; TO DO: REINSTATE SOMEWHERE ELSE:
+;;    (1) Logic that builds class extensions for non-logic objects.
+
+
+;; EXAMPLES TESTING SKOLEM FUNCTIONS:
+#|
+(deffunction miles-of (?i) :-> ?m)
+(assert (total miles-of))
+(assert (= mm (miles-of 5)))
+;; THIS WORKS, BUT ONLY WHEN 'miles-of' IS TOTAL:
+(cl:progn
+  (cc pl-user)
+  (retrieve ?x (= (miles-of ?x) mm))
+  )
+;; THIS DOESN'T WORK
+(cl:progn
+  (cc pl-user)
+  (retrieve ?x (= (miles-of ?x) (miles-of 5)))
+  )
+(clear-module "PL-USER")
+(cc pl-user)
+(defconcept COUNTRY (?c))
+(defconcept MONETARY-UNIT (?m?))
+(defconcept MONETARY-UNIT-FN (?m)
+  :=> (FUNCTION ?m))
+(defrelation cost (?x (?m MONETARY-UNIT)))
+(deffunction dollars-of ((?country COUNTRY)) :-> (?u MONETARY-UNIT-FN))
+(assert (Country US))
+(assert (cost Radio ((dollars-of US) 50)))
+(assert (cost Radio (VALUE (dollars-of US) 50)))
+(retrieve ?x (cost Radio ((dollars-of US) ?x)))
+|#

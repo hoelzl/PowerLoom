@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: make-stella.lisp,v 1.44 2003/04/18 21:15:54 hans Exp
+;;; Version: make-stella.lisp,v 1.47 2006/05/11 07:06:37 hans Exp
 
 ;;; Load STELLA from CL-translated files.
 
@@ -100,6 +100,7 @@
     (CL-USER::stella-c&l-translated "idl-translate-file")
     (CL-USER::stella-c&l-translated "idl-class-out")
     (CL-USER::stella-c&l-translated "idl-output")
+    (CL-USER::stella-c&l-translated "tools")
     (CL-USER::stella-c&l-translated "cl-lib" "stella-to-cl")
     (CL-USER::stella-c&l-translated "startup-system")
     )) ;; with-redefinition-warnings-suppressed

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cl-translate.ste,v 1.135 2003/09/30 00:47:23 hans Exp
+;;; Version: cl-translate.ste,v 1.146 2006/05/11 07:05:47 hans Exp
 
 ;;; Stella parse tree to Common Lisp translator.
 
@@ -65,6 +65,11 @@
      (return (third tree) (second tree) (rest (rest (rest tree)))))
     (otherwise
      (return (first tree) NULL (rest tree)))))
+
+(defglobal *cl-true-string-wrapper* VERBATIM-STRING-WRAPPER
+  (new VERBATIM-STRING-WRAPPER :wrapper-value "CL:T"))
+(defglobal *cl-false-string-wrapper* VERBATIM-STRING-WRAPPER
+  (new VERBATIM-STRING-WRAPPER :wrapper-value "CL:NIL"))
 
 (defglobal *cl-operator-table* KEY-VALUE-LIST NULL
   :documentation "Mapping from STELLA operators to Common-Lisp operators.")
@@ -176,11 +181,13 @@
 (startup-time-progn :early-inits
   (verbatim
     :common-lisp
-    (CL:when (clsys-use-vector-structs-p)
-      (CL:defmethod CL:print-object :around ((self CL:vector) stream)
-        (CL:if (clsys-vector-struct-p self)
-            (clsys-print-vector-struct self stream)
-          (CL:call-next-method))))
+    "(CL:when (clsys-use-vector-structs-p)
+      (#+:CLISP EXT:WITHOUT-PACKAGE-LOCK #+:CLISP (\"COMMON-LISP\")
+       #-:CLISP CL:PROGN
+        (CL:defmethod CL:print-object :around ((self CL:vector) stream)
+          (CL:if (clsys-vector-struct-p self)
+             (clsys-print-vector-struct self stream)
+           (CL:call-next-method)))))"
     :otherwise NULL))
 
 ;;; In an instance of Stella that uses structs or CL conses,
@@ -313,6 +320,7 @@
        (MAKE (return (cl-translate-make-tree tree)))
        (SYS-NEW (return (cl-translate-new-tree tree)))
        (MV-SETQ (setf (first tree) (quote CL:MULTIPLE-VALUE-SETQ))
+                (setf (second tree) (cl-translate-list-of-trees (second tree)))
                 (setf (third tree) (cl-translate-a-tree (third tree)))
                 (return tree))
        (QUOTE (setf (first tree) (quote CL:QUOTE)) ; WHY IS THIS HERE?
@@ -349,11 +357,17 @@
   ;; Translate a reference to the symbol 'tree'.
   ;; BUG: This might generate incorrect code if a local variable has the
   ;;      same name as a global!! (which argues for a new parse tree) 
-  (if (defined? (lookup-global-variable tree))
-      (return (cl-translate-global-symbol tree))
-    ;; Otherwise, it must be a local variable for which we
-    ;;    really never want to use a package or module prefix:
-    (return (cl-translate-local-symbol tree))))
+  ;; Special case TRUE and FALSE symbols
+  (cond ((eq? tree (quote TRUE))
+         (return *cl-true-string-wrapper*))
+        ((eq? tree (quote FALSE))
+         (return *cl-false-string-wrapper*))
+        ((defined? (lookup-global-variable tree))
+         (return (cl-translate-global-symbol tree)))
+        (otherwise
+         ;; Otherwise, it must be a local variable for which we
+         ;;    really never want to use a package or module prefix:
+         (return (cl-translate-local-symbol tree)))))
 
 (defmethod (cl-translate-atomic-tree OBJECT) ((tree KEYWORD))
   ;; Return a parse tree that evaluates to the keyword 'tree'.
@@ -380,6 +394,29 @@
       (setq symbolModule *module*))
     (return (yield-global-lisp-symbol symbolModule (symbol-name symbol)))))
 
+(defun (yield-readable-symbol-name STRING) ((symbolModule MODULE) (symbolName STRING) (local? BOOLEAN))
+  ;; Yield a Lisp symbol name, properly escaped for reading assuming that
+  ;; the Lisp system will be using :UPCASE as its readtable-case.
+  (let ((lispSymbolName
+         ;; Use 'slot-value' to disable the default:
+         (choose (or local?
+                     (defined? (slot-value symbolModule module-lisp-package)))
+                 symbolName
+                 ;; What we really want here is the relative name to the
+                 ;;    closest parent that has an explicit native package:
+                 (compute-full-name symbolName symbolModule))))
+    (case (compute-symbol-escape-code lispSymbolName false)
+      (:UNESCAPED
+       NULL)                            ; Already OK
+      (:ESCAPED 
+       (setq lispSymbolName
+	     (concatenate "|" (concatenate lispSymbolName "|"))))
+      (:COMPLEX-ESCAPED                 ; Slow, but really rare
+       (let ((s (NEW STRING-OUTPUT-STREAM)))
+         (print-symbol-name-readably lispSymbolName s false)
+         (setq lispSymbolName (the-string s)))))
+    (return lispSymbolName)))
+  
 (defun (yield-global-lisp-symbol OBJECT)
     ((symbolModule MODULE) (symbolName STRING))
   ;; Yield a Lisp symbol that can be used as a translation of the global
@@ -413,16 +450,7 @@
                            (lisp-package *module*)))
                  NULL
                  (lisp-package symbolModule)))
-        (lispSymbolName
-         ;; Use 'slot-value' to disable the default:
-         (choose (defined? (slot-value symbolModule module-lisp-package))
-                 symbolName
-                 ;; What we really want here is the relative name to the
-                 ;;    closest parent that has an explicit native package:
-                 (compute-full-name symbolName symbolModule))))
-    (when (case-sensitive? symbolModule)
-      (setq lispSymbolName
-	(concatenate "|" (concatenate lispSymbolName "|"))))
+        (lispSymbolName (yield-readable-symbol-name symbolModule symbolName FALSE)))
     (if (null? lispSymbolPackage)
         (return (new VERBATIM-STRING-WRAPPER :wrapper-value lispSymbolName))
       (return
@@ -433,21 +461,11 @@
 
 (defun (cl-translate-local-symbol OBJECT) ((symbol SYMBOL))
   ;; Translate a reference to the local symbol/variable 'symbol'.
-  (let ((symbolModule (interned-in symbol)))
-    (cond ((and (not (case-sensitive? *module*))
-                (or (null? symbolModule)
-                    (eql? symbolModule *module*)))
-           (return symbol))
-          ;; Otherwise, make sure we don't print a package/module prefix, even
-          ;;    if the local symbol was a permanent one (e.g., a /STELLA/SELF
-          ;;    used in a class constructor/accessor generator):
-          ((case-sensitive? *module*)
-           (return (new VERBATIM-STRING-WRAPPER
+  (return (new VERBATIM-STRING-WRAPPER
                         :wrapper-value
-                        (concatenate "|" (symbol-name symbol) "|"))))
-          (otherwise
-           (return (new VERBATIM-STRING-WRAPPER
-                        :wrapper-value (symbol-name symbol)))))))
+                        (yield-readable-symbol-name (interned-in symbol)
+                                                    (symbol-name symbol)
+                                                    TRUE))))
 
 (defun (cl-translate-setq-tree CONS) ((tree CONS))
   ;; Translate a 'setq' 'tree'.
@@ -736,16 +754,20 @@
                   where (eq? (first ib) variable))) )
 
 (defun (cl-translate-foreach-tree CONS) ((tree CONS))
-  ;; Translate a SYS-FOREACH tree.
+  ;; Translate a new SYS-FOREACH tree.
   ;; Tree has the form
   ;;    (SYS-FOREACH ((<iterVar> <type> <constructor expression>)*)
-  ;;                 ((<cursorVar> <type> <next expression>)*)
-  ;;                 <continuation test> <body>)
-  (let ((iteratorBindings (cast (second tree) (CONS OF CONS)))
-        (cursorBindings (cast (third tree) (CONS OF CONS)))
-        (continuationTest (cl-translate-boolean-test (fourth tree) FALSE))
-        (body (cl-translate-list-of-trees (nth-rest tree 4)))
+  ;;                 (<value expression>*)
+  ;;                 (<bump expression>*)
+  ;;                 <continuation test>
+  ;;                 <body>*)
+  (let ((iteratorBindings (CONS OF CONS) (second tree))
+        (valueTrees (CONS OF CONS) (third tree))
+        (nextTrees (CONS OF CONS) (fourth tree))
+        (continuationTest (cl-translate-boolean-test (fifth tree) FALSE))
+        (body (cl-translate-list-of-trees (nth-rest tree 5)))
         (declarations NIL)
+        (valueAssignments NIL)
         (nextAssignments NIL)
         (typeDeclarations NIL)
         (iteratorConstructor OBJECT NULL))
@@ -753,35 +775,22 @@
       (setq typeDeclarations
         (cl-yield-let-variable-type-declaration-trees iteratorBindings)))
     (foreach binding in iteratorBindings        ; collect iterator bindings
-             do
-             (setq iteratorConstructor (cl-translate-a-tree (third binding)))
-             (setf (third binding) NULL)        ; clip before gc
-             collect (bquote (& (cl-translate-local-symbol (first binding))
-                                & iteratorConstructor))
-             into declarations)
-    (when (generate-cl-type-declarations?)
-      (setq typeDeclarations
-        (concatenate
-          typeDeclarations
-          (cl-yield-let-variable-type-declaration-trees cursorBindings))))
-    (foreach binding in cursorBindings
-             do    ; collect next assigns
-             (pushq nextAssignments (cl-translate-a-tree (third binding)))
-             (setf (third binding) NULL)        ; clip before gc
-             (unless (duplicate-cursor-variable? (first binding) iteratorBindings)
-               (pushq declarations
-                      (bquote (& (cl-translate-local-symbol (first binding))
-			       & (cl-translate-a-tree
-				   (type-to-walked-null-value-tree
-				    (type-spec-to-base-type
-				     (second binding))))
-			       ))))) ;; collect cursor decls
+        do (setq iteratorConstructor (cl-translate-a-tree (third binding)))
+        collect (bquote (& (cl-translate-local-symbol (first binding))
+                           & iteratorConstructor))
+        into declarations)
+    (foreach tree in valueTrees
+        collect (cl-translate-a-tree tree) into valueAssignments)
+    (foreach tree in nextTrees
+        collect (cl-translate-a-tree tree) into nextAssignments)
     (return
-     (bquote (CL:let* & declarations
-                      && (cl-yield-declare-tree typeDeclarations FALSE)
-                      (CL:LOOP WHILE & continuationTest
-                               DO && (reverse nextAssignments)
-                               && (maybe-wrap-with-continue-label body))))) ))
+     (bquote
+      (CL:let* & declarations
+               && (cl-yield-declare-tree typeDeclarations FALSE)
+               (CL:LOOP WHILE & continuationTest
+                 DO && valueAssignments
+                 && (maybe-wrap-with-continue-label body)
+                 && nextAssignments))))))
 
 (defun (maybe-wrap-with-continue-label CONS) ((translatedLoopBody CONS))
   ;; Tack on a :CONTINUE label to 'translatedLoopBody'
@@ -1029,12 +1038,20 @@
           (when (method-call-inlining-enabled?)
             ;; Inline NULL? and DEFINED?:
             (case owner
-              ((@OBJECT @SECOND-CLASS-OBJECT @NATIVE-VECTOR @STRING @CODE @FLOAT)
-               (setq tree
-                 (bquote
-                  (CL:eq & (cl-translate-a-tree (first arguments))
-                         & (cl-translate-a-tree
-                            (type-to-walked-null-value-tree owner)))))
+              ((@OBJECT @SECOND-CLASS-OBJECT @NATIVE-VECTOR @STRING @CODE @FLOAT @ARRAY)
+	       (if (eq? owner @ARRAY)
+		   ;; KLUDGE: Because we don't have the full type-spec available to figure
+		   ;; out the rank of the array at translation time, we have to call this
+		   ;; function instead.  If we could get the entire TYPE-SPEC, then this
+		   ;; could be made more efficient, by in-lining the tests.
+		   (setq tree
+			 (bquote (& (cl-translate-global-symbol (quote NULL-ARRAY?))
+				    & (cl-translate-a-tree (first arguments)))))
+		   (setq tree
+			 (bquote
+			  (CL:eq & (cl-translate-a-tree (first arguments))
+				 & (cl-translate-a-tree
+				    (type-to-walked-null-value-tree owner owner))))))
                (case owner
                  (@FLOAT (setf (first tree) (quote CL:=)))
                  (otherwise NULL))
@@ -1170,7 +1187,10 @@
 	   (setq oTree (bquote (CL:make-condition (CL:quote & classSymbol)
 				 & (cl-translate-global-symbol
                                     (quote *condition-message-keyword*))
-				 & (cl-translate-a-tree (third tree))))))
+				 (& (cl-translate-global-symbol
+                                     (quote replace-substrings))
+                                  & (cl-translate-a-tree (third tree))
+                                  "~~" "~")))))
 	  ((or (not (use-cl-structs?))
 	       (cl-always-translate-to-clos-class? class))
 	   (setq oTree (bquote (CL:make-instance (CL:quote & classSymbol)))))
@@ -1564,11 +1584,17 @@
          (case (array-type-rank type)
            (1 (return (quote CL:SIMPLE-VECTOR)))
            (otherwise
-            (let ((dimensions NIL))
-              (foreach dim in (array-type-dimensions type)
+	    ;; cl-array-null
+	    ;; NOTE: Any change to this requires updates to the set
+	    ;;       of null values in cl-lib/cl-primal.ste as well
+            (let ((rank (array-type-rank type))
+                  (dimensions NIL))
+              (when (<= rank 5)           ; Limit of CL array NULL values!
+                (foreach dim in (array-type-dimensions type)
                   collect (choose (null? dim) (quote CL:*) dim)
                   into dimensions)
-              (return (bquote (CL:ARRAY CL:T & dimensions))))))))
+                (return (bquote (CL:ARRAY CL:T & dimensions)))))
+	    ))))
       (otherwise NULL))
     (return NULL)))
 
@@ -1690,7 +1716,9 @@
 	    (CL:FUNCTION
 	     & (cl-yield-method-arglist-type-declarations method)
 	     & (cl-yield-method-return-type-declaration method))
-	    & (cl-translate-global-symbol (slot-name method)))))
+	    & (cl-translate-global-symbol
+	       (yield-renamed-name-if-native
+		(slot-name method) :common-lisp :function)))))
 	(return NULL))))
 
 (defun (cl-yield-declare-tree CONS) ((declarations (CONS OF CONS)) 
@@ -1759,6 +1787,7 @@
   ;; Return a parse tree representing a parameter list for a Lisp method
   ;;    or function translation of 'method'.
   (let ((function? (method-function? method))
+        (abstract? (abstract? method))
         (oTree NIL)
         (oParameter OBJECT NULL)
         (firstParameterType OBJECT NULL))
@@ -1771,6 +1800,7 @@
               ;; the first argument of a method retains its type:
               ;; TO DO: FIGURE OUT HOW OPERATORS TURN INTO MULTI-METHODS:
               ((and (not function?)
+                    (not abstract?)
                     (eq? i 1))
                ;; first parameter of a method:
                (setq firstParameterType
@@ -1826,35 +1856,44 @@
           (cl-yield-method-parameter-type-declaration-trees method)))
       (setq methodDeclaration
         (cl-yield-method-type-declaration-tree method)))
-    (setq oTree
-      (bquote (& (choose function?
-                         (quote CL:DEFUN)
-                         (choose (use-defconsmethod? method)
-                                 (quote %%DEFCONSMETHOD)
-                                 (quote CL:DEFMETHOD)))
-                 & (cl-translate-global-symbol
-                    (yield-renamed-name-if-native
-                     methodName :common-lisp :function))
-                 & (cl-translate-method-parameters method)
-                 && (choose (defined? documentation)
-                            (bquote (& documentation))
-                            NIL)
-                 && (cl-yield-declare-tree declarations TRUE)
-                 && (cl-translate-list-of-trees bodyTree)
-                 && (choose (and (void? (type method))
-                                 (not (preserve-tail-merge-optimizability?)))
-                            (bquote (;;(CL:VALUES)
-                                     ;; Bob prefers having a value, so he can
-                                     ;;    see when evaluation is done in MCL:
-                                     :VOID))
-                            NIL))))
+    (if (and (not function?)
+             (abstract? method))
+      (setq oTree
+            (bquote (CL:DEFGENERIC
+                      & (cl-translate-global-symbol
+                         (yield-renamed-name-if-native
+                          methodName :common-lisp :function))
+                      & (cl-translate-method-parameters method))))
+      (setq oTree
+            (bquote (& (choose function?
+                               (quote CL:DEFUN)
+                               (choose (use-defconsmethod? method)
+                                       (quote %%DEFCONSMETHOD)
+                                       (quote CL:DEFMETHOD)))
+                       & (cl-translate-global-symbol
+                          (yield-renamed-name-if-native
+                           methodName :common-lisp :function))
+                       & (cl-translate-method-parameters method)
+                       && (choose (defined? documentation)
+                                  (bquote (& documentation))
+                                  NIL)
+                       && (cl-yield-declare-tree declarations TRUE)
+                       && (cl-translate-list-of-trees bodyTree)
+                       && (choose (and (void? (type method))
+                                       (not (preserve-tail-merge-optimizability?)))
+                                  (bquote (;;(CL:VALUES)
+                                           ;; Bob prefers having a value, so he can
+                                           ;;    see when evaluation is done in MCL:
+                                           :VOID))
+                                  NIL)))))
     (when (method-auxiliary? method)    ; gc auxiliary method:
       (free method))
     (when (defined? methodDeclaration)
       (setq oTree
 	(bquote
-         (CL:progn & oTree
-                   (CL:declaim & methodDeclaration)))))
+         (CL:progn (CL:declaim & methodDeclaration)
+		   & oTree
+                   ))))
     (return oTree)))
 
 
@@ -1873,6 +1912,7 @@
       (return (bquote (:TYPE & clType
 			     :INITFORM & (cl-translate-a-tree
 					  (type-to-walked-null-value-tree
+					   (type-specifier slot)
 					   (slot-base-type slot))))))
       (return NIL)) ))
 
@@ -2000,6 +2040,7 @@
       (return (bquote (& (cl-translate-local-symbol (slot-name slot))
 			 & (cl-translate-a-tree
 			    (type-to-walked-null-value-tree
+			     (type-specifier slot)
 			     (slot-base-type slot)))
 			 :TYPE & clType)))
       (return (bquote (& (cl-translate-local-symbol (slot-name slot))

@@ -1,0 +1,649 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: logic-macros.ste,v 1.73 2006/05/11 07:05:18 hans Exp
+
+;;; Macros used by the logic system.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Surrogate management
+  ;;
+
+;; Insure that 'PROPOSITION.IF' is interned in the "correct" module
+;;    (i.e., STELLA, not LOGIC) before the relation 'IF' is defined:
+(startup-time-progn :symbols
+  (intern-surrogate-in-module "PROPOSITION.IF" *stella-module* TRUE)
+  )
+
+
+  ;;
+;;;;;; Error macros
+  ;;
+
+(defclass LOGIC-EXCEPTION (STELLA-EXCEPTION))
+(defclass PROPOSITION-ERROR (LOGIC-EXCEPTION))
+(defclass PARSING-ERROR (LOGIC-EXCEPTION))
+(defclass CLASH (LOGIC-EXCEPTION))
+(defclass FAIL-EXCEPTION (LOGIC-EXCEPTION))
+(defclass QUERY-THREAD-LIMIT-VIOLATION (LOGIC-EXCEPTION))
+
+(defspecial *suppressNonLogicObjectWarning?* BOOLEAN TRUE)
+
+;; Forward declaration:
+(defun help-signal-proposition-error ((stream OUTPUT-STREAM) (warningOrError KEYWORD)))
+
+(defmacro signal-parsing-error (&body (message CONS))
+  ;; Error macro for KIF-to-Stella translator.
+  (let ((streamVar (local-gensym "STREAM")))
+    (setq message (format-message-arguments message FALSE))
+    (return 
+      (bquote
+       (let ((& streamVar  (new OUTPUT-STRING-STREAM)))
+	 (special ((*printReadably?* TRUE))
+	   (print-stream & streamVar "PARSING ERROR: " && message "." EOL)
+	   (help-signal-proposition-error & streamVar :ERROR))
+	 (signal-exception
+	  (new PARSING-ERROR :message (the-string & streamVar)))))) ))
+
+(defmacro signal-proposition-error (&body (message CONS))
+  ;; Print out message describing location of error, and then throw back to
+  ;;    'build-top-level-proposition'.
+  (let ((streamVar (local-gensym "STREAM")))
+    (setq message (format-message-arguments message FALSE))
+    (return 
+      (bquote
+       (let ((& streamVar  (new OUTPUT-STRING-STREAM)))
+	 (special ((*printReadably?* TRUE))
+	   (print-stream & streamVar "ERROR: " && message "." EOL)
+	   (help-signal-proposition-error & streamVar :ERROR))
+	 (signal-exception
+	  (new PROPOSITION-ERROR :message (the-string & streamVar)))))) ))
+
+(defmacro signal-proposition-warning (&body (message CONS))
+  (return
+    (bquote
+     (special ((*printReadably?* TRUE))
+       (print-stream STANDARD-WARNING "WARNING: " && message EOL)
+       (help-signal-proposition-error STANDARD-WARNING :WARNING)))))
+
+
+  ;;
+;;;;;; 'build-display-globals'
+  ;;
+
+(defmacro def-display-globals 
+          ((displayFunctionName SYMBOL) 
+           (globalVariableNames (CONS OF SYMBOL)))
+  ;; Build a display function named 'displayFunctionName' that when
+  ;;    called lists each global in 'globalVariableNames' along with
+  ;;    its current setting.
+  :lisp-macro? TRUE
+  (let ((printClauses NIL))
+    (foreach g in (reverse globalVariableNames)
+             do (setq printClauses
+                      (append 
+                       (bquote (& (symbol-name g) " =  " & g EOL))
+                       printClauses)))
+    (return
+     (bquote (defun (& displayFunctionName STRING) ()
+                    (print EOL
+                           && printClauses
+                           EOL)
+                    (return "")))) ))
+
+
+  ;;
+;;;;;; Query Interpreter macros
+  ;;
+
+;;; Query-tick timeout handling:
+
+;;; On a down move, the new scheme takes the currently available time of the
+;;; parent frame, decrements it by one and gives that to the child as available
+;;; resources.  When the child returns, whatever it actually used up gets
+;;; subtracted from the parent's resources.  On the up move the resources of
+;;; the child are nullified, which ensures they get reinitialized appropriately
+;;; on the next down move.  A parent can control how much a particular child
+;;; is allowed to use by modifying its own resources (see WhyNot machinery).
+;;; Timeouts are themselves implicit up moves that have to update parent
+;;; resources.  In-place moves are highly complicated, since they combine an
+;;; implicit up with an implicit down move (complexity is usually the price
+;;; we pay for destructive modification - arrgh).  Don't touch this unless
+;;; you absolutely have to, it is a real pain to get right.
+
+(defmacro move-in-place ()
+  ;; Current frame has been overlayed with :SUBQUERY or :PATTERN frame.
+  ;; Initiate first evaluation of overlay by pretending that we are moving
+  ;;    down.
+  (return
+    (bquote
+     (progn
+       ;;(print ">>>MOVE-IN-PLACE ON: " frame EOL) ;; for debugging timeouts
+       ;; reset `truth-value' and friends for new round of inference:
+       (setf (truth-value frame) NULL)
+       (setf (justification frame) NULL)
+       (when (defined? (partial-match-frame frame))
+         (clear-frame-partial-truth (partial-match-frame frame)))
+       (setq lastMove :DOWN)
+       (cond
+        (checkForMoveout?
+         ;; propagate resources and check for frame timeout:
+         (let ((parent (up frame))
+               (startTicks (starting-clock-ticks frame))
+               (availableTicks
+                (- (allotted-clock-ticks parent) (- clockTicks startTicks) 1)))
+           ;; update parent resources, since we had an implicit `move-up':
+           (setf (allotted-clock-ticks parent) availableTicks)
+           ;; account for implicit down move:
+           (-- availableTicks)
+           (setf (allotted-clock-ticks frame) availableTicks)
+           (setf (current-clock-ticks query) (++ clockTicks))
+           ;; make sure we set these after the above computation but before
+           ;;    the timeout test, so we won't reset it on a restart frame:
+           (setf (starting-clock-ticks frame) clockTicks)
+           ;;(print "MOVE-IN-PLACE CHECK TIMEOUT: start=" clockTicks
+           ;;       " available=" availableTicks EOL)
+           (when (<= availableTicks 0)
+             ;; for now, moveouts work just like depth cutoffs, but eventually
+             ;;     we might want to be able to resume the timed-out frames:
+             (pop-frames-up-to frame)
+             ;; simulate failure returning from frame:
+             (mv-setq (frame depth) (handle-timeout frame depth))
+             (setq lastMove :UP-FAIL)
+             ;; we had a timeout, adjust parent resources similar to
+             ;;    a regular UP move:
+             (-- (allotted-clock-ticks frame)
+                 (1+ (- clockTicks startTicks))))))
+        (otherwise
+         (setf (current-clock-ticks query) (++ clockTicks))
+         (setf (starting-clock-ticks frame) clockTicks)))
+       ;;(print "<<<MOVE-IN-PLACE ON: " frame EOL) ;; for debugging timeouts
+       ))))
+
+(defmacro move-down ()
+  ;; If down frame exists, make it the current frame.
+  ;; Otherwise, create a new deepest frame, link it below the current frame,
+  ;;    and fill in its proposition based on the position of the argument
+  ;;    cursor for the current frame.
+  (return
+   (bquote
+    (let ((upFrame frame)
+          (downFrame (down frame)))
+      ;;(print ">>>MOVE-DOWN from: " upFrame EOL
+      ;;       "               to: " downFrame EOL)
+      (setq depth (1+ depth))
+      (setf (current-clock-ticks query) (++ clockTicks))
+      (cond
+       ((defined? downFrame)
+        ;; IMPORTANT: IF THIS CASE CHANGES, ALSO ADAPT INITIALIZATION OF THE
+        ;;    BASE-CONTROL-FRAME IN `execute-backward-chaining-proof?'.
+        ;; revisit old frame:
+        (setq frame downFrame)
+        (setf (starting-clock-ticks frame) clockTicks)
+        (when (and checkForMoveout?
+                   (null? (allotted-clock-ticks frame)))
+          (setf (allotted-clock-ticks frame)
+            (1- (allotted-clock-ticks upFrame))))
+        ;; reset `truth-value' and friends for new round of inference:
+        (setf (truth-value frame) NULL)
+        (setf (justification frame) NULL)
+        (when (defined? (partial-match-frame frame))
+          (clear-frame-partial-truth (partial-match-frame frame)))
+        (setq lastMove :DOWN))
+       (otherwise      
+        ;; 'proposition' is most often an AND, OR, NOT or EXISTS proposition:
+        (let ((proposition (nth (arguments (proposition upFrame))
+                                (argument-cursor upFrame))))
+          (setq downFrame (create-down-frame upFrame proposition))
+          (setq frame downFrame)
+          (setf (starting-clock-ticks frame) clockTicks)
+          (when checkForMoveout?
+            (setf (allotted-clock-ticks frame)
+              (1- (allotted-clock-ticks upFrame))))
+          ;; set state variable:
+          (setq lastMove :DOWN))))
+      (when (and (> depth (current-depth-cutoff query))
+                 ;; EXPERIMENT: it only makes sense to prevent deeper rule
+                 ;;    chaining but not to kick out halfway into an antecedent
+                 ;;    because we moved into an AND or NOT:
+                 (eql? (state upFrame) :PATTERN))
+        (pop-frames-up-to frame)
+        ;; simulate failure returning from down frame:
+        (mv-setq (frame depth) (handle-depth-violation frame depth))
+        (setq lastMove :UP-FAIL))
+      ;; do this in sequence to the depth cutoff check above, so we'll
+      ;;    properly adjust the restart frame's resources if we had a cutoff:
+      (when checkForMoveout?
+        ;;(print "MOVE-DOWN CHECK TIMEOUT: start=" clockTicks " available="
+        ;;       (allotted-clock-ticks frame) EOL)
+        (when (and (<= (allotted-clock-ticks frame) 0)
+                   ;; don't bother if we already had a depth cutoff:
+                   (not (eql? lastMove :UP-FAIL)))
+          ;; for now, timeouts work just like depth cutoffs, but eventually
+          ;;     we might want to be able to resume the timed-out frames:
+          (pop-frames-up-to frame)
+          ;; simulate failure returning from down frame:
+          (mv-setq (frame depth) (handle-timeout frame depth))
+          (setq lastMove :UP-FAIL))
+        (when (eql? lastMove :UP-FAIL)
+          ;; we had a depth cutoff or timeout, adjust parent resources
+          ;;    similar to a regular UP move:
+          (-- (allotted-clock-ticks frame)
+              (1+ (- clockTicks (starting-clock-ticks downFrame))))))
+      ;;(print "<<<MOVE-DOWN from: " upFrame EOL
+      ;;       "               to: " frame EOL)
+      ))))
+      
+
+(defmacro move-up ((success? SYMBOL) (keepFrame? SYMBOL))
+  ;; Same as 'move-up', but tests for null up link.
+  (let ((lastMove KEYWORD NULL))
+    (case success?
+      (TRUE (setq lastMove :UP-TRUE))
+      (FAIL (setq lastMove :UP-FAIL)
+            (setq success? (quote FALSE))))     ; convert to BOOLEAN
+    (return
+      (bquote
+       (let ((parent (up frame)))
+         ;;(print ">>>MOVE-UP from: " frame EOL
+         ;;       "             to: " parent EOL)
+         (when (defined? parent)
+           (setf (result parent) frame)
+           (if (cache-query-results?)
+               (cache-goal
+                frame & success? 
+                & (choose (eql? keepFrame? (quote KEEP-FRAME))
+                          (quote TRUE) (quote FALSE))
+                clockTicks)
+             ;; Otherwise, maybe use alternative cache mechanism -
+             ;;    eventually, one of them should go away:
+             (update-goal-cache frame & success?)))
+         (setq depth (1- depth))
+         (when checkForMoveout?
+           ;; unset, so we'll properly reset it on the next down move:
+           (setf (allotted-clock-ticks frame) NULL)
+           (when (defined? parent)
+             ;; subtract what we've used up from the parents resources:
+             (setf (allotted-clock-ticks parent)
+               (- (allotted-clock-ticks parent)
+                  (- clockTicks (starting-clock-ticks frame))
+                  1))))
+         ;;(print "<<<MOVE-UP from: " frame EOL
+         ;;       "             to: " parent EOL)
+         (setq frame parent)
+         (when (null? frame)
+           ;; we are back at the top:
+           (setq success? & success?)
+           (break))
+         && (choose (eql? keepFrame? (quote KEEP-FRAME))
+                    NIL
+                    (bquote ((pop-down-frame frame))))
+         (setq lastMove & lastMove) lastMove)))))
+
+  ;;
+;;;;;; "query" macro
+  ;;
+
+#|
+;;; THERE APPEARS TO BE A BUG IN STELLA MACRO EXPANSION; REPLACE
+;;;    FOLLOW-ON DEFINITION BY THIS ONE WHEN BUG IS FIXED:
+(defmacro apply-retrieve ((variables CONS) (query-body CONS)
+                       (input-bindings CONS) &body (options CONS))
+  :documentation "Execute a query composed of io-variables `variables'
+and body `query-body'.  Before executing, bind variables to `input-bindings'
+(in sequence). If one variable is left unbound, returns a cons list of
+bindings of that variable.  If two or more are unbound, returns
+a cons list of cons lists of bindings.  Setting the option :singletons?
+to TRUE always returns a list of lists."
+  (let ((gensym-name (method-gensym "QUERY")))
+    (return
+     (bquote (apply-cached-retrieve
+              (bquote & variables)
+              (bquote & query-body)
+              (cons-list && input-bindings)
+              (quote & gensym-name)
+              (cons-list && options)))) ))
+|#
+
+(defmacro apply-retrieve (&body (body CONS))
+  :documentation "Execute a query composed of io-variables `variables'
+and body `queryBody'.  Before executing, bind variables to `inputBindings'
+(in sequence). If one variable is left unbound, returns a cons list of
+bindings of that variable.  If two or more are unbound, returns
+a cons list of cons lists of bindings:
+  `(apply-retrieve variables queryBody inputBindings)'"
+  (let ((gensymName (method-gensym "QUERY")))
+    (return
+     (bquote (apply-cached-retrieve
+              (bquote & (first body))
+              (bquote & (second body))
+              (cons-list && (cast (third body) CONS))
+              (cons-list && (nth-rest body 3))
+              (quote & gensymName)))) ))
+
+(defmacro apply-ask (&body (body CONS))
+  :documentation "Execute a yes/no query composed of input-variables
+`inputVariables' and body `queryBody'.  Before executing, bind variables
+to `inputBindings' (in sequence).
+  `(apply-ask inputVariables queryBody inputBindings)'"
+  (let ((gensymName (method-gensym "QUERY")))
+    (return
+     (bquote (apply-cached-ask
+              (bquote & (first body))
+              (bquote & (second body))
+              (cons-list && (cast (third body) CONS))
+              (cons-list && (nth-rest body 3))
+              (quote & gensymName)))) ))
+
+  ;;
+;;;;;;
+  ;;
+
+;; ONLY OCCURS ONCE (SO FAR):
+(defmacro within-meta-cache (&body (body CONS))
+  :documentation
+  "Execute `body' within the meta cache of the current module.
+Set appropriate special variables."
+  (return
+    (bquote
+     (special ((*context* (get-inference-cache *module* :META)))
+       && body))))
+
+(defmacro within-classification-session 
+          ((descriptionOrInstance KEYWORD) &body (body CONS))
+  :documentation
+  "Used during classification.  Execute `body' within the indicated
+classification session and inference world."
+  (return
+    (bquote
+     (special ((*classificationSession* 
+                (get-classification-session & descriptionOrInstance))
+               (*context* (classification-world *classificationSession*)))
+       && body))) )
+
+
+  ;;
+;;;;;; Lisp Packages for PowerLoom
+  ;;
+
+;;; These defined Lisp packages that are or may be referred to in
+;;;    defmodule statements.
+(verbatim
+  :common-lisp
+  (CL:unless (CL:find-package "POWERLOOM-USER")
+    (CL:defpackage "POWERLOOM-USER" (:nicknames "PL-USER")))
+  :otherwise NULL)
+
+;;; TEMPORARY UNTIL STELLA BUG IS FIXED (INTRODUCES 'LOOM-API'
+;;;    WITHOUT IMPORTING COMMON LISP):
+(verbatim
+  :common-lisp
+  "(CL:defpackage \"LOOM-API\" (:use))"
+  :otherwise NULL)
+
+(verbatim
+  :common-lisp
+  "(CL:defpackage \"PLI\"
+     (:use \"STELLA\")
+     (:import-from \"STELLA\" \"NULL-STRING\" \"CONSIFY\" \"LISTIFY\")
+     (:export #:INITIALIZE #:RESET-POWERLOOM #:CLEAR-CACHES  #:NEW-ENVIRONMENT
+              #:ASSERTION-ENV #:TAXONOMIC-ENV #:INFERENCE-ENV
+	      #:PL-ITERATOR #:LISTIFY #:CONSIFY #:NEXT? #:EMPTY? #:VALUE
+              #:GET-KEYWORD #:GET-SYMBOL
+	      #:GET-OPERATOR #:GET-OBJECT #:S-GET-OBJECT
+              #:GET-CONCEPT #:S-GET-CONCEPT #:GET-RELATION #:S-GET-RELATION
+              #:GET-NAME #:GET-SHORT-NAME #:GET-NAME-IN-MODULE
+	      #:OBJECT-TO-STRING #:OBJECT-TO-INTEGER #:OBJECT-TO-FLOAT 
+	      #:OBJECT-TO-PARSABLE-STRING #:STRING-TO-OBJECT
+	      #:GET-PROPOSITION #:S-GET-PROPOSITION
+              #:GET-PROPOSITIONS #:S-GET-PROPOSITIONS
+	      #:GET-BINARY-PROPOSITION #:GET-BINARY-PROPOSITIONS
+	      #:GET-INFERRED-BINARY-PROPOSITION-VALUES
+	      #:S-GET-INFERRED-BINARY-PROPOSITION-VALUES
+	      #:GET-PROPOSITIONS-OF #:S-GET-PROPOSITIONS-OF
+              #:GET-PROPOSITIONS-IN-MODULE
+	      #:IS-TRUE-UNARY-PROPOSITION #:IS-TRUE-BINARY-PROPOSITION
+	      #:IS-TRUE-PROPOSITION #:S-IS-TRUE-PROPOSITION
+	      #:IS-SUBRELATION
+	      #:GET-PROPER-SUBRELATIONS #:GET-DIRECT-SUBRELATIONS
+	      #:GET-PROPER-SUPERRELATIONS #:GET-DIRECT-SUPERRELATIONS
+	      #:IS-A
+	      #:GET-CONCEPT-INSTANCES #:S-GET-CONCEPT-INSTANCES
+	      #:GET-DIRECT-CONCEPT-INSTANCES #:S-GET-DIRECT-CONCEPT-INSTANCES
+	      #:GET-CONCEPT-INSTANCES-MATCHING-VALUE
+	      #:GET-CONCEPT-INSTANCE-MATCHING-VALUE
+	      #:GET-TYPES #:GET-DIRECT-TYPES #:GET-RELATION-EXTENSION
+	      #:S-GET-RELATION-EXTENSION
+	      #:GET-MODULE #:GET-CURRENT-MODULE #:GET-MODULES #:GET-HOME-MODULE
+              #:CREATE-MODULE #:S-CREATE-MODULE
+	      #:CHANGE-MODULE #:S-CHANGE-MODULE #:CLEAR-MODULE #:S-CLEAR-MODULE
+	      #:GET-CHILD-MODULES #:S-GET-CHILD-MODULES
+	      #:GET-PARENT-MODULES #:S-GET-PARENT-MODULES
+              #:GENERATE-UNIQUE-NAME
+              #:CREATE-KEYWORD #:CREATE-SYMBOL
+	      #:CREATE-OBJECT #:S-CREATE-OBJECT
+	      #:CREATE-CONCEPT #:S-CREATE-CONCEPT
+              #:CREATE-RELATION #:S-CREATE-RELATION
+              #:CREATE-FUNCTION #:S-CREATE-FUNCTION
+              #:REGISTER-SPECIALIST-FUNCTION #:S-REGISTER-SPECIALIST-FUNCTION
+              #:CREATE-ENUMERATED-LIST #:CREATE-ENUMERATED-SET
+	      #:DESTROY-OBJECT #:S-DESTROY-OBJECT
+	      #:ASSERT-UNARY-PROPOSITION #:ASSERT-BINARY-PROPOSITION #:ASSERT-NARY-PROPOSITION
+	      #:ASSERT-PROPOSITION #:S-ASSERT-PROPOSITION
+	      #:RETRACT-UNARY-PROPOSITION #:RETRACT-BINARY-PROPOSITION #:RETRACT-NARY-PROPOSITION
+              #:RETRACT-PROPOSITION #:S-RETRACT-PROPOSITION
+              #:CONCEIVE #:S-CONCEIVE
+	      #:GET-RULES #:S-GET-RULES #:S-PRINT-RULES #:RUN-FORWARD-RULES
+	      #:GET-ARITY #:S-GET-ARITY #:GET-DOMAIN #:S-GET-DOMAIN
+	      #:GET-RANGE #:S-GET-RANGE #:GET-NTH-DOMAIN #:S-GET-NTH-DOMAIN
+	      #:LOAD #:LOAD-STREAM #:LOAD-NATIVE-STREAM
+              #:SAVE-MODULE #:S-SAVE-MODULE
+	      #:GET-PREDICATE #:GET-COLUMN-COUNT 
+              #:GET-NTH-VALUE #:GET-NTH-LOGIC-OBJECT
+	      #:GET-NTH-STRING #:GET-NTH-INTEGER #:GET-NTH-FLOAT
+              #:GET-ENUMERATED-COLLECTION-MEMBERS
+	      #:EVALUATE #:S-EVALUATE
+              #:IS-LOGIC-OBJECT #:IS-INTEGER #:IS-FLOAT #:IS-NUMBER #:IS-STRING
+              #:IS-ENUMERATED-COLLECTION #:IS-ENUMERATED-SET #:IS-ENUMERATED-LIST
+	      #:IS-TRUE #:IS-FALSE #:IS-UNKNOWN #:IS-INCONSISTENT #:IS-STRICT #:IS-DEFAULT
+	      #:ASK #:S-ASK #:RETRIEVE #:S-RETRIEVE
+              ))"
+  :otherwise NULL)
+
+
+  ;;
+;;;;;; Arithmetic Computation and Constraint Support Macros
+  ;;
+
+(defmacro define-computed-constraint ((name SYMBOL)
+				      (var-list CONS)
+				      (constraint-test CONS)
+				      &body (position-computations CONS))
+  :public? TRUE
+  :documentation "Defines `name' to be a constraint computation which uses
+`constraint-test' to determine if a fully bound set of variables
+satisfies the constraint.  The forms in `position-computations'
+are used to compute the value for each of the positions. All such
+computations must set the variable `value' to be the result
+computed for the missing position.  Setting `value' to `null' for
+any such computation means that that particular argument cannot
+be computed from the others.  The input variables in `var-list'
+will be bound to the N arguments to the constraint.
+  The generated function will return a Stella Object and take as 
+inputs the values of the N arguments to the constraint.  A value
+of `null' means that the value is not available.  If all
+arguments are not `null', then the return value will be a Stella
+wrapped boolean indicating whether the constraint is satisified
+or not.
+  If more than one input value is `null', then this constraint
+code will not be called."
+  (let ((valueComputationCode CONS
+  NIL)
+	(valueSymbol (intern-symbol "VALUE")))  ;; Hack to make this appear in the correct module.
+    (foreach computation in position-computations
+	as i in (interval 0 NULL)
+        collect (bquote (& i & computation))
+	into valueComputationCode)
+    (return
+      (bquote
+       (DEFUN (& name OBJECT) ((missing-argument INTEGER-WRAPPER) && var-list)
+	 (LET ((& valueSymbol OBJECT NULL))
+	      (case (wrapper-value missing-argument)
+		;; Check Constraint
+		(-1 & constraint-test)
+		&& valueComputationCode
+		(otherwise NULL))
+	      (RETURN & valueSymbol))) )) ))
+
+;;;
+;;; The following two macros are used to make it easier to support
+;;; generic arithmetic operations in the logic
+;;;
+
+(defmacro define-arithmetic-test-on-wrappers ((name SYMBOL) (test-name SYMBOL))
+  :documentation "Defines `name' as an arithmetic comparision operation using the
+test `test-name'.  It will take two wrapped number parameters and
+return a `boolean'.  The code will use the appropriate test for
+the specific subtype of wrapped number actually passed in."
+  (return 
+    (bquote
+     (defun (& name BOOLEAN) ((x NUMBER-WRAPPER) (y NUMBER-WRAPPER))
+       :public? TRUE
+       (typecase x
+	 (INTEGER-WRAPPER
+	  (typecase y
+	    (INTEGER-WRAPPER
+	     (return (& test-name (wrapper-value x) (wrapper-value y))))
+	    (FLOAT-WRAPPER
+	     (return (& test-name (cast (wrapper-value x) FLOAT) (wrapper-value y))))))
+	 (FLOAT-WRAPPER
+	  (typecase y
+	    (INTEGER-WRAPPER
+	     (return (& test-name (wrapper-value x) (cast (wrapper-value y) FLOAT))))
+	    (FLOAT-WRAPPER
+	     (return (& test-name (wrapper-value x) (wrapper-value y)))))))))))
+
+(defmacro define-arithmetic-operation-on-wrappers ((name SYMBOL) (operation-name SYMBOL))
+  :documentation "Defines `name' as an arithmetic comparision operation using the
+test `test-name'.  It will take two wrapped number parameters and
+return a wrapped number.  The code will use the appropriate test
+for the specific subtype of wrapped number actually passed in,
+and return the appropriate subtype of wrapped number based on the
+normal arithmetic contagion rules.
+  
+For example, if both input parameters are wrapped integers then
+the output will be a wrapped integer.  If the inputs are a
+wrapped integer and a wrapped float then the output will be a
+wrapped float, etc."
+  (return
+    (bquote
+     (defun (& name NUMBER-WRAPPER) ((x NUMBER-WRAPPER) (y NUMBER-WRAPPER))
+       :public? TRUE
+       (let ((floatResult FLOAT NULL))
+	 (typecase x
+	   (INTEGER-WRAPPER
+	    (typecase y
+	      (INTEGER-WRAPPER
+	       (return
+		 (wrap-literal
+		  (safe-cast (& operation-name (wrapper-value x) (wrapper-value y)) INTEGER))))
+	      (FLOAT-WRAPPER
+	       (setq floatResult (& operation-name (wrapper-value x) (wrapper-value y))))))
+	   (FLOAT-WRAPPER
+	    (typecase y
+	      ((INTEGER-WRAPPER FLOAT-WRAPPER)
+	       (setq floatResult (& operation-name (wrapper-value x) (wrapper-value y)))))))
+	 (return (wrap-literal floatResult)))))))
+
+
+  ;;
+;;;;;; API MACROS
+  ;;
+
+(defmacro with-logic-environment 
+          ((moduleForm OBJECT) (environment OBJECT) &body (body CONS))
+  :documentation
+  "Execute `body' within the module resulting from `moduleForm'.
+`*module*' is an acceptable `moduleForm'.  It will locally rebind 
+`*module*' and `*context*' and shield the outer bindings from changes."
+  :public? TRUE
+  (let ((moduleVar (local-gensym "MDL"))
+	(contextVar (local-gensym "CXT")))
+    (return
+     (bquote
+      (let ((& moduleVar MODULE & moduleForm)
+	    (& contextVar CONTEXT & moduleVar))
+        (when (null? & moduleVar)
+          (setq & moduleVar *module*)
+	  (setq & contextVar *context*))
+        (special ((*module* & moduleVar)
+                  (*context* & contextVar))
+          ;; TEMPORARY KLUDGE UNTIL ENVIRONMENTS BECOME REAL:
+          && (choose (and (symbol? environment)
+                          (not (eql? environment (quote NULL))))
+                     (bquote ((ignore & environment)))
+                     NIL)
+	  ;; TEMPORARY.  CAN BE REMOVED ONCE WE ADD MORE PRECISE
+	  ;; PROCESS LOCKING IN POWERLOOM.
+	  (with-process-lock *powerloom-lock* ; Force synchronization
+            && body)))))))
+
+
+  ;;
+;;;;;; Kludges
+  ;;
+
+(defglobal *cyc-kludges-enabled?* BOOLEAN FALSE)
+
+(defmacro when-cyc-kludges-enabled (&body (body CONS))
+  ;; Kludge to allow de/activation of Cyc specific kludges as needed
+  ;;    by the WhyNot module.
+  ;; Also serves to annotate them as such.
+  (return
+    (bquote
+     (when *cyc-kludges-enabled?*
+       && body))))

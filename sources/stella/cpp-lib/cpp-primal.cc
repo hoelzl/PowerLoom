@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2003      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: cpp-primal.cc,v 1.55 2003/04/18 21:15:58 hans Exp
+// Version: cpp-primal.cc,v 1.64 2006/05/10 02:33:14 hans Exp
 
 // Native C++ support for STELLA
 
@@ -122,6 +122,15 @@ int round(int n) {
 int round(double n) {
   return (int) ::floor(n+0.5);
 }
+
+int truncate (int n) {
+  return n;
+}
+
+int truncate(double n) {
+  return (int) n;
+}
+
 
 // `double exp(double x)' already available in math.h.
 
@@ -286,9 +295,23 @@ int stringPosition(char* string, char character, int start) {
   // Return the position of 'character' within 'string' (counting
   // from zero), or return NULL if 'character' does not occur within 'string'.
 
-  int i = start;
+  int i = (start == NULL_INTEGER) ? 0 : start;
   int string_length = strlen(string);
   for (; i < string_length; i++) {
+    if (string[i] == character) {
+      return i;
+    }
+  }
+  return NULL_INTEGER;
+}
+
+int stringLastPosition(char* string, char character, int end) {
+  // Return the position of the last occurence of 'character' within
+  // 'string' (counting from zero), or return NULL if 'character'
+  //  does not occur within 'string'.  Counts backward from 'end'.
+
+  int i = (end == NULL_INTEGER) ? strlen(string) : end;
+  for (; i >= 0; i--) {
     if (string[i] == character) {
       return i;
     }
@@ -302,7 +325,7 @@ int stringSearch(char* string, char* substring, int start) {
   // a substring.
   int begin, end;
 
-  begin = start;
+  begin = (start == NULL_INTEGER) ? 0 : start;
   int stringLength = strlen(string);
   if (stringLength < (strlen(substring) + begin))
     return NULL_INTEGER;
@@ -372,6 +395,22 @@ char* integerToString(int i) {
   return(ostringstream_to_c_string(&s));
 }
 
+char* integerToHexString(int i) {
+  std::ostringstream s;
+  s << std::hex << i;
+  return(ostringstream_to_c_string(&s));
+}
+
+char* integerToStringInBase(int i, int base) {
+  // BUG:  Only supports base 8, 10, 16:
+  // SHOULD ADD IN THE GENERAL CODE FROM THE LISP VERSION
+  // AND USE IT IF base IS NOT 8, 10 OR 16.
+  std::ostringstream s;
+  s << std::setbase(base) << i;
+  return(ostringstream_to_c_string(&s));
+}
+
+
 char* floatToString(double f) {
   std::ostringstream s;
   s << f;
@@ -387,6 +426,7 @@ char* formatFloat (double v, int n) {
 }
 
 int stringToInteger(char* string) {
+  // TO DO: Consider using std::atoi(string)  instead.
   std::istringstream s(string);
   int result;
   s >> result;
@@ -394,6 +434,7 @@ int stringToInteger(char* string) {
 }
 
 double stringToFloat(char* string) {
+  // TO DO: Consider using std::atof(string)  instead.
   std::istringstream s(string);
   double result;
   s >> result;
@@ -470,8 +511,10 @@ boolean probeFileP(char* filename) {
     return TRUE;
 }
 
+} // end of namespace stella; close here to make MinGW happy
 #include <sys/types.h>
 #include <sys/stat.h>
+namespace stella {
 
 CalendarDate* fileWriteDate(char* filename) {
   // Return the time of the last modification of `filename' if available.
@@ -556,6 +599,12 @@ double ticktockResolution () {
  //
 
 void startupCppPrimal() {
+  // For Darwin dynamic libraries, we need to call GC_init() before
+  // calling any other GC functions (cf. docs/README.darwin).
+  // This shouldn't hurt any non-Darwin systems.
+#ifdef STELLA_USE_GC
+  GC_init();
+#endif
 }
 
 } // end of namespace stella

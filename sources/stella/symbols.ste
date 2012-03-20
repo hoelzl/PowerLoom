@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: symbols.ste,v 1.69 2003/07/16 03:29:20 hans Exp
+;;; Version: symbols.ste,v 1.76 2006/05/11 07:06:26 hans Exp
 
 ;;; Procedures that manipulate keywords and symbols.
 
@@ -324,7 +324,7 @@ to a symbol or surrogate name to form a qualified name.")
         (offset (lookup offsetTable name)))
     (when (defined? offset)
       (return offset))
-    (foreach super in (advance (visible-modules module) 1)
+    (foreach super in (rest (visible-modules module))
         do (setq offset
              (lookup (select-symbol-offset-table super kindOfSym) name))
            (when (defined? offset)
@@ -344,18 +344,12 @@ to a symbol or surrogate name to form a qualified name.")
         (2 (return (get-kwd-from-offset offset))))
       (return NULL)) ))
 
-(defun (lookup-rigid-symbol GENERALIZED-SYMBOL)
-       ((name STRING) (kindOfSym INTEGER))
-  :documentation "Return the symbol named `name'.  Case sensitive."
-  ;; Return the permanent symbol with name 'name' visible from
-  ;;    the current module.
-  (let ((module *module*))
-    (when (qualified-name? name)
-      (mv-setq (module name)
-               (compute-module-and-bare-name name)))
-    (if (defined? module)
-      (return (lookup-rigid-symbol-wrt-module name module kindOfSym))
-      (return NULL)) ))
+(defun (lookup-rigid-symbol GENERALIZED-SYMBOL) ((name STRING) (kindOfSym INTEGER))
+  :documentation "Return the permanent symbol with name 'name' and type
+`kindOfSym' visible from the current module (case-sensitive)."
+  :public? TRUE
+  (return (lookup-rigid-symbol-wrt-module name *module* kindOfSym)))
+
 
 ;;; Top-level symbol lookup functions
 
@@ -566,13 +560,11 @@ not consider inherited modules).  If none exists, intern it locally in
     (special ((*module* (interned-in baseSymbol)))
       (when (defined? *module*)
         (return (intern-rigid-symbol-locally
-                 (choose (case-sensitive? *module*)
-                         newName
-                         (string-upcase newName))
+                 newName
                  *module*
                  SYMBOL-SYM)))
       (setq *module* currentModule)
-      (return (intern-symbol newName)))))
+      (return (intern-rigid-symbol-case-sensitively newName SYMBOL-SYM FALSE)))))
 
 (defun (intern-surrogate SURROGATE) ((name STRING))
   :documentation "Return a newly-created or existing surrogate with name `name'."
@@ -1026,15 +1018,22 @@ and the fill digits.")
   :public? TRUE :globally-inline? TRUE
   ;; NOTE: This does preserve the module information as opposed to
   ;;    `surrogate-to-symbol' which doesn't.
-  (return (type-to-symbol surrogate)))
+  (return (intern-symbol-in-module (symbol-name surrogate) (interned-in surrogate) FALSE))
+  ;(return (type-to-symbol surrogate))
+  )
 
+(defun (symbol-to-type SURROGATE) ((self SYMBOL))
+  :documentation "Convert `self' into a surrogate with the same name and module."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (intern-surrogate-in-module (symbol-name self) (interned-in self) TRUE)))
+  
 (defun (string-to-surrogate SURROGATE) ((self STRING))
+  :documentation "Return a surrogate with the name 'self' visible
+in the current module.  Very tricky: The logic is designed to avoid
+returning an inherited surrogate that has no value.  In that case,
+a new local surrogate is created that shadows the inherited surrogate."
   :public? TRUE
-  ;; Return a surrogate with the same name as 'self'.
-  ;; Very tricky: The logic is designed to avoid returning
-  ;;    an inherited surrogate that has no value.  In that case,
-  ;;    a new local surrogate is created that shadows the inherited
-  ;;    surrogate.
   (let ((surrogate
          (intern-surrogate-in-module self *module* FALSE)))
     (when (or (eql? (home-context surrogate) *module*)
@@ -1043,14 +1042,13 @@ and the fill digits.")
     (return (intern-surrogate-in-module self *module* TRUE)) ))
 
 (defun (symbol-to-surrogate SURROGATE) ((self SYMBOL))
+  :documentation "Return a surrogate with the same name as 'self'.
+Very tricky: The logic is designed to avoid returning an inherited surrogate
+that has no value.  In that case, a new local surrogate is created that shadows
+the inherited surrogate.  Unlike 'string-to-surrogate', the search starts first
+from the home context of 'self', and if that fails, then it restarts in
+*module*."
   :public? TRUE
-  ;; Return a surrogate with the same name as 'self'.
-  ;; Very tricky: The logic is designed to avoid returning
-  ;;    an inherited surrogate that has no value.  In that case,
-  ;;    a new local surrogate is created that shadows the inherited
-  ;;    surrogate.  Unlike 'string-to-surrogate', the search
-  ;;    starts first from the home context of 'self', and
-  ;;    if that fails, then it restarts  in *module*.
 ;  (when (explicitly-qualified-symbol? self)
 ;    (within-module (home-context self)
 ;       (return (string-to-surrogate (symbol-name self)))))
@@ -1064,40 +1062,41 @@ and the fill digits.")
     ;;    surrogate with NULL value:
     (return (string-to-surrogate (symbol-name self))) ))
 
-;;; 'surrogatify' converts 'self' into a surrogate, even when
-;;;    it's a symbol or a string.
+
 (defmethod (surrogatify SURROGATE) ((self SURROGATE))
+  :documentation "Converts 'self' into a surrogate."
   :public? TRUE
-  (return self) )
+  (return self))
 
 (defmethod (surrogatify SURROGATE) ((self SYMBOL))
   :public? TRUE
-  ;; Turn transient symbols into permanent ones.
-  ;; Make sure the generated surrogate lives in the same module as 'self'
-  ;;    and is not inherited from a parent module.
+  :documentation "Converts 'self' into a surrogate (same semantics
+as `symbol-to-surrogate' which see)."
   (return (symbol-to-surrogate self)) )
 
 (defmethod (surrogatify SURROGATE) ((self STRING))
   :public? TRUE
+  :documentation "Converts 'self' into a surrogate."
+  ;;; THIS SEEMS WRONG (or SYMBOL.surrogatify is), since they do
+  ;;; use different semantics; should use `string-to-surrogate' here
   (return (intern-surrogate self)) )
 
+#|
+;;; Hopefully obsolete:
 (defmethod (surrogatify SURROGATE) ((self CONS))
   :public? TRUE
   ;; Catch case of NIL
   (if (nil? self)
     (return (intern-surrogate "NIL"))
     (error "Cons passed to 'surrogatify'")) )
+|#
 
 (defmethod (surrogatify SURROGATE) ((self OBJECT))
   :public? TRUE
-  (error "OBJECT passed to 'surrogatify'")
-  ; (return NULL)
-  )
+  (error "Don't know how to 'surrogatify' " self))
 
 (defun (typify TYPE) ((self OBJECT))
   :public? TRUE
-  ;; Convert transient type to permanent type (assuming
-  ;;    'with-transient-objects' is not in effect).
   (return (surrogatify self)) )
 
 ;;; 'keywordify' converts 'self' into a keyword, even when
@@ -1133,58 +1132,45 @@ and the fill digits.")
 
 
   ;;
-;;;;;;  'intern-generalized-symbol' and friends (minus qualified pathnames)
+;;;;;;  Support for parsing and printing of STELLA symbols
   ;;
 
 (defun (surrogate-name? BOOLEAN) ((name STRING))
+  :documentation
+  "Return TRUE if name is prefixed by 'SURROGATE-PREFIX-CHARACTER'."
   :public? TRUE
-  ;; Return TRUE if name is prefixed by 'SURROGATE-PREFIX-CHARACTER'.
   (return (and (> (length name) 0)
                (eq? (nth name 0) SURROGATE-PREFIX-CHARACTER))) )
 
-(defun (qualified-name? BOOLEAN) ((name STRING))
-  :public? TRUE
-  ;; Return TRUE if 'name' contains the character MODULE-SEPARATOR-CHARACTER,
-  ;;    or if it begins with a DOT (so that "." and ".." are found).
-  ;; We reject the name "/", since the divide character needs to be
-  ;;    accessible.
-  ;; We als reject module names that begin with a digit or .<digit> to
-  ;;    allow numbers with unit information such as `0.5km/h'.
-  (cond ((= (length name) 0) (return FALSE))
-        ((member? name MODULE-SEPARATOR-CHARACTER)
-         (when (> (length name) 1)
-           (when (digit-character? (nth name 0))
-             (return FALSE))
-           (when (and (eql? (nth name 0) #\.)
-                      (digit-character? (nth name 1)))
-             (return FALSE))
-           (return TRUE)))
-        ((eq? (nth name 0) #\.)
-         (case (length name)
-           (1 (return TRUE))
-           (2 (when (eql? (nth name 1) #\.)
-                (return TRUE)))
-           (otherwise NULL))))
-  (return FALSE))
-
 (defun (keyword-name? BOOLEAN) ((name STRING))
+  :documentation "Return TRUE if name is prefixed by ':'."
   :public? TRUE
-  ;; Return TRUE if name is prefixed by ':'.
   (return (and (> (length name) 0)
                (eq? (nth name 0) #\:))) )
 
-(defun (intern-generalized-symbol GENERALIZED-SYMBOL) ((name STRING))
+(defun (intern-stella-name GENERALIZED-SYMBOL) ((name STRING))
+  :documentation "Parse `name' which is assumed to be the printed
+representation of a STELLA symbol, surrogate or keyword, intern
+it into the current or specified module and return the result.
+This is identical to calling `unstringify' on `name' but 10-15
+times faster."
   :public? TRUE
-  ;; Return a symbol or keyword.
-  (cond
-   ((qualified-name? name)          ; contains #\/ ?
-    (return (intern-qualified-name name TRUE)))
-   ((keyword-name? name)                ; prefixed by #\: ?
-    (return (intern-keyword (rest name))))
-   ((surrogate-name? name)          ; prefixed by #\@ ?
-    (return (intern-surrogate (rest name))))
-   (otherwise
-    (return (intern-symbol name)))) )
+  ;; replaces the old `intern-generalized-symbol'
+  (let ((module *module*))
+    (mv-bind (bareName moduleName kind)
+        (parse-stella-name name TRUE)
+      (when (defined? moduleName)
+        (setq module (get-stella-module moduleName TRUE)))
+      (case kind
+        (:SYMBOL
+         (if (and *transientObjects?*
+                  (null? moduleName))
+             (return (intern-transient-symbol bareName))
+           (return (intern-symbol-in-module bareName module FALSE))))
+        (:SURROGATE
+         (return (intern-surrogate-in-module bareName module FALSE)))
+        (:KEYWORD
+         (return (intern-rigid-symbol-wrt-module bareName NULL KEYWORD-SYM)))))))
 
 (defun (compute-full-name STRING) ((name STRING) (module MODULE))
   :public? TRUE

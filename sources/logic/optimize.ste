@@ -1,0 +1,2693 @@
+; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: optimize.ste,v 1.79 2006/05/11 07:05:25 hans Exp
+
+;;; PowerLoom Query Optimizer
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(defclass GOAL-RECORD (STANDARD-OBJECT)
+  :slots
+  ((generator-goals :type (LIST OF PROPOSITION) :allocation :embedded)
+;   (generator-costs :type (LIST OF INTEGER-WRAPPER) :allocation :embedded)
+   (other-goals :type (LIST OF PROPOSITION) :allocation :embedded)) )
+
+
+  ;;
+;;;;;; Optimizer utility predicates
+  ;;
+
+;; USE THIS IF THE SAFETY CHECK GOES OFF:
+;(defun (variable-bound? BOOLEAN) ((variable PATTERN-VARIABLE))
+;  ;; Return TRUE if 'variable' is bound.
+;  (cond
+;   ((defined? (bound-to variable)) (return TRUE))
+;   ((defined? (variable-value variable))
+;    (if (not (isa? (variable-value variable) @PATTERN-VARIABLE))
+;      (return TRUE)
+;      (return (variable-bound? (variable-value variable)))))
+;   (otherwise (return FALSE))) )
+
+(defun (variable-bound? BOOLEAN) ((variable PATTERN-VARIABLE))
+  ;; Return TRUE if 'variable' is bound.
+  ;; IF THIS SAFETY CHECK FAILS, REWRITE USING MORE COMPLEX TEST
+  ;;    FOR FOLLOWING 'variable-value' LINKS:
+  (safety 3 (or (null? (variable-value variable))
+                (not (isa? (variable-value variable) @PATTERN-VARIABLE)))
+          "BUG: Need to rewrite the 'variable-bound?' procedure")
+  (return (or (defined? (bound-to variable))
+              (defined? (variable-value variable)))) )
+
+(defun (argument-bound? BOOLEAN) ((argument OBJECT))
+  ;; Return TRUE if 'argument' is a bound variable, a proposition
+  ;;    all of whose arguments (recursively) are bound, or a constant.
+  (typecase argument
+    (PATTERN-VARIABLE
+     (return (variable-bound? argument)))
+    (PROPOSITION
+     (if (defined? (io-variables argument))
+         (return (quantified-argument-bound? argument NULL))
+       (return (forall arg in (arguments argument)
+                   always (argument-bound? arg)))))
+    (DESCRIPTION
+     (return (or (null? (external-variables argument))
+                 (forall v in (external-variables argument)
+                     always (argument-bound? v)))))
+    (otherwise (return TRUE))) )
+
+(defun (quantified-argument-bound? BOOLEAN) ((argument OBJECT) (quantifiedVars LIST))
+  ;; Just like `argument-bound?' but also considers quantified variables
+  ;;    introduced by quantified argument propositions.
+  ;; Having the separate version saves the extra complexity for the
+  ;;    far less common case.
+  (when (null? quantifiedVars)
+    (setq quantifiedVars (new LIST)))
+  (typecase argument
+    (PATTERN-VARIABLE
+     (return (or (variable-bound? argument)
+                 (memb? quantifiedVars argument))))
+    (PROPOSITION
+     (let ((ioVars (io-variables argument)))
+       (when (defined? ioVars)
+         (foreach var in ioVars
+             do (insert quantifiedVars var)))
+       (return (forall arg in (arguments argument)
+                   always (quantified-argument-bound? arg quantifiedVars)))))
+    (DESCRIPTION
+     (return (or (null? (external-variables argument))
+                 (forall v in (external-variables argument)
+                     always (quantified-argument-bound? v quantifiedVars)))))
+    (otherwise (return TRUE))) )
+
+(defun (unbound-variable? BOOLEAN) ((argument OBJECT))
+  ;; Return TRUE if 'argument' is an unbound pattern variable.
+  (typecase argument
+    (PATTERN-VARIABLE
+     (return (not (variable-bound? argument))))
+    (otherwise (return FALSE))) )
+
+(defun (has-disjunction? BOOLEAN) ((goal PROPOSITION))
+  ;; Return TRUE if 'goal' is a disjunction or contains
+  ;;    a proposition argument containing a disjunction.
+  (when (eql? (kind goal) :OR)
+    (return TRUE))
+  (return (exists arg in (arguments goal)
+                  where (and (isa? arg @PROPOSITION)
+                             (has-disjunction? arg)))) )
+
+;;; NOTHING CALLS THIS!!!:
+(defun (modal-goal? BOOLEAN) ((goal PROPOSITION))
+  ;; Return TRUE if 'goal' contains a propositional argument.
+  (return (exists arg in (arguments goal) where (isa? arg @PROPOSITION))) )
+
+;;; NOTHING CALLS THIS EITHER:
+(defun (has-inversions? BOOLEAN) ((goal PROPOSITION))
+  ;; Assumes that 'goal' is a :FUNCTION goal.
+  (return
+   (defined? (permutation-table (get-description (relationRef goal))))) )
+
+(defun (computed-term? BOOLEAN) ((self DESCRIPTION))
+  ;; Designed for use by both a specialist and procedural code.
+  ;; Return TRUE if 'self' is a relation that can be evaluated
+  ;;    only when all of its input arguments are bound.
+  ;; TO DO: FIGURE OUT IF SOME INFERENCE SHOULD BE ADDED HERE:
+  (return (test-property? self PL-KERNEL/@COMPUTED)) )
+
+(defun (computed-constraint? BOOLEAN) ((self DESCRIPTION))
+  ;; Return TRUE if 'self' is a relation that can be evaluated by a constraint
+  ;;    computation as long as at most one of its arguments are unbound.
+  (return
+    (and (test-property? self PL-KERNEL/@COMPUTED)
+         (defined? (access-binary-value
+                    self PL-KERNEL-KB/@RELATION-CONSTRAINT)))))
+
+(defun (computed-predicate? BOOLEAN) ((goal PROPOSITION))
+  ;; Return TRUE if all input arguments to 'goal' must be bound
+  ;;    for it to be evaluated.
+  (let ((description (get-description (relationRef goal))))
+    (return
+      (and (defined? description)
+           (or (computed-term? description)
+               (member? (quote (PL-KERNEL/@LISTOF PL-KERNEL/@SETOF))
+                        (surrogate-value-inverse description)))) )))
+
+(defun (simulate-create-choice-point INTEGER) ()
+  ;; Return the offset to the first unused location on the unbinding stack.
+  ;; Logic copied from 'create-choice-point'.
+  (return (1+ (top-unbinding-stack-offset 
+               (current-pattern-record *queryIterator*)))) )
+
+
+  ;;
+;;;;;; Determination of enumerated class extensions
+  ;;
+
+(defun (relation-supports-extension? BOOLEAN) ((self NAMED-DESCRIPTION))
+  ;; Helping function for 'generator-collection?'
+  ;; Return TRUE if the members of self can be enumerated.
+  ;; IDEA: WE COULD ELIMINATE THE LITERAL TEST IF WE MARKED ALL LITERAL
+  ;;    CLASSES abstract?:
+  (return
+    (and (not (test-property? self PL-KERNEL/@ABSTRACT))
+         (not (logical-subtype-of-literal? (surrogate-value-inverse self)))
+         ;; THIS ISN'T WORKING OUT YET -rmm
+         #|
+         (or (defined? (extension self))
+             ;; assumes (for now at least) that unnamed descriptions
+             ;;    can be enumerated:
+             (defined? (equivalent-value self)))
+             |#
+         )))
+
+(defun (generator-collection? BOOLEAN) ((collection OBJECT))
+  ;; Called by 'distribute-open-goal' to determine if members of
+  ;;   'collection' can be explicitly enumerated.
+  (when (and *reversePolarity?*
+             (not (closed-term? collection)))
+    (return FALSE))
+  (typecase collection
+    (DESCRIPTION
+     (return
+      ;; assumes that an unnamed description can enumerated:
+      (or  (not (isa? collection @NAMED-DESCRIPTION))
+           (relation-supports-extension? collection))))
+    (PATTERN-VARIABLE
+     (let ((boundToValue (argument-bound-to collection)))
+       (cond
+        ;; QUESTION: CAN THE BOUND VALUE EVER BE SOMETHING OTHER THAN 
+        ;;    BOUND? (POSSIBLY IF THE 'variable-value' LINK MAKES IT SO)?
+        ((defined? boundToValue)
+         (return (generator-collection? boundToValue)))
+        ;; QUESTION: IS THIS A SUFFICIENT TEST?:
+        ((defined? (defining-proposition collection))
+         (return TRUE))
+        (otherwise
+         (return FALSE)))))
+    (SURROGATE
+     (return (relation-supports-extension? (get-description collection))))
+    (otherwise (return TRUE))) )
+
+  
+  ;;
+;;;;;; Goal Record procedures
+  ;;
+
+(defun initialize-optimizer-goal-records ((size INTEGER))
+  ;; Insure that sufficient goal records exist, and that they are all
+  ;;    cleared.
+  (let ((stack (optimizer-goal-records *queryIterator*)))
+    (when (null? stack)
+      (setq stack (new EXTENSIBLE-VECTOR :array-size 20))
+      (setf (optimizer-goal-records *queryIterator*) stack))
+    (when (> size (length stack))       ; extend size of stack if necessary
+      (insert-at stack size NULL))
+    (foreach i in (interval 0 (1- size))
+             do
+             (let ((goalRecord (nth stack i)))
+               (when (null? goalRecord)
+                 (setq goalRecord (new GOAL-RECORD))
+                 (setf (nth stack i) goalRecord))
+               (clear (generator-goals goalRecord))
+               (clear (other-goals goalRecord)))) ))
+
+(defun (goal-record GOAL-RECORD) ((variable PATTERN-VARIABLE))
+  ;; Return the goal record for 'variable'.
+  (return
+   (nth (optimizer-goal-records *queryIterator*)
+        (bound-to-offset variable)) ) )
+
+(defspecial *distributedOpenGoal?* BOOLEAN FALSE
+  :documentation "Used by 'distribute-open-goal' to signal that
+a goal was distributed by 'help-distribute-goal'.")
+             
+(defun help-distribute-goal ((argument OBJECT) (parentGoal PROPOSITION)
+                             (generator? BOOLEAN))
+  ;; Helping function for 'distribute-open-goal'.
+  ;; 'parentGoal' represents a goal that contains 'argument' nested somewhere
+  ;;    within it.
+  (typecase argument
+    (PATTERN-VARIABLE
+     (when (variable-bound? argument)
+       (return))
+     (let ((goalRecord (goal-record argument)))
+       ;; if 'argument' appears more than once in 'parentGoal', we record
+       ;;    it only once:
+       (when (or (member? (generator-goals goalRecord) parentGoal)
+                 (member? (other-goals goalRecord) parentGoal))
+         (return))
+       (if generator?
+         (insert (generator-goals goalRecord) parentGoal)
+         (insert (other-goals goalRecord) parentGoal))
+       (setq *distributedOpenGoal?* TRUE)))
+    (PROPOSITION 
+     ;; 'parentGoal' is a modal proposition containing the proposition 'argument':
+     (foreach arg in (arguments argument)
+              do (help-distribute-goal arg parentGoal generator?)))
+    (otherwise NULL)) )
+
+(defun distribute-open-goal ((goal PROPOSITION))
+  ;; Called by 'optimize-ordering-of-conjuncts'.
+  ;; Attach 'goal' to the goal records for each of its variable arguments.
+  ;; If a propositional argument is encountered (so 'goal' must be a modal),
+  ;;    recursively distribute that proposition to its variable arguments.
+  ;; Only an original goal is stored -- if 'modalParentGoal' is defined,
+  ;;    variables within 'goal' are attached to 'modalParentGoal'.
+  (special ((*distributedOpenGoal?* FALSE))
+   (case (kind goal)
+     (:FUNCTION
+      ;; UPGRADE NEEDED: IF SINGLE-ARG FUNCTION AND OUTPUT ARG IS A UNIQUENESS
+      ;;    KEY, THEN DON'T DISTRIBUTE:
+      (foreach arg in (but-last (arguments goal))
+               do (help-distribute-goal
+                   arg goal (not (computed-predicate? goal))))
+      (help-distribute-goal 
+       (last-argument goal) goal FALSE))
+     (:EQUIVALENT
+      (foreach arg in (arguments goal)
+               do (help-distribute-goal arg goal FALSE)))
+     (:ISA
+      (help-distribute-goal 
+       (first (arguments goal)) goal
+       (generator-collection? (get-description (relationRef goal)))))
+      ;; UPGRADE NEEDED: IF BINARY PREDICATE AND OTHER ARG IS A UNIQUENESS
+      ;;    KEY, THEN DON'T DISTRIBUTE:
+     (:PREDICATE
+      (foreach arg in (arguments goal)
+               do (help-distribute-goal
+                   arg goal (not (computed-predicate? goal)))))
+     ((:NOT :FAIL)
+      (help-distribute-goal (first (arguments goal)) goal FALSE))
+     (:IMPLIES
+      (foreach arg in (arguments goal)
+               do (help-distribute-goal arg goal TRUE)))
+     (otherwise
+      NULL))
+   ;; if 'goal' has not been distributed, record it as a residue goal:
+   (when (not *distributedOpenGoal?*)
+     (insert (residue-goals *queryIterator*) goal)) ))
+
+
+  ;;
+;;;;;; Computing uniqueness vector lists and indexing vectors
+  ;;
+
+;;; These routines compute vectorized representation of data used
+;;;    by the query optimizer.
+
+(defslot NAMED-DESCRIPTION uniquenessVectors :type (LIST OF BOOLEAN-VECTOR)
+  :documentation "Caches a list of vectors representing keys
+for the slot/relation.")
+
+(defslot NAMED-DESCRIPTION indexing-vector :type BOOLEAN-VECTOR
+  :documentation "Caches a vector indicating which arguments
+of a slot/relation have backlinks to referencing propositions.")
+
+;;; Constants used by 'get-uniqueness-vectors' and
+;;;    'get-indexing-vector' so that
+;;;    return values can be structure-shared:
+
+(defconstant V-0-0 BOOLEAN-VECTOR (zero-one-list-to-boolean-vector (list 0 0)))
+
+(defconstant V-1-0 BOOLEAN-VECTOR (zero-one-list-to-boolean-vector (list 1 0)))
+
+(defconstant V-0-1 BOOLEAN-VECTOR (zero-one-list-to-boolean-vector (list 0 1)))
+
+(defconstant V-1-1 BOOLEAN-VECTOR (zero-one-list-to-boolean-vector (list 1 1)))
+
+(defconstant V-1-0-AND-V-0-1 (LIST OF BOOLEAN-VECTOR) (list V-1-0 V-0-1))
+
+(defconstant V-1-0-SINGLETON (LIST OF BOOLEAN-VECTOR) (list V-1-0))
+
+(defconstant V-0-1-SINGLETON (LIST OF BOOLEAN-VECTOR) (list V-0-1))
+
+(defun (get-binary-uniqueness-vectors (LIST OF BOOLEAN-VECTOR))
+       ((self NAMED-DESCRIPTION))
+  ;; Return a list of vectors, each of which specifies a uniqueness key
+  ;;    for 'self'.  Each key specifies a set of columns, such that
+  ;;    binding those columns uniquely determines the identity of a
+  ;;    slot-instance (a tuple).
+  (let ((singleValuedInverse?
+         (and (defined? (inverse-description self))
+              (single-valued-term? (inverse-description self)))))
+    (if (single-valued-term? self)
+      (return (choose singleValuedInverse? V-1-0-AND-V-0-1 V-1-0-SINGLETON))
+      (return (choose singleValuedInverse? V-0-1-SINGLETON NIL-LIST))) ))
+
+(defun (get-uniqueness-vectors (LIST OF BOOLEAN-VECTOR)) ((self NAMED-DESCRIPTION))
+  ;; Return a list of vectors, each of which specifies a uniqueness key
+  ;;    for 'self'.  Each key specifies a set of columns, such that
+  ;;    binding those columns uniquely determines the identity of a
+  ;;    slot-instance (a tuple).
+  (when (eql? (arity self) 2)
+    (return (get-binary-uniqueness-vectors self)))
+  (let ((cachedVectorList (LIST OF BOOLEAN-VECTOR) (uniquenessVectors self)))
+    (if (defined? cachedVectorList)
+      (return cachedVectorList)
+      (return NIL-LIST)) ))
+
+(defun (get-binary-indexing-vector BOOLEAN-VECTOR) ((self NAMED-DESCRIPTION))
+  ;; Return a vector that specifies which columns of 'self' are indexed.
+  ;; A column is indexed if backlinked? is true of its type, or if
+  ;;    a hash index for it exists.
+  (let ((ioVariableTypes (io-variable-types self))
+        (typeOne (ensure-deferred-description (nth ioVariableTypes 0)))
+        (typeTwo (ensure-deferred-description (nth ioVariableTypes 1)))
+        (bitOne? (type-has-backlinks? typeOne))
+        (bitTwo? (type-has-backlinks? typeTwo)))
+    (if bitOne?
+      (return (choose bitTwo? V-1-1 V-1-0))
+      (return (choose bitTwo? V-0-1 V-0-0))) ))
+
+(defun (get-indexing-vector BOOLEAN-VECTOR) ((self NAMED-DESCRIPTION))
+  ;; Return a vector that specifies which columns of 'self' are indexed.
+  ;; A column is indexed if backlinked? is true of its type, or if
+  ;;    a hash index for it exists.
+  (when (eql? (arity self) 2)
+    (return (get-binary-indexing-vector self)))
+  (let ((cachedVector (indexing-vector self)))
+    (when (defined? cachedVector)
+      (return cachedVector))
+    (let ((zeroOneList (new (LIST OF INTEGER-WRAPPER))))
+      (foreach type in (io-variable-types self)
+          ;; TO DO: ACCOUNT FOR HASH INDICES:
+          collect (choose (type-has-backlinks?
+                           (ensure-deferred-description type))
+                          ONE-WRAPPER
+                          ZERO-WRAPPER)
+               into zeroOneList)
+      (setf (indexing-vector self) 
+            (zero-one-list-to-boolean-vector zeroOneList))
+      (free zeroOneList)
+      (return (indexing-vector self))) ))
+
+
+  ;;
+;;;;;; Computing the cheapest generator goal
+  ;;
+
+;;; These constants and routines are called by 'estimate-goal-cost'
+;;;    to estimate the cost of binding a variable using a particular
+;;;    goal or kind of goal.
+
+(defconstant ESTIMATED-SLOT-VALUE-COLLECTION-SIZE COST-ESTIMATE 4.0
+  :documentation "Estimate of the average size of a collection
+representing the fillers of a slot.")
+
+(defconstant ESTIMATED-NUMBER-OF-PREDICATE-BINDINGS COST-ESTIMATE 6.0
+  :documentation "Very crude estimate of the number of stored propositions
+that will match a predicate at least one of whose arguments are bound.
+Chosen to be larger than ESTIMATED-SLOT-VALUE-COLLECTION-SIZE.")
+
+(defconstant ESTIMATED-SIZE-OF-CLASS-EXTENSION COST-ESTIMATE 11.0
+  :documentation "Must be greater than ESTIMATED-NUMBER-OF-PREDICATE-BINDINGS
+to force the optimizer to prefer predicates containing at least
+one bound variable.  Also greater than ESTIMATED-SIZE-OF-PREDICATE-EXTENSION,
+for no particularly valid reason.")
+
+(defconstant ESTIMATED-CARDINALITY-OF-DESCRIPTION COST-ESTIMATE 20.0
+  :documentation "Indefensible estimate of the number instances
+generable by an arbitrary unnamed description.")
+
+(defconstant ESTIMATED-CARDINALITY-OF-MEMBER-OF COST-ESTIMATE 30.0
+  :documentation "Even more indefensible estimate of the number instances
+generable by a 'member-of' predicate.  CAUTION: Must be set
+less than 'ESTIMATED-CARDINALITY-OF-SUBSET-OF'.")
+
+(defconstant ESTIMATED-CARDINALITY-OF-SUBSET-OF COST-ESTIMATE 40.0
+  :documentation "Egregiously indefensible estimate of the number instances
+generable by a 'subset-of' predicate.  Set high because 'subset-of'
+can't generate all defined supersets or subsets, causing potential
+incompleteness.")
+
+(defun update-observed-cardinality ((self NAMED-DESCRIPTION) (cardinality INTEGER))
+  ;; Assign 'cardinality' to be the observed cardinality of 'self'.
+  (within-context *module*
+    (special ((*invisibleAssertion?* TRUE))              
+      (assert-tuple PL-KERNEL/@OBSERVED-CARDINALITY-OF (cons-list self cardinality)))) )
+
+(defun (access-observed-cardinality INTEGER) ((self DESCRIPTION))
+  ;; Assign 'cardinality' to be the observed cardinality of 'self'.
+  (within-context *module*
+    (let ((value (access-binary-value self PL-KERNEL/@OBSERVED-CARDINALITY-OF)))
+      (if (and (defined? value)
+               (isa? value @INTEGER-WRAPPER))
+        (return value)
+        (return NULL)))) )
+
+(defun (estimate-cardinality-of-extension COST-ESTIMATE) ((description NAMED-DESCRIPTION))
+  ;; If the cardinality of 'self' has been cached, return that value
+  ;;    (even though it might be out of date).  Otherwise, compute
+  ;;    the cardinality  of the extension, cache it, and return the value.
+  ;; Returns a minimum value of 5 (this being one more than the value
+  ;;    returned by a multi-valued slot).
+  ;; ADD LOGIC THAT RECOMPUTES THIS VALUE EVERY SO OFTEN (IN CASE THE
+  ;;    CACHED VALUE GOES OUT OF DATE).
+  (when (or (null? description)
+            (not (relation-supports-extension? description)))
+    (return NULL))
+  (let ((estimate (access-observed-cardinality description)))
+    (when (and (null? estimate)
+               (defined? (extension description)))
+      (setq estimate (estimated-length (extension description))))
+    (when (null? estimate)
+      (setq estimate 0.0))
+    (return (max estimate
+                 (choose (class-description? description)
+                         ;; don't let class estimate be too low, since classes
+                         ;;    often have subclasses:
+                         ESTIMATED-SIZE-OF-CLASS-EXTENSION
+                         ;; this seems extremely arbitrary (hc):
+                         (* ESTIMATED-NUMBER-OF-PREDICATE-BINDINGS
+                            ESTIMATED-NUMBER-OF-PREDICATE-BINDINGS
+                            ESTIMATED-NUMBER-OF-PREDICATE-BINDINGS))))) )
+   
+(defun (estimate-MEMBER-OF-goal-fanout COST-ESTIMATE) ((goal PROPOSITION))
+  ;; Estimate the cost of generating bindings for the 'member-of'
+  ;;    proposition 'goal'.
+  (let ((memberValue (argument-bound-to (first (arguments goal))))
+        (collectionValue (argument-bound-to (second (arguments goal)))))
+    (safety 3 (or (null? memberValue) (null? collectionValue))
+            "OOPS: FORGOT HOW OPTIMIZER WORKS")
+    (cond
+     ((defined? memberValue)
+      ;; this is a hack to discourage using 'member-of' as a generator.
+      ;; CAUTION: It must be cheaper than using 'subset-of' as a generator.
+      (return ESTIMATED-CARDINALITY-OF-MEMBER-OF))
+     ((defined? collectionValue)
+      (typecase collectionValue
+        (DESCRIPTION
+         (return
+          (choose (isa? collectionValue @NAMED-DESCRIPTION)
+                  (estimate-cardinality-of-extension collectionValue)
+                  ESTIMATED-CARDINALITY-OF-DESCRIPTION)))
+        (COLLECTION
+         (return (length collectionValue)))
+        (otherwise
+         ;; neither argument is bound:
+         (return ESTIMATED-SLOT-VALUE-COLLECTION-SIZE))))
+     (otherwise (return NULL))) ))
+
+(defun (estimate-PREDICATE-goal-fanout COST-ESTIMATE) ((goal PROPOSITION))
+  ;; Estimate the cost of generating bindings for 'goal', given the
+  ;;    current set of bindings (lower cost is better).
+  ;; Return NULL-INTEGER if new bindings for 'goal' cannot be generated.
+  ;; 'goal' is a :FUNCTION or :PREDICATE proposition.
+  (when (member-of-proposition? goal)
+    (return (estimate-MEMBER-OF-goal-fanout goal)))
+  (let ((description (get-description (relationRef goal)))
+        (goalVector (arguments-vector-to-boolean-vector (arguments goal))))
+    (when (null? description)
+      (return NULL))
+; (print "GOALVECTOR: " goalVector EOL)
+; (print "INDEXINGVECTOR: " (get-indexing-vector description) EOL)
+    ;; search for a bound argument indexed by 'goal':
+    (when (not (exists gBit in goalVector
+                       as iBit in (get-indexing-vector description)
+                       where (and (eql? iBit TRUE-WRAPPER)
+                                  (eql? gBit TRUE-WRAPPER))))
+      (return (estimate-cardinality-of-extension 
+               (get-description (relationRef goal)))))
+    ;; search for uniqueness key that matches 'vector' on each of its
+    ;;    columns, indicating a cost = 1 match.
+    (let ((allBitsMatch? BOOLEAN NULL))
+      (foreach uniquenessKey in (get-uniqueness-vectors description) 
+               do
+               (setq allBitsMatch? TRUE)
+               (foreach uBit in uniquenessKey
+                        as gBit in goalVector
+                        where (and (eql? uBit TRUE-WRAPPER)
+                                   (eql? gBit FALSE-WRAPPER))
+                        do
+                        (setq allBitsMatch? FALSE)
+                        (break))
+               (when allBitsMatch?
+                 (return 1.0)))
+      (return ESTIMATED-NUMBER-OF-PREDICATE-BINDINGS)) ))
+
+(defconstant INFERABLE-PENALTY-COST COST-ESTIMATE 7.0
+  :documentation "Amount of penalty for using inferable relations as goals.")
+
+(defconstant SUBSET-OF-PENALTY-COST COST-ESTIMATE 20.0
+  :documentation "Amount of penalty for using 'subset-of' as a goal.")
+
+;;; MAYBE TO DO: Handle HOLDS propositions similar to what we do in the
+;;;    dynamic optimizer.
+
+(defun (estimate-goal-cost COST-ESTIMATE) ((goal PROPOSITION))
+  ;; Estimate the cost, as measured by the expected amount of work associated
+  ;;    with the goal 'goal'.
+  (case (kind goal)
+    ((:ISA :FUNCTION :PREDICATE)
+     (let ((description (get-description (relationRef goal))))
+       (if (or (null? description)
+               (not (inferable? description)))
+         (return 1.0)
+         (return INFERABLE-PENALTY-COST))))
+    (:IMPLIES                           ; could invoke expensive subsumption test:
+     (return SUBSET-OF-PENALTY-COST))
+    (otherwise (return 1.0))) )
+
+(defun (estimate-goal-fanout COST-ESTIMATE) ((goal PROPOSITION))
+  ;; Estimate the cost, as measured by the number of expected instantiations
+  ;;    of the generator goal 'goal'.
+  (case (kind goal)
+    (:ISA
+     (return (estimate-cardinality-of-extension
+               (get-description (relationRef goal)))))
+    ((:FUNCTION :PREDICATE)
+     (return (estimate-PREDICATE-goal-fanout goal)))
+    (:IMPLIES
+     ;; this is a hack.  Estimated to be very high because completeness
+     ;;    can be compromised using 'subset-of' as a generator:
+     (return ESTIMATED-CARDINALITY-OF-SUBSET-OF))
+    (:EQUIVALENT
+     (if (or (argument-bound? (first (arguments goal)))
+             (argument-bound? (second (arguments goal))))
+       (return 1.0)
+       (return NULL)))
+    ((:NOT :FAIL) (return NULL))) )
+          
+(defun (cheapest-generator-goal PROPOSITION COST-ESTIMATE COST-ESTIMATE)
+       ((variable PATTERN-VARIABLE))
+  ;; Called by 'compute-optimal-open-goal-ordering'.
+  ;; Return the cheapest goal in '(generator-goals (goal-record variable))'
+  ;;    that can generate bindings for all of its unbound arguments.
+  ;; Return a second value representing the estimated 'cost' (using a
+  ;;    completely unspecified metric), and a third representing the
+  ;;    estimated number of bindings of 'variable' generated by the 
+  ;;    selected goal.
+ (trace-if :OPTIMIZER EOL "CHEAPEST: " variable 
+           " GENERATORS: " (generator-goals (goal-record variable)) EOL)
+  (let ((bestGoal PROPOSITION NULL)
+        (bestCost COST-ESTIMATE NULL)
+        (bestFanout COST-ESTIMATE NULL)
+        (generatorCost COST-ESTIMATE NULL)
+        (generatorFanout COST-ESTIMATE NULL))
+    (foreach goal in (generator-goals (goal-record variable))             
+             do
+             (setq generatorCost (estimate-goal-cost goal))
+             (setq generatorFanout (estimate-goal-fanout goal))
+             (when (and (defined? generatorFanout)
+                        (or (null? bestFanout)
+                            (< generatorFanout bestFanout)
+                            (and (eql? generatorFanout bestFanout)
+                                 (< generatorCost bestCost))))
+               (when (and (eql? generatorFanout 1.0)
+                          (eql? generatorCost 1.0))
+                 ;; can't do any better than this:
+                 (return goal 1.0 1.0))
+               (setq bestGoal goal)
+               (setq bestFanout generatorFanout)
+               (setq bestCost generatorCost)))
+    (if (defined? bestFanout)
+      (progn
+        (trace-if :OPTIMIZER "  SELECTED: " bestGoal "  " bestCost "  " bestFanout EOL)
+        (return bestGoal bestCost bestFanout))
+      (return NULL 0.0 0.0)) ))
+
+
+  ;;
+;;;;;; 'optimize-ordering-of-conjuncts' and helping functions
+  ;;
+
+(defun propagate-single-valued-constraints
+       ((goal PROPOSITION) (goalSequence (LIST OF PROPOSITION)))
+  ;; Helping function for 'simulate-bind-variable-and-propagate-constraints'.
+  ;; Also called by 'optimize-ordering-of-conjuncts'.
+  ;; If can immediately bind a new variable (with cost = 1), perform the binding
+  ;;    by recursively calling 'simulate-bind-variable-and-propagate-constraints'.
+  ;; Note: Logic here is similar to 'simulate-goal-evaluation'.
+  ;; CAUTION: Assumes that at least one of the arguments of 'goal' is bound.
+  ;; QUESTION: Can we think of an example of cost = 1 propagation for
+  ;;    modals that are not predicates ('believes', 'holds-at', ...)?
+  (let ((arguments (arguments goal)))
+    (case (kind goal)
+      ((:FUNCTION :PREDICATE)
+       (when (single-valued-term? (get-description (relationRef goal)))
+         ;; TO DO: UPGRADE THIS TO UNDERSTAND UNIQUENESS KEYS:
+         (if (and (forall arg in (but-last arguments)
+                          always (argument-bound? arg))
+                  (unbound-variable? (last arguments)))
+           (progn
+             ;; tricky: we may have pushed 'goal' onto list already, but still
+             ;;    be in the loop thats binding its variables:
+             (when (not (member? goalSequence goal))
+               (push goalSequence goal))
+             (simulate-bind-variable-and-propagate-constraints
+              (last arguments) goalSequence))
+           ;; if permutation-table exists, simulate inverted binding:
+           (progn
+             "NOT YET IMPLEMENTED"))))
+      ((:ISA :IMPLIES) ;; in general, binds to more than one value:
+       NULL)
+      (:EQUIVALENT
+       ;; tricky: relies on fact that at least one arg is bound:
+       (cond
+        ((unbound-variable? (first arguments))
+         (safety 3 (not (member? goalSequence goal)) "Bug in optimizer")
+         (push goalSequence goal)
+         (simulate-bind-variable-and-propagate-constraints
+          (first arguments) goalSequence))
+        ((unbound-variable? (second arguments))
+         (safety 3 (not (member? goalSequence goal)) "Bug in optimizer")
+         (push goalSequence goal)
+         (simulate-bind-variable-and-propagate-constraints
+          (second arguments) goalSequence))))
+      ((:NOT :FAIL)
+       NULL)) ))
+        
+(defun collect-closed-goals 
+       ((goals (LIST OF PROPOSITION)) (goalSequence (LIST OF PROPOSITION)))
+  ;; Helping function for 'simulate-bind-variable-and-propagate-constraints'.
+  ;; Push each goal in 'goals' containing no unbound variables onto
+  ;;    'goalSequence'.
+  ;; Tricky: 'compute-optimal-open-goal-ordering' may have already pushed
+  ;;    a "cheapest generator goal" onto 'goalSequence', so we check to see
+  ;;    that that goal doesn't get pushed twice.  In all other cases
+  ;;    closed goals can be assumed not to belong to 'goalSequence', because
+  ;;    at least one of their variables just got bound by 
+  ;;    'simulate-bind-variable-to-value':
+  (foreach g in goals
+           where (and (all-arguments-bound? g)
+                      (not (member? goalSequence g)))
+           do (push goalSequence g)) )
+
+(defun simulate-bind-variable-and-propagate-constraints
+       ((variable PATTERN-VARIABLE) (goalSequence (LIST OF PROPOSITION)))
+  ;;  Simulate binding 'variable' to a value (by actually binding it),
+  ;;     push any newly-closed goals onto 'goalSequence', and recursively
+  ;;     simulate binding of any other variables that can be bound
+  ;;     with cost = 1.
+  (let ((goalRecord (goal-record variable)))
+    (safety 3 (unbound-variable? variable)
+            "INTERNAL ERROR: Query optimizer found bound variable "
+            "where unbound variable was expected.")
+    (simulate-bind-variable-to-value variable)
+    ;; collect newly-closed goals into 'goalSequence':
+    (collect-closed-goals (generator-goals goalRecord) goalSequence)
+    (collect-closed-goals (other-goals goalRecord) goalSequence)
+    ;; scan goals looking for ones with a single unbound variable that
+    ;;    can be bound with cost = 1:
+    (foreach g in (generator-goals goalRecord)
+             do (propagate-single-valued-constraints g goalSequence))
+    (foreach g in (other-goals goalRecord)
+             do (propagate-single-valued-constraints g goalSequence)) ))
+
+(defun bind-all-variables-in-generator-goal
+       ((goal PROPOSITION) (goalSequence (LIST OF PROPOSITION)))
+  ;; Foreach unbound variable appearing as an argument in 'goal',
+  ;;    bind it and propagate constraints.
+  ;; TO DO: FIGURE OUT HOW NESTED PROPOSITIONS WORK HERE:
+  (foreach arg in (arguments goal)
+           where (and (isa? arg @PATTERN-VARIABLE)
+                      (unbound-variable? arg))
+           do (simulate-bind-variable-and-propagate-constraints 
+               arg goalSequence)) )
+
+(defspecial *optimalGoalOrderingRecursions* INTEGER NULL)
+(defglobal *optimal-goal-ordering-cutoff* INTEGER 100)
+
+(defun compute-optimal-open-goal-ordering
+       ((optimizerVariables (LIST OF PATTERN-VARIABLE))
+        (numberOfOpenGoals INTEGER)
+        (goalSequence (LIST OF PROPOSITION)) 
+        (priorCost COST-ESTIMATE) (priorFanout COST-ESTIMATE))
+  ;; Use a depth-first branch and bound search to find the cheapest
+  ;;    permutation of 'goalSequence'.
+  ;; Strategy: At each iteration, simulate the binding of each optimizer variable
+  ;;    in turn, propagate effects of making that binding on other goals and
+  ;;    other variables, and then recurse deeper.  Save the current best goal
+  ;;    sequence and its cost.  Cost is the product of generator costs, where
+  ;;    the cost of a generator is an estimate of the number of possible bindings
+  ;;    against real data.
+  ;;    The use of optimizer variables reduces the number of permutations
+  ;;       considered.  Worst case is the factorial of the number of variables,
+  ;;       rather than the factorial of the number of goals.
+  (let ((goalSequenceCheckPoint CONS NULL)
+        (choicePointUnbindingOffset INTEGER NULL)
+        (cumulativeCost COST-ESTIMATE NULL)
+        (cumulativeFanOut COST-ESTIMATE NULL))
+    (if (>= *optimalGoalOrderingRecursions* *optimal-goal-ordering-cutoff*)
+        (return)
+      (++ *optimalGoalOrderingRecursions*))
+    (when (empty? optimizerVariables)
+      (setf (best-goal-sequence *queryIterator*) goalSequence)
+      (return))
+    (foreach vbl in optimizerVariables
+             where (not (variable-bound? vbl))
+             do
+             (mv-bind (generatorGoal generatorCost generatorFanOut)
+                      (cheapest-generator-goal vbl)
+                 (when (null? generatorGoal)
+                   (continue))
+                 ;; estimate increased cost of this choice of generator:
+                 (setq cumulativeFanOut (* priorFanout generatorFanOut))
+                 (setq cumulativeCost (+ priorCost (* cumulativeFanOut generatorCost)))
+                 ;; check for integer overflow - this needs to be improved:
+                 ;; NOTE: Switching to floats for costs wouldn't buy us all that
+                 ;;    much more in range, and, while there is an overflow
+                 ;;    exception class in C++, programs only may use it to report
+                 ;;    overflows.  Thus we couldn't rely on a native exception
+                 ;;    and would need to use a MAX-FLOAT constant to check for
+                 ;;    overflows, since floats don't overrun to become negative:
+                 ;; TO DO: REWRITE THIS TO WORK FOR FLOATS:
+                 (when (or (null? cumulativeCost)
+                           (< cumulativeCost priorCost))
+                   (continue))
+                 ;; no overflow; if we are doing worse than the best cost so far,
+                 ;;    continue loop, ignoring this particular choice of
+                 ;;    generator:
+                 (when (and (defined? (best-cost *queryIterator*))
+                            (>= cumulativeCost (best-cost *queryIterator*)))
+                   (continue))
+                 ;; check point current list of goals:
+                 (setq goalSequenceCheckPoint (the-cons-list goalSequence))
+                 ;; check point variable bindings:
+                 (setq choicePointUnbindingOffset (simulate-create-choice-point))
+                 ;; first push generator goal onto 'goalSequence':
+                 (push goalSequence generatorGoal)
+                 ;; next push all newly-closed goals onto 'goalSequence', and
+                 ;;    then propagate constraints:
+                 (bind-all-variables-in-generator-goal generatorGoal goalSequence))
+             (if (eql? (length goalSequence) numberOfOpenGoals)
+               ;; all open goals are now closed, record best effort so far:
+               (when (or (null? (best-cost *queryIterator*))
+                         (< cumulativeCost (best-cost *queryIterator*)))
+                 (setf (best-cost *queryIterator*) cumulativeCost)
+                 (setf (best-goal-sequence *queryIterator*)
+                       (copy goalSequence)))
+               ;; one or more open goal still exists; recurse deeper:
+               (compute-optimal-open-goal-ordering 
+                optimizerVariables numberOfOpenGoals goalSequence 
+                cumulativeCost cumulativeFanOut))
+             ;; pop goals collected during this pass:
+             (setf (the-cons-list goalSequence) goalSequenceCheckPoint)
+             ;; unbind variables bound during this pass:
+             (unbind-variables-beginning-at
+              (current-pattern-record *queryIterator*) 
+              choicePointUnbindingOffset)) ))
+
+(defun compute-greedy-open-goal-ordering
+       ((optimizerVariables (LIST OF PATTERN-VARIABLE))
+        (numberOfOpenGoals INTEGER)
+        (goalSequence (LIST OF PROPOSITION)) 
+        (priorCost COST-ESTIMATE) (priorFanout COST-ESTIMATE))
+  ;; Use a greedy search to find a good permutation of 'goalSequence'.
+  ;; Strategy: At each iteration, simulate the binding of each optimizer variable
+  ;;    in turn, propagate effects of making that binding on other goals and
+  ;;    other variables.  Greedily select the variable with the best combination
+  ;;    of low generator cost and high binding potential for other open goals.
+  ;;    Then continue by selecting the best variable from the remaining unbound
+  ;;    variables.
+  ;; Worst-case complexity is quadratic in the number of variables.
+  (let ((goalSequenceCheckPoint CONS NULL)
+        (choicePointUnbindingOffset INTEGER NULL)
+        (bestGeneratorGoal PROPOSITION NULL)
+        ; (bestGeneratorGoalCost COST-ESTIMATE NULL)
+        (bestGeneratorFanout COST-ESTIMATE NULL)
+        (bestCombinedCost COST-ESTIMATE NULL)
+        (openGoalReduction INTEGER NULL))
+    (when (empty? optimizerVariables)
+      (setf (best-goal-sequence *queryIterator*) goalSequence)
+      (return))
+    (loop
+      (setq bestGeneratorGoal NULL)
+      ; (setq bestGeneratorGoalCost NULL)
+      (setq bestGeneratorFanout NULL)
+      (setq bestCombinedCost NULL)
+      (foreach vbl in optimizerVariables
+          where (not (variable-bound? vbl))
+          do (mv-bind (generatorGoal generatorCost generatorFanout)
+                 (cheapest-generator-goal vbl)
+               (when (null? generatorGoal)
+                 (continue))
+               ;; check-point current list of goals:
+               (setq goalSequenceCheckPoint (the-cons-list goalSequence))
+               ;; check-point variable bindings:
+               (setq choicePointUnbindingOffset (simulate-create-choice-point))
+               ;; first push generator goal onto 'goalSequence':
+               (push goalSequence generatorGoal)
+               ;; next push all newly-closed goals onto 'goalSequence', and
+               ;;    then propagate constraints:
+               (bind-all-variables-in-generator-goal generatorGoal goalSequence)
+
+               ;; Take into account how many open goals binding this variable
+               ;;    closes.  Alternatively/additionally, we could count the
+               ;;    the number of goals in which this variable appears:
+               (setq openGoalReduction
+                 (ceiling
+                  (* (/ (- (length goalSequence) (length goalSequenceCheckPoint))
+                        numberOfOpenGoals)
+                     100)))             ; somewhat arbitrary weight
+               (let ((combinedCost (- (+ generatorFanout generatorCost) openGoalReduction)))
+                 (when (or (null? bestCombinedCost)
+                           (< combinedCost bestCombinedCost))
+                   (setq bestGeneratorGoal generatorGoal)
+                   (setq bestGeneratorFanout generatorFanout)
+                   (setq bestCombinedCost combinedCost)))
+                 
+               ;; pop goals collected during this pass:
+               (setf (the-cons-list goalSequence) goalSequenceCheckPoint)
+               ;; unbind variables bound during this pass:
+               (unbind-variables-beginning-at
+                (current-pattern-record *queryIterator*)
+                choicePointUnbindingOffset)))
+      ;; End test:
+      (when (null? bestGeneratorGoal)
+        (when (= (length goalSequence) numberOfOpenGoals)
+          ;; all open goals are now closed, record the generated goal sequence:
+          (setf (best-cost *queryIterator*) priorCost)
+          (setf (best-goal-sequence *queryIterator*) goalSequence))
+        (return))
+      ;; Make binding of best variable of this pass permanent:
+      (setq priorFanout (* priorFanout bestGeneratorFanout))
+      (push goalSequence bestGeneratorGoal)
+      (bind-all-variables-in-generator-goal bestGeneratorGoal goalSequence))))
+
+(defun compute-backup-open-goal-ordering ((goalSequence (LIST OF PROPOSITION)))
+  ;; Situation: We couldn't find an optimal ordering.  Produce
+  ;;    an ordering that leaves the original order of goals
+  ;;    nearly intact.  Heuristic: Put non-generating type
+  ;;    tests after all other goals.
+  ;; Side-effect: May push goals onto '(residue-goals *queryIterator*)'.
+  ;; Careful: Make sure that 'best-goal-sequence' is in reverse order.
+  (foreach g in goalSequence
+      do (if (and (null? (estimate-goal-cost g))
+                  (variable-type? g))
+             (insert-last (residue-goals *queryIterator*) g)
+           (push (best-goal-sequence *queryIterator*) g))) )
+
+(defun collect-unbound-goal-variables
+    ((goal PROPOSITION) (unboundVariables (LIST OF PATTERN-VARIABLE)))
+  ;; Collect all unbound variables of `goal' into `unboundVariables'.
+  (foreach arg in (arguments goal)
+      do (typecase arg
+           (PATTERN-VARIABLE
+            (when (unbound-variable? arg)
+              (insert-new unboundVariables arg)))
+           (PROPOSITION
+            (collect-unbound-goal-variables arg unboundVariables)
+            (case (kind arg)
+              ((:FORALL :EXISTS)
+               ;; Remove any quantified variables that might have been collected:
+               (foreach var in (io-variables arg)
+                   do (remove unboundVariables var)))
+              (otherwise NULL)))
+           (otherwise NULL))))
+
+(defun extract-open-goal-clusters
+    ((openGoals (LIST OF PROPOSITION))
+     (openGoalClusters (LIST OF (LIST OF PROPOSITION))))
+  ;; If there are at least two or more clusters of open goals in `openGoals'
+  ;;    collect them into `openGoalClusters' and remove them from `openGoals'.
+  ;; Otherwise, leave `openGoals' and `openGoalClusters' unchanged.
+  ;; A cluster is defined by having a closed set of unbound variables not
+  ;;    shared by any other clusters.
+  (let ((allGoals (copy-cons-list (the-cons-list openGoals)))
+        (remainingGoals allGoals)
+        (cursor (CONS OF PROPOSITION) NULL)
+        (goal PROPOSITION NULL)
+        (clusters (new (LIST OF (LIST OF PROPOSITION))))
+        (currentCluster (LIST OF PROPOSITION) NULL)
+        (currentClusterVars (new (LIST OF PATTERN-VARIABLE)))
+        (currentClusterVarsGrew? FALSE)
+        (unboundGoalVars (new (LIST OF PATTERN-VARIABLE))))
+    (loop
+      (clear currentClusterVars)
+      (loop
+        (when (empty? remainingGoals)
+          (break))
+        (when (defined? (first remainingGoals))
+          (collect-unbound-goal-variables
+           (first remainingGoals) currentClusterVars))
+        (if (non-empty? currentClusterVars)
+            (break)
+          (setq remainingGoals (rest remainingGoals))))
+      (when (empty? currentClusterVars)
+        ;; no more goals with unbound variables:
+        (break))
+      ;; Initialize new cluster:
+      (setq currentCluster (new (LIST OF PROPOSITION)))
+      (insert currentCluster (first remainingGoals))
+      (setf (first remainingGoals) NULL) ;; mark consumed element
+      (setq remainingGoals (rest remainingGoals))
+      (loop
+        (setq currentClusterVarsGrew? FALSE)
+        (setq cursor remainingGoals)
+        (while (non-empty? cursor)
+          (setq goal (first cursor))
+          (when (defined? goal)
+            (clear unboundGoalVars)
+            (collect-unbound-goal-variables goal unboundGoalVars)
+            (when (exists var in unboundGoalVars
+                      where (member? currentClusterVars var))
+              (push currentCluster goal)
+              (setf (first cursor) NULL) ;; mark consumed element
+              (foreach var in unboundGoalVars
+                  where (not (member? currentClusterVars var))
+                  do (insert currentClusterVars var)
+                     (setq currentClusterVarsGrew? TRUE))))
+          (setq cursor (rest cursor)))
+        (when (not currentClusterVarsGrew?)
+          (break)))
+      (push clusters (reverse currentCluster)))
+    (free currentClusterVars)
+    (cond ((>= (length clusters) 2)
+           (clear openGoals)
+           (setf (the-cons-list openGoals) (remove allGoals NULL))
+           (foreach cluster in (reverse clusters)
+               collect cluster into openGoalClusters))
+          (otherwise
+           (when (defined? currentCluster)
+             (free currentCluster))))
+    (free clusters)))
+
+(defun collect-optimizer-variables ((proposition PROPOSITION) (collection LIST))
+  ;; Called by `compute-open-goal-ordering' and friends.
+  ;; Collect those variables found in 'proposition' into 'collection' that
+  ;;    are unbound, don't represent the output of a function proposition,
+  ;;    are named, and may appear as an argument to a generator goal.
+  (case (kind proposition)
+    ((:ISA :FUNCTION :PREDICATE :EQUIVALENT :IMPLIES)
+     (foreach arg in (arguments proposition)
+              where (unbound-variable? arg)                    
+              do
+              (let ((variable PATTERN-VARIABLE arg))
+                (cond
+                 ;; if 'variable' is equated with another value, bind
+                 ;;    it to that value:
+                 ((not (eql? variable (innermost-of variable)))
+                  (simulate-bind-variable-to-value variable))
+                 ;; otherwise, collect 'variable' if its not the output
+                 ;;    of a :FUNCTION proposition:
+                 ((and (null? (defining-proposition variable))
+                       (not (anonymous-variable? variable)))
+                  (insert-new collection variable))))))
+    (otherwise NULL)) )
+
+(defun (bigger-conjunction? BOOLEAN) ((prop1 PROPOSITION) (prop2 PROPOSITION))
+  ;; Return TRUE if `prop1' has more arguments than `prop2'.
+  (return (> (length (arguments prop1)) (length (arguments prop2)))))
+
+(defun compute-open-goal-ordering ((andProposition PROPOSITION)
+                                   (openGoals (LIST OF PROPOSITION))
+                                   (goalSequence (LIST OF PROPOSITION)))
+  ;; Compute a good (if possible, optimal) ordering for `openGoals'
+  ;;    which is a subset of the arguments of `andProposition'.
+  ;; `goalSequence' is an initial ordering for a subset of `openGoals'
+  ;;    which was determined by taking function output variables and
+  ;;    constraint propagation into account.
+  ;; If `openGoals' contains two or more independent clusters that
+  ;;    do not share any unbound variables, then they will be combined
+  ;;    into subordinate AND propositions to enable a clustered
+  ;;    conjunction evaluation strategy with restricted backtracking.
+  (let ((openGoalClusters (new (LIST OF (LIST OF PROPOSITION))))
+        (clusterPropositions (LIST OF PROPOSITION) NIL-LIST)
+        (optimizerVariables (new (LIST OF PATTERN-VARIABLE)))
+        (initialGoalSequence (CONS OF PROPOSITION) NULL)
+        (initialResidueGoals (CONS OF PROPOSITION) NULL))
+    ;; Find open goal clusters and convert them into subordinate ANDs:
+    (when (try-to-cluster-conjunctions?)
+      ;; MINOR PERFORMANCE BUG: IF WE DO DETECT CLUSTERS, THIS WILL TRY TO
+      ;;    RECLUSTER THEM IN THE RECURSIVE CALLS; HOWEVER, CLUSTERS ARE RARE:
+      (extract-open-goal-clusters openGoals openGoalClusters))
+    (when (non-empty? openGoalClusters)
+      ;; We have two or more clusters:
+      (setq clusterPropositions (new LIST))
+      (special ((*evaluationMode* :DESCRIPTION)) ; avoid logging during fastening
+        (foreach cluster in openGoalClusters
+            collect (choose (> (length cluster) 1)
+                            (fasten-down-one-proposition
+                             (conjoin-propositions (the-cons-list cluster)) TRUE)
+                            (first cluster))
+            into clusterPropositions))
+      ;; Treat one-element clusters like regular open goals:
+      ;; NOTE: CURRENTLY, WE NEED TO HAVE AT LEAST ONE COMPLEX CLUSTER IN ORDER
+      ;;    TO TRIGGER CLUSTERED `AND' EVALUATION.  IF THIS TURNS OUT TO BE A
+      ;;    PROBLEM, WE'LL NEED A FLAG TO MARK `andProposition' AS CLUSTERED.
+      (foreach prop in clusterPropositions
+          where (not (eql? (kind prop) :AND))
+          collect prop into openGoals)
+      ;; Restrict `goalSequence' to those still remaining in `openGoals':
+      (foreach it on goalSequence
+          where (not (member? openGoals (value it)))
+          do (setf (value it) NULL))
+      (remove goalSequence NULL))
+    (free openGoalClusters)
+    
+    ;; Optimize open goal ordering:
+    (setq initialGoalSequence (the-cons-list goalSequence))
+    (setq initialResidueGoals (the-cons-list (residue-goals *queryIterator*)))
+    (foreach goal in openGoals
+        do (collect-optimizer-variables goal optimizerVariables))
+    ;; First, try to compute the optimal goal ordering:
+    (special ((*optimalGoalOrderingRecursions* 0))
+      (compute-optimal-open-goal-ordering
+       optimizerVariables (length openGoals) goalSequence 1.0 1.0)
+      (when (>= *optimalGoalOrderingRecursions* *optimal-goal-ordering-cutoff*)
+        ;; We timed out looking for an optimal ordering, use a greedy mechanism:
+        (setf (the-cons-list goalSequence) initialGoalSequence)
+        (setf (the-cons-list (residue-goals *queryIterator*)) initialResidueGoals)
+        (clear (best-goal-sequence *queryIterator*))
+        (setf (best-cost *queryIterator*) NULL)
+        (compute-greedy-open-goal-ordering
+         optimizerVariables (length openGoals) goalSequence 1.0 1.0)))
+    (when (and (empty? (best-goal-sequence *queryIterator*))
+               (not (empty? openGoals)))
+      (compute-backup-open-goal-ordering (reverse openGoals))
+      (trace-if :OPTIMIZER "Using backup goal ordering:" EOL
+                "Original Goal: " andProposition EOL))
+
+    ;; Append cluster propositions (`best-goal-sequence' is in reverse order):
+    (foreach prop in (sort clusterPropositions
+                           ;; Try bigger clusters earlier under the assumption
+                           ;;    that more conjuncts tend to fail more easily:
+                           (the-code :function bigger-conjunction?))
+        where (eql? (kind prop) :AND)
+        do (push (best-goal-sequence *queryIterator*) prop))))
+
+(defun optimize-ordering-of-conjuncts ((andProposition PROPOSITION))
+  ;; Reorder (optimize) the conjuncts in 'proposition'.
+  (let ((initiallyClosedGoals (new (LIST OF PROPOSITION)))
+        (openGoals (new (LIST OF PROPOSITION)))
+        (goalSequence (new (LIST OF PROPOSITION))))
+    ;; subdivide conjuncts/goals into closed, disjunctive, and other (open):
+    (foreach g in (arguments andProposition)
+        do (cond
+            ((all-arguments-bound? g)
+             (insert initiallyClosedGoals g))
+            ;; TO DO: FIGURE OUT WHAT ELSE SHOULD GO INTO RESIDUE:
+            ((or (has-disjunction? g)
+                 (eql? (kind (cast g PROPOSITION)) :FORALL))
+             ;; defer evaluation of disjunctive goals
+             (insert (residue-goals *queryIterator*) g))
+            (otherwise
+             (insert openGoals g))))
+    ;; create goal record for each unbound variable:
+    (foreach goal in openGoals
+        do (distribute-open-goal goal))
+    ;; propagate constraints, possibly binding more variables:
+    (foreach g in openGoals
+        where (exists arg in (arguments g) where (argument-bound? arg))
+        do (propagate-single-valued-constraints g goalSequence))
+    ;; at last, compute the best goal ordering:
+    (compute-open-goal-ordering andProposition openGoals goalSequence)
+    (reorder-goals
+     andProposition (reverse initiallyClosedGoals)
+     (reverse (best-goal-sequence *queryIterator*))
+     (residue-goals *queryIterator*))
+    (trace-if :OPTIMIZER "Optimized goal: " andProposition EOL) ))
+
+(defun reorder-goals ((andProposition PROPOSITION)
+                      (initiallyClosedGoals (LIST OF PROPOSITION))
+                      (goalSequence (LIST OF PROPOSITION))
+                      (residueGoals (LIST OF PROPOSITION)))
+  ;; Called by 'optimize-ordering-of-conjuncts' to destructively
+  ;;    reorder the conjuncts in 'andProposition' into a more optimal
+  ;;    ordering.
+  (let ((arguments (arguments andProposition))
+        (originalNumberOfArguments (length arguments))
+        (index 0))
+    (foreach g in initiallyClosedGoals
+        do (setf (nth arguments index) g)
+           (++ index))
+    (foreach g in goalSequence
+        do ;; NOTE: `distribute-open-goal' might record some open goals as
+           ;;    residue goals which may later also wind up in the goal
+           ;;    sequence generated by `compute-backup-open-goal-ordering',
+           ;;    so, remove them here:
+           (remove residueGoals g)
+           (setf (nth arguments index) g)
+           (++ index))
+    (foreach g in residueGoals
+        do (setf (nth arguments index) g)
+           (++ index))
+    ;; If there were clustered arguments, shorten the arguments vector:
+    (when (< index originalNumberOfArguments)
+      (setf (arguments andProposition)
+        (new ARGUMENTS-VECTOR :array-size index))
+      (foreach arg in arguments
+          as i in (interval 0 (1- index))
+          do (setf (nth (arguments andProposition) i) arg)))))
+
+
+  ;;
+;;;;;; Query simulator and top-level query optimizer
+  ;;
+
+(defun simulate-bind-variable-to-value ((formula OBJECT))
+  ;; If 'formula' is a variable, bind it to a value (it doesn't matter
+  ;;    what value we bind it to).
+  (typecase formula
+    (PATTERN-VARIABLE
+     (when (not (argument-bound? formula))
+       (set-pattern-variable-binding formula :BOUND)))
+    (otherwise NULL)) )
+
+;; THIS IS DISABLED FOR NOW, SINCE THE OPTIMIZER CAN FAIL, LEAVING
+;;    THE BACKUP OPTIMIZER IN CHARGE, WITH NO GUARANTEES WRT UNBOUND
+;;    VARIABES:
+(defun warn-of-unbound-variable-argument ((proposition PROPOSITION))
+  ;; Signal serious bug in query optimizer.
+  (return)
+#|
+  (foreach
+   arg in (arguments proposition)
+   where (unbound-variable? arg)
+   do
+   (warn "Query Bug: Unbound variable " arg " encountered within proposition" EOL
+   "   " proposition " during query simulation."))
+   |#
+)
+
+(defun simulate-goal-evaluation ((goal PROPOSITION))
+  ;; Simulate the binding of each unbound argument in 'goal'.
+  ;; Verify that the optimizer is working correctly, i.e.,
+  ;;    signal an error if one or more arguments of 'goal' is a variable
+  ;;    left unbound by the simulation.
+  ;; Verifies correctness of 'propagate-single-valued-constraints' and
+  ;;    'optimize-ordering-of-conjuncts'.
+  (let ((arguments (arguments goal))
+        (ok? FALSE))
+    (case (kind goal)
+      (:FUNCTION
+       (setq ok? (choose
+                  (computed-predicate? goal)
+                  ;; TO DO: UPGRADE THIS TO UNDERSTAND permutation-table:
+                  (forall arg in (but-last arguments)
+                      always (argument-bound? arg))
+                  (exists arg in arguments
+                      where (and (argument-bound? arg)
+                                 (type-has-backlinks?
+                                  (ensure-deferred-description
+                                   (logical-type arg))))))))
+      (:PREDICATE
+       (if (member-of-proposition? goal)
+           (setq ok? (argument-bound? (second arguments)))
+         (setq ok?
+           (choose (computed-predicate? goal)
+                   (forall arg in arguments
+                       always (argument-bound? arg))
+                   (exists arg in arguments
+                       where 
+                         (and (argument-bound? arg)
+                              (type-has-backlinks?
+                               (ensure-deferred-description
+                                (logical-type arg)))))))))
+      (:ISA
+       (setq ok? TRUE))
+      (:EQUIVALENT
+       (setq ok? (or (argument-bound? (first arguments))
+                     (argument-bound? (second arguments))))))
+    (when (not ok?)
+      (warn-of-unbound-variable-argument goal))
+    (foreach arg in arguments
+             do (simulate-bind-variable-to-value arg)) ))
+
+(defun simulate-and-optimize-argument ((formula OBJECT))
+  ;; Helping function for simulate-and-optimize-query'.
+  ;; Recursively optimize propositional arguments and description arguments.
+  (typecase formula
+    (PROPOSITION
+     (simulate-and-optimize-query formula))
+;; THIS OPTIMIZATION SHOULD HAPPEN IN THE COURSE OF NORMAL BACKTRACKING
+;;    INTO THE NESTED DESCRIPTION, SO WE ARE COMMENTING IT OUT -rmm
+;    (DESCRIPTION
+;     ;; 'formula' appearing as an argument should not have any of its
+;     ;;    io-variables bound; so a null boolean vector should occur:
+;     (let ((vectorOfZeros 
+;            (arguments-vector-to-boolean-vector (io-variables formula))))
+;       (optimize-query formula vectorOfZeros *queryOptimizerControlFrame*)))
+    (otherwise
+     NULL)) )
+
+(defun simulate-and-optimize-query ((proposition PROPOSITION))
+  ;; Called by 'optimize-query'.
+  ;; Optimize each 'AND' proposition found at or within 'formula'.
+  ;; Outer optimizations simulate binding of variables before recursively
+  ;;    optimizing nested propositions.
+  (let ((arguments (arguments proposition))
+        (kind (kind proposition)))
+    (when *reversePolarity?*
+      (case kind
+        (:AND (setq kind :OR))
+        (:OR (setq kind :AND))
+        (:IMPLIES
+         (error "REVERSE POLARITY NOT YET IMPLEMENTED FOR :IMPLIES WITHIN "
+                "QUERY OPTIMIZER"))
+        (otherwise NULL)))
+    (case kind
+      ((:ISA :PREDICATE :FUNCTION :EQUIVALENT)
+       (simulate-goal-evaluation proposition)
+       (foreach arg in arguments
+                do (simulate-and-optimize-argument arg)))
+      (:AND
+       (let ((choicePointUnbindingOffset
+              (simulate-create-choice-point)))
+         (initialize-optimizer-memory -1)
+         (optimize-ordering-of-conjuncts proposition)
+         (unbind-variables-beginning-at
+          (current-pattern-record *queryIterator*)
+          choicePointUnbindingOffset))
+       (foreach arg in (arguments proposition) ;; reaccess possibly shortened args
+                do (simulate-and-optimize-query arg)))
+      (:OR
+       (foreach
+        arg in arguments
+        do
+        (let ((choicePointUnbindingOffset
+               (simulate-create-choice-point)))
+          (simulate-and-optimize-query arg)
+          (unbind-variables-beginning-at
+           (current-pattern-record *queryIterator*) 
+           choicePointUnbindingOffset))))
+      (:NOT
+       (let ((oldReversePolarity? *reversePolarity?*))
+         (special 
+          ((*reversePolarity?* (not oldReversePolarity?)))
+          (when *reversePolarity?*
+            (warn-of-unbound-variable-argument proposition))
+          (simulate-and-optimize-query (first arguments)))))
+      (:IMPLIES
+       (warn-of-unbound-variable-argument proposition)
+       (foreach arg in arguments
+                do (simulate-and-optimize-argument arg)))
+      (:EXISTS
+       (simulate-and-optimize-query (first arguments)))
+      (:FORALL
+       (let ((choicePointUnbindingOffset
+              (simulate-create-choice-point)))
+         (foreach arg in arguments
+                  do (simulate-and-optimize-argument arg))
+         (unbind-variables-beginning-at
+          (current-pattern-record *queryIterator*)
+          choicePointUnbindingOffset)))
+      (otherwise NULL)) ))
+
+(defun initialize-optimizer-memory ((stackSize INTEGER))
+  ;; Clear the memory structures used by the conjuncts optimizer.
+  (when (and (<= stackSize 0)
+             (defined? (optimizer-goal-records *queryIterator*)))
+    (setq stackSize (length (optimizer-goal-records *queryIterator*))))
+  (initialize-optimizer-goal-records stackSize)
+  (setf (residue-goals *queryIterator*) (list))
+  (setf (best-goal-sequence *queryIterator*) (list))
+  (setf (best-cost *queryIterator*) NULL) )
+
+(defspecial *queryOptimizerControlFrame* CONTROL-FRAME
+  :documentation "Keeps track of last control frame allocated by
+the query optimizer.  Used by recursive invocations of the optimizer.")
+
+(defun optimize-query ((description DESCRIPTION) (booleanVector BOOLEAN-VECTOR)
+                       (parentFrame CONTROL-FRAME))
+  ;; Called by 'select-optimal-query-pattern'.
+  ;; Simulate execution of the query 'description'.  Use backtracking
+  ;;    to estimate the relative costs of different possible orderings
+  ;;    of the conjuncts in each nested :AND proposition.  Reorder the
+  ;;    conjuncts to reflect the cheapest ordering.
+  ;; tricky: recursive calls to 'optimize-query' happen IN BETWEEN
+  ;;    calls to 'optimize-ordering-of-conjuncts', so we can
+  ;;    use the same goal records:
+  (let ((frame (create-down-frame parentFrame NULL))
+        (variablesCount (+ (length (io-variables description))
+                           (length (internal-variables description))
+                           (choose (defined? (external-variables description))
+                                   (length (external-variables description))
+                                   0))))
+    (initialize-optimizer-memory variablesCount)
+    ;; allocate variables frames and record top of unbindings stack:
+    (create-pattern-record frame NULL NULL)
+    (activate-pattern-record (pattern-record frame) variablesCount)
+    ;; establish entry-point bindings:
+    (foreach ioVar in (io-variables description)
+             as initiallyBound? in booleanVector
+             where initiallyBound?
+             do (simulate-bind-variable-to-value ioVar))
+    (special ((*queryOptimizerControlFrame* frame))
+      (simulate-and-optimize-query (proposition description)))
+    ;; induce 'pop-control-frame' to call 'deallocate-...':
+    (setf (state frame) :PATTERN)
+    (pop-down-frame parentFrame) ))
+
+(defspecial *boundToOffsetCounter* INTEGER NULL
+  :documentation "Enables 'select-optimal-query-pattern' to tell
+'copy-variables-vector' that it should initialize the 'bound-to-offset'
+slot of each variable in the copy operation.")
+
+;; Should this be settable as a feature?
+(defglobal *query-optimization-strategy* KEYWORD :DYNAMIC
+  :documentation "Keyword indicating what clause reordering strategy should
+be used for conjunctive queries.  Legal values are :STATIC which performs
+optimization once for each conjunctive pattern by simulating a query,
+:STATIC-WITH-CLUSTERING which additionally tries to cluster conjunction into
+independent clusters, :DYNAMIC which performs simple greedy optimization
+dynamically during a query, :DYNAMIC-WITH-CLUSTERING which also looks
+for clusters (not yet implemented), and :NONE to indicate no optimization
+should be performed.")
+
+(defun (use-dynamic-query-optimization? BOOLEAN) ()
+  ;; Return TRUE if we use dynamic query optimization.
+  :globally-inline? TRUE
+  (return
+    (and (or (eql? *query-optimization-strategy* :DYNAMIC)
+             (eql? *query-optimization-strategy* :DYNAMIC-WITH-CLUSTERING)))))
+
+(defun (dynamically-optimize-proposition? BOOLEAN) ((self PROPOSITION))
+  ;; Return true if `self' should get optimized dynamically.
+  (return (and (use-dynamic-query-optimization?)
+               (not (dont-optimize? self)))))
+
+(defun (use-static-query-optimization? BOOLEAN) ()
+  ;; Return TRUE if we use static query optimization.
+  :globally-inline? TRUE
+  (return
+    (and (not (eql? *query-optimization-strategy* :NONE))
+         (not (use-dynamic-query-optimization?)))))
+
+(defun (statically-optimize-proposition? BOOLEAN) ((self PROPOSITION))
+  ;; Return true if `self' should get optimized statically.
+  (return (and (use-static-query-optimization?)
+               (not (dont-optimize? self)))))
+
+(defun (try-to-cluster-conjunctions? BOOLEAN) ()
+  ;; Return TRUE if we should try to cluster conjunctions into independent
+  ;;    subsets of conjuncts.
+  :globally-inline? TRUE
+  (return (or (eql? *query-optimization-strategy* :STATIC-WITH-CLUSTERING)
+              ;(eql? *query-optimization-strategy* :DYNAMIC-WITH-CLUSTERING)
+              )))
+
+(defun (select-optimal-query-pattern DESCRIPTION)
+       ((description DESCRIPTION) (booleanVector BOOLEAN-VECTOR)
+        (parentFrame CONTROL-FRAME))
+  ;; Called by 'continue-subquery-proof'.
+  ;; Run a simulation of 'description' using the current set of bindings,
+  ;;    to determine an optimal ordering of conjuncts at all levels within
+  ;;    'description'.
+  ;; Optimizer results are cached for later use, indexed on BOOLEAN-VECTORSs.
+  (let ((pattern DESCRIPTION NULL)
+        (queryPatterns (query-patterns description)))
+    (when (defined? queryPatterns)
+      (setq pattern (lookup queryPatterns booleanVector)))
+    ;; short-circuit caching of optimized queries when trace is enabled:
+    (when (trace-keyword? :OPTIMIZER)
+      ;; this overrides caching of optimized queries:
+      (setq pattern NULL))
+    (when (defined? pattern)
+      (return pattern))
+    (when (null? queryPatterns)
+      (setf (query-patterns description) (new KEY-VALUE-LIST)))
+    (special ((*boundToOffsetCounter* 0))
+             (setq pattern (copy-description description NULL TRUE)))
+    (insert-at (query-patterns description) booleanVector pattern)
+    ;; optimize 'pattern':
+    (unless (or (not (use-static-query-optimization?))
+                (dont-optimize? description)
+                (contains-operator? 
+                 (proposition description) PL-KERNEL/@CUT)
+                (contains-operator? 
+                 (proposition description) PL-KERNEL/@BOUND-VARIABLES))
+      (optimize-query pattern booleanVector parentFrame))
+    (simplify-description pattern TRUE)
+    (return pattern) ))
+
+
+  ;;
+;;;;;; Dynamic on-the-fly query optimizer
+  ;;
+
+(defun (dynamically-estimate-goal-cost COST-ESTIMATE) ((goal PROPOSITION))
+  ;; Estimate the cost of proving one ground instance of `goal'.
+  ;; Mirror image of the static version for now.
+  (case (kind goal)
+    ((:ISA :FUNCTION :PREDICATE)
+     (let ((operator (operator goal))
+           (description (get-description operator))
+           (firstArgValue OBJECT NULL))
+       (when (eql? operator PL-KERNEL/@HOLDS)
+         (setq firstArgValue (argument-bound-to (first (arguments goal))))
+         (if (defined? firstArgValue)
+             (if (isa? firstArgValue @NAMED-DESCRIPTION)
+                 (setq description firstArgValue)
+               (setq description NULL))
+           (return INFERABLE-PENALTY-COST)))
+       (if (or (null? description)
+               (not (inferable? description)))
+         (return 1.0)
+         (return INFERABLE-PENALTY-COST))))
+    (:IMPLIES
+     ;; could invoke expensive subsumption test:
+     (return SUBSET-OF-PENALTY-COST))
+    (otherwise
+     (return 1.0))))
+
+(defun (dynamically-estimate-goal-fanout COST-ESTIMATE) ((goal PROPOSITION))
+  ;; Estimate the number of expected instantiations for `goal'.
+  ;; If the return value is NULL, `goal' cannot be used as a generator.
+  (when (all-arguments-bound? goal)
+    (return 1.0))
+  (case (kind goal)
+    (:ISA
+     (return
+       (dynamically-estimate-extension-size
+        (get-description (relationRef goal)))))
+    ((:FUNCTION :PREDICATE)
+     (when (eql? (operator goal) PL-KERNEL/@HOLDS)
+       (if (not (argument-bound? (first (arguments goal))))
+           (return NULL) ;; can't generate relations
+         (return (dynamically-estimate-predicate-goal-fanout goal))))
+     (if (all-key-arguments-bound? goal)
+         (return 1.0)
+       (return (dynamically-estimate-predicate-goal-fanout goal))))
+    (:IMPLIES
+     ;; this is a hack.  Estimated to be very high because completeness
+     ;;    can be compromised using 'subset-of' as a generator:
+     (return ESTIMATED-CARDINALITY-OF-SUBSET-OF))
+    (:EQUIVALENT
+     (if (or (argument-bound? (first (arguments goal)))
+             (argument-bound? (second (arguments goal))))
+         (return 1.0)
+       (return NULL)))
+    ((:NOT :FAIL :FORALL)
+     (return NULL))
+    (:AND
+     (let ((fanout COST-ESTIMATE NULL)
+           (minFanout COST-ESTIMATE NULL))
+       (foreach arg in (arguments goal)
+           do (setq fanout (dynamically-estimate-goal-fanout arg))
+              (when (or (null? minFanout)
+                        (< fanout minFanout))
+                (setq minFanout fanout)))
+       (return minFanout)))
+    (:OR
+     (let ((fanout COST-ESTIMATE NULL)
+           (totalFanout COST-ESTIMATE NULL))
+       (foreach arg in (arguments goal)
+           do (setq fanout (dynamically-estimate-goal-fanout arg))
+              (when (defined? fanout)
+                (when (null? totalFanout)
+                  (setq totalFanout 0))
+                (++ totalFanout fanout)))
+       (return totalFanout)))
+    (otherwise
+     (return NULL))))
+
+(defun (dynamically-estimate-predicate-goal-fanout COST-ESTIMATE)
+    ((goal PROPOSITION))
+  ;; Estimate the number of bindings that will be generated for `goal',
+  ;;    given the current set of bindings.
+  ;; Return NULL if new bindings for `goal' cannot be generated.
+  ;; `goal' is assumed to be a :FUNCTION or :PREDICATE proposition.
+  ;; TO DO:
+  ;;    - CREATE SMARTER VERSION OF THIS THAT TAKES SUBS INTO ACCOUNT.
+  ;;    - BETTER HANDLE RELATIONS SUCH AS `SUBRELATION' THAT GENERATE
+  ;;      SIZEABLE NUMBERS OF BINDINGS VIA SPECIALISTS.
+  (case (operator goal)
+    (PL-KERNEL/@MEMBER-OF
+     (return (estimate-MEMBER-OF-goal-fanout goal)))
+    (PL-KERNEL/@INSTANCE-OF
+     (return (dynamically-estimate-INSTANCE-OF-goal-fanout goal)))
+    (otherwise
+     (let ((patternArgs NIL)
+           (relation (operator goal))
+           (arguments (arguments goal))
+           (firstArgIndex 0)
+           (nofUnboundArgs 0)
+           (unboundArgIndex INTEGER NULL)
+           (key OBJECT NULL)
+           (relationExtension? TRUE)
+           (description (get-description relation)))
+       (when (eql? relation PL-KERNEL/@HOLDS)
+         ;; we already know that the relation argument is bound:
+         (cond ((isa? (argument-bound-to (first arguments)) @NAMED-DESCRIPTION)
+                (setq description (argument-bound-to (first arguments)))
+                (setq firstArgIndex 1))
+               (otherwise
+                (setq description NULL))))
+       (when (null? description)
+         (return NULL))
+       (foreach i in (interval firstArgIndex (1- (length arguments)))
+           do (setq key (argument-bound-to (nth arguments i)))
+              (cond ((defined? key)
+                     (when (instance-has-backlinks? key)
+                       (setq relationExtension? FALSE)))
+                    (otherwise
+                     (++ nofUnboundArgs)
+                     (setq unboundArgIndex i)))
+           collect key into patternArgs)
+       (when (computed-term? description)
+         (case nofUnboundArgs
+           (0 (return 1))
+           (1 (cond ((= unboundArgIndex (1- (length arguments)))
+                     ;; the last arg of a computable relation is unbound:
+                     (return 1))
+                    ((computed-constraint? description)
+                     ;; one argument of a computed constraint is unbound:
+                     (return 1))))
+           (otherwise NULL))
+         ;; no other unbound case can be handled by computed relations:
+         (return NULL))
+       ;; EXPERIMENT: don't generate for (fn a ?x ?y) if `fn' is total,
+       ;;    since there are (usually) infinitely many ?x that each justify
+       ;;    a different ?y. This fixes the `append' demo but is a bit drastic:
+       (when (and (test-property? description PL-KERNEL/@TOTAL)
+                  (> nofUnboundArgs 1)
+                  (= unboundArgIndex (1- (length arguments))))
+         (return NULL))
+       (if relationExtension?
+           (return (dynamically-estimate-extension-size description))
+         ;; this is VERY CRUDE, since it doesn't consider subrelations:
+         (return
+           (estimated-length
+            (select-propositions
+             (make-selection-pattern
+              :RELATION NIL (cons relation patternArgs))))))))))
+
+(defun (dynamically-estimate-INSTANCE-OF-goal-fanout COST-ESTIMATE)
+    ((goal PROPOSITION))
+  ;; Estimate the cost of generating bindings for the `instance-of'
+  ;;    proposition `goal'.
+  (let ((instanceValue (argument-bound-to (first (arguments goal))))
+        (collectionValue (argument-bound-to (second (arguments goal)))))
+    (cond
+     ((defined? instanceValue)
+      (return (length (all-types instanceValue))))
+     ((defined? collectionValue)
+      (typecase collectionValue
+        (DESCRIPTION
+         (return
+           (choose (isa? collectionValue @NAMED-DESCRIPTION)
+                   (dynamically-estimate-extension-size collectionValue)
+                   ESTIMATED-CARDINALITY-OF-DESCRIPTION)))
+        (COLLECTION
+         (return (length collectionValue)))
+        (otherwise
+         ;; should never get here:
+         (return NULL))))
+     (otherwise
+      (return NULL)))))
+
+(defun (dynamically-estimate-extension-size COST-ESTIMATE)
+    ((description NAMED-DESCRIPTION))
+  ;; If the cardinality of `description' has been cached, return that value
+  ;;    (even though it might be out of date).  Otherwise, estimate
+  ;;    the cardinality of the extension, cache it, and return the value.
+  ;; TO DO: CREATE SMARTER VERSION OF THIS THAT TAKES SUBS INTO ACCOUNT.
+  (when (or (null? description)
+            (not (relation-supports-extension? description)))
+    (return NULL))
+  (let ((estimate COST-ESTIMATE #|(access-observed-cardinality description)|#
+                  NULL))
+    (when (null? estimate)
+      ;; this is VERY CRUDE, since it doesn't take subrelations into account:
+      (setq estimate
+        (estimated-length (get-description-extension description TRUE))))
+    (return estimate)))
+
+(defun (dynamically-estimate-unbound-variable-penalty COST-ESTIMATE)
+    ((goal PROPOSITION))
+  ;; Calculate a penalty for the unbound variables in `goal' that can
+  ;;    produce unwanted fanout.
+  ;; Return 1.0 if all key variables are bound.
+  (case (kind goal)
+    ((:NOT :FAIL)
+     (return
+       (dynamically-estimate-unbound-variable-penalty
+        (first (arguments goal)))))
+    (:AND
+     (let ((penalty COST-ESTIMATE NULL)
+           (minPenalty COST-ESTIMATE NULL))
+       (foreach arg in (arguments goal)
+           do (setq penalty
+                (dynamically-estimate-unbound-variable-penalty arg))
+              (when (or (null? minPenalty)
+                        (< penalty minPenalty))
+                (setq minPenalty penalty)))
+       (return minPenalty)))
+    (:OR
+     (let ((totalPenalty COST-ESTIMATE 0.0))
+       (foreach arg in (arguments goal)
+           do (++ totalPenalty
+                  (dynamically-estimate-unbound-variable-penalty arg)))
+       (return totalPenalty)))
+    ((:FUNCTION :PREDICATE :EQUIVALENT :ISA)
+     (let ((arguments (arguments goal))
+           (operator (operator goal))
+           (holds? (eql? operator PL-KERNEL/@HOLDS))
+           (isFunction?
+            (or (eql? (kind goal) :FUNCTION)
+                (and holds?
+                     (not (unbound-variable? (first arguments)))
+                     (function? (argument-bound-to (first arguments))))))
+           (firstKeyArgIndex
+            (choose holds? 1 0))
+           (lastKeyArgIndex
+            (choose isFunction?
+                    (- (length arguments) 2)
+                    (1- (length arguments))))
+           (nofUnboundVars
+            (choose
+             (and holds? (unbound-variable? (first arguments)))
+             ;; highly penalize an unbound relation variable - the proper
+             ;;    penalty would be the set of relations with matching arity;
+             ;;    the number 10 is a high penalty but still a low estimate:
+             10
+             0)))
+       (foreach i in (interval firstKeyArgIndex lastKeyArgIndex)
+           where (unbound-variable? (nth arguments i))
+           do (++ nofUnboundVars))
+       (when (computed-predicate? goal)
+         (case nofUnboundVars
+           (0 ;; all (input) args are bound, we are safe:
+            (return 0.0))
+           (1 ;; 1 unbound is ok for computed constraints:
+            (when (and (computed-constraint? (get-description operator))
+                       ;; if it is a relation, there is exactly 1 unbound arg,
+                       ;;    if it is a function one of the input args is
+                       ;;    unbound which means we have to check whether the
+                       ;;    last argument is properly bound:
+                       (or (not isFunction?)
+                           (not (unbound-variable?
+                                     (nth arguments (1+ lastKeyArgIndex))))))
+                  (return 0.0)))
+           (otherwise NULL))
+         ;; return "infinite" penalty, since computed relations need all their
+         ;;    inputs bound:
+         (return 10000.0))
+       ;; More unbound vars are worse than fewer ones in the presence of
+       ;;    chaining, even though generating an extension via `(c ?x)' or
+       ;;    `(r ?x ?y)' isn't qualitatively different.  We scale by the
+       ;;    ratio of unbound to all args, because a single unbound variable
+       ;;    in a unary proposition is usually worse than in a ternary one:
+       (return (+ 1.0 (* nofUnboundVars
+                         (/ nofUnboundVars
+                            ;; # of key arguments:
+                            (- lastKeyArgIndex firstKeyArgIndex -1)))))))
+    (otherwise
+     ;; arbitrary guess in lieu of deeper analysis:
+     (return 3.0))))
+
+(defun dynamically-reoptimize-arguments ((arguments (VECTOR OF PROPOSITION))
+                                         (cursor INTEGER))
+  ;; Find the cheapest goal in `arguments' starting at `cursor' and
+  ;;    make `(arguments cursor)' point at it.
+  ;; This does nothing if the current goal at cursor has all arguments
+  ;;    bound and is not inferable, but for generator goals it remeasures
+  ;;    the fanout for every new set of initial bindings.
+  (let ((lastArgIndex (1- (length arguments)))
+        (cheapestArgIndex cursor)
+        (cost COST-ESTIMATE NULL)
+        (fanout COST-ESTIMATE NULL)
+        (unbound COST-ESTIMATE NULL)
+        (bestCost COST-ESTIMATE NULL)
+        (argument PROPOSITION NULL))
+    (when (>= cursor lastArgIndex)
+      (return))
+    (foreach i in (interval cursor lastArgIndex)
+        do (setq argument (nth arguments i))
+           (when (or (contains-operator? argument PL-KERNEL/@CUT)
+                     (contains-operator? argument PL-KERNEL/@BOUND-VARIABLES))
+             ;; can't move anything across these operators:
+             (break))
+           (setq unbound
+             (dynamically-estimate-unbound-variable-penalty argument))
+           (if (= unbound 1.0)
+               ;; all variables are bound, shortcut fanout estimator:
+               (setq fanout 1.0)
+             (setq fanout (dynamically-estimate-goal-fanout argument)))
+           (when (null? fanout)
+             ;; can't be used as a generator:
+             (continue))
+           (when (< fanout 1.0)
+             ;; KLUDGE: optimal fanout is 1:
+             (setq fanout 1.0))
+           (setq cost (dynamically-estimate-goal-cost argument))
+           ;; simple multiplication might be too crude:
+           (setq cost (* cost fanout unbound))
+           (when (or (null? bestCost)
+                     (< cost bestCost))
+             (setq bestCost cost)
+             (setq cheapestArgIndex i)
+             (when (= bestCost 1.0)
+               ;; can't do better than that:
+               (break))))
+    (when (> cheapestArgIndex cursor)
+      ;(print "*** reordering args: using " (nth arguments cheapestArgIndex)
+      ;       " instead of " (nth arguments cursor) EOL)
+      (setq argument (nth arguments cursor))
+      (setf (nth arguments cursor) (nth arguments cheapestArgIndex))
+      (setf (nth arguments cheapestArgIndex) argument))))
+
+
+  ;;
+;;;;;; 'simplify-description'
+  ;;
+
+(defspecial *postOptimization?* BOOLEAN FALSE
+  :documentation "Used by 'simplify-description' to permit application
+of order-dependent optimizations.")
+
+(defun simplify-description ((description DESCRIPTION) (postOptimization? BOOLEAN))
+  ;; Eliminate logically-redundant clauses from 'description'.
+  ;; If 'postOptimization?', perform simplifications that are 
+  ;;    order-independent (i.e., can be safely performed only AFTER 
+  ;;    optimization).
+  (when (null? (proposition description))
+    (return))
+  (special ((*postOptimization?* postOptimization?))
+    (simplify-proposition (proposition description))) )
+
+(defun (copy-list-to-arguments-vector ARGUMENTS-VECTOR) ((arguments LIST))
+  ;; Create an arguments vector of arguments filled from 'arguments'.
+  (let ((vector (new ARGUMENTS-VECTOR :array-size (length arguments))))
+    (foreach arg in arguments
+             as i in (interval 0 NULL)
+             do (setf (nth vector i) arg))
+    (return vector) ))
+
+(defun (conjunct-cancels-isa-proposition? BOOLEAN) 
+       ((isaConjunct PROPOSITION) (otherConjunct PROPOSITION))
+  ;; Helping function for 'simplify-conjunction'.
+  ;; Return TRUE if the existence of 'otherConjunct' in a conjunction
+  ;;    makes 'isaConjunct' logically redundant.
+  ;; If (not *postOptimization?*), return TRUE only when exact
+  ;;    duplicates are detected.
+  (case (kind otherConjunct)
+    (:ISA
+     (return (and (eql? (first (arguments otherConjunct))
+                        (first (arguments isaConjunct)))
+                  (choose *postOptimization?*
+                          (relationref-specializes-relationref?
+                           (relationRef otherConjunct)
+                           (relationRef isaConjunct))
+                          (eql?
+                           (relationRef otherConjunct)
+                           (relationRef isaConjunct))))))              
+    ((:FUNCTION :PREDICATE)
+     (let ((inMember (first (arguments isaConjunct)))
+           (inType (relationRef isaConjunct)))
+       (return
+        (and *postOptimization?*
+             (type? inType)
+             (surrogate? (relationRef otherConjunct))
+             (exists arg in (arguments otherConjunct)
+                     as argType in (io-variable-types 
+                                    (get-description (relationRef otherConjunct)))
+                     where (and (eql? arg inMember)
+                                (logical-subtype-of? argType inType)))))))
+    (otherwise
+     (return FALSE))) )
+
+(defun simplify-conjunction ((andProposition PROPOSITION))
+  ;; Helping function for 'simplify-proposition'.
+  ;; Replace redundant conjuncts by TRUE-PROPOSITION; then eliminate all
+  ;;    TRUE-PROPOSITION conjuncts.
+  (let ((conjunctsList (new (LIST OF PROPOSITION)))
+        (cursor (CONS OF PROPOSITION) NULL)
+        (cursorPos 0))
+    (foreach arg in (arguments andProposition)
+             do (push conjunctsList arg))
+    (setq cursor (the-cons-list conjunctsList))
+    (while (non-empty? cursor)
+      (let ((conjunct (value cursor)))
+        (case (kind conjunct)
+          (:EQUIVALENT
+           (when
+             ;; designed to avoid deleting (= ?x//5 5):
+             (or (eql? (first (arguments conjunct)) 
+                       (second (arguments conjunct)))
+                 ;; tricky (dangerous): assumes that case of equated
+                 ;;    variables means that one has been substituted
+                 ;;    for the other throughout a description:
+                 (and (eql? (value-of (first (arguments conjunct)))
+                            (value-of (second (arguments conjunct))))
+                      (isa? (first (arguments conjunct))
+                            @PATTERN-VARIABLE)
+                      (isa? (second (arguments conjunct))
+                            @PATTERN-VARIABLE)))
+             (foreach arg in (arguments conjunct)
+                      do (remove-dependent-proposition-link arg conjunct))
+             (setf (value cursor) TRUE-PROPOSITION)))
+          (:ISA
+           ;; we look in the conjuncts list for a conjunct that dominates
+           ;;    'conjunct', i.e., that makes it redundant:
+           (let ((dominatingConjunct
+                  (some otherConj in conjunctsList
+                      as i in (interval 0 NULL)
+                      where (and (not (= i cursorPos)) ;; don't check own position
+                                 (conjunct-cancels-isa-proposition?
+                                  conjunct otherConj)))))
+             (when (or (eql? (relationRef conjunct) @THING)
+                       (defined? dominatingConjunct))
+               (unless (eql? conjunct dominatingConjunct)
+                 (foreach arg in (arguments conjunct)
+                     do (remove-dependent-proposition-link arg conjunct)))
+               (setf (value cursor) TRUE-PROPOSITION))))
+          (:AND
+           (simplify-conjunction (value cursor)))
+          (otherwise NULL)))
+      (setq cursor (rest cursor))
+      (++ cursorPos))
+    (when (member? conjunctsList TRUE-PROPOSITION)
+      (remove conjunctsList TRUE-PROPOSITION)
+      (reverse conjunctsList)
+      (case (length conjunctsList)
+        (0
+         (overlay-with-constant-proposition andProposition TRUE-PROPOSITION))
+        (1
+         ;; eliminate 'andProposition' entirely, replacing it by its
+         ;;    lone argument:
+         ;; Caution: 'overlay-proposition' assumes that its proposition
+         ;;    argument is unfastened. Hence, we need to repair
+         ;;    backlinks here:
+         (overlay-proposition andProposition (first conjunctsList))
+         (foreach arg in (arguments andProposition)
+                  do (add-dependent-proposition-link arg andProposition)))
+        (otherwise
+        (setf (arguments andProposition)
+              (copy-list-to-arguments-vector conjunctsList))))
+      (free conjunctsList)) ))
+
+(defun simplify-proposition ((proposition PROPOSITION))
+  ;; Eliminate logically-redundant clauses from 'proposition'.
+  ;; Currently, we eliminate TRUE, (= ?x ?x), (THING ?x), and
+  ;;    ISA propositions specialized by other ISA propositions within
+  ;;    the same conjunction.
+  (case (kind proposition)
+    (:FORALL
+        ;; FIXED?: Don't simplify forall's since we might need the type props
+        ;; to make universal introduction work properly - should this instead
+        ;; be fixed by inherit-description by obeying variable types?
+        ;; This solves the failing `teenager' test-suite case.
+        NULL)
+    (:AND (simplify-conjunction proposition))
+    (otherwise
+     (foreach arg in (arguments proposition)
+         do (typecase arg
+              (PROPOSITION (simplify-proposition arg))
+              (DESCRIPTION (simplify-description arg *postOptimization?*))
+              (otherwise NULL))))))
+
+
+  ;;
+;;;;;; 'copy-description'
+  ;;
+
+(defun (copy-description DESCRIPTION) 
+       ((self DESCRIPTION) (parentMapping ENTITY-MAPPING)
+        (addBackLinks? BOOLEAN))
+  ;; Return a copy of the description 'self'.
+  ;; Used by query optimizer to create multiple copies of 
+  ;;    a description optimized for different initial variable
+  ;;    bindings.
+  (within-context (home-context self)
+   (let ((copy (create-description NULL FALSE))
+         (mapping (new ENTITY-MAPPING)))
+     (when (defined? parentMapping)
+       ;; copy external variables into the local mapping:
+       (foreach (k v) in parentMapping
+                where (isa? k @PATTERN-VARIABLE)
+                do (insert-at mapping k v)))
+     (setf (io-variables copy) 
+           (copy-variables-vector (io-variables self) mapping))
+     (setf (internal-variables copy) 
+           (copy-variables-vector (internal-variables self) mapping))
+     (when (defined? (external-variables self))
+       ;; copy external variables via `copy-variables-vector' below, since it
+       ;;    properly initializes `bound-to-offset's.  TRICKY: some of the
+       ;;    external variables might be mapped to non-variables in which case
+       ;;    we have to create a real-variables-only copy before passing it
+       ;;    to `copy-variables-vector':
+       (let ((realExternalVars
+              (collect var in (external-variables self)
+                 where (or (null? (lookup mapping var))
+			   (variable? (lookup mapping var)))))
+             (externalVarsCopy VARIABLES-VECTOR NULL))
+         (if (= (length (external-variables self)) (length realExternalVars))
+             ;; we can use the original vector directly:
+             (setq externalVarsCopy
+               (copy-variables-vector (external-variables self) mapping))
+           ;; some vars were mapped onto constants, only copy unmapped ones:
+           (when (non-empty? realExternalVars)
+             (setq externalVarsCopy
+               (copy-variables-vector
+                (copy-cons-list-to-variables-vector realExternalVars)
+                mapping))))
+         (setf (external-variables copy) externalVarsCopy)))
+     ;; mildly tricky: setting '*boundToOffsetCounter*' to NULL disables
+     ;;    generation of bound-to-offsets within copied variables:
+     ;; CAUTION: must be in description mode to prevent logging copied
+     ;;    propositions as locally-conceived:
+     (when (defined? (proposition self))
+       (special ((*boundToOffsetCounter* NULL)
+                 (*evaluationMode* :DESCRIPTION))
+                (setf (proposition copy)
+                      (choose addBackLinks?
+                              (recursively-fasten-down-propositions
+                               (copy-proposition (proposition self) mapping) FALSE)
+                              (copy-proposition (proposition self) mapping)))))
+     (when (dont-optimize? self)
+       (setf (dont-optimize? copy) TRUE))
+     (free mapping)
+     (return copy) )))
+
+(defun (copy-variable PATTERN-VARIABLE) 
+       ((self PATTERN-VARIABLE) (mapping ENTITY-MAPPING))
+  ;; Create a copy of 'self' and pair 'copy' and 'self' within
+  ;;    'mapping'.
+  ;; Note: The 'defining-proposition' slot gets filled in during
+  ;;    the copy of the defining proposition.
+  ;; Caution: This only works if all variables (io and internal) are
+  ;;    copied before any propositions are copied.
+  (let ((copy PATTERN-VARIABLE (lookup mapping self)))
+    (when (defined? copy)
+      (return copy))
+    (setq copy (create-variable (skolem-type self) (skolem-name self) FALSE))
+    (case *printMode*
+      ((:REALISTIC :FLAT)
+       (setf (skolem-name copy) (skolem-name self)))
+      (otherwise
+       ; skip inner '?'
+       (let ((copyName
+              (concatenate
+                "?CP_" (subsequence (symbol-name (skolem-name self)) 1 NULL))))
+         (setf (skolem-name copy) (intern-symbol copyName)))))
+    (setf (skolem-type copy) (skolem-type self))
+    (when (defined? (variable-value self))
+      ;; tricky: assumes that variable-value chains have been collapsed:
+      (safety 3 (not (isa? (variable-value self) @PATTERN-VARIABLE))
+              "BUG: Failed to collapse variable value chains")
+      (setf (variable-value copy) (variable-value self)))
+    (insert-at mapping self copy)
+    (return copy) ))
+
+(defun (copy-variables-vector VARIABLES-VECTOR)
+       ((self VARIABLES-VECTOR) (mapping ENTITY-MAPPING))
+  ;; Create a copy of 'self', with the mapping of old variables
+  ;;    to new variables recorded in 'mapping'.
+  ;; BUG: DOESN'T ALLOW FOR THE POSSIBILITY OF EXTERNAL-VARIABLES.
+  (when (empty? self)
+    (return ZERO-VARIABLES-VECTOR))
+  (let ((copy (new VARIABLES-VECTOR :array-size (length self))))
+    (foreach vbl in self
+             as i in (interval 0 NULL)
+             do
+             (let ((vblCopy (copy-variable vbl mapping)))
+               (when (defined? *boundToOffsetCounter*)
+                 (setf (bound-to-offset vblCopy) *boundToOffsetCounter*)
+                 (++ *boundToOffsetCounter*))
+               (setf (nth copy i) vblCopy)))
+    (return copy) ))
+
+(defun (copy-proposition PROPOSITION) 
+       ((self PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Create a copy of the proposition 'self', assumed to belong to
+  ;;    some description.
+  ;; 'mapping' records how variables map to variables and 
+  ;;    propositions map to propositions.
+  ;; CAUTION: Does not copy backlinks.
+  (let ((copy PROPOSITION (lookup mapping self)))
+    (cond
+     ((defined? copy)
+      (return copy))
+     ((eql? (kind self) :CONSTANT)
+      (return self)))
+    (setq copy
+      (create-proposition (quote PREDICATE) (length (arguments self))))
+    (setf (home-context copy) *module*)
+    (setf (kind copy) (kind self))      ; overwrite with correct kind
+    (setf (operator copy)
+      (copy-proposition-argument (operator self) mapping))
+    (setf (truth-value copy) (truth-value self))
+    (when (defined? (weight self))         ;;   Weights for partial matcher 
+      (setf (weight copy) (weight self)))  ;; - Moriarty
+    (when (variable-type? self)
+      (setf (variable-type? copy) TRUE))
+    (when (descriptive? self)
+      (setf (descriptive? copy) TRUE))
+    (when (dont-optimize? self)
+      (setf (dont-optimize? copy) TRUE))
+    (when (defined? (annotations self))
+      (setf (annotations copy) (copy (annotations self)))
+      (finalize-proposition-annotations copy))
+    (insert-at mapping self copy)
+    (case (kind self)
+      ((:FORALL :EXISTS)
+       (setf (io-variables copy)
+         (copy-variables-vector (io-variables self) mapping)))
+      (otherwise NULL))
+    (foreach arg in (arguments self)
+        as i in (interval 0 NULL)
+        do (setf (nth (arguments copy) i)
+             (copy-proposition-argument arg mapping)))
+    (return copy)))
+
+(defun (copy-proposition-argument OBJECT) ((self OBJECT)
+                                           (mapping ENTITY-MAPPING))
+  ;; Return a copy of 'self' if 'self is a variable or a proposition.
+  ;; Otherwise, return 'self'.
+  (let ((copy (lookup mapping self)))
+    (when (defined? copy)
+      (when (description-mode?)
+        (typecase copy
+          (PATTERN-VARIABLE NULL)
+          (LOGIC-OBJECT
+           ;; If we are partially instantiating a forall or exists with
+           ;;    `inherit-proposition', we have to make sure that we don't
+           ;;    directly point to named logic objects to avoid erroneous
+           ;;    backpointers.  Instead, we do what `evaluate-SURROGATE-term'
+           ;;    would have done by returning the surrogate instead:
+           ;; QUESTION: Should `copy-proposition' automatically enter
+           ;;    description mode when it copies a quantified proposition?
+           (when (defined? (surrogate-value-inverse copy))
+             (return (surrogate-value-inverse copy))))
+          (otherwise NULL)))
+      (return copy))
+    (typecase self
+      (PROPOSITION (return (copy-proposition self mapping)))
+      (DESCRIPTION
+       (if (defined? (external-variables self))
+         (let ((copy (copy-description self mapping TRUE)))
+           (insert-at mapping self copy)
+           (return copy))
+         ;; if 'self is a self-contained description, don't make a copy:
+         (return self)))
+      (PATTERN-VARIABLE
+       ;; all variables are copied up front in 'copy-description':
+       (error "OOPS -- BUG IN 'copy-description'"))
+      (otherwise (return self))) ))
+
+
+  ;;
+;;;;;; 'inherit-proposition'
+  ;;
+
+;;; These routines resemble the 'copy-proposition' routines,
+;;;    but they need to account for structure sharing and
+;;;    unflattening of :FUNCTION propositions.
+
+(defun (mapped-value-of OBJECT)
+       ((self OBJECT) (mapping ENTITY-MAPPING) (createSkolem? BOOLEAN))
+  ;; Called by 'inherit-xxx' routines to determine the mapped values of
+  ;;    arguments to propositions being inherited.
+  (let ((value (only-if (defined? mapping) (lookup mapping self))))
+    (when (defined? value)
+      (return value))
+    (if (and (defined? *queryIterator*)
+             ;; careful, in case we are called with a KAPPA here and
+             ;; see a parent query iterator, then `argument-bound-to'
+             ;; would break on internal vars that don't have offsets:
+             (or (not (variable? self))
+                 (defined? (bound-to-offset (cast self PATTERN-VARIABLE)))))
+      (setq value (argument-bound-to self))
+      (progn
+        (setq value (value-of self))
+        (when (variable? self)
+          (setq value NULL))))
+    (when (and (defined? mapping)
+               (defined? value))
+      (unless (isa? self @PROPOSITION)
+        ;; Do not map propositions onto themselves, since that causes a
+        ;;    problem with `inherit-proposition' for propositions of the
+        ;;    form `(or (forall ....) ...)'.  In that case a call to
+        ;;    `find-similar-proposition' calls this function which in turn
+        ;;    records the `forall' before it gets actually copied.  Then
+        ;;    `copy-proposition' immediately returns thinking nothing needs to
+        ;;    be done which is wrong.
+        ;; TO DO: REVISIT THIS, SINCE THE RECORDING MIGHT BE NECESSARY
+        ;;    IN SOME CASES TO AVOID DUPLICATES.
+        (insert-at mapping self value))
+      (return value))
+    ;; must be a free variable (unbound at top-level):
+    (if createSkolem?
+      (return (create-skolem-for-unmapped-variable self mapping))
+      (return NULL)) ))
+
+(defun (single-valued-predicate? BOOLEAN) ((proposition PROPOSITION))
+  ;; Return TRUE if 'proposition' represents a single-valued predicate.
+  (return
+   (and (eql? (kind proposition) :PREDICATE)
+        (single-valued-term? (get-description (relationRef proposition))))) )
+
+(defun (binary-proposition? BOOLEAN) ((proposition PROPOSITION))
+  ;; Return TRUE if 'proposition' takes two arguments.
+  :globally-inline? TRUE
+  (return (eql? (length (arguments proposition)) 2)) )
+
+(defun (inherit-EQUIVALENT-proposition PROPOSITION)
+       ((skolem SKOLEM) (value OBJECT))
+  ;; Called when inheriting a :FUNCTION proposition.
+  ;;    'skolem' is the output skolem, and 'value' is the inherited
+  ;;    value.  Return an EQUIVALENT proposition equating the two.
+  (let ((equivalentProp
+         (some p in (unfiltered-dependent-propositions skolem PL-KERNEL/@EQUIVALENT)
+                 where
+                 (and (eql? (relationRef p) PL-KERNEL/@EQUIVALENT)
+                      (or (eql? (nth (arguments p) 0) value)
+                          (eql? (nth (arguments p) 1) value))))))
+    (when (null? equivalentProp)
+      (setq equivalentProp (create-proposition (quote EQUIVALENT) 2))
+      (setf (nth (arguments equivalentProp) 0) skolem)
+      (setf (nth (arguments equivalentProp) 1) value))
+    (return equivalentProp) ))
+
+(defun (inherit-FUNCTION-proposition PROPOSITION)
+       ((self PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Called by 'map-functional-value' and 'inherit-proposition'.
+  ;; No equivalent of the inheriting :FUNCTION proposition 'self'
+  ;;     exists.  Create one, with an unbound output skolem.
+  (let ((copy PROPOSITION NULL)
+        (inputArgs NIL)
+        (nofInputArgs (1- (length (arguments self))))
+        (argMapsTo OBJECT NULL))
+    ;; semi-tricky: we are careful to call
+    ;;    'create-function-proposition' before 'map-functional-value' calls
+    ;;    'map-and-enqueue-variable'.  This ensures that the skolem
+    ;;    created to represent the output of the function does not get
+    ;;    indexed into a class extension:
+    (foreach arg in (arguments self)
+        as i in (interval 1 NULL)
+        where (<= i nofInputArgs)
+        do (setq argMapsTo (mapped-value-of arg mapping FALSE))
+           ;; exit if an input argument isn't mapped (yet):
+           (when (null? argMapsTo)
+             (return NULL))
+        collect argMapsTo into inputArgs)
+    (setq copy (create-function-proposition (relationRef self) inputArgs))
+    (return copy) ))
+
+(defun (equal-up-to-skolem-identity? BOOLEAN) 
+       ((inheritedArg OBJECT) (baseArg OBJECT) (mapping ENTITY-MAPPING))
+  ;; Helping function for 'find-similar-proposition'.
+  ;; Return TRUE if 'inheritedArg' and 'baseArg' can safely be considered
+  ;;    equivalent for inheritance purposes.
+  ;; We compare the mapped value of 'inheritedArg' to 'baseArg'
+  ;;    (unless 'mapping' is NULL).
+  ;; The test is 'eql?' except for the case when 'baseArg'
+  ;;    is a skolem.  In that case, if 'baseArg' has only
+  ;;    one dependent (the proposition that has it as an argument)
+  ;;    then we also return TRUE.  The equivalence is sustainable
+  ;;    only if a mapping between 'inheritedArg' and 'baseArg' is
+  ;;    established later on.
+  (let ((inheritedValue 
+         (choose (defined? mapping)
+                 (mapped-value-of inheritedArg mapping FALSE)
+                 inheritedArg))
+        (baseValue (value-of baseArg)))
+    (when (eql? inheritedValue baseValue)
+      (return TRUE))
+ ;; EXIT FALSE UNTIL WE UNDERSTAND HOW TO REWRITE THIS:
+ (return FALSE)
+ #|
+    (typecase baseValue
+      (SKOLEM
+       ;; BUG: THIS TEST DOESN'T TAKE INTO ACCOUNT UNFASTENED
+       ;;    PROPOSITIONS THAT POINT AT 'baseValue'.
+       ;; UNFINISHED: FIX-UP AFTERWORDS FOR THE CASE WHEN 'mapping' IS DEFINED.
+       (return
+        ;; THIS IS RATHER SLOW:
+        (eql? (estimated-length (unfiltered-dependent-propositions baseValue NULL)) 1)))
+      (otherwise (return FALSE)))
+ |#
+ ))
+
+(defun (find-similar-proposition PROPOSITION) 
+       ((proposition PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Look for a proposition attached to the first argument of 'proposition'
+  ;;    that matches 'proposition', using 'mapping' to interpret variable
+  ;;     values of arguments of 'proposition'.
+  ;; Used by 'inherit-xxx' routines to find duplicates.
+  ;; If 'mapping' is NULL, then 'proposition' is an already inherited
+  ;;     copy (probably created from a HOLDS) that requires a second
+  ;;     duplicate check.
+  ;; QUESTION: WE DON'T SEARCH UP 'inverse-variable-value' LINKS LOOKING FOR
+  ;;    DUPLICATES.  SHOULD WE???
+  (when (eql? (kind proposition) :CONSTANT)
+    (return NULL))
+  (let ((kind (kind proposition))
+        (operator (operator proposition))
+        (argMapsTo OBJECT NULL)
+        (dependentsList PROPOSITIONS-INDEX NULL)
+        (hasDiscouragedArgument? FALSE))
+    ;; tricky: because relation arguments often are converted to surrogates,
+    ;;    they often aren't backindexed.  Here, our mapping maps to relations,
+    ;;    not surrogates, so we have to avoid using relations if possible:
+    (foreach arg in (arguments proposition)
+        do (when (argument-discourages-backlinks? arg)
+             (setq hasDiscouragedArgument? TRUE)
+             (continue))
+           (let ((mapsTo (mapped-value-of arg mapping FALSE)))
+             (when (and (defined? mapsTo)
+                        (instance-has-backlinks? mapsTo))
+               (setq argMapsTo mapsTo)
+               (break))))
+    (when (and (null? argMapsTo)
+               hasDiscouragedArgument?)
+      ;; try again, allowing relations to generate backlinks:
+      (foreach arg in (arguments proposition)
+          where (argument-discourages-backlinks? arg)
+          do (let ((mapsTo (mapped-value-of arg mapping FALSE)))
+               (when (and (defined? mapsTo)
+                          (instance-has-backlinks? mapsTo))
+                 (setq argMapsTo mapsTo)
+                 (break)))))
+    (when (null? argMapsTo)
+      (return NULL))
+    (typecase argMapsTo
+      (LOGIC-OBJECT
+       (setq dependentsList
+         ;; should we use `select-...' here?
+         (unfiltered-dependent-propositions argMapsTo operator))
+       (case kind
+         (:FUNCTION
+          ;; find match on first n-1 arguments:
+          (return
+           (some p in dependentsList
+                 where
+                 (and (eql? (kind p) kind)
+                      (eql? (operator p) operator)
+                      (forall arg1 in (but-last (arguments proposition))
+                              as arg2 in (but-last (arguments p))
+                              always
+                              (equal-up-to-skolem-identity?
+                               arg1 arg2 mapping))))))
+         (otherwise
+          (return
+           (some p in dependentsList
+                 where
+                 (and (eql? (kind p) kind)
+                      (eql? (operator p) operator)
+                      (forall arg1 in (arguments proposition)
+                              as arg2 in (arguments p)
+                              always
+                              (equal-up-to-skolem-identity?
+                               arg1 arg2 mapping))))))))
+      (otherwise NULL))
+    (return NULL) ))
+
+(defun (inherit-proposition-argument OBJECT) 
+       ((argument OBJECT) (parent PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Return a copy of 'argument' if it is a variable or a proposition.
+  ;; Re-evaluate surrogates depending on the 'parent' proposition and
+  ;;    the current evaluation mode.
+  ;; Otherwise, return 'argument'.
+  (typecase argument
+    (PROPOSITION
+     (return (inherit-proposition argument mapping)))
+    (DESCRIPTION
+     (if (named-description? argument)
+       (return argument)
+       ;; BUG: THE BINDINGS OF ARGUMENTS SCOPED OUTSIDE OF 'argument' BUT
+       ;;    USED INSIDE OF 'argument' MUST BE PRE-RECORDED IN 'mapping'
+       ;;    (CURRENTLY WE ONLY RECORD MAPPING OF PROPOSITIONS; FIX
+       ;;    IS TO RECORD EVERYTHING THAT GETS COPIED, OR PERHAPS
+       ;;    SOMETHING SHORT OF THAT):
+       (return (copy-description argument mapping TRUE))))
+    (PATTERN-VARIABLE (return (mapped-value-of argument mapping TRUE)))
+    (SURROGATE
+     ;; should we call `evaluate-term' here to make this cleaner?
+     (if (or (description-mode?)
+             (and (eql? (kind parent) :ISA)
+                  (eql? (relationRef parent) argument)))
+       (return argument)
+       (let ((value (surrogate-value argument)))
+         (if (relation? value)
+             ;; we picked up a STELLA relation, return its description:
+             (return (surrogate-to-description argument))
+           (return value)))))
+    (otherwise (return argument))) )
+
+(defun (eradicate-holds-proposition PROPOSITION) ((self PROPOSITION))
+  ;; Replace a HOLDS proposition by ordinary one if possible.
+  (when (and (eql? (operator self) PL-KERNEL/@HOLDS)
+             (not (isa? (first (arguments self)) @PATTERN-VARIABLE)))
+    ;; overlay 'self' with version that eliminates the 'HOLDS':
+    (normalize-predicate-proposition self)
+    (let ((duplicate (find-similar-proposition self NULL)))
+      ;; if a duplicate exists (up to skolem identity), clobber
+      ;;    its arguments and return it:
+      (when (defined? duplicate)
+        (foreach arg in (arguments self)
+                 as i in (interval 0 NULL)
+                 do
+                 (setf (nth (arguments duplicate) i) arg))
+        (free self)
+        (return duplicate))))
+  (return self) )
+
+(defun (inherit-proposition PROPOSITION) 
+       ((self PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Inherit 'self' onto the objects that variables within its arguments
+  ;;    are bound to.  'self' resides within a description.
+  ;; Strategy:
+  ;;    (1) Check for duplicate.
+  ;;    (2) Inherit each argument of 'self'.  If some argument cannot
+  ;;        be inherited, fail also at this level.
+  ;;    (2) Create a copy of the proposition 'self'.  Copy in inherited 
+  ;;        arguments.
+  (case (kind self)
+    ((:FORALL :EXISTS)
+     ;; make a copy with variables copied into variables (not into skolems):
+     (special ((*evaluationMode* :DESCRIPTION))
+       (return (copy-proposition self mapping))))
+    (:FUNCTION
+     (let ((value (inherit-proposition-argument
+                   (last-argument self) self mapping))
+           (copy PROPOSITION NULL))
+       (when (null? value)
+         (return NULL))
+       (setq copy (find-similar-proposition self mapping))
+       (when (null? copy)
+         (setq copy (inherit-FUNCTION-proposition self mapping))
+         (setq copy (eradicate-holds-proposition copy)))
+       ;; tricky: we don't inherit a :FUNCTION proposition. Instead,
+       ;;    we inherit an :EQUIVALENT proposition between the local
+       ;;    output skolem and the inherited function's output value:
+       (if (eql? (last-argument copy) value)
+         (setq copy TRUE-PROPOSITION)
+         (setq copy (inherit-EQUIVALENT-proposition (last-argument copy) value)))
+       (insert-at mapping self copy)
+       (return copy)))
+    (otherwise NULL))
+  (let ((matchingProposition PROPOSITION (lookup mapping self)))
+    (when (defined? matchingProposition)
+      (return matchingProposition))
+    ;; Don't inherit type declarations for quantified variables, unless
+    ;;    (1) we have a null variable binding in which case the variable
+    ;;    must be unmapped and correspond to a top-level existential that
+    ;;    is yet to be skolemized, or
+    ;;    (2) we have a skolem binding which might stem from skolemizing
+    ;;    an existential variable.
+    (when (variable-type? self)
+      (let ((binding (lookup mapping (first (arguments self)))))
+        (when (and (defined? binding)
+                   (not (skolem? binding)))
+          (return TRUE-PROPOSITION))))
+    ;; EXPERIMENT: commented, since we don't really seem to need it
+    ;; and it now causes a bug with some of the PSYASE translation
+    ;; stuff due to improved normalization.  In general, calling
+    ;; `find-similar-proposition' seems primarily an "optimization"
+    ;; that avoids generating duplicate propositions; however, since
+    ;; we've improved our duplicate detection machinery, we might want
+    ;; to eliminate it alltogether, since it is an expensive function,
+    ;; particularly, if we have high-fanout backlinks:
+    ;(setq matchingProposition (find-similar-proposition self mapping))
+    (when (defined? matchingProposition)
+      (insert-at mapping self matchingProposition)
+      (return matchingProposition)))
+  (let ((operator (operator self))
+        (argumentsMapTo (new LIST))
+        (copy PROPOSITION NULL)
+        (argMapsTo OBJECT NULL))
+    ;; inherit args first, so we can exit early if one of them
+    ;;    returns NULL:
+    (foreach arg in (arguments self)
+             do
+             (setq argMapsTo (inherit-proposition-argument arg self mapping))
+             (when (null? argMapsTo)
+               (return NULL))
+             collect argMapsTo into argumentsMapTo)
+    (setq copy (create-proposition (quote CONSTANT) 0))
+    (setf (kind copy) (kind self))      ; overwrite with correct kind
+    (setf (operator copy) operator)
+    (setf (arguments copy) (copy-list-to-arguments-vector argumentsMapTo))
+    (when (variable-type? self)
+      (setf (variable-type? copy) TRUE))
+    (setq copy (eradicate-holds-proposition copy))
+    (insert-at mapping self copy)
+    (return copy) ))
+
+(defun (create-skolem-for-unmapped-variable SKOLEM)
+       ((variable PATTERN-VARIABLE) (mapping ENTITY-MAPPING))
+  ;; 'variable' is unbound and (probably) unmapped (it is explicitly or
+  ;;     implicitly existentially-quantified).
+  ;; Create a new skolem, and map 'variable' to it.
+  (let ((skolem (lookup mapping variable)))
+    (when (defined? skolem)
+      (return skolem))
+    (safety 3 (null? (variable-value variable))
+            "SYSTEM BUG: BOUND VARIABLE WHERE IT SHOULDN'T BE")
+    (setq skolem (create-variable-or-skolem 
+                  (skolem-type variable) NULL))
+    (insert-at mapping variable skolem)
+    (return skolem) ))
+
+(defun (inherit-as-top-level-proposition (CONS OF PROPOSITION))
+       ((proposition PROPOSITION) (mapping ENTITY-MAPPING))
+  ;; Called by 'inherit-unnamed-description', 'try-refutation-proof' and
+  ;;    'try-or-introduction-proof'.
+  ;; Copy 'proposition' onto its mappings or bindings.  Return a list
+  ;;    of the top-level proposition(s) created.
+  ;; Assumes that all variables within 'proposition' have bindings.
+  ;; CAUTION: Inherited propositions are NOT fastened down.
+  (let ((resultList NIL))
+    (when (null? mapping)
+      (setq mapping (new ENTITY-MAPPING)))
+    (case (kind proposition)
+      (:AND
+       (foreach arg in (arguments proposition)
+                do (pushq resultList (inherit-proposition arg mapping))))
+      (:EXISTS
+       ;; create a variable or skolem for each existential variable,
+       ;;    and then copy the body of the exists:
+       (foreach vbl in (io-variables proposition)
+                do (create-skolem-for-unmapped-variable vbl mapping))
+       (pushq resultList
+              (inherit-proposition (first (arguments proposition)) mapping)))
+      (otherwise
+       (pushq resultList (inherit-proposition proposition mapping))))
+    (free mapping)
+    (foreach p in resultList
+        do (normalize-top-level-proposition p NULL))
+    (return resultList)) )
+
+
+  ;;
+;;;;;; Inherit-description
+  ;;
+
+(defun (map-and-enqueue-variable? BOOLEAN)
+       ((variable OBJECT) (localValue OBJECT)
+        (mapping ENTITY-MAPPING) (queue LIST))
+  ;; Helping function for 'inherit-unnamed-description'.
+  ;; Record that 'variable' maps to 'localValue' in 'mapping' and push
+  ;;    'variable' onto 'queue'.
+  ;; If 'localValue' is NULL, a skolem gets created (unless 'variable' maps
+  ;;    to a constant).
+  ;; A clash may occur if 'variable' already maps to another distinct value.
+  ;; Return TRUE if the mapping was successful, return FALSE if there was a clash.
+  (typecase variable
+    (PATTERN-VARIABLE
+     (let ((mapsToValue (lookup mapping variable)))
+       ;;; TRICKY: We now allow bound relation variables such as `?county/LA' which
+       ;;; are the result of equality constraints between a relation variable
+       ;;; and a constant or other variable; we ignore the binding here and rely
+       ;;; on the existence of the appropriate equivalence proposition to establish
+       ;;; the equivalence during inheritance and generate a clash if necessary:
+       ;(safety 3 (eql? variable (value-of variable)) "Internal bug in inheriting.")
+       (when (null? mapsToValue)
+         (setq mapsToValue (native-value-of variable))
+         (when (defined? mapsToValue)
+           (insert-at mapping variable mapsToValue)))
+       (cond
+        ((defined? mapsToValue)
+         ;; either we've been here before, or 'mapsToValue' is a constant.
+         ;; in either case, we don't need to push anything onto 'mapping'
+         ;; or 'queue', but check for a potential clash, since if we have
+         ;; non-unique io-variables (due to collapsed identity constraints),
+         ;; we need to ensure that we are not violating a previous binding.
+         ;; Handles rules like this: (=>> (and (= ?x ?y) (r1 ?x ?y)) (r2 ?x ?y))
+         ;; - see test-suite "FORWARD INFERENCE BUG":
+         (return (or (null? localValue)
+                     (eql? mapsToValue localValue)
+                     ;; check whether clashing values are equatable:
+                     (skolem? localValue)
+                     (skolem? mapsToValue))))
+        ((defined? localValue)
+         (insert-at mapping variable localValue)
+         (when (isa? localValue @LOGIC-OBJECT)
+           (push queue variable)))
+        (otherwise
+         ;; create a skolem and map 'variable' to it:
+         (let ((skolem
+                (create-variable-or-skolem (skolem-type variable) NULL)))
+           (insert-at mapping variable skolem)
+           (push queue variable))))))
+    (otherwise NULL))
+  (return TRUE))
+
+(defun collect-structural-functions
+       ((proposition PROPOSITION) (structuralFunctions (LIST OF PROPOSITION)))
+  ;; Collect into 'structuralFunctions' all functions and predicates
+  ;;    nested within 'proposition' that fix the meaning of a variable,
+  ;;    so that inheritance can uniquely map onto the equivalent.
+  ;; Used by 'help-inherit-description' so that only 'top-level'
+  ;;    functions are used to define a mapping.
+  (case (kind proposition)
+    (:FUNCTION (insert structuralFunctions proposition))
+    (:PREDICATE
+     (when (single-valued-predicate? proposition)
+       (insert structuralFunctions proposition)))
+    (:AND
+     (foreach conjunct in (arguments proposition)
+              do (collect-structural-functions conjunct structuralFunctions)))
+    (:EXISTS
+     (collect-structural-functions
+      (first (arguments proposition)) structuralFunctions))
+    ;; don't recurse into :OR, :NOT, etc:
+    (otherwise NULL)) )
+
+(defun (map-functional-value? BOOLEAN)
+       ((proposition PROPOSITION) (mapping ENTITY-MAPPING) (queue LIST))
+  ;; Called by 'inherit-unnamed-description' to find or create values of 
+  ;;    functions and ranges of single-valued predicates as a prelude
+  ;;    to inheriting propositions.
+  ;; Returns TRUE unless there was a clash in `map-and-enqueue-variable?'.
+  (let ((copy (find-similar-proposition proposition mapping)))
+    (when (and (null? copy)
+               (eql? (kind proposition) :FUNCTION))
+      (setq copy (inherit-FUNCTION-proposition proposition mapping)))
+    (when (defined? copy)
+      (let ((localFunctionalValue (value-of (last-argument copy))))
+        ;; map the range of 'proposition' to the range of the matching
+        ;;    proposition:
+        (return
+          (map-and-enqueue-variable?
+           (last-argument proposition) localFunctionalValue mapping queue))))
+    (return TRUE)))
+  
+(defun (inherit-description-propositions (CONS OF PROPOSITION))
+    ((arguments VECTOR) (description DESCRIPTION))
+  ;; Inherit the structure within 'description' onto the objects
+  ;;    in 'arguments' and return a list of fastened-down, top-level
+  ;;    propositions.
+  ;; NOTE: This does not automatically assert any of the propositions
+  ;;    it instantiated.
+  (let ((mapping (new ENTITY-MAPPING))
+        (variableQueue (new (LIST OF PATTERN-VARIABLE)))
+        (structuralFunctions (LIST OF PROPOSITION) (new LIST)))
+    ;; Map variables onto arguments:
+    (foreach v in (io-variables description)
+        as arg in arguments
+        do (unless (map-and-enqueue-variable? v arg mapping variableQueue)
+             (return NIL)))
+    (foreach v in (internal-variables description)
+        collect v into variableQueue)
+    ;; For each variable in 'variableQueue', extend the mapping in 'mapping'
+    ;;    by following function and single-valued predicate links attached to
+    ;;    the variable:
+    (collect-structural-functions
+     (proposition description) structuralFunctions)
+    (loop
+      (when (empty? variableQueue)
+        (break))
+      (let ((variable PATTERN-VARIABLE (pop variableQueue)))
+        (foreach p in (unfiltered-dependent-propositions variable NULL)
+            where (member? structuralFunctions p)
+            do (unless (map-functional-value? p mapping variableQueue)
+                 (return NIL)))))
+    ;; Done mapping variables; inherit the top-level proposition within
+    ;;    'description' onto the instances mapped to within 'mapping':
+    (let ((propositions (inherit-as-top-level-proposition
+                         (proposition description) mapping)))
+      (foreach it on propositions
+          do (setf (value it)
+               (recursively-fasten-down-propositions (value it) FALSE)))
+      (return propositions))))
+
+(defun inherit-unnamed-description 
+           ((self OBJECT) (description DESCRIPTION) (defaultTrue? BOOLEAN))
+  :public? TRUE
+  (typecase self
+    (VECTOR (VECTOR.inherit-unnamed-description self description defaultTrue?))
+    (LOGIC-OBJECT 
+     (LOGIC-OBJECT.inherit-unnamed-description self description defaultTrue?))) )
+
+(defun VECTOR.inherit-unnamed-description 
+           ((arguments VECTOR) (description DESCRIPTION) (defaultTrue? BOOLEAN))
+  ;; Inherit the structure within 'description' onto the objects
+  ;;    in 'arguments'.
+  ;; Fasten down each inherited proposition.
+  ;; Assumes that the length of 'arguments' equals the number of
+  ;;    io-variables in 'description'.
+  (foreach prop in (inherit-description-propositions arguments description)
+      where (not (true? prop))
+      do (assign-truth-value 
+          prop
+          ;; QUESTION: DOES THIS INCORRECTLY CLIP STRICT TRUE?:
+          (choose defaultTrue? DEFAULT-TRUE-TRUTH-VALUE TRUE-TRUTH-VALUE))
+         (unless (defined? *collectForwardPropositions*)
+           (continue))
+      collect prop into *collectForwardPropositions*))
+
+(defun LOGIC-OBJECT.inherit-unnamed-description
+           ((instance LOGIC-OBJECT) (description DESCRIPTION) (defaultTrue? BOOLEAN))
+  ;; Inherit the structure within 'description' onto the objects
+  ;;    in 'arguments'.
+  (let ((vector (new VECTOR :array-size 1)))
+    (setf (nth vector 0) instance)
+    ;; BUG: THIS NEEDS TO INHERIT A DESCRIPTION *PLUS* RUN UP
+    ;;    variable-value-inverse LINKS:
+    (inherit-unnamed-description vector description defaultTrue?) ))
+
+(defun inherit-description 
+    ((arguments VECTOR) (description DESCRIPTION) (defaultTrue? BOOLEAN))
+  ;; Inherit 'description' onto 'arguments.
+  (typecase description
+    (NAMED-DESCRIPTION
+     (let ((prop
+            (update-tuple (surrogate-value-inverse description)
+                          (consify arguments)
+                          :CONCEIVE)))
+       (unless (true? prop)
+         (when (defined? *collectForwardPropositions*)
+           (pushq *collectForwardPropositions* prop))
+         (assign-truth-value 
+          prop
+          ;; QUESTION: DOES THIS INCORRECTLY CLIP STRICT TRUE?:
+          (choose defaultTrue? DEFAULT-TRUE-TRUTH-VALUE TRUE-TRUTH-VALUE)))))
+    (otherwise
+     (inherit-unnamed-description arguments description defaultTrue?))) )

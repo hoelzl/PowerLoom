@@ -1,0 +1,1468 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: classify.ste,v 1.27 2006/05/11 07:05:07 hans Exp
+
+;;; Routines that classify descriptions and instances
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; "inferable?" computation
+  ;;
+
+;;; These routines compute whether a description is 'inferable' or not.
+;;; A non-inferable description is one such that membership can be
+;;;    inferred only by an explicit ISA assertion to it or one of its
+;;;    offspring.
+;;; 'non-inferable' is the analogue of 'primitive' in a description logic.
+;;;    The classifier relies heavily on it for pruning its search space.
+;;;    The query optimizer uses it to prune backtracking.
+;;; If a description A has a subdescription B such that none of the
+;;;    intensional parents of B specialize A, then A is inferable.
+;;; The 'inferable' computation is relatively expensive for descriptions
+;;;    higher up in the taxonomy; hence memoization is essential.
+
+(defun bump-inferable-timestamp ()
+  ;; Bump the timestamp, making existing cache(s) obsolete.
+  :globally-inline? TRUE
+  (bump-memoization-timestamp :IMPLIES-PROPOSITION-UPDATE))
+
+(defun help-collect-intensional-parents
+       ((description DESCRIPTION) (proposition PROPOSITION) (collection LIST))
+  ;; Helping function for 'all-intensional-parents'.
+  (case (kind proposition)
+    ((:PREDICATE :FUNCTION :ISA)
+     (when (and (forall arg1 in (arguments proposition)
+                        as arg2 in (io-variables description)
+                        always (eql? arg1 arg2))
+                (eql? (length (arguments proposition)) 
+                      (length (io-variables description))))
+       (push collection (get-description (relationref proposition)))))
+    (:AND
+     (foreach arg in (arguments proposition)
+         do (help-collect-intensional-parents description arg collection)))
+    (:EXISTS
+     (help-collect-intensional-parents
+      description (first (arguments proposition)) collection))
+    (otherwise NULL)) )
+
+(defun (all-intensional-parents (LIST OF DESCRIPTION)) ((self DESCRIPTION))
+  ;; Return a list of parents of 'self' found in its definition.
+  ;; Only named descriptions appear in this list.
+  (let ((collection (LIST OF DESCRIPTION) (new LIST)))
+    (help-collect-intensional-parents self (proposition self) collection)
+    (return collection) ))
+
+(defun (inferable-through-by-some-descendant? BOOLEAN)
+    ((self NAMED-DESCRIPTION)
+     (throughChild LOGIC-OBJECT)
+     (alreadyVisitedList CONS))
+  ;; Helping function for 'compute-inferable?'.
+  ;; Return true if `self' is inferable via `throughChild'.
+  ;; Returns true if there exists a subcollection of 'throughChild'
+  ;;    none of whose intensional parents specialize 'self', or if
+  ;;    'throughChild' is inferable via a specialist or computation.
+  (typecase throughChild
+    (NAMED-DESCRIPTION
+     (cond ((or (defined? (lookup-specialist throughChild))
+                (defined? (lookup-computation throughChild)))
+            ;; `throughChild'/antecedent is (at least partially) computable
+            ;;     and, therefore, can be generated via inference:
+            (return TRUE))
+           ((and (not (eql? (kind (proposition self)) 
+                            (kind (proposition throughChild)))))
+            ;; Catches rules such as `(=> (r ?x ?y) (c ?x))' or even
+            ;;    `(=> (r ?x) (c ?x))' where `r' is a (unary) relation and
+            ;;    `c' is a concept.  Such cases are not picked up by the
+            ;;    specializing proposition iterators and need inference
+            ;;    to conclude `c'.  NOTE: We don't want to shortcut for
+            ;;    unnamed descriptions that contain an :AND proposition,
+            ;;    otherwise we would not properly check for intensional
+            ;;    parents below:
+            (return TRUE))
+           ((not (inferable-with-cycle-check? throughChild alreadyVisitedList))
+            ;; `throughChild' is non-inferable; make quick exit.  This also
+            ;;    catches cases where `throughChild' was already visited.
+            ;; This is a win if we already computed and cached it in a previous
+            ;;    run; otherwise, we'll visit a very similar part of the
+            ;;    hierarchy as we'll do in the loop below.  We could move most
+            ;;    of the logic of `inferable-with-cycle-check?' into here and
+            ;;    memoize for the price of using a lot more memoization space:
+            (return FALSE)))
+     (foreach p in (applicable-rules-of-description
+                    throughChild :BACKWARD FALSE)
+         where (and (not (forward-only? p))
+                    (true? p))
+         do (when (inferable-through-by-some-descendant?
+                   self (nth (arguments p) 0) alreadyVisitedList)
+              (return TRUE)))
+     (return FALSE))
+    (DESCRIPTION
+     (return
+       (not (exists parent in (all-intensional-parents throughChild)
+                where (description-implies-description? parent self)))))
+    (otherwise
+     (return FALSE))))
+
+(defun (inferable-with-cycle-check? BOOLEAN) 
+    ((self DESCRIPTION) (alreadyVisitedList CONS))
+  ;; Return TRUE if one of the antecedents of 'self'
+  ;;    has no name and doesn't reference 'self' within its definition.
+  ;; We memoize the result, since the computation is somewhat expensive.
+  (when (memb? alreadyVisitedList self)
+    (return FALSE))
+  (let ((inferable? FALSE))
+    (typecase self
+      (NAMED-DESCRIPTION
+       (setq inferable?
+         (memoize (self *context*)
+                  :timestamps :IMPLIES-PROPOSITION-UPDATE
+                  :max-values 500
+                  (and (not (eql? (surrogate-value-inverse self) @THING))
+                       ;; minor hack to only cons once and do it in here:
+                       (defined? (setq alreadyVisitedList
+                                   (cons self alreadyVisitedList)))
+                       (exists p in (applicable-rules-of-description
+                                     self :BACKWARD FALSE)
+                           where (and (not (forward-only? p))
+                                      (true? p)
+                                      (inferable-through-by-some-descendant?
+                                       self
+                                       (nth (arguments p) 0)
+                                       alreadyVisitedList)))))))
+      (otherwise
+       (setq inferable? TRUE)))
+    (return inferable?)))
+
+(defun (inferable? BOOLEAN) ((self DESCRIPTION))
+  ;; Return TRUE if some one of the antecedents of 'self'
+  ;;    has no name and doesn't reference 'self' within its definition.
+  ;; Note: We cache the result, since the computation is somewhat
+  ;;    expensive.
+  :inline inferable-with-cycle-check?
+  (within-context (get-inferable-test-context)
+    (return (inferable-with-cycle-check? self NIL)) ))
+
+(defun (non-inferable? BOOLEAN) ((self DESCRIPTION))
+  ;; Return TRUE if 'self' can be infered using only lookup.
+  ;; 'non-inferable' is the extensional analogue of 'primitive'.
+  :inline inferable?
+  (return (not (inferable? self))) )
+
+
+  ;;
+;;;;;; Marker routines
+  ;;
+
+(defclass MARKER-TABLE (STANDARD-OBJECT)
+  :documentation "Used to record (mark) a set of objects.
+Can be optimized for testing only, or also for recall."
+  :slots ((test-table :type HASH-TABLE)
+          (recall-table :type LIST)
+          (supports-recall? :type BOOLEAN)) )
+
+(defun (create-marker-storage MARKER-TABLE) ((supportRecall? BOOLEAN))
+  :documentation "Return a new marker storage object, used to
+remember with objects have been 'marked'.  If 'supportRecall?'
+is set, then the iterator 'recall-marked-objects' can be invoked
+on the new marker storage object."
+  (let ((table (new MARKER-TABLE)))
+    (setf (test-table table) (new HASH-TABLE))
+    (when supportRecall?
+      (setf (supports-recall? table) TRUE)
+      (setf (recall-table table) (new LIST)))
+    (return table) ))
+
+(defmethod set-marker ((self MARKER-TABLE) (object OBJECT))
+  :documentation "Record membership of 'object' in the marker
+storage object 'self'."
+  (if (supports-recall? self)
+    (when (null? (lookup (test-table self) object))
+      (insert-at (test-table self) object TRUE-WRAPPER)
+      (push (recall-table self) object))
+    (insert-at (test-table self) object TRUE-WRAPPER)) )
+
+(defmethod (test-marker? BOOLEAN) ((self MARKER-TABLE) (object OBJECT))
+  :documentation "Return TRUE if 'object' is stored (marked) in 'self'."
+  (return (defined? (lookup (test-table self) object))) )
+
+(defspecial *specialMarkerTable* MARKER-TABLE
+  :documentation "Special variable that points to the marker table 
+referenced by the function 'test-special-marker-table?'.")
+ 
+(defun (test-special-marker-table? BOOLEAN) ((self OBJECT))
+  :documentation "Return TRUE if the object 'self' is stored (marked)
+in the table pointed at by the special variable *specialMarkerTable*.
+Designed for use by 'remove-if'."
+  (return (test-marker? *specialMarkerTable* self)) )
+
+(defmethod (recall-marked-objects LIST-ITERATOR) ((self MARKER-TABLE))
+  :documentation "Return an iterator that generates all marked objects
+recorded in 'self'."
+  (safety 3 (supports-recall? self)
+          "Called 'recall-marked-objects' on a table that
+           doesn't support recall.")
+  (return (allocate-iterator (recall-table self))) )
+
+
+  ;;
+;;;;;; Utility functions used by the classifier
+  ;;
+
+(defun (all-named-direct-superdescriptions (CONS OF NAMED-DESCRIPTION))
+       ((self DESCRIPTION) (removeEquivalents? BOOLEAN))
+  ;; Utility function used (only) by the classifier.
+  ;; Return a list of named direct supercollections of 'self'.
+  (let ((result NIL))
+    (foreach d in (all-direct-supercollections self removeEquivalents?)
+             where (isa? d @NAMED-DESCRIPTION)
+             do (pushq result d))
+    (return result) ))
+
+(defun (all-named-direct-subdescriptions (CONS OF NAMED-DESCRIPTION))
+       ((self DESCRIPTION))
+  ;; Utility function used (only) by the classifier.
+  ;; Return a list of named direct subcollections of 'self'.
+  (let ((result NIL))
+    (foreach d in (all-direct-subcollections self FALSE)
+             where (isa? d @NAMED-DESCRIPTION)
+             do (pushq result d))
+    (return result) ))
+
+(defun add-isa-link ((instance LOGIC-OBJECT) (superDescription DESCRIPTION))
+  ;; Place an isa (IN) link between 'instance' and 'superDescription',
+  ;;    and mark it as a subsumption-derived link.
+  (let ((isaProp (assert-isa-proposition 
+                   instance (surrogate-value-inverse superDescription))))
+     ;; mark 'isaProp' as a subsumption link:
+     (setf (subsumption-link? isaProp) TRUE)
+     (when (trace-keyword? :CLASSIFIER-INFERENCES)
+       (special ((*printReadably?* TRUE))
+         (when *emit-thinking-dots?*
+           (print EOL))
+         (print "Recognized type: " isaProp EOL)))))
+
+(defun add-subsumption-link 
+       ((subDescription DESCRIPTION) (superDescription DESCRIPTION))
+  ;; Place an IMPLIES link between 'subDescription' and 'superDescription',
+  ;;    and mark it as a subsumption-derived link.
+  (let ((impliesProp (assert-description-implies-description
+                      subDescription superDescription FALSE)))
+    ;; mark 'impliesProp' as a subsumption link:
+    (setf (subsumption-link? impliesProp) TRUE)
+    (when (trace-keyword? :CLASSIFIER-INFERENCES)
+      (special ((*indentCounter* 4)
+                (*printReadably?* TRUE))
+        (when *emit-thinking-dots?*
+          (print EOL))
+        (print "Recognized subsumption link:" EOL "    " impliesProp EOL))))
+
+  ;; tricky: remember to update inferable direct caches; both
+  ;;    the cache on 'superDescription' and those on parents
+  ;;    of 'superDescription'.
+  (push (all-inferable-direct-subcollections superDescription)
+        subDescription)
+  ;; slightly tricky: rather than recomputing
+  ;;    '(all-inferable-direct-subcollections p)' from scratch,
+  ;;    we can skip the 'inferable?' filter here:
+  (foreach p in (all-named-direct-superdescriptions superDescription FALSE)
+           do
+           (let ((subcollections (all-inferable-direct-subcollections p)))
+             (setf (the-cons-list subcollections)
+                   (cast
+                    (most-general-collections (the-cons-list subcollections))
+                    (CONS OF DESCRIPTION))))) )
+
+;; KEEP.  THIS IMPLEMENTATION COULD PROVE FASTER THAN THE UNCOMMENTED
+;;    ONE BELOW IT: 
+;(defun (most-specific-collections (LIST OF DESCRIPTION))
+;       ((descriptions (LIST OF DESCRIPTION)))
+;  ;; Destructively remove all but the most specific descriptions
+;  ;;    in 'descriptions'.
+;  (when (null? (rest descriptions))
+;    (return descriptions))
+;  (let ((markerTable (create-marker-storage FALSE)))
+;    (foreach d in descriptions
+;             do
+;             (foreach super in (all-direct-supercollections d ???)
+;                      do (mark-unmarked-superrelations markerTable super)))
+;    (special ((*specialMarkerTable* markerTable))
+;     (remove-if descriptions
+;                (code :function test-special-marker-table?))))
+;  (return descriptions) )
+
+(defun (most-specific-collections (CONS OF LOGIC-OBJECT))
+       ((descriptions (CONS OF LOGIC-OBJECT)))
+  ;; Destructively remove all but the most specific descriptions
+  ;;    in 'descriptions'.
+  (when (null? (rest descriptions))
+    (return descriptions))
+  (let ((cursor1 descriptions)
+        (cursor2 CONS NULL)
+        (value1 OBJECT NULL)
+        (value2 OBJECT NULL))
+    (while (not (nil? cursor1))
+      (setq value1 (value cursor1))
+      (when (defined? value1)
+        (setq cursor2 (rest cursor1))
+        (while (not (nil? cursor2))
+          (setq value2 (value cursor2))
+          (when (defined? value2)
+            (if (collection-implies-collection? value1 value2)
+              (setf (value cursor2) NULL)
+              (when (collection-implies-collection? value2 value1)
+                (setf (value cursor1) NULL)
+                ;; skip onto next value in OUTER loop:
+                (break))))
+          (setq cursor2 (rest cursor2))))
+      (setq cursor1 (rest cursor1))))
+  (setq descriptions (remove descriptions NULL))
+  (return descriptions) )
+
+(defun (most-general-collections (CONS OF LOGIC-OBJECT))
+       ((descriptions (CONS OF LOGIC-OBJECT)))
+  ;; Destructively remove all but the most general descriptions
+  ;;    in 'descriptions'.
+  (when (null? (rest descriptions))
+    (return descriptions))
+  (let ((cursor1 descriptions)
+        (cursor2 CONS NULL)
+        (value1 OBJECT NULL)
+        (value2 OBJECT NULL))
+    (while (not (nil? cursor1))
+      (setq value1 (value cursor1))
+      (when (defined? value1)
+        (setq cursor2 (rest cursor1))
+        (while (not (nil? cursor2))
+          (setq value2 (value cursor2))
+          (when (defined? value2)
+            (if (collection-implies-collection? value2 value1)
+              (setf (value cursor2) NULL)
+              (when (collection-implies-collection? value1 value2)
+                (setf (value cursor1) NULL)
+                ;; skip onto next value in OUTER loop:
+                (break))))
+          (setq cursor2 (rest cursor2))))
+      (setq cursor1 (rest cursor1))))
+  (setq descriptions (remove descriptions NULL))
+  (return descriptions) )
+
+(defspecial *findSupersAndSubsDescription* DESCRIPTION NULL
+  :documentation "Points to a possibly unnamed description being
+temporarily classified.")
+
+(defun (named-collection? BOOLEAN) ((self LOGIC-OBJECT))
+  :public? TRUE
+  ;; Used to determine if we should attach a subsumption link to
+  ;;    'self' (unnamed collections don't get extra links,
+  ;;    except to *findSupersAndSubsDescription*) 
+  ;; Return TRUE if 'self' has a name, or is the input argument
+  ;;    to find-direct-supers-and-subs'.
+  ;; TO DO: FIGURE OUT IF NAMED LOGIC-OBJECTS COUNT.
+  (return (or (defined? (surrogate-value-inverse self))
+              (eql? self *findSupersAndSubsDescription*))) )
+
+(defun (most-specific-named-collections (CONS OF LOGIC-OBJECT))
+       ((descriptions (CONS OF LOGIC-OBJECT)))
+  :public? TRUE
+  ;; Destructively weed out all but the most specific named descriptions
+  ;;    in 'descriptions'.
+  ;; Tricky.  If an unnamed description exists, its most specific
+  ;;    named ancestors must be added to the list.
+  ;; Strategy:
+  ;;    Compute most-specific descriptions (named or not).
+  ;;    Replace each named description with its most specific
+  ;;       named ancestors.
+  ;;    Recompute the most-specific descriptions.
+  ;; The strategy assumes that unnamed descriptions are infrequent.
+  (setq descriptions (most-specific-collections descriptions))
+  (let ((recompute? FALSE))
+    (foreach d in (copy-cons-list descriptions)
+             where (not (named-collection? d))
+             do
+             ;; remove unnamed description 'd':
+             (setq descriptions (remove descriptions d))
+             (foreach super in (all-direct-supercollections d FALSE)
+                      do (pushq descriptions super))
+             (setq recompute? TRUE))
+    (when recompute?
+      (most-specific-named-collections descriptions))
+    (return descriptions) ))
+
+(defun (most-specific-named-descriptions (CONS OF NAMED-DESCRIPTION))
+       ((descriptions (CONS OF LOGIC-OBJECT)))
+  ;; Like 'most-specific-named-collections' but returns only
+  ;;    named descriptions.
+  (setq descriptions (most-specific-collections descriptions))
+  (let ((recompute? FALSE))
+    (foreach d in (copy-cons-list descriptions)
+             where (not (named-description? d))
+             do ;; remove unnamed description 'd':
+             (setq descriptions (remove descriptions d))
+             (foreach super in (all-direct-supercollections d FALSE)
+                      do (pushq descriptions super))
+             (setq recompute? TRUE))
+    (when recompute?
+      (most-specific-named-collections descriptions))
+    (return (cast descriptions (CONS OF NAMED-DESCRIPTION))) ))
+
+
+  ;;
+;;;;;; Classifier caching routines
+  ;;
+
+;;; Caching scheme.  A CLASSIFICATION-SESSION is stored in the
+;;;    inference cache world accessed during a session that involves
+;;;    incremental or batch classification of descriptions.
+;;;    The session stores a hash table for descriptions that
+;;;    records useful (but ephemeral) data.  If the current module
+;;;    is updated, the whole caching structure gets blown away.
+
+(defclass CLASSIFICATION-CACHE (STANDARD-OBJECT)
+  :documentation "Records various kinds of data about a description
+during a classification session."
+  :slots
+  ((inferable-direct-subdescriptions :type (LIST OF DESCRIPTION))
+   (cache-upclassification-timestamp :type INTEGER :initially -1)
+   (cache-downclassification-timestamp :type INTEGER :initially -1)
+   (introduction-timestamp :type INTEGER :initially 0)
+   ))
+          
+(defclass CLASSIFICATION-SESSION (STANDARD-OBJECT)
+  :slots
+  ((classification-world :type WORLD)
+   (classification-cache-table 
+    :type (HASH-TABLE OF OBJECT CLASSIFICATION-CACHE)
+    :allocation :embedded)
+   (classification-timeclock :type INTEGER :initially 0)
+   (introduction-timestamp-stack :type (LIST OF INTEGER-WRAPPER)
+                             :initially (list 0))
+   (everything-classified? :type BOOLEAN)
+   (last-cache-table-key :type LOGIC-OBJECT)
+   (last-cache-table-value :type CLASSIFICATION-CACHE)
+   ))
+
+(defslot WORLD classification-session
+  :public? TRUE
+  :documentation "Points to a record that caches the distributed
+state of descriptions participating in a classification session."
+  :type CLASSIFICATION-SESSION)
+
+(defspecial *classificationSession* CLASSIFICATION-SESSION NULL
+  :public? TRUE
+  :documentation "Points to state of on-going classification session.")
+
+(defun (get-classification-world WORLD) ()
+  :public? TRUE
+  ;; Find or create an inference cache world for a
+  ;;    classification session.
+  (safety 3 (defined? *classificationSession*) 
+          "Tried to classify outside of a classification session.")
+  (return (classification-world *classificationSession*)) )
+
+(defun (get-classification-session CLASSIFICATION-SESSION)
+       ((instanceOrDescription KEYWORD))
+  :public? TRUE
+  ;; Find or create a classification session for the current
+  ;;    classification session.
+  (when (defined? *classificationSession*)
+    (return *classificationSession*))
+  ;; '*classificationSession*' needs initializing.  Look for
+  ;;    preexisting session or create a new one:
+  (let ((world WORLD NULL)
+        (session CLASSIFICATION-SESSION NULL))
+    (case instanceOrDescription
+      (:DESCRIPTION (setq world (get-inference-cache *module* :META)))
+      (:INSTANCE (setq world (get-inference-cache *module* :TMS))))
+    (setq session (classification-session world))
+    (when (null? session)
+      (setq session (new CLASSIFICATION-SESSION))
+      ;; doubly-link world and session:
+      (setf (classification-session world) session)
+      (setf (classification-world session) world))
+    (return session) ))
+
+(defun (get-classification-cache CLASSIFICATION-CACHE) ((self OBJECT))
+  ;; Find or create a classification cache for 'self'.
+  ;; Optimized for repeated accesses on 'self'.
+  (let ((session *classificationSession*)
+        (cache CLASSIFICATION-CACHE NULL))
+    ;; if we are lucky, we avoid a hash lookup here:
+    (when (eql? (last-cache-table-key session) self)
+      (return (last-cache-table-value session)))
+    (setq cache (lookup (classification-cache-table session) self))
+    (when (null? cache)
+      (setq cache (new CLASSIFICATION-CACHE))
+      (insert-at (classification-cache-table session)
+                 self cache))
+    (setf (last-cache-table-key session) self)
+    (setf (last-cache-table-value session) cache)
+    (return cache) ))
+
+(defglobal *cache-inferable-subcollections?* BOOLEAN TRUE
+  :documentation "If TRUE, prevents caching of computations of
+all inferable subcollections of a collection.")
+
+(defun (toggle-inferable-direct-subcollections-caching STRING) ()
+  ;; Enable or disable caching of inferable direct subcollections.
+  (setq *cache-inferable-subcollections?*
+        (not *cache-inferable-subcollections?*))
+  (return (choose *cache-inferable-subcollections?*
+                  "Inferable subcollections caching enabled"
+                  "Inferable subcollections caching disabled")))
+
+(defun (all-inferable-direct-subcollections (LIST OF DESCRIPTION))
+       ((self LOGIC-OBJECT))
+  ;; Dynamically-create index used by the classifier to avoid
+  ;;    scanning through non-inferable descriptions in the downward 
+  ;;    search of direct subdescriptions.
+  ;; Return the list of inferable direct subcollections stored in it.
+  ;; Tricky: 'add-subsumption-link' can add to this cache when
+  ;;    new subsumption links are added.
+  (let ((cache (get-classification-cache self))
+        (list (inferable-direct-subdescriptions cache)))
+    (when (or (null? list)
+              (not *cache-inferable-subcollections?*))
+      ;; fill the cache:
+      (setq list (new LIST))
+      (foreach sub in (all-named-direct-subdescriptions self)
+               where (inferable? sub)
+               do (insert list sub))
+      (setf (inferable-direct-subdescriptions cache) list))
+    (return list) ))
+
+(defun flush-inferable-direct-subdescriptions-cache 
+       ((impliesProposition PROPOSITION))
+  ;; Called in response to an IMPLIES proposition going true.
+  ;; Kill the cache on the consequent of 'impliesProposition'.
+  (when (null? *classificationSession*)
+    (return))
+  (let ((cache (get-classification-cache
+                (nth (arguments impliesProposition) 1))))
+    (when (defined? cache)
+      (setf (inferable-direct-subdescriptions cache) NULL)) ))
+
+(defun (current-classification-time TIMESTAMP) ()
+  ;; Return the value of the classification timeclock.
+  (return (classification-timeclock *classificationSession*)) )
+
+;;; The classification timeclock gets bumped by each call to
+;;;    'refresh-xxclassification-timestamp' or 
+;;;    'introduce-into-classification-session'.
+(defun (bump-classification-timeclock TIMESTAMP) ()
+  ;; Increment the clock that generates dates for classification
+  ;;    timestamps and return the new time.
+  ;; The clock gets bumped by 'introduce-into-classification-session'.
+  (return (++ (classification-timeclock *classificationSession*))) )
+
+(defmethod (introduction-timestamp TIMESTAMP) ((self LOGIC-OBJECT))
+  :public? TRUE
+  ;; Return the time that a description was created.
+  (return (introduction-timestamp (get-classification-cache self))) )
+
+;; BUG: WHAT IF THERE IS A SESSION GOING ON IN A MODULE OTHER THAN
+;;    THE CURRENT ONE???:
+(defun introduce-into-classification-session ((self DESCRIPTION))
+  ;; 'self' is newly-defined.
+  ;; If a classification session is on-going, bump the
+  ;;    current classification clock, set the introduction time
+  ;;    of 'self' to the new time, and push the introduction timestamp
+  ;;    stack.
+  ;;  This makes 'self' younger than the time stamps of all
+  ;;    currently-classified descriptions.
+  (let ((world (meta-inference-cache *module*)))
+    (when (or (null? world)
+              (null? (classification-session world)))
+      (return))
+    (let ((newTimestamp (bump-classification-timeclock)))
+      (setf (introduction-timestamp (get-classification-cache self))
+            newTimestamp)
+      (push (introduction-timestamp-stack *classificationSession*)
+            newTimestamp)) ))
+
+(defun (youngest-introduction-timestamp INTEGER) ()
+  ;; Return the timestamp of the most recently introduced description.
+  ;; Tricky: We keep a stack of introduction timestamps, because when
+  ;;    we exit 'find-direct-supers-and-subs' we may eliminate a virgin
+  ;;    description and pop its corresponding introduction time (making
+  ;;    otherwise non-downclassified descriptions classified again).
+  (return 
+   (wrapper-value (first (introduction-timestamp-stack *classificationSession*)))) )
+
+(defun (upclassification-timestamp INTEGER) ((self OBJECT))
+  ;; Get the time that 'self' was last upclassified.
+  (return (cache-upclassification-timestamp
+           (get-classification-cache self))) )
+
+(defun (downclassification-timestamp INTEGER) ((self LOGIC-OBJECT))
+  ;; Get the time that 'self' was last downclassified.
+  (return (cache-downclassification-timestamp
+           (get-classification-cache self))) )
+
+(defun refresh-upclassification-timestamp ((self OBJECT))
+  ;; Set the upclassification time for 'self' to the current clock
+  ;;   time.
+  (setf (cache-upclassification-timestamp (get-classification-cache self))
+        (bump-classification-timeclock)) )
+
+(defun refresh-downclassification-timestamp ((self LOGIC-OBJECT))
+  ;; Set the downclassification time for 'self' to the current clock
+  ;;   time.
+  (setf (cache-downclassification-timestamp (get-classification-cache self))
+        (bump-classification-timeclock)) )
+
+(defun flush-classification-sessions ()
+  ;; Discard the current classification session(s), so that all
+  ;;    of its caches get tossed.
+  (let ((jitWorld (lookup-inference-cache *module* :JUST-IN-TIME))
+        (metaWorld (lookup-inference-cache *module* :META))
+        (tmsWorld (lookup-inference-cache *module* :TMS)))
+    (when (defined? jitWorld)
+      (setf (classification-session jitWorld) NULL))
+    (when (defined? metaWorld)
+      (setf (classification-session metaWorld) NULL))
+    (when (defined? tmsWorld)
+      (setf (classification-session tmsWorld) NULL)) ))
+
+(defun (upclassified? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  ;; Return TRUE if 'self' has been upclassified more
+  ;;    recently than the latest introduction of a new description.
+  ;; Used to determine whether a parent needs re-upclassifying.
+  (return (> (upclassification-timestamp self)
+             (youngest-introduction-timestamp))) )
+
+(defun (upclassified-later-than? BOOLEAN) ((self LOGIC-OBJECT) (other LOGIC-OBJECT))
+  :public? TRUE
+  ;; Return TRUE if 'self' has been classified more recently than the
+  ;;    introduction time of 'other'.
+  ;; Used by 'help-collect-parents-below?' to determine whether or not a new
+  ;;    subsumption test is needed, or if an old one still stands.
+  (return (> (upclassification-timestamp self)
+             (introduction-timestamp other))) )
+
+(defun (downclassified? BOOLEAN) ((self LOGIC-OBJECT))
+  :public? TRUE
+  ;; Return TRUE if 'self' is non-inferable or has been downclassified more
+  ;;    recently than the latest introduction of a new description.
+  ;; Used to determine whether a parent needs re-downclassifying.
+  (return (or (non-inferable? self)
+              (> (downclassification-timestamp self)
+                 (youngest-introduction-timestamp)))) )
+
+
+  ;;
+;;;;;; Workhorse classification routines
+  ;;
+
+(defun mark-unmarked-superrelations 
+       ((description DESCRIPTION) (selfIsBelowTable MARKER-TABLE))
+  ;; Visit all unmarked descriptions implied by (above) 'description'
+  ;;    and mark them.
+  (set-marker selfIsBelowTable description)
+  (foreach super in (all-named-direct-superdescriptions description TRUE)
+           where (not (test-marker? selfIsBelowTable description))
+           do (mark-unmarked-superrelations super selfIsBelowTable)) )
+
+(defun (apply-subsumption-test? BOOLEAN) 
+    ((subsumptionTest FUNCTION-CODE) (self LOGIC-OBJECT) (super LOGIC-OBJECT) )
+  ;; Apply `subsumptionTest' to `self' and `super' which is expected to
+  ;;    return a TRUTH-VALUE.
+  (let ((result TRUTH-VALUE (funcall subsumptionTest self super)))
+    (trace-if (:CLASSIFIER :CLASSIFIER-PROFILE)
+              "   SPECIALIZES?:  " result "  self=" self " super=" super EOL)
+    (return (true-truth-value? result))))
+
+(defun (help-collect-parents-below? BOOLEAN)
+       ((self LOGIC-OBJECT) (super DESCRIPTION)
+        (newParentDescriptions (LIST OF DESCRIPTION))
+        (alreadyVisitedTable MARKER-TABLE)
+        (selfIsBelowTable MARKER-TABLE)
+        (subsumptionTest FUNCTION-CODE))
+  ;; Test unvisited descriptions at and below 'super' for an 
+  ;;    isa or subsumption relationship with 'self'.  Mark nodes visited.
+  ;; Return TRUE iff 'self' specializes/satisfies 'super' or one of its
+  ;;    subdescriptions.
+  ;; If no subdescriptions of 'super' are specialized/satisfied by 'self',
+  ;;    add 'super' to 'newParentDescriptions'.
+ (trace-if :classifier "HELP-COLLECT-PARENTS-BELOW  self= " self "    super= " super EOL)
+ (trace-if :classifier "   TEST-MARKER of 'super': " (test-marker? selfIsBelowTable super) EOL)
+  (let ((foundSubsumingSub? FALSE))
+    (set-marker alreadyVisitedTable super)
+    (cond
+     ((test-marker? selfIsBelowTable super)
+      (setq foundSubsumingSub? TRUE)
+      ;; visit defined subs of super:
+      (foreach sub in (all-inferable-direct-subcollections super)
+               where (not (test-marker? alreadyVisitedTable sub))
+               do
+               (help-collect-parents-below?
+                self sub newParentDescriptions
+                alreadyVisitedTable selfIsBelowTable
+                subsumptionTest)))
+     ;; perform subsumption test (unless earlier computation is still valid):
+     ((and (not (upclassified-later-than? self super))
+           (apply-subsumption-test? subsumptionTest self super))
+      (setq foundSubsumingSub? TRUE)
+      (mark-unmarked-superrelations super selfIsBelowTable)
+      (let ((existsMoreSpecificSub?
+             (exists sub in (all-inferable-direct-subcollections super)
+                     where (and (not (test-marker? alreadyVisitedTable sub))
+                                (help-collect-parents-below?
+                                 self sub newParentDescriptions
+                                 alreadyVisitedTable selfIsBelowTable
+                                 subsumptionTest)))))
+        (when (not existsMoreSpecificSub?)
+ (trace-if (:CLASSIFIER :CLASSIFIER-PROFILE)
+           EOL "XXXXXXX PUSHING NEW PARENT: " super "  of " self EOL EOL)
+           (push newParentDescriptions super))))
+     ;; subsumption test failed; don't search below super:
+     (otherwise NULL))
+    (return foundSubsumingSub?) ))
+
+(defun collect-subsuming-parents-below 
+       ((self LOGIC-OBJECT) (super DESCRIPTION)
+        (newParentDescriptions (LIST OF DESCRIPTION))
+        (alreadyVisitedTable MARKER-TABLE)
+        (selfIsBelowTable MARKER-TABLE)
+        (subsumptionTest FUNCTION-CODE))
+  ;; Situation: 'self' is isa-linked or specializes a description at or
+  ;;    below 'super'.
+  ;; Test unvisited descriptions below 'super' for an isa or subsumption
+  ;;    relationship with 'self'.  Mark nodes visited.
+  ;; Add each leaf description to 'newParentDescriptions'.
+ (trace-if :classifier "COLLECT-SUBSUMING  self= " self "    super= " super EOL)
+ (trace-if :classifier "   ALL-INFERABLE-SUBS:  " (cons-list (listify (all-inferable-direct-subcollections super))) EOL)
+  (special ((*reversePolarity?* FALSE))
+    (foreach sub in (all-inferable-direct-subcollections super)
+             where (not (test-marker? alreadyVisitedTable sub))
+             do
+             (help-collect-parents-below?
+              self sub newParentDescriptions
+              alreadyVisitedTable selfIsBelowTable
+              subsumptionTest)) ))
+
+  ;;
+;;;;;; Starting point routines
+  ;;
+
+;;; These routines generate ancestors of an instance or description
+;;;    for an :ISA or :IMPLIES relations
+
+(defun (all-ancestors-of-parents (ITERATOR OF LOGIC-OBJECT))
+       ((supers (CONS OF LOGIC-OBJECT)))
+  ;; Generate all supercollections of each member of 'supers', inclusive.
+  (let ((collection (copy-cons-list supers)))
+    (foreach s in supers
+             do (foreach a in (all-supercollections s)
+                         where (not (member? supers a))
+                         do (pushq collection a)))
+    (return (allocate-iterator collection)) ))
+
+(defun (all-ancestor-collections (ITERATOR OF LOGIC-OBJECT))
+       ((self OBJECT) (instanceOrDescription KEYWORD))
+  ;; Helping function for 'help-upclassify-one-entity'.
+  (case instanceOrDescription
+    (:INSTANCE (return (all-ancestors-of-parents (all-isa-collections self))))
+    (:DESCRIPTION
+     ;; THIS SHOULD BREAK ON A DESCRIPTION THAT HAS NO PARENTS.  WHEN THAT
+     ;;    HAPPENS, WE NEED TO FIGURE OUT WHAT TO DO:
+     (safety 3 (not (virgin? (cast self DESCRIPTION))) "HOW DID THAT VIRGIN SNEAK IN?")
+     (return (all-supercollections self)))) )
+             
+
+  ;;
+;;;;;; Top-level classify-below routines
+  ;;
+
+;;; CAUTION: Note optimization in subsumption search:  'classify-instance'
+;;;    and 'classify-description' only initiate a search from non-inferable
+;;;    descriptions, while 'collect-subsuming-parents-below' and
+;;;    'help-collect-parents-below?' only descend down into inferable concepts.
+;;;    This strategy can eliminate a large amount of search -- we never
+;;;    visit an inferable description D unless we are assured that the 'self'
+;;;    object inherits all non-inferable descriptions above D.
+
+(defspecial *classify-from-non-inferable-parents-only?* BOOLEAN TRUE
+  :documentation
+  "If true (the default) only consider those relations (or instances) for
+classification that have at least one non-inferable parent (or type).  This
+can greatly reduce the classification effort.  To find entities that were
+left unclassified due to this optimization use `list-unclassified-relations'
+or `list-unclassified-instances'."
+  :public? TRUE)
+
+(defun help-upclassify-one-entity ((self LOGIC-OBJECT)
+                                   (instanceOrDescription KEYWORD))
+  ;; Infer `instance-of' relations (or `subset-of' depending on the value of
+  ;;    `instanceOrDescription') between 'self' and named descriptions
+  ;;    attached to classes and concepts in the hierarchy.
+  (when (upclassified? self)
+    (return))
+  (let ((alreadyVisitedTable (create-marker-storage FALSE))
+        (instanceIsBelowTable (create-marker-storage FALSE))
+        (newParentDescriptions (new (LIST OF DESCRIPTION))))
+    (set-marker instanceIsBelowTable self)
+    (foreach super in (all-ancestor-collections self instanceOrDescription)
+        do (set-marker instanceIsBelowTable super))
+    (trace-if :classifier
+              "   WORLD: " *context* "  self: " self EOL
+              "   ANCESTORS: "
+              (consify (all-ancestor-collections self instanceOrDescription))
+              EOL)
+    (foreach super in (all-ancestor-collections self instanceOrDescription)
+        where (and (isa? super @DESCRIPTION)
+                   (or (not *classify-from-non-inferable-parents-only?*)
+                       (non-inferable? (cast super DESCRIPTION)))
+                   (not (test-marker? alreadyVisitedTable super)))
+        do (set-marker alreadyVisitedTable super)
+           (collect-subsuming-parents-below
+            self super newParentDescriptions
+            alreadyVisitedTable instanceIsBelowTable
+            (choose
+             (eql? instanceOrDescription :INSTANCE)
+             (the-code :FUNCTION instance-satisfies-description?)
+             (the-code :FUNCTION description-specializes-description?))))
+    (foreach pd in (most-specific-named-collections 
+                    (the-cons-list newParentDescriptions))
+        do (case instanceOrDescription
+             (:INSTANCE (add-isa-link self pd))
+             (:DESCRIPTION (add-subsumption-link self pd))))
+    (refresh-upclassification-timestamp self)) )
+
+(defun upclassify-one-instance ((self LOGIC-OBJECT))
+  ;; Infer instance-of relations between 'self' and named descriptions
+  ;;    attached to classes in the hierarchy.
+  (when (upclassified? self)
+    (return))       
+  (trace-if (:CLASSIFIER :CLASSIFIER-PROFILE) "UPCLASSIFY:  " self EOL)
+  (emit-thinking-dot :UPCLASSIFY)
+  (help-upclassify-one-entity self :INSTANCE) )
+
+(defun upclassify-one-description ((self LOGIC-OBJECT))
+  :public? TRUE
+  ;; Infer implies relations between 'self' and other named descriptions
+  ;;    in the hierarchy.
+  ;; Subtle: We upclassify all ancestors of 'self' prior to classifying
+  ;;    it, because this minimizes the number of :IMPLIES links that
+  ;;    get generated.
+  (when (or (upclassified? self)
+            (not (isa? self @DESCRIPTION)))
+    (return))
+  (trace-if (:CLASSIFIER :CLASSIFIER-PROFILE) "UPCLASSIFY: " self EOL)
+  (emit-thinking-dot :UPCLASSIFY)
+  ;; look inside of definition of 'self' for parents that need to
+  ;;    appear in the list generated by 'all-named-direct-superdescriptions':
+  (let ((equivalents (all-equivalent-collections self TRUE)))
+    ;; infer (named) parents of any definitional descriptions:
+    (foreach e in equivalents
+             where (not (named-description? e))
+             do (foreach pd in (all-intensional-parents e)
+                         do (add-subsumption-link self pd))))
+  (foreach super in (all-named-direct-superdescriptions self TRUE)
+           do (upclassify-one-description super))
+  (help-upclassify-one-entity self :DESCRIPTION) )
+
+;;; Strategy for finding descriptions that specialize 'self':
+;;;    Let PARENTS be the set of direct supers of 'self'.  Every
+;;;    description that specializes 'self' must necessarily
+;;;    specialize each description in PARENTS.  Hence, we only
+;;;    need search the subtree of one of the PARENTS.
+
+(defun help-downclassify-one-description
+       ((node LOGIC-OBJECT) (self LOGIC-OBJECT) 
+        (necessaryAncestors (CONS OF LOGIC-OBJECT))
+        (alreadyVisitedTable MARKER-TABLE))
+  ;; Look at and below 'node' for descriptions which specialize 'self'.
+  ;; Each node visited gets is either already upclassified, or if it's
+  ;;    upclassification is too old (or non-existent) it is
+  ;;    upclassified on the spot.
+  ;; Search terminates only when 'node' specializes 'self' or we
+  ;;    run out of subdescriptions.
+  (when (or (test-marker? alreadyVisitedTable node)
+            (description-implies-description? node self))
+    (return))
+  (set-marker alreadyVisitedTable node)
+  (let ((nodeCouldBeTheOne? TRUE))
+    (cond
+     ((eql? (upclassification-timestamp node) -1)       ; never upclassified?
+      (upclassify-one-description node))
+     ((not (upclassified-later-than? node self))
+      ;; failure of 'node' to classify below a necessary
+      ;;    ancestor could obviate the need to upclassify 'node':
+      (if (exists ancestor in necessaryAncestors
+                  where
+                  (and (upclassified-later-than? node ancestor)
+                       (not (description-implies-description?
+                             node ancestor))))
+        ;; indicate that 'node' can't specialize 'self', and DON'T
+        ;;    reclassify 'node' (just to save time):
+        (setq nodeCouldBeTheOne? FALSE)
+        ;; reclassify node:
+        (upclassify-one-description node))))
+    ;; either 'node's classification is now up-to-date, or it
+    ;;    didn't specialize a necessary ancestor:
+    (when (and nodeCouldBeTheOne?
+               (description-implies-description? node self))
+      ;; no need to look deeper:
+      (return))
+    ;; 'node' flunks out; try its subs:
+    (foreach subNode in (all-named-direct-subdescriptions node)
+             do (help-downclassify-one-description
+                 subNode self necessaryAncestors alreadyVisitedTable))) )
+
+;;; Strategy for choosing a down-classify parent (very tricky):
+;;;    For downclassifying below a description 'self', it is necessary only
+;;;       to search the subtree of a single downclassified parent of 'self',
+;;;       because any specializer of 'self' necessarily specializes all of
+;;;       its parents (if a parent is not downclassified, then we can't tell
+;;;       how many children it might have).
+;;;    So, we require that at least one parent of 'self' be downclassified.
+;;;       If none are downclassified, then we pick one and downclassify it.
+;;;       If more than one is downclassified, then we pick the one with the
+;;;       fewest children (we could downclassify all parents first, but
+;;;       this might generate unnecessary work, so we dont).
+;;;    Potentially, we might recursively downclassify all the way up to THING.
+;;;       Fortunately, a non-inferable parent is automatically downclassified,
+;;;       so most of the time we expect the upward recursion to terminate
+;;;       reasonably quickly.
+;;;    Additional optimization (courtesy of Lipkis): If a downclassified
+;;;       parent of 'self' has only one child ('self'), then its impossible
+;;;       for 'self' to infer another child, because that child would have
+;;;       specialized the parent, and we know that it didn't.  In this
+;;;       case, we can abandon the search for children of 'self' before we
+;;;       even start.
+
+(defun (collection-with-fewest-children LOGIC-OBJECT) 
+       ((collections (CONS OF LOGIC-OBJECT)))
+  ;; Return the member of 'collections' with the fewest children.
+  (when (null? (rest collections))
+    (return (first collections)))
+  (let ((bestCollection (first collections))
+        (lowestChildCount 100))         ; initialize at infinity
+    (foreach c in collections
+             do
+             (let ((childCount 0))
+               ;; CHANGE TO CALL 'backwards-rules-of-description':
+               (foreach p on (applicable-rules-of-description c :BACKWARD TRUE)
+                        do (++ childCount))
+               (when (< childCount lowestChildCount)
+                 (setq bestCollection c)
+                 (setq lowestChildCount childCount))))
+    (return bestCollection) ))
+
+(defun (choose-best-downclassified-parent LOGIC-OBJECT) 
+       ((parents (CONS OF LOGIC-OBJECT)))
+  ;; Called by 'downclassify-one-description'.
+  ;; Scan parents of 'self', choosing the one with the fewest children.
+  ;; Side-effect: Downclassify the best parent, if its downclassification isn't
+  ;;    current.
+  ;; Optimization: If one is found with only one child, return NULL.
+  (when (nil? parents)                  ; only parent is THING?
+    (return NULL))
+  (let ((downclassifiedParents NIL)
+        (bestParent LOGIC-OBJECT NULL))
+    (foreach p in parents
+             where (downclassified? p)
+             do (progn (safety 3 (or (not (isa? p @DESCRIPTION))
+                                     (null? (rules-with-deferred-satellites (cast p DESCRIPTION))))
+                               "BUG IN DOWNCLASSIFICATION"))
+             collect p into downclassifiedParents)
+    (case (length downclassifiedParents)
+      (0
+       (let ((namedParents NIL))
+         (foreach p in parents where (named-description? p)
+                  collect p into namedParents)
+         (when (non-empty? namedParents)
+           (setq bestParent (collection-with-fewest-children namedParents)))
+         (when (null? bestParent)
+           (setq bestParent (collection-with-fewest-children parents)))
+         (downclassify-one-description bestParent)))
+      (1 
+       (setq bestParent (first downclassifiedParents)))
+      (otherwise
+       (setq bestParent (collection-with-fewest-children downclassifiedParents))))
+ (trace-if :classifier "   BEST PARENT:   " bestParent "   ALL-PARENTS: " parents EOL)
+    (return bestParent) ))
+
+(defun downclassify-one-description ((self LOGIC-OBJECT))
+  :public? TRUE
+  ;; Classify all defined concepts below supers of 'self' that
+  ;;    might specialize 'self'.
+  (special ((*classificationSession* (get-classification-session :DESCRIPTION)))
+   (when (not (downclassified? self))      
+     ;; nothing can classify below a non-inferable (primitive) description:
+     (when (non-inferable? self)
+       (refresh-downclassification-timestamp self)
+       (return))
+     (trace-if (:CLASSIFIER :CLASSIFIER-PROFILE) "DOWNCLASSIFY-ONE-DESCRIPTION:  " self EOL)      
+     (emit-thinking-dot :DOWNCLASSIFY)
+     ;; if 'self' were NOT inferable, any children would already
+     ;;    be explicitly linked, so the search terminates immediately.
+     (let ((alreadyVisitedTable (create-marker-storage FALSE))
+           (parents (all-named-direct-superdescriptions self FALSE))
+           (bestParent (choose-best-downclassified-parent parents))
+           (otherParents (remove parents bestParent)))
+       (set-marker alreadyVisitedTable self)
+       ;; tricky: if 'bestParent' is NULL, then no additional children
+       ;;    of 'self' can be infered:
+       (when (defined? bestParent)
+         (foreach child in (all-named-direct-subdescriptions bestParent)
+                  do
+                  (help-downclassify-one-description
+                   child self otherParents alreadyVisitedTable))))
+     (refresh-downclassification-timestamp self)) ))
+
+(defmethod (virgin? BOOLEAN) ((self DESCRIPTION))
+  ;; Return TRUE if 'self' is a bare description with no
+  ;;    associated relation, and as yet no dependent propositions.
+  (return (and (empty? (unfiltered-dependent-propositions self NULL))
+               (not (named-collection? self)))) )
+
+(defun evaporate-virgin ((self DESCRIPTION))
+  ;; Helping function for 'find-direct-supers-and-subs'.
+  ;; Remove :IMPLIES links between 'self' and its subs and supers.
+  ;; Add a new link for each child/parent pair that bypasses 'self',
+  ;;    leaving the inheritance links semantically equivalent.
+  ;; Some logic borrowed from 'assert-implies-link-between-relations'.
+  (let ((parentImplies (new (LIST OF PROPOSITION)))
+        (childImplies (new (LIST OF PROPOSITION)))
+        (parent DESCRIPTION NULL)
+        (child DESCRIPTION NULL)
+        (bridgeProp PROPOSITION NULL))
+    (foreach p in (unfiltered-dependent-propositions self NULL)
+             do
+             (if (eql? (nth (arguments p) 0) self)
+               (push parentImplies p)
+               (push childImplies p)))
+    (foreach cp in childImplies
+             do
+             (setq child (nth (arguments cp) 0))
+             (foreach pp in parentImplies
+                      do
+                      (setq parent (nth (arguments pp) 1))
+                      (setq bridgeProp
+                            (assert-description-implies-description child parent TRUE))
+                      (when (and (subrelation-link? cp)
+                                 (subrelation-link? pp))
+                        (setf (subrelation-link? bridgeProp) TRUE))
+                      (update-proposition-truth-value bridgeProp :ASSERT-TRUE)))
+    (foreach p in (unfiltered-dependent-propositions self NULL)
+             do (destroy-proposition p)) ))
+
+(defun (find-direct-supers-and-subs
+        (CONS OF DESCRIPTION) (CONS OF DESCRIPTION) (CONS OF DESCRIPTION))
+       ((self DESCRIPTION) (onlySupers? BOOLEAN))
+  :documentation "Classify 'self' and return three values, its direct
+supers, direct subs, and a list of equivalent descriptions.
+Setting 'supersOnly?' may speed up the computation (perhaps by a lot).
+If 'description' is nameless and has no dependent propositions, then
+it is automatically removed from the hierarchy after classification."
+  :public? TRUE
+  ;; Tricky: If 'self' is a "virgin" description going in,
+  ;;    we try to restore the network to close to its previous state
+  ;;    after the computation.  We do this by removing
+  ;;    any :IMPLIES links attached to 'self', and
+  ;;    popping the introduction timestamp stack.
+  (finalize-objects)
+  (when (null? self)
+    (return NIL NIL NIL))
+  (special ((*findSupersAndSubsDescription* self))
+   (within-classification-session :DESCRIPTION
+    (let ((virgin? (virgin? self))
+          (oldCurrentTime (current-classification-time)) ; only for safety check
+          (supers NIL)
+          (subs NIL)
+          (equivalents NIL))
+      (when virgin?
+        ;; bump current classification time and set introduction timestamp:
+        (introduce-into-classification-session self))
+      (upclassify-one-description self)
+      ;; classify any NEW parents of 'self' (the original parents were
+      ;;    classified first thing).  Parents that classify below 'self'
+      ;;    are equivalent to 'self':
+      (foreach super in (all-named-direct-superdescriptions self FALSE)
+               do (upclassify-one-description super))
+      (setq supers (all-named-direct-superdescriptions self TRUE))
+      (when (not onlySupers?)
+        (downclassify-one-description self)
+        ;; TO DO: ELIMINATE NAMELESS ONES??:
+        (setq subs (consify (all-direct-subcollections self TRUE))))
+      (foreach e in (all-equivalent-collections self FALSE)
+               where (named-description? e)
+               collect e into equivalents)
+      (when virgin?
+        (safety 3 (and (eql? (current-classification-time) (1+ oldCurrentTime))
+                       (eql? (current-classification-time)
+                             (youngest-introduction-timestamp)))
+                "OOPS -- BUG IN CLASSIFICATION TIMESTAMPING")
+        ;; remove :IMPLIES links to 'self'; but add in equivalents:
+        (evaporate-virgin self)
+        (pop (introduction-timestamp-stack *classificationSession*)))
+      (return supers subs equivalents) ))))
+
+(defun (find-direct-supers-of-instance (CONS OF LOGIC-OBJECT)) ((self OBJECT))
+  :documentation "Classify 'self' and return a list of most specific 
+named descriptions among all descriptions that it satisfies."
+  :public? TRUE
+  (finalize-objects)
+  (when (null? self)
+    (return NIL))
+  (within-classification-session :INSTANCE
+    (upclassify-one-instance self)
+    (return (most-specific-named-collections (all-isa-collections self)))) )
+  
+
+  ;;
+;;;;;; Top level calls to classifier
+  ;;
+
+(defun upclassify-named-descriptions ((module MODULE) (local? BOOLEAN))
+  :documentation "Classify named descriptions local to 'module' and inherited
+by 'module'.  If 'local?', don't classify inherited descriptions.  If
+'module' is NULL, classify descriptions in all modules."
+  ;; 
+  (within-classification-session :DESCRIPTION
+    (within-module (choose (null? module) *module* module)
+      (cond
+       ((null? module)
+        (upclassify-all-descriptions))
+       (local?
+        (foreach d in (all-named-descriptions module TRUE)
+            do (upclassify-one-description d)))
+       (otherwise
+        (let ((session *classificationSession*))
+          (when (not (everything-classified? session))
+            (foreach m in (all-included-modules module)
+                do (foreach d in (all-named-descriptions m TRUE)
+                       do (upclassify-one-description d)))
+            ;; record that everything is classified:
+            (setf (everything-classified? session) TRUE))))))))
+
+(defun classify-relations ((module NAME) (local? BOOLEAN))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation "Classify named relations visible in `module'.
+If `local?', only classify descriptions defined within `module', i.e.,
+don't classify descriptions inherited from ancestor modules.
+If `module' is NULL, classify relations in all modules.
+
+Conceptually, the classifier operates by comparing each concept or relation
+with all other concepts/relations, searching for a proof that a
+subsumption relation exists between each pair. Whenever a new subsumption
+relation is discovered, the classifier adds an `implication' link between
+members of the pair, thereby augmenting the structure of the
+concept or relation hierarchy. The implemented classification algorithm is
+relatively efficient -- it works hard at limiting the number of concepts
+or relations that need to be checked for possible subsumption
+relationships.
+"
+  (finalize-objects)
+  (let ((theModule (coerce-to-module module TRUE)))
+    (when (defined? theModule)
+      (when (null? module)
+        (setq theModule NULL))
+      (upclassify-named-descriptions theModule local?))))
+
+(defun (list-unclassified-relations (CONS OF NAMED-DESCRIPTION))
+    ((module NAME) (local? BOOLEAN))
+  :documentation
+  "Collect all named description in `module' (or in any module if `module'
+is NULL) that were not (or will not be) classified due to their lack of
+non-inferable/primitive ancestor relations."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (when (not *classify-from-non-inferable-parents-only?*)
+    (return NIL))
+  (finalize-objects)
+  (let ((theModule (coerce-to-module module TRUE))
+        (unclassified NIL))
+    (when (defined? theModule)
+      (when (null? module)
+        (setq theModule NULL))
+      (within-classification-session :DESCRIPTION
+        (within-module (choose (null? theModule) *module* theModule)
+          (foreach d in (all-named-descriptions theModule local?)
+              where (and (inferable? d)
+                         (not (exists super in (all-ancestor-collections
+                                                d :DESCRIPTION)
+                                  where (non-inferable? super))))
+              collect d into unclassified))))
+    (return unclassified)))
+
+(defun upclassify-instances ((module MODULE) (local? BOOLEAN))
+  :documentation "Classify instances local to 'module' and inherited
+by 'module'.  If 'local?', don't classify inherited descriptions.  If
+'module' is NULL, classify descriptions in all modules."
+  ;; 
+  (within-classification-session :INSTANCE
+    (within-module (choose (null? module) *module* module)
+      (cond
+       ((null? module)
+        (upclassify-all-instances))
+       (local?
+        (foreach i in (all-instances module TRUE)
+            do (upclassify-one-instance i)))
+       (otherwise
+        (foreach m in (all-included-modules module)
+            do (foreach i in (all-instances m TRUE)
+                   do (upclassify-one-instance i))))))))
+
+(defun classify-instances ((module NAME) (local? BOOLEAN))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation "Classify instances visible in `module'.
+If `local?', only classify instances that belong to `module',
+i.e., don't classify instances inherited from ancestor modules.
+If `module' is NULL, classify instances in all modules.
+
+Conceptually, the classifier operates by comparing each instance
+with all concepts in the hierarchy, searching for a
+proof for each pairing indicating that the instance belongs to the concept.
+Whenever a new `is-a' relation is discovered, the classifier
+adds an `is-a' link between the instance and the concept, thereby
+recording an additional fact about the instance.  The implemented
+classification algorithm is relatively efficient -- it works hard
+at limiting the number of concepts or relations that need to
+be checked for possible is-a relationships.
+"
+  (finalize-objects)
+  (let ((theModule (coerce-to-module module TRUE)))
+    (when (defined? theModule)
+      (when (null? module)
+        (setq theModule NULL))
+      (upclassify-instances theModule local?))))
+
+(defun (list-unclassified-instances (CONS OF LOGIC-OBJECT))
+    ((module NAME) (local? BOOLEAN))
+  :documentation
+  "Collect all instances in `module' (or in any module if `module'
+is NULL) that were not (or will not be) classified due to their lack of
+non-inferable/primitive type assertions."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (when (not *classify-from-non-inferable-parents-only?*)
+    (return NIL))
+  (finalize-objects)
+  (let ((theModule (coerce-to-module module TRUE))
+        (unclassified NIL))
+    (when (defined? theModule)
+      (when (null? module)
+        (setq theModule NULL))
+      (within-classification-session :INSTANCE
+        (within-module (choose (null? theModule) *module* theModule)
+          (foreach i in (all-instances theModule local?)
+              where (and (not (function-output-skolem? i) )
+                         (not (exists type in (all-ancestor-collections
+                                               i :INSTANCE)
+                                  where (non-inferable? type))))
+              collect i into unclassified))))
+    (return unclassified)))
+
+;; OOPS: THIS MAY NOT BE COMPATIBLE WITH THE NEW CACHING SCHEME:
+(defun upclassify-all-descriptions ()
+  :documentation "Classify all named descriptions."
+  (finalize-objects)
+  (within-classification-session :DESCRIPTION
+    (foreach d in (all-named-descriptions NULL FALSE)
+             do (upclassify-one-description d)) ))
+
+(defun upclassify-all-instances ()
+  :documentation "Classify all named instances."
+  (finalize-objects)
+  (within-classification-session :INSTANCE
+    (foreach i in (all-instances NULL FALSE)
+             do (upclassify-one-instance i)) ))
+
+  ;;
+;;;;;; Searching for cycles
+  ;;
+
+(defun (all-equivalent-collections (CONS OF LOGIC-OBJECT))
+       ((self LOGIC-OBJECT) (reflexive? BOOLEAN))
+  :public? TRUE
+  ;; Return a list of all descriptions that are co-extensional
+  ;;    with 'self'.
+  (let ((equivalents (CONS OF LOGIC-OBJECT) (cons-list self))
+        (unscannedEquivalents (list self))
+        (u LOGIC-OBJECT NULL))
+    (when (member? (all-supercollections self) self)
+      (loop
+        (setq u (pop unscannedEquivalents))
+        (foreach parent in (all-direct-supercollections u FALSE)
+                 where (and (not (member? equivalents parent))
+                            (member? (all-supercollections parent) u))
+                        do 
+                        (pushq equivalents parent)
+                        (push unscannedEquivalents parent))
+        (when (empty? unscannedEquivalents)
+          (break))))
+    (if reflexive?
+      (return equivalents)
+      (return (remove equivalents self))) ))
+
+(defun (all-cycles (CONS OF CONS)) ((module MODULE) (local? BOOLEAN))
+  :public? TRUE
+  :documentation "Return a list of lists of descriptions that are
+provably co-extensional."
+  "NOT YET IMPLEMENTED"
+  (return NULL) )
+
+
+#|
+;; TEST CODE:
+(cc pl-user)
+
+;(clear-module "PL-USER")
+
+(defconcept a (?y))
+(defconcept b (?y))
+(defconcept c (?y))
+(defconcept d (?y))
+(defconcept e (?y))
+(defconcept f (?y))
+(defconcept g (?y))
+
+(defconcept a&f (?x) :<=> (and (a ?x) (f ?x)))
+
+(assert (=> (d ?x) (c ?x)))
+(assert (=> (c ?x) (b ?x)))
+(assert (=> (b ?x) (a ?x)))
+(assert (=> (b ?x) (d ?x)))
+(assert (=> (e ?x) (c ?x)))
+(assert (=> (b ?x) (f ?x)))
+(assert (=> (g ?x) (d ?x)))
+
+(find-direct-supers-and-subs  (get "B") TRUE)
+
+(setq d (eval (conceive-term (bquote (setofall ?x (and (a ?x) (f ?x)))))))
+(find-direct-supers-and-subs  d FALSE)
+
+(all-equivalent-collections (get "G") TRUE)
+(all-equivalent-collections (get "A") FALSE)
+(all-equivalent-collections (get "D") FALSE)
+(all-equivalent-collections (get "D") TRUE)
+
+(listify (all-supercollections (get "C")))
+(listify (all-direct-supercollections (get "C") FALSE))
+(listify (all-direct-supercollections (get "C") TRUE))
+
+(eval (all-equivalent-relations (get "C") TRUE))
+(eval (all-equivalent-relations (get "C") FALSE))
+(eval (all-superrelations (get "C") FALSE))
+(eval (all-superrelations (get "C") TRUE))
+(eval (all-subrelations (get "C") TRUE))
+(eval (all-subrelations (get "C") FALSE))
+(eval (all-superrelations (get "D") TRUE))
+(eval (all-subrelations (get "D") TRUE))
+(eval (all-direct-superrelations (get "C") TRUE))
+(eval (all-direct-superrelations (get "D") TRUE))
+(eval (all-direct-subrelations (get "C") TRUE))
+(eval (all-direct-subrelations (get "D") TRUE))
+(eval (all-direct-subrelations (get "C") FALSE))
+(eval (all-direct-subrelations (get "D") FALSE))
+
+
+;;; MORE TEST CODE
+
+(set-feature :classifier)
+(list-features)
+(add-trace :classifier)
+(drop-trace :classifier)
+(toggle-inferable-direct-subcollections-caching)
+(toggle-inferable-cache)
+(flush-classification-sessions)
+
+(cc pl-user)
+;(clear-module "PL-USER")
+
+(defconcept a (?y))
+(defconcept b (?y))
+(defconcept c (?y))
+(defconcept d (?y))
+(defconcept e (?y))
+(defconcept f (?y))
+(defconcept g (?y))
+
+(cl:progn
+(cc pl-user)
+(clear-module "PL-USER")  
+(defconcept a (?y))
+(defconcept b (?y))
+(defconcept c (?y))
+(defconcept a&b (?y) :<=> (and (a ?y) (b ?y)))
+(defconcept B&A (?y) :<=> (and (b ?y) (a ?y)))
+(defconcept a&b&c (?y) :<=> (and (a ?y) (b ?y) (c ?y)))
+)
+
+(cl:time (find-direct-supers-and-subs (get "A&B") FALSE))
+(find-direct-supers-and-subs (get "A&B") FALSE)
+(find-direct-supers-and-subs (get "B&A") FALSE)
+(find-direct-supers-and-subs (get "A&B&C") FALSE)
+
+(flush-classification-sessions)
+
+(cl:progn
+  (cc pl-user)
+  (defobject Fred)
+  (assert (a Fred))
+  (assert (b fred))
+  (retract (a Fred))
+  (find-direct-supers-of-instance (get "FRED"))
+  )
+(finalize-objects)
+
+(cc pl-user)
+
+;;; FOR DEBUGGING:
+(defun display-classification-session ((msgString STRING))
+  (print msgString EOL)
+  (let ((metaWorld (get-inference-cache *module* :META))
+        (tmsWorld (get-inference-cache *module* :TMS)))
+    (when (defined? metaWorld)
+      (print "  META WORLD: " metaWorld EOL)
+      (print "   session: " (classification-session metaWorld) EOL))
+    (when (defined? tmsWorld)
+      (print "  DEFAULT WORLD: " tmsWorld EOL)
+      (print "   session: " (classification-session tmsWorld) EOL))))
+
+|#

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-stella.lisp,v 1.10 2003/04/18 21:14:20 hans Exp
+;;; Version: load-stella.lisp,v 1.14 2006/05/21 07:11:23 hans Exp
 
 ;;; Load Stella.
 
@@ -55,6 +55,8 @@
 (load (merge-pathnames "translations" *load-pathname*))
 (load "PL:native;lisp;stella;load-stella.lisp")
 
-(format t "~&~a loaded.~
-           ~%Type `(in-package \"STELLA\")' to execute STELLA commands."
+(format t "~&~a loaded.~%Type `(in-package \"STELLA\")' to execute STELLA commands."
 	stella::*stella-version-string*)
+
+;; needed to make Allegro Emacs FI interface behave sanely with STELLA:
+#+allegro (tpl:setq-default cl-user::*redefinition-warnings* nil)
