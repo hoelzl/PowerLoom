@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2011      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: arithmetic.ste,v 1.47 2011/04/15 20:58:31 hans Exp
+;;; Version: arithmetic.ste,v 1.48 2011/09/20 00:41:10 hans Exp
 
 ;;; Evaluators perform computations (e.g., '+', '>') during constraint
 ;;;    propagation, and may side-effect, causing additional propagations.
@@ -891,103 +891,112 @@
           do (print-stream out (pli/object-to-string arg)))
       (return (the-string out)))))
 
-(defun (subsequence-specialist KEYWORD)
-       ((frame CONTROL-FRAME) (lastMove KEYWORD))
-  ;; Specialist that applies computed constraints.
-  ;; If all arguments are bound, the constraint is evaluated to see
-  ;;   if it holds.
-  ;; If all but one argument is bound, and the unbound argument is
-  ;;   a pattern variable, then the missing value is computed.
-  (let ((proposition (proposition frame))
-        (superArg (first (arguments proposition)))
-        (superArgValue (argument-bound-to superArg))
-        (p1Arg (second (arguments proposition)))
-        (p1ArgValue (argument-bound-to p1Arg))
-	(p2Arg (third (arguments proposition)))
-        (p2ArgValue (argument-bound-to p2Arg))
-        (subArg (fourth (arguments proposition)))
-        (subArgValue (argument-bound-to subArg))
+(defun (subsequence-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Constraint specialist for the `substring' relation.
+  ;; This is somewhat complicated to support a variety of different binding patterns,
+  ;; most of which we rarely/never use.  For example:
+  ;;      (substring "foobar" 2 4 ?sub)
+  ;;      (substring "foobar" ?p1 3 "oo")
+  ;;      (substring "foobar" 1 ?p2 "oo")
+  ;;      (substring "foobar" ?p1 ?p2 "o")
+  ;;      (substring "foobar" 2 4 "ob")
+  ;; We also coerce the string arguments to type string if necessary and interpret
+  ;; -1 as the end of the string.
+  (ignore lastMove)
+  (let ((arguments (arguments (proposition frame)))
+        (superArg (first arguments))   ;; ?s
+        (p1Arg (second arguments))     ;; ?start
+	(p2Arg (third arguments))      ;; ?end
+        (subArg (fourth arguments))    ;; ?sub
         (iterator (iterator frame)))
-    (ignore lastMove)
+    (when (null? iterator)
+      ;; First time (the common case):
+      (let ((superArgValue (argument-bound-to superArg))
+            (super (choose (string? superArgValue)
+                           (unwrap-string superArgValue)
+                           (pli/object-to-string superArgValue)))
+            (superLength INTEGER NULL)
+            (p1ArgValue (argument-bound-to p1Arg))
+            (p1 INTEGER NULL)
+            (p2ArgValue (argument-bound-to p2Arg))
+            (p2 INTEGER NULL)
+            (subArgValue (argument-bound-to subArg))
+            (sub (choose (string? subArgValue)
+                         (unwrap-string subArgValue)
+                         (pli/object-to-string subArgValue)))
+            (subLength (choose (defined? sub)
+                               (/stella/length sub)
+                               NULL)))
+        (when (null? super)
+          ;; If the superstring is empty, then we get an infinite number
+          ;; of possibilities, so just fail out of the computation.
+          (return :FAILURE))
 
-    (when (null? iterator)  ;; First time
-      (cond ((null? superArgValue)
-	     ;; If the superstring is empty, then we get an infinite number
-	     ;; of possibilities, so just fail out of the computation.
-	     (return :FAILURE))
-	    ((null? subArgValue)
-	     ;; If the result is empty, then only compute it if both of the
-	     ;; position arguments are bound
-	     (let ((p1 INTEGER NULL)
-		   (p2 INTEGER NULL)
-		   (super STRING NULL))
-	       (if (or (null? p1ArgValue) 
-		       (null? p2ArgValue))
-		 (return :FAILURE)
-		 (progn 
-		   (setq p1 (wrapper-value (cast p1ArgValue INTEGER-WRAPPER)))
-		   (setq p2 (wrapper-value (cast p2ArgValue INTEGER-WRAPPER)))
-		   (setq super (unwrap-string superArgValue))
-		   (if (or (stella/< p1 0) (stella/> p2 (/stella/length super)))
-		     (return :TERMINAL-FAILURE)
-		     (return
-		       (select-proof-result
-			(bind-argument-to-value? 
-			 subArg (subsequence super p1 p2) TRUE)
-			FALSE TRUE)))))))
-	    ((null? p1ArgValue)
-	     (if (null? p2ArgValue)
-	       (progn  ;; Allocate iterator for substring positions:
-		 (setq iterator (new SUBSTRING-POSITION-ITERATOR
-				     :super-string (unwrap-string superArgValue)
-				     :sub-string (unwrap-string subArgValue)))
-		 (setf (iterator frame) iterator))
-	       ;; Compute missing value
-	       (let ((p2 (wrapper-value (cast p2ArgValue INTEGER-WRAPPER)))
-		     (sub (unwrap-string subArgValue))
-		     (lsub (/stella/length sub)))
-		 (cond ((stella/> lsub p2) ;; Substring too long for position
-			(return :TERMINAL-FAILURE))
-		       ((string-eql? (subsequence (unwrap-string superArgValue) 
-						  (/stella/- p2 lsub) p2)
-				     sub)
-			(return
-			  (select-proof-result
-			   (bind-argument-to-value? p1Arg (/stella/- p2 lsub) TRUE)
-			   FALSE TRUE)))
-		       (otherwise
-			(return :TERMINAL-FAILURE))))))
-	    ((null? p2ArgValue)
-	     (let ((p1 (wrapper-value (cast p1ArgValue INTEGER-WRAPPER)))
-		   (sub (unwrap-string subArgValue))
-		   (lsub (/stella/length sub))
-		   (super (unwrap-string superArgValue))
-		   (lsuper (/stella/length super)))
-	       (cond ((or (stella/< p1 0)
-			  (stella/> (/stella/+ p1 lsub) lsuper))  ;; Substring too long for position
-		      (return :TERMINAL-FAILURE))
-		     ((string-eql? sub (subsequence super p1 (/stella/+ p1 lsub)))
-		      (return
-			(select-proof-result
-			 (bind-argument-to-value? p2Arg (/stella/+ p1 lsub) TRUE)
-			 FALSE TRUE)))
-		     (otherwise
-		      (return :TERMINAL-FAILURE)))))
-	    ;; All arguments bound
-	    (otherwise
-	     (let ((super-string (unwrap-string superArgValue))
-                   (begin-index (unwrap-integer p1ArgValue))
-                   (end-index (unwrap-integer p2ArgValue))
-                   ;; Make sure the subsequence call won't fail with an error:
-                   (match? (and (/stella/<= end-index (/stella/length super-string))
-                                (bind-argument-to-value? 
-			         subArg 
-			         (subsequence super-string begin-index end-index)
-			         TRUE))))
-	       (set-frame-truth-value frame 
-				      (choose match? TRUE-TRUTH-VALUE FALSE-TRUTH-VALUE))
-	       (return (select-proof-result match? FALSE TRUE))))))
-    ;; At this point, the code has either returned or allocated an iterator
+        ;; argument normalization, type and range checking:
+        (setq superLength (/stella/length super))
+        (when (defined? p1ArgValue)
+          (if (integer? p1ArgValue)
+              (setq p1 p1ArgValue)
+            (return :TERMINAL-FAILURE))
+          (when (or (/stella/< p1 0)
+                    (/stella/> p1 superLength))
+            (return :TERMINAL-FAILURE)))
+        (when (defined? p2ArgValue)
+          (if (integer? p2ArgValue)
+              (setq p2 p2ArgValue)
+            (return :TERMINAL-FAILURE))
+          (when (/stella/= p2 -1)
+            (setq p2 superLength))
+          (when (or (/stella/> p2 superLength)
+                    (and (defined? p1)
+                         (/stella/>= p1 p2)))
+            (return :TERMINAL-FAILURE)))
+        
+        ;; now compute one or more values:
+        (cond ((null? sub)
+               ;; If sub is unbound, only compute it if both positions are bound:
+               (if (and (defined? p1)
+                        (defined? p2))
+                   (return
+                     (select-proof-result
+                      (bind-argument-to-value? subArg (subsequence super p1 p2) TRUE)
+                      FALSE TRUE))
+                 (return :FAILURE)))
+              ((null? p1)
+               (if (null? p2)
+                   ;; Allocate iterator for substring positions:
+                   (setf (iterator frame)
+                     (new SUBSTRING-POSITION-ITERATOR :super-string super :sub-string sub))
+                 ;; Compute missing value:
+                 (cond ((stella/> subLength p2)
+                        ;; Substring too long for position:
+                        (return :TERMINAL-FAILURE))
+                       ((eql? (subsequence super (/stella/- p2 subLength) p2) sub)
+                        (return
+                          (select-proof-result
+                           (bind-argument-to-value? p1Arg (/stella/- p2 subLength) TRUE)
+                           FALSE TRUE)))
+                       (otherwise
+                        (return :TERMINAL-FAILURE)))))
+              ((null? p2)
+               (cond ((stella/> (/stella/+ p1 subLength) superLength)
+                      ;; Substring too long for position:
+                      (return :TERMINAL-FAILURE))
+                     ((eql? sub (subsequence super p1 (/stella/+ p1 subLength)))
+                      (return
+                        (select-proof-result
+                         (bind-argument-to-value? p2Arg (/stella/+ p1 subLength) TRUE)
+                         FALSE TRUE)))
+                     (otherwise
+                      (return :TERMINAL-FAILURE))))
+              (otherwise
+               ;; All arguments bound:
+               (let ((match? (bind-argument-to-value? subArg (subsequence super p1 p2) TRUE)))
+                 (set-frame-truth-value frame (choose match? TRUE-TRUTH-VALUE FALSE-TRUTH-VALUE))
+                 (return (select-proof-result match? FALSE TRUE)))))))
+    
+    ;; At this point, the code has either returned or allocated an iterator:
+    (setq iterator (iterator frame))
     (if (and (next? iterator)
              (bind-argument-to-value? p1Arg 
 				      (first (cast (/stella/value iterator) CONS))
@@ -1045,10 +1054,16 @@
 
 (defun (LENGTH-computation INTEGER-WRAPPER) ((x OBJECT))
   (typecase x
-    (STRING-WRAPPER
+    (STRING
      ;; LENGTH is a PL-KERNEL-KB deffunction:
-     (return (/stella/length (wrapper-value x))))
-    (otherwise
-     (print "Length computation not yet implemented for Lists")
-     (return NULL-INTEGER))) )
-
+     (return (stella/length (wrapper-value x))))
+    (SKOLEM
+     (cond ((or (enumerated-list? x)
+                (enumerated-set? x))
+            (return (1- (stella/length (arguments (defining-proposition x))))))
+           ((logical-collection? x)
+            (let ((listValue (asserted-collection-members x TRUE)))
+              (when (defined? listValue)
+                (return (stella/length listValue)))))))
+    (otherwise NULL))
+  (return NULL))

@@ -1,4 +1,4 @@
-;;; -*- Mode: Lisp; Parekage: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;                                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: propositions.ste,v 1.208 2011/04/16 00:23:25 hans Exp
+;;; Version: propositions.ste,v 1.210 2011/09/20 01:21:44 hans Exp
 
 ;;; Parsing and constructing propositions.
 
@@ -2767,7 +2767,9 @@ without signalling an error if none exists.")
     (otherwise (error "Can't evaluate the term " self))) )
 
 (defun (evaluate-LITERAL-WRAPPER-term OBJECT) ((self LITERAL-WRAPPER))
-  (return (permanentify self)))
+  (if *backlink-all-proposition-arguments?*
+      (return (rewrap-argument self))
+    (return self)))
 
 ;;; TO DO: FIGURE OUT HOW TO ADD TYPES TO SURROGATES.  IDEA: IF SUBSTITUTING
 ;;;    A VALUE, THE PRIMARY TYPE OF THE NEW VALUE MUST SPECIALIZE THE PRIMARY
@@ -2866,9 +2868,9 @@ without signalling an error if none exists.")
   ;;    THEY SHOULD EVALUATE TO (SEE ALSO `inherit-proposition-argument').
   (typecase self
     (PATTERN-VARIABLE
-     (when (defined? (lookup-logic-variable-binding (skolem-name self)))
-       ;; we must be re-evaluating a variable that was stuck into a parse tree:
-       (return self)))
+     ;; we must be re-evaluating a variable that was stuck into a parse tree - do
+     ;; this unconditionally, since it might be an implicit function term var:
+     (return self))
     (SKOLEM
      ;; Always return this, since they are legal and can arise in queries.
      ;; Was previously allowed except in (description-mode?).
@@ -3507,9 +3509,14 @@ structure hash code which might be shared by different objects.")
 ;;;   hashing without preventing detection of different looking
 ;;;   duplicates (e.g., if order of quantified variables differs).
 
-(defun (proposition-hash-index INTEGER) ((self PROPOSITION) (mapping ENTITY-MAPPING))
+(defun (proposition-hash-index INTEGER) ((self PROPOSITION)
+                                         (mapping ENTITY-MAPPING)
+                                         (derefSurrogates? BOOLEAN))
   ;; Compute a hash code that can be used to index `self' for
   ;;    the purpose of duplicate detection.
+  ;; If `mapping' is non-NULL, substitute values from before hashing.
+  ;; If `derefSurrogates?', dereference surrogates to their values
+  ;;    before hashing which is useful for descriptive propositions.
   ;; This purposely ignores variable names and positions and skolems
   ;;    and does the right thing for commutative propositions.  It
   ;;    is assumed that true equivalence is checked via
@@ -3523,13 +3530,13 @@ structure hash code which might be shared by different objects.")
                       (eql? (kind self) :FUNCTION))
                  (last arguments)
                  NULL))
+        (priorArg OBJECT NULL)
         (argCode 0)
         (commutative? FALSE))
     (case (kind self)
       ((:AND :OR :EQUIVALENT)
        (setq commutative? TRUE))
       (otherwise NULL))
-    (setq code (rotate-hash-code code))
     (foreach arg in arguments
         do (when mapped?
              (if (eql? arg functionOutput)
@@ -3550,13 +3557,13 @@ structure hash code which might be shared by different objects.")
                (setq argCode (object-hash-code @SKOLEM))
              (typecase arg
                (PROPOSITION
-                (setq argCode (proposition-hash-index arg mapping)))
+                (setq argCode (proposition-hash-index arg mapping derefSurrogates?)))
                (NAMED-DESCRIPTION
                 (setq argCode (object-hash-code arg)))
                (DESCRIPTION
                 ;; we ignore the fact that this is a description, but it's
                 ;; unlikely that we would often clash because of that:
-                (setq argCode (proposition-hash-index (proposition arg) mapping)))
+                (setq argCode (proposition-hash-index (proposition arg) mapping derefSurrogates?)))
                (PATTERN-VARIABLE
                 (setq argCode (object-hash-code @PATTERN-VARIABLE)))
                (SKOLEM
@@ -3564,60 +3571,76 @@ structure hash code which might be shared by different objects.")
                   (if (and (defined? definingProp)
                            (not (eql? definingProp self)))
                       ;; we have a function term as an argument, hash it:
-                      (setq argCode (proposition-hash-index definingProp mapping))
+                      (setq argCode (proposition-hash-index definingProp mapping derefSurrogates?))
                     (setq argCode (object-hash-code @SKOLEM)))))
+               (SURROGATE
+                (when derefSurrogates?
+                  (setq arg (surrogate-value arg)))
+                (setq argCode (hash-code arg)))
                (WRAPPER
                 (setq argCode (hash-code arg)))
                (otherwise
                 (setq argCode (object-hash-code arg)))))
-           (setq code (logxor code argCode))
-           (unless commutative?
+           (when (or (null? priorArg)     ;; first arg, rotate for operator
+                     (not commutative?)
+                     ;; if we have a commutative prop with equal arguments such as (= a a),
+                     ;; we need to rotate, otherwise all of these will have equal codes:
+                     (eql? arg priorArg))
              ;; rotate right to take argument order into account:
-             (setq code (rotate-hash-code code))))
+             (setq code (rotate-hash-code code)))
+           (setq code (logxor code argCode))
+           (setq priorArg arg))
     (return code)))
+
+(defun (lookup-matching-proposition-in-bucket PROPOSITION) ((bucket LIST)
+                                                            (self PROPOSITION)
+                                                            (mapping ENTITY-MAPPING))
+  ;; Helper for `find-duplicate-complex-proposition'.
+  ;; Return a duplicate (or equivalent) of 'self' if there is one in `bucket'.
+  (let ((homeModule (base-module (home-context self)))
+        (function? (eql? (kind self) :FUNCTION))
+        (operator (operator self))
+        (arguments (arguments self))
+        (arity (length arguments))
+        (rewrapped? FALSE))
+    (remove-deleted-members bucket)
+    (foreach p in bucket
+        do (typecase p
+             (PROPOSITION
+              (when (and (eql? operator (operator p))
+                         (= arity (length (arguments p))))
+                (loop ;; since we might have to try again after rewrapping - kludge
+                  (when (or (and function?
+                                 (equivalent-function-propositions? self p mapping))
+                            (and (not function?)
+                                 (equivalent-propositions? self p mapping)))
+                    (if (subcontext? homeModule (base-module (home-context p)))
+                        (return p)
+                      (break)))
+                  ;; we failed due to an argument mismatch, see whether we need to rewrap:
+                  (cond (rewrapped?
+                         (break))
+                        (otherwise
+                         (rewrap-proposition-arguments self)
+                         (setq rewrapped? TRUE)
+                         (continue))))))
+             (otherwise NULL)))
+    (return NULL) ))
 
 (defun (find-duplicate-complex-proposition PROPOSITION) ((self PROPOSITION))
   ;; Return a duplicate (or equivalent) of 'self' if there is one.
   ;; If not, add 'self' to `*structured-objects-index*'.
   ;; Also finds duplicate function propositions that are identical to
   ;;    `self' except for the last argument.
-  (let ((index (wrap-integer (proposition-hash-index self NULL)))
+  (let ((index (wrap-integer (proposition-hash-index self NULL FALSE)))
         (bucket (lookup *structured-objects-index* index))
-        (homeModule (base-module (home-context self)))
-        (function? (eql? (kind self) :FUNCTION)))
+        (duplicate PROPOSITION NULL))
     (when (null? bucket)
       (insert-at *structured-objects-index* index (list self))
       (return NULL))
-    (remove-deleted-members bucket)
-    (let ((operator (operator self))
-          (arguments (arguments self))
-          (arity (length arguments))
-          (rewrapped? FALSE))
-      (foreach p in bucket
-          do (typecase p
-               (PROPOSITION
-                (when (and (eql? operator (operator p))
-                           (= arity (length (arguments p))))
-                  (loop ;; since we might have to try again after rewrapping - kludge
-                    (when (or (and function?
-                                   ;; special equality test that ignores the last argument:
-                                   (forall arg1 in arguments
-                                       as arg2 in (arguments p)
-                                       as i in (interval 2 arity) ;; only compare n-1 args
-                                       always (eql? (value-of arg1) (value-of arg2))))
-                              (and (not function?)
-                                   (equivalent-propositions? self p NULL)))
-                      (if (subcontext? homeModule (base-module (home-context p)))
-                          (return p)
-                        (break)))
-                    ;; we failed due to an argument mismatch, see whether we need to rewrap:
-                    (cond (rewrapped?
-                           (break))
-                          (otherwise
-                           (rewrap-proposition-arguments self)
-                           (setq rewrapped? TRUE)
-                           (continue))))))
-             (otherwise NULL))))
+    (setq duplicate (lookup-matching-proposition-in-bucket bucket self NULL))
+    (when (defined? duplicate)
+      (return duplicate))
     (push bucket self)
     (return NULL) ))
 
@@ -3644,6 +3667,19 @@ structure hash code which might be shared by different objects.")
     ;; NOTE: if the above gets enabled again, :FUNCTIONs need to be handled here:
     (otherwise
      (return (find-duplicate-complex-proposition self)))))
+
+(defun (find-matching-non-descriptive-proposition PROPOSITION) ((self PROPOSITION)
+                                                                (mapping ENTITY-MAPPING))
+  ;; If `self' is descriptive, try to find a matching non-descriptive proposition
+  ;; relative to `mapping' and the current *structured-objects-index*.
+  ;; Otherwise, return `self'.
+  (when (not (descriptive? self))
+    (return self))
+  (let ((index (wrap-integer (proposition-hash-index self mapping TRUE)))
+        (bucket (lookup *structured-objects-index* index)))
+    (if (defined? bucket)
+        (return (lookup-matching-proposition-in-bucket bucket self mapping))
+      (return NULL))))
 
 (defspecial *dont-check-for-duplicate-propositions?* BOOLEAN FALSE
   :documentation "If TRUE never check for the existence of duplicate
@@ -3832,6 +3868,9 @@ propositions when building a new proposition.")
     (CONS (return (CONS.build-proposition tree)))
     (SURROGATE (return (SURROGATE.build-proposition tree)))
     (SYMBOL (return (SYMBOL.build-proposition tree)))
+    ((PATTERN-VARIABLE PROPOSITION)
+     ;; already evaluated:
+     (return tree))
     (otherwise
      (signal-proposition-error "Illegal logical sentence: " tree))))
  
@@ -5414,7 +5453,7 @@ the processing and validation."
     (when (and (defined? predicateValue)
                (eql? (object-surrogate predicateValue) PL-KERNEL/@SETOF))
       ;; normalize argument order of sets to pick up duplicates:
-      (setq inputArguments (sort inputArguments (the-code :function logic-form-less?))))
+      (setq inputArguments (normalize-setof-arguments inputArguments)))
     (let ((functionProposition
            (find-or-create-function-proposition
             (choose (defined? predicateValue ) 
@@ -5481,15 +5520,19 @@ the processing and validation."
         (otherwise NULL)))
     (return result?) ))
 
+(defun (normalize-setof-arguments CONS) ((args CONS))
+  ;; Sort and uniquify `args' to a SETOF term.
+  (return
+    (sort (remove-duplicates (copy-cons-list args))
+          (the-code :function logic-form-less?))))
+
 (defun (create-enumerated-set SKOLEM) ((set LIST))
   ;; Create a proposition representing 'set' and return its output skolem.
   ;; We don't run this through the complete function-proposition machinery
   ;;    to avoid generating backlinks from all the set elements.
-  (let ((setProp (begin-creating-function-proposition
-                  PL-KERNEL/@SETOF
-                  ;; sort arguments to normalize set terms:
-                  (sort (copy-cons-list (the-cons-list set))
-                        (the-code :function logic-form-less?))))
+  (let ((setElements (normalize-setof-arguments (the-cons-list set)))
+        (setProp
+         (begin-creating-function-proposition PL-KERNEL/@SETOF setElements))
         (duplicate
          (only-if (not (description-mode?))
            ;; this will either find a duplicate or insert
@@ -5499,7 +5542,7 @@ the processing and validation."
     (when (defined? duplicate)
       (return (last-argument duplicate)))
     (setq skolem (create-skolem PL-KERNEL/@SET NULL))
-    (setf (nth (arguments setProp) (length set)) skolem)
+    (setf (nth (arguments setProp) (1- (length (arguments setProp)))) skolem)
     (setf (defining-proposition skolem) setProp)
     (add-dependent-proposition-link skolem setProp)
     (setf (unfastened? setProp) NULL)

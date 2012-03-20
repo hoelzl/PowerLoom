@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2011      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: generate.ste,v 1.20 2010/09/09 23:14:42 hans Exp
+;;; Version: generate.ste,v 1.22 2011/05/05 22:12:35 hans Exp
 
 ;;; Routines that generate a source expression for a logic object
 
@@ -179,10 +179,12 @@
 (defun (generate-proposition OBJECT) ((self PROPOSITION))
   ;; Generate source for a proposition.
     (case (kind self)
-      ((:PREDICATE :FUNCTION :ISA :AND :OR :NOT)
+      ((:PREDICATE :ISA :AND :OR :NOT)
        (let ((operator (generate-operator self)))
          (return (bquote (& operator
                             && (generate-arguments (arguments self)))))))
+      (:FUNCTION
+       (return (generate-function-proposition self)))
       (:EQUIVALENT
        (return (bquote (= && (generate-arguments (arguments self))))))
       (:EXISTS
@@ -208,19 +210,36 @@
 
 (defun (generate-function-as-term CONS) ((self PROPOSITION))
   ;; Return source for 'self' denoting a skolemized function.
-  (let ((arguments NIL))
-    (foreach arg in (but-last (arguments self))
-             collect (generate-term arg) into arguments)
+  (let ((args (arguments self))
+        (arguments NIL))
+    (foreach i in (interval 0 (- (length args) 2))
+        collect (generate-term (nth args i)) into arguments)
     (return (bquote (& (generate-operator self) && arguments))) ))
+
+(defun (generate-function-proposition CONS) ((self PROPOSITION))
+  ;; Return source for 'self'.  This emulates the behavior
+  ;; of `print-kif-function-proposition' and `print-skolem'
+  ;; on the last argument.  That is, this will print the value
+  ;; of the last arg if it is defined, hence, the function prop
+  ;; and the associated equivalence prop will look identical.
+  (let ((result (generate-function-as-term self))
+        (lastArg (last (arguments self)))
+        (lastArgValue (innermost-of lastArg)))
+    (if (and (defined? lastArgValue)
+             (not (eql? lastArgValue lastArg)))
+        (setq lastArg (generate-term lastArgValue))
+      (setq lastArg (generate-term lastArg)))
+    (if *printFunctionsAsRelations?*
+        (return (bquote (&& result & lastArg)))
+      (return (bquote (= & result & lastArg))))))
 
 (defun (generate-skolem OBJECT) ((self SKOLEM))
   ;; Return source for the skolem term 'self'.
   (cond
    ((defined? (native-value-of self))
     (return (generate-term (native-value-of self))))
-   ((and (defined? (defining-proposition self))
-         (null? (variable-value self)))
-       (return (generate-function-as-term (defining-proposition self))))
+   ((defined? (defining-proposition self))
+    (return (generate-function-as-term (defining-proposition self))))
    ((and (defined? (innermost-of self))
          ;; guards against infinite loops with some Cyc function props -
          ;;    there might be a more enlightened fix for this:

@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: descriptions.ste,v 1.102 2011/04/16 00:26:28 hans Exp
+;;; Version: descriptions.ste,v 1.103 2011/09/20 01:10:22 hans Exp
 
 ;;; Named and unnamed descriptions and related support.
 
@@ -273,6 +273,11 @@ primitive description.")
       ;; fill in description fields:
       (setf (io-variable-names description) ioVariableNames)
       (setf (io-variable-types description) ioVariableTypes)
+      ;; signal that this description is named (to `named-description?')
+      ;; so `equivalent-descriptions?' won't break due to the NULL proposition
+      ;; (tricky: since this is a named description, initializing its
+      ;; proposition later will not change its `proposition-hash-index'):
+      (setf (surrogate-value-inverse description) @UNFINALIZED)
       (special ((*fillingConstraintPropagationQueues?* FALSE)
                 ;; make sure we use assertion mode for proper backlinking:
                 (*evaluationMode* :EXTENSIONAL-ASSERTION))
@@ -293,6 +298,7 @@ primitive description.")
          (link-originated-proposition
           description
           (assert-property description PL-KERNEL/@VARIABLE-ARITY)))
+       (setf (surrogate-value-inverse description) NULL)
        (return description)))) )
     
 (defun link-stella-relation-and-description ((self RELATION) (description NAMED-DESCRIPTION))
@@ -762,9 +768,11 @@ a list of quantified, typed variables.")
                 (exists arg2 in (arguments other)
                         where (equivalent-formulae? arg1 arg2 mapping))))) )
 
-(defun (equivalent-propositions? BOOLEAN) 
-       ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
-  ;; Helping function for 'equivalent-formulae?'.
+(defun (help-equivalent-propositions? BOOLEAN) ((self PROPOSITION)
+                                                (other PROPOSITION)
+                                                (mapping ENTITY-MAPPING)
+                                                (ignoreLastArg? BOOLEAN))
+  ;; Helping function for 'equivalent-propositions?'.
   ;; Return TRUE if 'self' is a duplicate of the proposition 'other'.
   (when (eql? self other)
     (return TRUE))
@@ -792,28 +800,33 @@ a list of quantified, typed variables.")
               do (insert-at mapping v1 v2))))
        (otherwise NULL))
      ;; TO DO: UPGRADE TO TEST FOR COMMUTATIVE PREDICATE:
-     (return (or (and (eql? (operator self) (operator other))
-                      (forall arg1 in (arguments self)
-                              as arg2 in (arguments other)
-                              always (equivalent-formulae? arg1 arg2 mapping))
-                      (eql? (length (arguments self))
-                            (length (arguments other))))
-                 (and (defined? mapping) ;; HOLDS-KLUDGE
-                      (eql? (operator self) PL-KERNEL/@HOLDS)
-                      (equivalent-holds-proposition? self other mapping)))))) )
+     (let ((selfArgs (arguments self))
+           (otherArgs (arguments other)))
+       (return (or (and (eql? (operator self) (operator other))
+                        (forall arg1 in selfArgs
+                            as arg2 in otherArgs
+                            as i in (interval 2 (choose ignoreLastArg? (length selfArgs) NULL))
+                            always (equivalent-formulae? arg1 arg2 mapping))
+                        (eql? (length selfArgs) (length otherArgs)))
+                   (and (defined? mapping) ;; HOLDS-KLUDGE
+                        (eql? (operator self) PL-KERNEL/@HOLDS)
+                        (equivalent-holds-proposition? self other mapping))))))))
 
-(defun (equivalent-function-propositions? BOOLEAN)
-    ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
+(defun (equivalent-propositions? BOOLEAN) ((self PROPOSITION)
+                                           (other PROPOSITION)
+                                           (mapping ENTITY-MAPPING))
+  ;; Helping function for 'equivalent-formulae?'.
+  ;; Return TRUE if 'self' is a duplicate of the proposition 'other'.
+  (return (help-equivalent-propositions? self other mapping FALSE)))
+
+(defun (equivalent-function-propositions? BOOLEAN) ((self PROPOSITION)
+                                                    (other PROPOSITION)
+                                                    (mapping ENTITY-MAPPING))
   ;; Return TRUE if `self' and `other' are equivalent function propositions,
   ;;    i.e., they are identical up to their skolem output argument.
-  (when (and (eql? (kind self) :FUNCTION)
-             (eql? (kind other) :FUNCTION))
-    (when (null? mapping)
-      (setq mapping (new ENTITY-MAPPING)))
-    ;; slightly inefficient, otherwise we'd have to duplicate the logic above:
-    (insert-at mapping (last-argument self) (last-argument other))
-    (return (equivalent-propositions? self other mapping)))
-  (return FALSE))
+  (return (and (eql? (kind self) :FUNCTION)
+               (eql? (kind other) :FUNCTION)
+               (help-equivalent-propositions? self other mapping TRUE))))
 
 (defun (equivalent-descriptions? BOOLEAN)
        ((self DESCRIPTION) (other DESCRIPTION) (mapping ENTITY-MAPPING))
@@ -1011,7 +1024,7 @@ a list of quantified, typed variables.")
 (defun (find-duplicate-complex-description DESCRIPTION) ((self DESCRIPTION))
   ;; Return a duplicate (or equivalent) of 'self' if there is one.
   ;; If not, add 'self' to `*structured-objects-index*'.
-  (let ((index (wrap-integer (proposition-hash-index (proposition self) NULL)))
+  (let ((index (wrap-integer (proposition-hash-index (proposition self) NULL FALSE)))
         (bucket (lookup *structured-objects-index* index))
         (homeModule (base-module (home-context self)))
         (mapping (new ENTITY-MAPPING)))
