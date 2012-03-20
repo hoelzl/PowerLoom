@@ -86,7 +86,7 @@ import edu.isi.powerloom.PLI;
  *  response uses.  Line terminators may be any combinbation of CR, LF or CR/LF.
  *
  * @author Thomas Russ
- * @version PowerLoomServer.java,v 1.6 2003/03/27 01:38:39 tar Exp
+ * @version PowerLoomServer.java,v 1.7 2003/10/23 17:43:00 tar Exp
  */
 public class PowerLoomServer {
 
@@ -186,7 +186,7 @@ public class PowerLoomServer {
 	} else if ((args[argn].equals("-kb"))) {
 	  argn++;
 	  System.out.println("Loading " + args[argn] + " ...");
-	  PLI.load(args[argn]);
+	  PLI.load(args[argn], null);
 	  System.out.println("   Done.");
 	} else if (args[argn].equals("-port")) {
 	    ++argn;

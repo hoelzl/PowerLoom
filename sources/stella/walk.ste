@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: walk.ste,v 1.274 2003/05/01 23:49:52 tar Exp
+;;; Version: walk.ste,v 1.276 2003/10/23 17:10:31 tar Exp
 
 ;;; Stella code walker.
 
@@ -1379,6 +1379,27 @@ confirmation with the user."
     (return
       (intern-transient-symbol
        (yield-gensym-name prefix prefixCounter)))))
+
+(defun (method-gensym SYMBOL) ((prefix STRING))
+  ;; Generate a globally unique gensym based on the name of the currently
+  ;;    walked method and `prefix'.  This is useful for generating global
+  ;;    variables or symbols associated with a particular function.  Multiple
+  ;;    gensyms for the same function will be numbered consecutively starting
+  ;;    from 000 similar to local gensyms.
+  (let ((method *methodBeingWalked*)
+        (local? FALSE))
+    (when (defined? method)
+      (if (method-function? method)
+          (setq prefix
+            (concatenate "F-" (symbol-name (slot-name method)) "-" prefix))
+        (setq prefix
+          (concatenate "M-" (symbol-name (slot-owner method))
+                       "." (symbol-name (slot-name method))
+                       "-" prefix)))
+      (setq local? TRUE))
+    (if local?
+        (return (local-gensym prefix))
+      (return (gensym prefix)))))
 
 (defun (yield-local-variable-alias SYMBOL) ((variable SYMBOL) (level INTEGER))
   ;; Return an alias for the local `variable' which is bound at `level' >= 1,
@@ -7536,6 +7557,11 @@ functions that would cause too much stress for some wimpy compilers).")
        TRUE))))
 
 (defun (yield-startup-function-classname STRING) ((function-name SYMBOL))
+  ;; If this is the system startup function, then use a normal name.
+  ;; Otherwise, it is an internal startup name and gets a leading underscore.
+  ;; IMPORTANT:  This character may be used as key by the Java translation
+  ;; software in deciding whether the class is public is not.  This is a
+  ;; bit of a kludge, but it saves a slot that would otherwise be needed.
   (if (system-startup-file? *currentFile*)
     (return (string-capitalize (symbol-name function-name)))
     (return (concatenate "_" (string-capitalize (symbol-name function-name))))))
@@ -7580,11 +7606,18 @@ functions that would cause too much stress for some wimpy compilers).")
       ;; (2) Combine all STARTUP-TIME-PROGNs and walk the actual startup
       ;;     function (treating it as an auxiliary function avoids the 
       ;;     generation of any more startup-time code and stringification):
-      (setq tree
-        (bquote
-         (defun & startupFnName ()
-                :public? TRUE :auxiliary? TRUE
-                && (combine-startup-function-units startupFnName))))
+      (if (system-startup-file? *currentFile*)
+        (setq tree
+              (bquote
+               (defun & startupFnName ()
+                      :public? TRUE :auxiliary? TRUE
+                      (with-process-lock *bootstrap-lock*
+                        && (combine-startup-function-units startupFnName)))))
+        (setq tree
+              (bquote
+               (defun & startupFnName ()
+                      :public? TRUE :auxiliary? TRUE
+                      && (combine-startup-function-units startupFnName)))))
       ;; Set this for Java translation:
       (setf (method-startup-classname
              (cast (the-object (help-walk-auxiliary-tree tree TRUE)) METHOD-SLOT))

@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: translations.lisp,v 1.22 2003/04/18 21:14:23 hans Exp
+;;; Version: translations.lisp,v 1.23 2003/09/30 20:09:39 hans Exp
 
 ;;; Pathname translations for PowerLoom and related systems.
 
@@ -78,6 +78,8 @@
                 #+:ALLEGRO-V6.0   |acl6.0|
                 #+(:AND :ALLEGRO-V6.1 :SUN)    |acl6.1-sun|
                 #+:ALLEGRO-V6.1   |acl6.1|
+                #+(:AND :ALLEGRO-V6.2 :SUN)    |acl6.2-sun|
+                #+:ALLEGRO-V6.2   |acl6.2|
                 #+:ALLEGRO        |aclx.x|
                 #+:LCL4.1         |lcl4.1|
                 #+:LCL4.0         |lcl4.0|
@@ -85,6 +87,8 @@
                 #+:MCL            |mcl|
                 #+:LISPWORKS4.0   |lw4.0|
                 #+:LISPWORKS4.1   |lw4.1|
+                #+:CMU18          |cmu18|
+                #+:CMU            |cmu|
                                   |lisp|"))))
 
 (let* ((directorySeparator
@@ -122,6 +126,11 @@
                     (format nil "~akbs/**/~a"
                             *powerloom-root-directory*
                             physicalPattern)))
+       (othersTranslation
+        (substitute directorySeparator #\/
+                    (format nil "~a**/~a"
+                            *powerloom-root-directory*
+                            physicalPattern)))
        ;; try to figure out dynamically whether the current Lisp/OS
        ;;    combination needs a separate directory-only translation
        ;;    rule.
@@ -141,7 +150,8 @@
           `(("sources;**;*.*.*" ,sourcesTranslation)
             ("native;**;*.*.*" ,nativesTranslation)
             ("bin;**;*.*.*" ,binariesTranslation)
-            ("kbs;**;*.*.*" ,kbsTranslation)))
+            ("kbs;**;*.*.*" ,kbsTranslation)
+            ("**;*.*.*" ,othersTranslation)))
     (when needs-directory-rule?
       (setf (logical-pathname-translations "PL")
             (append `(("sources;**;" ,(truncate-last sourcesTranslation ppLength))

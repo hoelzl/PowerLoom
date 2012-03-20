@@ -2,7 +2,7 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;                                                                          ;
-;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 1997                   ; 
+;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 1997-2003              ; 
 ;  University of Southern California, Information Sciences Institute       ;
 ;  4676 Admiralty Way                                                      ;
 ;  Marina Del Rey, California 90292                                        ;
@@ -25,12 +25,17 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-powerloom.lisp,v 1.8 2000/04/20 23:26:00 hans Exp
+;;; Version: load-powerloom.lisp,v 1.9 2003/10/22 23:42:02 hans Exp
 
 ;;; Load PowerLoom.
 
 (in-package "CL-USER")
 
+
+;; Set this to t to use structs instead of CLOS objects as the implementation
+;; of STELLA classes.  Structs are significantly faster but can cause problems
+;; when classes are redefined.  Use for production versions only.
+(defvar *load-cl-struct-stella?* nil)
 
 (load (merge-pathnames "translations" *load-pathname*))
 (load (merge-pathnames "load-stella" *load-pathname*))
@@ -46,6 +51,3 @@
 	stella::*powerloom-version-string*)
 
 (stella::in-module "PL-USER")
-
-;; Uncomment this to turn off runtime type checking:
-;(setq stella::*safety* 1)

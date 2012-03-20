@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: Native.java,v 1.39 2003/04/18 21:16:07 hans Exp
+// Version: Native.java,v 1.40 2003/10/23 17:16:50 tar Exp
 
 // Native Java stuff for STELLA
 
@@ -367,19 +367,16 @@ public class Native {
       return (new BufferedInputStream(new FileInputStream(filename)));
     }
     catch (java.io.FileNotFoundException e) {
-      java.lang.System.err.println("File not found: " + e);
-      return null;
+      throw NoSuchFileException.newNoSuchFileException("openInputFileStream: " + e.getMessage());
     }
   }
 
   public static BufferedOutputStream openOutputFileStream(String filename) {
    try {
      return (new BufferedOutputStream (new FileOutputStream(filename)));
-
    }
    catch (java.io.IOException e) {
-     java.lang.System.err.println("I/O Error: " + e);
-     return null;
+     throw InputOutputException.newInputOutputException("openOutputFileStream: " + e.getMessage());
    }
   }
 
@@ -394,8 +391,7 @@ public class Native {
       return s.readLine();
     }
     catch (IOException e) {
-      java.lang.System.err.println("I/O Error in readLine: " + e);
-      return null;
+      throw InputOutputException.newInputOutputException("readLine: " + e.getMessage());
     }
   }
 
@@ -416,9 +412,7 @@ public class Native {
       }
     }
     catch (IOException e) {
-      java.lang.System.err.println("I/O Error in readCharacter: " + e);
-      return_char = Stella.NULL_CHARACTER;
-      return_values[0] = Stella.TRUE_WRAPPER;
+      throw InputOutputException.newInputOutputException("readCharacter: " + e.getMessage());
     }
 
     return return_char;
@@ -429,7 +423,7 @@ public class Native {
       stream.unread(c);
     }
     catch (IOException e) {
-      java.lang.System.err.println("I/O Error in unreadCharacter: " + e);
+      throw InputOutputException.newInputOutputException("unreadCharacter: " + e.getMessage());
     }
   }
 
@@ -459,6 +453,31 @@ public class Native {
     (new File(filename)).delete();
   }
 
+
+  /*
+  public static void copyFile(String fromFilename, String toFilename) {
+    java.io.FileInputStream fromFile = null;
+    java.io.FileOutputStream toFile = null;
+    byte buffer [] = new byte[1024];
+    int bytesRead = 0;
+
+    try {
+      fromFile = new FileInputStream(Stella.translateLogicalPathname(fromFilename));
+      toFile  = new FileOutputStream(Stella.translateLogicalPathname(toFilename));
+      while (bytesRead >= 0) {
+        bytesRead = fromFile.read(buffer, 0, 1024);
+        if (bytesRead > 0) toFile.write(buffer, 0, bytesRead);
+      }
+    } catch (java.lang.FileNotFoundException fnf) {
+      throw NoSuchFileException.newNoSuchFileException(fnf.getMessage());
+    } catch (java.lang.IOException ioe) {
+      throw InputOutputException.newInputOutputException("copyFile: " + e.getMessage());
+    } finally {
+      if (fromFile != null) fromFile.close();
+      if (toFile != null) toFile.close();
+    }
+  }
+  */
     //
   ///// Exception-handling support
    //
@@ -560,17 +579,17 @@ public class Native {
 	throw (StellaException) e.getTargetException();
       // and generate a new stella exception for the others:
       }	else if (y == null) {
-	java.lang.System.err.println("Invocation Target Exception in funcall of function:\n  "
-			   + x + formatArguments(z));
+	java.lang.System.err.println("Invocation Target Exception in funcall of function:");
+        java.lang.System.err.println("    " + x + formatArguments(z));
       }
       else {
-	java.lang.System.err.println("Invocation Target Exception in funcall of:\n  "
-                           + x + " on " + y + formatArguments(z));
+	java.lang.System.err.println("Invocation Target Exception in funcall of:");
+        java.lang.System.err.println("    " + x + " on " + y + formatArguments(z));
       }
-      java.lang.System.err.println("     " + e.getTargetException());
+      java.lang.System.err.println("    " + e.getTargetException());
       e.getTargetException().printStackTrace(java.lang.System.err);
       java.lang.System.err.println();
-      throw StellaException.newStellaException("Funcall failed.");
+      throw StellaException.newStellaException("Funcall failed:" + e.getTargetException().getMessage());
     }
   }
 
@@ -579,7 +598,7 @@ public class Native {
       return Class.forName(className);
     }
     catch (ClassNotFoundException e) {
-      throw StellaException.newStellaException ("Can't find class `" + className + "' in find_java_class");
+      throw NoSuchObjectException.newNoSuchObjectException ("Can't find class `" + className + "' in find_java_class");
     }
   }
 
@@ -594,7 +613,7 @@ public class Native {
       return theMethod;
     }
     catch (ClassNotFoundException e) {
-      throw StellaException.newStellaException ("Can't find class `" + className + "' in find_java_method");
+      throw NoSuchObjectException.newNoSuchObjectException ("Can't find class `" + className + "' in find_java_method");
     }
     catch (NoSuchMethodException e) {
       StringBuffer params = new StringBuffer(" [");
@@ -606,7 +625,7 @@ public class Native {
 	  }
       params.append("]");
 
-      throw StellaException.newStellaException ("Can't find method `" + methodName + "' on `" + className + "' for " + params + " in find_java_method");
+      throw NoSuchObjectException.newNoSuchObjectException ("Can't find method `" + methodName + "' on `" + className + "' for " + params + " in find_java_method");
     }
   }
 

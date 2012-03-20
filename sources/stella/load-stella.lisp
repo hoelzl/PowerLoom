@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-stella.lisp,v 1.30 2003/04/18 21:15:15 hans Exp
+;;; Version: load-stella.lisp,v 1.31 2003/10/24 19:33:25 hans Exp
 
 ;;; Load STELLA.
 
@@ -54,9 +54,22 @@
 (defvar *stella-native-directory* "PL:native;lisp;stella;")
 (defvar *stella-binary-directory* "PL:bin;stella;")
 
-;;; Use these switches to load a version of Stella that uses structs:
-(defvar *load-cl-struct-stella?* NIL)
-(defvar *load-vector-struct-stella?* NIL)
+;;; Various switches to customize the behavior of STELLA:
+
+(defvar *load-cl-struct-stella?* NIL
+  "If T load the version of STELLA that uses Lisp structs instead of
+CLOS objects to implement STELLA objects.  This greatly improves slot
+access speed for the price of less flexibility with class redefinition.
+Use for production versions only.")
+
+(defvar *load-vector-struct-stella?* NIL
+  "Obsolete.")
+
+(defvar *use-stella-hash-tables?* #+allegro T #-allegro NIL
+  "If T use STELLA's implementation of hash tables instead of native
+Lisp hash tables.  Useful if native hash tables are fraught with
+performance problems (as happens in some versions of Allegro once
+hash tables grow large).")
 
 ;;; Compiler optimization for translated Stella files:
 (defvar *stella-compiler-optimization*
