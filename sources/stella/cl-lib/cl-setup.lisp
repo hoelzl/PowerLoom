@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cl-setup.lisp,v 1.69 2010/02/10 22:11:20 hans Exp
+;;; Version: cl-setup.lisp,v 1.70 2010/05/27 21:06:56 tar Exp
 
 ;;; Common-Lisp package setup and boot support.
 
@@ -172,6 +172,10 @@
 (CL:defgeneric length (self))
 (CL:defgeneric method-argument-count (self))
 (CL:defgeneric position (self object start))
+
+;; Note: In SBCL these declarations will get clobbered when methods
+;;       are defined and they will generate warnings.  But they help
+;;       in other places.
 
 (CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) arity))
 (CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) buffered-input-length))
@@ -1014,14 +1018,16 @@
 
 (cl:defmacro with-style-warnings-suppressed (CL:&body forms)
   ;; Wrap form with code to suppress undefined function warnings
-  #|
-  ;; disabled for now, since some of these warnings are important clues
-  ;; (e.g., that CMUCL's aggressive type inference might cause problems):
+
+  ;; disabled full warning for now, since some of these warnings are
+  ;; important clues (e.g., that CMUCL's aggressive type inference
+  ;; might cause problems):
   `(CL:handler-bind 
-       ((CL:style-warning #'CL:muffle-warning))
-    ,@forms )
-  |#
-  `(CL:progn ,@forms))
+       (; (CL:style-warning #'CL:muffle-warning)
+	#+:sbcl (SB-KERNEL:REDEFINITION-WARNING #'CL:muffle-warning)
+        #+:sbcl (SB-EXT:IMPLICIT-GENERIC-FUNCTION-WARNING #'CL:muffle-warning)
+        )
+    ,@forms ))
 
 
   ;;

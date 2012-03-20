@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: propagate.ste,v 1.57 2009/02/07 06:13:22 hans Exp
+;;; Version: propagate.ste,v 1.61 2010/09/10 01:16:59 hans Exp
 
 ;;; Evaluator routines that compute forward propagation for the
 ;;;    propositional calculus.
@@ -108,6 +108,10 @@ forward chaining as well as various other propagation control information.")
       (setf (propagation-environment self) environment))
     (return environment)))
 
+(defun unlink-propagation-environment ((self CONTEXT))
+  ;; Remove the propagation environment linked to `self' if it has one.
+  (setf (propagation-environment self) NULL))
+
 (defmethod defer-default-proposition ((self PROPAGATION-ENVIRONMENT)
                                       (proposition PROPOSITION))
   ;; Register `proposition' as a deferred default proposition.
@@ -152,12 +156,15 @@ posting derived default propositions to temporary queues.")
   :documentation "Return :POSTED if `proposition' is on the evaluation queue
 for *context*, :EVALUATED if has been evaluated, or NULL if it has never been evaluated."
   :public? TRUE :globally-inline? TRUE
-  (return (lookup (evaluation-states (get-propagation-environment *context*)) proposition)))
+  (if (description-mode?)
+      (return NULL)
+    (return (lookup (evaluation-states (get-propagation-environment *context*)) proposition))))
 
 (defun evaluation-state-setter ((proposition PROPOSITION) (state KEYWORD))
   :documentation "Record the evaluation `state' of 'proposition'."
   :public? TRUE
-  (insert-at (evaluation-states (get-propagation-environment *context*)) proposition state))
+  (unless (description-mode?)
+    (insert-at (evaluation-states (get-propagation-environment *context*)) proposition state)))
 
 (defun post-for-evaluation ((self PROPOSITION) (world CONTEXT))
   :documentation "Push 'self' onto the evaluation queue (unless it's already there)."
@@ -349,9 +356,13 @@ chaining.")
 (defglobal *max-skolem-generation-count* INTEGER 3)
 
 (defun apply-rule-consequent-to-vector
-       ((consequent DESCRIPTION) (arguments ARGUMENTS-VECTOR)
-        (rule PROPOSITION) (triggerDescription DESCRIPTION) 
-        (triggerProposition PROPOSITION) (touchedDefault? BOOLEAN))
+       ((consequent DESCRIPTION)
+        (arguments ARGUMENTS-VECTOR)
+        (rule PROPOSITION)
+        (triggerDescription DESCRIPTION) 
+        (triggerProposition PROPOSITION)
+        (touchedDefault? BOOLEAN)
+        (bc-justification JUSTIFICATION))
   ;; Helping function for 'apply-forward-rules-to-vector'.
   ;; 'rule' is an IMPLIES or a FORALL (used for tracing only).
   (ignore triggerDescription)
@@ -395,7 +406,8 @@ chaining.")
                (max (1+ skolemGenerationCount) (skolem-generation-count skolem))))
            ;; THIS MAY NOT BE APPROPRIATE IF 'rule' IS A :FORALL?:  -rmm
            (record-forward-goal rule arguments p)
-           (record-forward-justification p rule (cons-list triggerProposition))))))
+           (record-forward-justification 
+            (cons-list triggerProposition) rule arguments p bc-justification)))))
 
 (defun trace-forward-rule ((rule PROPOSITION)
                            (trigger PROPOSITION)
@@ -436,6 +448,16 @@ chaining.")
   ;; Foreach forward :IMPLIES proposition attached to 'triggerDescription',
   ;;    inherit its consequent onto 'arguments'.
   ;; Note: 'triggerDescription' has a name unless it is a complement.
+  ;;
+  ;; Method:  Forward rules with a simple (atomic) antecedent are handled
+  ;;          by just applying the consequent, since they are trivially
+  ;;          satisfied by having the trigger description satisfied.
+  ;;       Forward rules that have a complex antecedent are evaluated whenever
+  ;;          one of the trigger clauses is true.  But then a cached query
+  ;;          has to be run to see if the remaining clauses of the complex
+  ;;          antecedent are also satisifed.  This may involve a small amount
+  ;;          of backchaining.  The results are a set of bindings from the cached
+  ;;          query.
   (let ((evaluatedArgs arguments))
     (foreach arg in arguments
         as i in (interval 0 NULL)
@@ -451,11 +473,15 @@ chaining.")
   ;; NOTE: Should `collect-forward-chaining-rules' test for `true?' instead?
   (mv-bind (rules indices)
       (collect-forward-chaining-rules triggerDescription)
+    ;; Handle simple forward chaining rules
    (foreach (r touchedDefault?) in rules
        where (applicable-forward-rule? r arguments)
        do (apply-rule-consequent-to-vector
            (nth (arguments r) 1) arguments r 
-           triggerDescription triggerProposition touchedDefault?))
+           triggerDescription triggerProposition touchedDefault?
+           NULL))
+    ;; Handle complex forward chaining rules, where a query for
+    ;; the residuals is used.
    (foreach (fwdIndex touchedDefault?) in indices
        do (let ((inputArgs NIL))
             ;; check -- variable arity relation may allow mismatch:
@@ -480,6 +506,7 @@ chaining.")
                    (setf (value it) arg)))
           (let ((outputBindings CONS NULL)
                 (truthValues CONS NULL)
+                (justifications CONS NULL)
                 (traceForwardInference? (trace-keyword? :PROPAGATE))
                 (traceGoalTree? (and traceForwardInference?
                                      (trace-keyword? :GOAL-TREE)))
@@ -496,28 +523,35 @@ chaining.")
             ;; it could destructively modify the cached query run here in a recursive
             ;; call - this is seriously not thread safe:
             (special ((*fillingConstraintPropagationQueues?* TRUE))
-              (mv-setq (outputBindings truthValues)
+              (mv-setq (outputBindings truthValues justifications)
                 (apply-cached-retrieve
                  (io-variables fwdIndex)
                  (query-body fwdIndex)
                  (input-bindings fwdIndex)
                  ;; Run backward goals in shallow mode only; if somebody needs
                  ;; deep inference they can explicitly wrap a `query' around a goal:
-                 (cons-list :singletons? TRUE :inference-level :shallow)
+                 (cons-list :singletons? FALSE :inference-level :shallow)
                  (cache-id fwdIndex))))
             (when traceGoalTree?
               (print "Done proving forward goal: " (query-body fwdIndex) EOL EOL))
             (setq *traced-keywords* oldTraceKeywords)
+            ;; NOTE:  We currently build the justification inside the 
+	    ;;        APPLY-RULE-CONSEQUENT-TO-VECTOR? function by passing down
+	    ;;        any backward-chaining justification from a complex antecedent.
+	    ;;        An alternative method would be to build the justification at
+	    ;;        this level.  If here, then the simple antecedent case also needs
+	    ;;        the justification raised to this level.
             (foreach ob in outputBindings
                 as tv in truthValues
-                do (apply-rule-consequent-to-vector
-                    (consequent fwdIndex)
-                    (copy-list-to-arguments-vector
-                     (listify (cast ob CONS)))
-                    (master-rule fwdIndex)
-                    triggerDescription triggerProposition
-                    (or touchedDefault?
-                        (eql? tv DEFAULT-TRUE-TRUTH-VALUE)))))) ))
+                do (let ((justification (popq justifications)))
+                     (apply-rule-consequent-to-vector
+                      (consequent fwdIndex)
+                      (copy-list-to-arguments-vector (listify (cast ob CONS)))
+                      (master-rule fwdIndex)
+                      triggerDescription 
+		      triggerProposition
+                      (or touchedDefault? (eql? tv DEFAULT-TRUE-TRUTH-VALUE))
+                      justification))))) ))
 
 (defun (applicable-forward-rule? BOOLEAN)
        ((rule PROPOSITION) (arguments ARGUMENTS-VECTOR))
@@ -704,7 +738,8 @@ chaining.")
   ;; Strategy: With regard to parsing, we avoid calling 
   ;;    'evaluate-new-proposition' for other than the first time that
   ;;    a proposition is conceived.
-  (when (description-mode?)
+  (when (or (description-mode?)
+            (descriptive? self))
     (return))
   (let ((world (lookup-constraint-propagation-world *context*)))
     (when (defined? world)
@@ -858,6 +893,23 @@ chaining.")
       (when (unequate-conflicting-default-values? self)
         (equate-values firstArg secondArg))
       |#
+
+      ;#|
+      ;; Disjointness testing: this is generally the right thing to do, but we
+      ;; need to make things more efficient with respect to type lookup and
+      ;; disjointness testing; in particular, we need to memoize types as well
+      ;; as disjointness tests; maybe we should also have a cheap test for classes
+      ;; to see whether they participate in any partitions or not.  Conceivably,
+      ;; this machinery could move into `bind-skolem-to-value', since there we
+      ;; already do some type checking.
+      (let ((firstArgTypes (all-asserted-types firstArg))
+            (secondArgTypes (all-asserted-types secondArg)))
+        (foreach type1 in firstArgTypes
+            where (exists type2 in secondArgTypes
+                    where (disjoint-terms? type1 type2))
+            do (signal-unification-clash firstArg secondArg)))
+      ;|#
+      
       (equate-values firstArg secondArg))
      ((eql? firstArg secondArg)
       (assign-truth-value self TRUE))
@@ -1333,6 +1385,14 @@ forward chainer has been run then in one where it has not (see
     (if (defined? instance)
       (return (the-cons-list (all-facts-of-instance instance FALSE TRUE)))
       (return NULL))))
+
+(defun print-facts ((instanceRef OBJECT))
+  :documentation "Like ALL-FACTS-OF, but prints each fact on a separate 
+line on the standard output stream."
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  (let ((instance (coerce-to-instance instanceRef NULL)))
+    (foreach fact in (all-facts-of-instance instance false false)
+	do (print fact EOL))))
 
 (defun (call-all-facts-of (LIST OF PROPOSITION)) ((instanceRef OBJECT))
   :command? TRUE :public? TRUE :evaluate-arguments? TRUE

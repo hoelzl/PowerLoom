@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2008      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2010      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: cpp-primal.hh,v 1.53 2008/09/09 00:50:25 hans Exp
+// Version: cpp-primal.hh,v 1.55 2010/09/08 21:32:38 hans Exp
 
 // Native C++ support for STELLA
 
@@ -56,7 +56,7 @@
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
-#include <limits.h>
+#include <limits>
 #include <exception>
 #include <stdexcept>
 
@@ -89,9 +89,9 @@ class Vector;
 class Stream;
 
 // Primitive types
-typedef int boolean;
-typedef int fat_boolean;
-typedef int one_bit_boolean;
+typedef bool boolean;
+typedef bool fat_boolean;
+typedef bool one_bit_boolean;
 typedef void* cpp_function_code;
 typedef Object* (Object::*cpp_method_code) ();
 typedef void cpp_hash_table;
@@ -185,10 +185,11 @@ unsigned int native_hash_string (const char* x);
 char* native_read_line(std::istream* stream);
 char native_read_character(std::istream* stream, boolean& return4);
 
-boolean probeFileP(char* filename);
-CalendarDate* fileWriteDate(char* filename);
-long long int fileLength(char* filename);
-void deleteFile(char* filename);
+boolean nativeProbeFileP(char* filename);
+CalendarDate* nativeFileWriteDate(char* filename);
+long long int nativeFileLength(char* filename);
+void nativeDeleteFile(char* filename);
+void nativeRenameFile(char* fromfile, char* tofile);
 
 clock_t getTicktock();
 double ticktockDifference(clock_t t1, clock_t t2);

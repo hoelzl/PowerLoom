@@ -1,6 +1,6 @@
 # Makefile for primal C++ support
 
-# Version: Makefile,v 1.21 2006/05/16 06:42:06 hans Exp
+# Version: Makefile,v 1.22 2010/10/11 22:05:31 hans Exp
 
 SYSTEMS-ROOT = ../..
 STELLA-ROOT = ..
@@ -8,7 +8,7 @@ STELLA-ROOT = ..
 # g++ settings:
 CXX   = g++
 CC    = gcc
-CFLAGS = -w -O2 -g -fno-common
+CFLAGS = -w -O2 -g -fno-common -fPIC
 CXXFLAGS = $(CFLAGS)
 
 # Comment GC-SWITCHES and GC-LIB to not use the garbage collector:

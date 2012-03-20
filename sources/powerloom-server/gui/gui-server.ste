@@ -1,0 +1,153 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2002-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: gui-server.ste,v 1.11 2010/02/13 04:04:49 hans Exp
+
+(in-package "STELLA")
+
+(in-module "GUI-SERVER")
+
+
+;;; NOTES:
+
+;;; - This code was initially written for a case-sensitive module
+;;;   but the current GUI-SERVER module is not case-sensitive anymore
+;;;   (thus, the non-uniform mixed-case notation).
+;;; - Most of what used to be here was moved into `webtools/marshaller.ste'.
+;;; - Instead of the special-purpose code to construct SOAP envelopes in here,
+;;;   we should use/extend the standard API defined in webtools/soap.ste;
+;;;   however, the Java side relies on the special-purpose format, so we
+;;;   won't touch this for now.
+
+
+  ;;
+;;;;;; SOAP support for GUI server.
+  ;;
+
+(DEFGLOBAL *GUI-SERVER-MODULE* MODULE
+  (GET-STELLA-MODULE "GUI-SERVER" TRUE))
+
+(DEFGLOBAL *SOAP-RESULT-PREFIX* STRING "<?xml version='1.0' encoding='UTF-8'?><env:Envelope xmlns:env='http://schemas.xmlsoap.org/soap/envelope/' xmlns:xsd='http://www.w3.org/2001/XMLSchema' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xmlns:enc='http://schemas.xmlsoap.org/soap/encoding/' xmlns:ns0='http://hello.org/wsdl' env:encodingStyle='http://schemas.xmlsoap.org/soap/encoding/'><env:Body><response><result><![CDATA[")
+
+(DEFGLOBAL *SOAP-EXCEPTION-PREFIX* STRING "<?xml version='1.0' encoding='UTF-8'?><env:Envelope xmlns:env='http://schemas.xmlsoap.org/soap/envelope/' xmlns:xsd='http://www.w3.org/2001/XMLSchema' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xmlns:enc='http://schemas.xmlsoap.org/soap/encoding/' xmlns:ns0='http://hello.org/wsdl' env:encodingStyle='http://schemas.xmlsoap.org/soap/encoding/'><env:Body><response><exception><![CDATA[")
+
+(DEFGLOBAL *SOAP-RESULT-SUFFIX* STRING "]]></result></response></env:Body></env:Envelope>")
+
+(DEFGLOBAL *SOAP-EXCEPTION-SUFFIX* STRING "]]></exception></response></env:Body></env:Envelope>")
+
+(DEFUN (SERVER-PROCESS-SOAP-REQUEST STRING) ((requestBody STRING))
+  (LET ((exception STRING NULL)
+	(realResult STRING "")
+	(soapResult STRING NULL))
+    (SERVER-LOG :HIGH "Request: " requestBody)
+    (EXCEPTION-CASE
+	(LET ((soapTree (SERVER-PARSE-XML-DOCUMENT-STRING requestBody))
+	      (soapBodyContents (SERVER-EXTRACT-SOAP-BODY-CONTENTS soapTree)))
+	  (SETQ realResult (SERVER-INVOKE-POWERLOOM-METHOD soapBodyContents)))
+      (LOGIC-EXCEPTION (e)
+	(SETQ exception (SERVER-MARSHAL-EXCEPTION "PowerLoom Error" e)))
+      (STELLA-EXCEPTION (e)
+	(SETQ exception (SERVER-MARSHAL-EXCEPTION "STELLA Error" e)))
+      (NATIVE-EXCEPTION (e)
+	(SETQ exception (SERVER-MARSHAL-EXCEPTION "Internal Error" e))))
+    (SETQ soapResult (SERVER-GENERATE-SOAP-RESPONSE realResult exception))
+    (SERVER-LOG :HIGH "Response: " soapResult)
+    (RETURN soapResult)))
+
+(DEFUN (SERVER-MARSHAL-EXCEPTION STRING) ((type STRING) (exception NATIVE-EXCEPTION))
+  (LET ((message (EXCEPTION-MESSAGE exception))  ;; todo: replace this with the actual message
+	(serverException (NEW |ServerException|))
+	(xmlString STRING NULL))
+    (SETF (|Message| serverException) message)
+    (SETF (|Type| serverException) type)
+    (SETQ xmlString (TO-XML-STRING serverException))
+    (RETURN xmlString)))
+
+(DEFUN (SERVER-GENERATE-SOAP-RESPONSE STRING) ((response STRING) (exception STRING))
+  (IF (DEFINED? exception)
+      (RETURN (CONCATENATE *SOAP-EXCEPTION-PREFIX* exception *SOAP-EXCEPTION-SUFFIX*))
+    (RETURN (CONCATENATE *SOAP-RESULT-PREFIX* response *SOAP-RESULT-SUFFIX*))))
+
+(DEFUN (SERVER-PARSE-XML-DOCUMENT-STRING (CONS OF CONS)) ((request STRING))
+  (RETURN (COLLECT item IN (XML-EXPRESSIONS (NEW INPUT-STRING-STREAM
+						 :THE-STRING request)
+					    NULL))))
+
+(DEFUN (SERVER-EXTRACT-SOAP-BODY-CONTENTS OBJECT) ((parseTree (CONS OF CONS)))
+  (LET ((body CONS (THIRD (FIRST parseTree)))
+	(bodyContents (THIRD body)))
+    (RETURN bodyContents)))
+
+(DEFUN (SERVER-EXTRACT-METHOD-NAME STRING) ((bodyContents CONS))
+  (RETURN (NAME (CAST (FIRST bodyContents) XML-OBJECT))))
+
+(DEFUN (SERVER-EXTRACT-ARGUMENTS (CONS OF OBJECT)) ((bodyContents CONS))
+  (SPECIAL ((*DEFAULT-XML-OBJECT-MODULE* *GUI-SERVER-MODULE*))
+    (LET ((rawArgs (CONS OF CONS) (REST (REST bodyContents)))
+	  (result NIL))
+      (FOREACH arg IN rawArgs
+        COLLECT (FROM-XML-STRING (CAST (THIRD arg) STRING-WRAPPER)) INTO result)
+      (RETURN result))))
+
+(DEFUN (SERVER-INVOKE-POWERLOOM-METHOD STRING) ((bodyContents CONS))
+  (LET ((methodName (SERVER-EXTRACT-METHOD-NAME bodyContents))
+	(arguments (SERVER-EXTRACT-ARGUMENTS bodyContents))
+	(result |XMLObject| (DISPATCH-CALL methodName arguments))
+	(marshaledResult (TO-XML-STRING result)))
+    ;(PRINT "invoking: methodName = " methodName ", arguments = " arguments EOL)
+    (RETURN marshaledResult)))
+
+
+  ;;
+;;;;;; HTTP Server Handler
+  ;;
+
+(defun gui-request-handler ((xchg http/http-exchange))
+  (let ((request (http/get-request-body xchg))
+        (response (server-process-soap-request request)))
+      (print-stream (http/get-reply-stream xchg) response)))
+
+(startup-time-progn
+  (http/publish-handler "/ploom/soap-rpc/powerloom-gui-service"
+                        (the-code :function gui-request-handler)
+                        :content-type (http/get-http-mime-type :xml null)
+                        :documentation "SOAP service for PowerLoom GUI."))

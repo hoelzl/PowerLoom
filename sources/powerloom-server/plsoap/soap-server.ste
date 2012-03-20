@@ -1,0 +1,480 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2004-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: soap-server.ste,v 1.15 2010/05/28 22:10:54 tar Exp
+
+(in-package "STELLA")
+
+(in-module "PLSOAP")
+
+
+;;;;
+;;;;  Objects for SOAP parsing
+;;;;
+
+(DEFGLOBAL *SOAP-READ-ONLY?* BOOLEAN FALSE)
+
+(DEFNAMESPACE "http://www.isi.edu/powerloom/" :INVISIBLE-ON-OUTPUT? FALSE)
+
+
+(DEFCLASS |module| (XML-OBJECTS/|XMLObject|))
+
+(DEFCLASS |nresults| (XML-OBJECTS/|XMLObject|)
+  :PUBLIC-SLOTS
+  ((/STELLA/XML-OBJECTS/XSI/|type| :TYPE STRING)))
+
+(DEFCLASS |pattern| (XML-OBJECTS/|XMLObject|))
+
+(DEFCLASS |options| (XML-OBJECTS/|XMLObject|))
+
+(DEFCLASS soap-command (XML-OBJECTS/|XMLObject|)
+  :documentation "Common parent in type hierarchy.  This will
+not actually be realized in surface syntax."
+   ;; NOTE:  This should be done by inheritance, but the XML object maker
+   ;; only looks at local slots, so this needs to be repeated on each
+   ;; concrete subtype.  It is also here so that a general accessor will
+   ;; be created for the slot access.
+  :PUBLIC-SLOTS
+  ((target-module :TYPE |module|)))
+
+(DEFCLASS |command| (soap-command) 
+  :PUBLIC-SLOTS
+  ((target-module :TYPE |module|)))
+
+(DEFCLASS |assertion| (soap-command)
+  :PUBLIC-SLOTS
+  ((target-module :TYPE |module|)))
+
+(DEFCLASS |retraction| (soap-command)
+  :PUBLIC-SLOTS
+  ((target-module :TYPE |module|)))
+
+(DEFCLASS |ask| (soap-command)
+  :PUBLIC-SLOTS
+  ((target-module :TYPE |module|)
+   (options :TYPE |options|)))
+
+(DEFCLASS |retrieval| (soap-command)
+  :PUBLIC-SLOTS
+  ((target-module :TYPE |module|)
+   (nresults :TYPE |nresults|)
+   (pattern :TYPE |pattern|)
+   (options :TYPE |options|)))
+
+(DEFCLASS |query| (XML-OBJECTS/|XMLObject|))
+
+(DEFCLASS |result| (XML-OBJECTS/|XMLObject|))
+
+(DEFCLASS |answer| (XML-OBJECTS/|XMLObject|)
+  :PUBLIC-SLOTS
+  ((query :type |query|)
+   (result :type |result|)))
+
+
+(DEFCLASS |item| (XML-OBJECTS/|XMLObject|)
+  :PUBLIC-SLOTS 
+  ((/STELLA/XML-OBJECTS/XSI/|type| :TYPE STRING)))
+
+(DEFCLASS |proposition| (XML-OBJECTS/|XMLObject|))
+
+(DEFCLASS |tuple| (XML-OBJECTS/|XMLObject|)
+  :PUBLIC-SLOTS
+  ((nresults :TYPE |nresults|)
+   (item :TYPE (LIST OF |item|))))
+
+(DEFCLASS |tuples| (XML-OBJECTS/|XMLObject|)
+  :PUBLIC-SLOTS
+  ((nresults :TYPE |nresults|)
+   (query :TYPE |query|)
+   (pattern :TYPE |pattern|)
+   (tuple :TYPE (LIST OF |tuple|))))
+
+(DEFCLASS |propositions| (XML-OBJECTS/|XMLObject|)
+  :PUBLIC-SLOTS
+  ((nresults :TYPE |nresults|)
+   (proposition :TYPE (LIST OF |proposition|))))
+
+(DEFCLASS |powerloomerror| (XML-OBJECTS/|XMLObject|))
+(DEFCLASS |stellaerror| (XML-OBJECTS/|XMLObject|))
+(DEFCLASS |nativeerror| (XML-OBJECTS/|XMLObject|))
+
+
+;;;
+;;; TO DO:  Change this to work with streams rather than going through
+;;;         the detour of using strings for input and output.
+;;;
+
+;;;;
+;;;;  Server response function
+;;;;
+
+(defglobal *POWERLOOM-SOAP-MODULE* MODULE (get-stella-module "PLSOAP" TRUE))
+
+(defun (powerloom-process-soap-request STRING) ((request-body STRING))
+  (let ((answer  XML-OBJECTS/|XMLObject| null)
+        (request XML-OBJECTS/|XMLObject| null))
+    (special ((*DEFAULT-XML-OBJECT-MODULE* *POWERLOOM-SOAP-MODULE*))
+;    (powerloom-server/server-log :all "request: " request-body)
+      (exception-case
+        (progn 
+          (setq request (XML-OBJECTS/from-xml-string request-body))
+          (setq answer (process-soap-encoded-command
+		        (SOAP-ENV/get-body-contents request))))
+        (LOGIC-EXCEPTION (e)
+          (setq answer (new |powerloomerror|))
+          (set-content answer (exception-message e))
+	  (setq answer (create-soap-fault "SOAP-ENV:Server" "PowerLoom error" NULL answer)))
+        (STELLA-EXCEPTION (e)
+          (setq answer (new |stellaerror|))
+          (set-content answer (exception-message e))
+	  (setq answer (create-soap-fault "SOAP-ENV:Server" "PowerLoom error" NULL answer)))
+        (NATIVE-EXCEPTION (e)
+          (setq answer (new |nativeerror|))
+          (set-content answer (exception-message e))
+	  (setq answer (create-soap-fault "SOAP-ENV:Server" "PowerLoom error" NULL answer))))
+;    (powerloom-server/server-log :all "response: " soap-result)
+      (return (XML-OBJECTS/to-xml-string (create-soap-envelope answer))) )))
+
+(defun powerloom-soap-request-handler ((xchg HTTP/HTTP-EXCHANGE))
+  :documentation "WRITE ME"
+  :public? TRUE
+  (let ((request (http/get-request-body xchg))
+        (reply (http/get-reply-stream xchg)))
+    (print-stream reply (powerloom-process-soap-request request))))
+
+(startup-time-progn
+  (http/publish-handler "/ploom/soap-rpc/powerloom-soap-service"
+                        (the-code :function powerloom-soap-request-handler)
+                        :content-type (http/get-http-mime-type :xml null)
+                        :documentation "Service for PowerLoom SOAP server."))
+
+
+;;;;
+;;;;  Command execution
+;;;;
+
+(defun (safe-get-content STRING) ((obj XML-OBJECTS/|XMLObject|))
+  (if (defined? obj)
+    (return (XML-OBJECTS/get-content obj))
+    (return null)))
+
+(defun check-read-only ((command-form soap-command))
+  ;; Signals an error for commands that can change the KB
+  ;;   if we are a read-only server.
+  (when *SOAP-READ-ONLY?*
+    (typecase command-form
+      ((|ask| |retrieval|)
+       NULL)
+      (otherwise
+       (error "Command not supported in read-only mode." command-form)))))
+
+(defun (process-soap-encoded-command XML-OBJECTS/|XMLObject|) ((command-form soap-command))
+  (let ((module-name (safe-get-content (target-module command-form)))
+	(module MODULE null))
+    (check-read-only command-form)
+    (when (null? module-name)
+      (error "No module specified. " command-form))
+    (setq module (pli/get-module module-name NULL))
+    (when (null? module)
+      (error "No module named '" module-name "'.  " command-form))
+    (special ((*typeCheckMode* :IGNORE-TYPE-VIOLATIONS))
+     (within-module (pli/get-module module-name NULL)
+       (typecase command-form
+	 (|command|
+	  (let ((command-string (safe-get-content command-form)))
+	    (when (or (null? command-string) 
+		      (empty? command-string))
+	      (error "Command was empty." command-form))
+	    (return (soap-encode-command-response
+		     (pli/s-evaluate command-string module-name NULL)))))
+	 (|assertion|
+	  (let ((command-string (safe-get-content command-form)))
+	    (when (or (null? command-string) 
+		      (empty? command-string))
+	      (error "Command was empty." command-form))
+	    (return (soap-encode-assert-response
+		     (pli/s-assert-proposition command-string module-name NULL)))))
+	 (|retraction|
+	  (let ((command-string (safe-get-content command-form)))
+	    (when (or (null? command-string) 
+		      (empty? command-string))
+	      (error "Command was empty." command-form))
+	    (return (soap-encode-assert-response
+		     (pli/s-retract-proposition command-string module-name NULL)))))
+	 (|ask|
+	  (let ((base-query-string (safe-get-content command-form))
+		(query-string base-query-string)
+		(query-options (safe-get-content (options command-form))))
+	    (when (or (null? query-string)
+		      (empty? query-string))
+	      (error "Query was empty." command-form))
+	    (unless (or (null? query-options)
+			(empty? query-options))
+	      (setq query-string (concatenate query-string " " query-options)))
+	    (return (soap-encode-simple-answer
+		     query-string
+		     (pli/s-ask base-query-string module-name NULL)))))
+	 (|retrieval|
+	  (let ((n-results (safe-get-content (nresults command-form)))
+		(query-pattern (safe-get-content (pattern command-form)))
+		(query-options (safe-get-content (options command-form)))
+		(base-query-string (safe-get-content command-form))
+		(query-string base-query-string)
+                (query-form NIL)
+                )
+	    (when (or (null? query-string)
+		      (empty? query-string))
+	      (error "Query was empty." command-form))
+	    (unless (or (null? query-pattern)
+			(empty? query-pattern))
+              (if (defined? (position query-pattern #\( 0))
+	        (setq query-string (concatenate query-pattern " " query-string))
+                (setq query-string (concatenate "(" query-pattern ") " query-string))))
+	    (if (or (null? n-results)
+		    (empty? n-results))
+		(setq query-string (concatenate "/STELLA/ALL " query-string))
+		(setq query-string (concatenate n-results " " query-string)))
+	    (unless (or (null? query-options)
+			(empty? query-options))
+	      (setq query-string (concatenate query-string " " query-options)))
+	    #|
+	    (return (soap-encode-retrieval-answer
+		     (pli/s-retrieve query-string module-name NULL)))
+	    |#
+            ;; Copy over code from pli/retrieve since we need to get at the
+            ;;   query iterator in order to get the query variables list
+            (with-logic-environment (pli/get-module module-name NULL) NULL
+               (foreach sexp in (s-expressions (new STRING-INPUT-STREAM :the-string query-string))
+                        collect sexp into query-form)
+               (return (soap-encode-retrieval-answer base-query-string (call-retrieve query-form))))
+            ))
+	 (otherwise
+	  (error "XML is not a recognized command: " command-form))) ))))
+
+;;;;
+;;;;  Utility routines
+;;;;
+
+(defun (soap-encode-command-response XML-OBJECTS/|XMLObject|) ((obj OBJECT))
+  (special ((*printReadably?* TRUE)
+	    (*printMode* :REALISTIC))
+    (let ((answer (new |result|)))
+      (set-content answer (stringify obj))
+      (return answer) )))
+
+(defun (soap-encode-assert-response XML-OBJECTS/|XMLObject|) ((iter (PLI/PL-ITERATOR OF PROPOSITION)))
+  (special ((*printReadably?* TRUE)
+	    (*printMode* :REALISTIC))
+    (let ((answer (new |propositions|))
+	  (props (new (LIST OF |proposition|)))
+          (prop-form |proposition| NULL)
+          (count (new |nresults|))
+	  (n 0))
+      (foreach prop in iter
+         do (++ n)
+            (setq prop-form (new |proposition|))
+            (set-content prop-form (stringify prop))
+            (push props prop-form))
+      (setf (|textContent| count) (integer-to-string n))
+      (setf (/STELLA/XML-OBJECTS/XSI/|type| count) "XSD:int")
+      (setf (nresults answer) count)
+      (setf (proposition answer) (reverse props))
+      (return answer) )))
+
+(defun (soap-encode-simple-answer XML-OBJECTS/|XMLObject|) ((query-string STRING)
+							    (tv TRUTH-VALUE))
+  (special ((*printReadably?* TRUE)
+	    (*printMode* :REALISTIC))
+    (let ((truth-value (new |result| :|textContent| (stringify tv)))
+	  (ans (new |answer|)))
+      (setf (query ans) (new |query| :|textContent| query-string))
+      (setf (result ans) truth-value)
+      (return ans) )))
+
+(defun (soap-encode-item |item|) ((obj OBJECT))
+  (let ((encoded-item  (new |item|)))
+    (typecase obj
+      (FLOAT-WRAPPER
+       (setf (|textContent| encoded-item) (float-to-string (unwrap-float obj)))
+       (setf (/STELLA/XML-OBJECTS/XSI/|type| encoded-item) "XSD:double"))
+      (INTEGER-WRAPPER
+       (setf (|textContent| encoded-item) (integer-to-string (unwrap-integer obj)))
+       (setf (/STELLA/XML-OBJECTS/XSI/|type| encoded-item) "XSD:int"))
+      (STRING-WRAPPER
+       (setf (|cdataContent| encoded-item) (unwrap-string obj))
+       (setf (/STELLA/XML-OBJECTS/XSI/|type| encoded-item) "XSD:string"))
+      (otherwise
+       (set-content encoded-item (stringify obj))))
+    (return encoded-item)))
+
+
+(defun (soap-encode-tuple |tuple|) ((obj OBJECT))
+  (let ((result (new |tuple|))
+	(items (new (LIST of |item|)))
+        (count (new |nresults|))
+	(n 0))
+    (typecase obj
+      (CONS 
+       (foreach i in obj
+         do (++ n)
+            (push items (soap-encode-item i))))
+      (otherwise
+       (setq n 1)
+       (push items (soap-encode-item obj))))
+    (setf (|textContent| count) (integer-to-string n))
+    (setf (/STELLA/XML-OBJECTS/XSI/|type| count) "XSD:int")
+    (setf (nresults result) count)
+    (setf (item result) (reverse items))
+    (return result) ))
+
+
+#|
+;; Older version that did not include the query variable pattern in the returned value.
+(defun (soap-encode-retrieval-answer XML-OBJECTS/|XMLObject|) ((iter PLI/PL-ITERATOR))
+  (special ((*printReadably?* TRUE)
+	    (*printMode* :REALISTIC))
+    (let ((result (new |tuples|))
+	  (tuples (new (LIST OF |tuple|)))
+          (count (new |nresults|))
+          ;(query-pattern (new |pattern|))
+	  (n 0))
+      (foreach answer in iter
+         do (++ n)
+            (push tuples (soap-encode-tuple answer)))
+      (setf (|textContent| count) (integer-to-string n))
+      (setf (/STELLA/XML-OBJECTS/XSI/|type| count) "XSD:int")
+      (setf (nresults result) count)
+      ;(setf (pattern result) query-pattern)
+      (setf (tuple result) (reverse tuples))
+      (return result) )))
+|#
+
+;; Potential new version that also retrieves the query pattern.
+(defun (soap-encode-retrieval-answer XML-OBJECTS/|XMLObject|) ((query-string STRING)
+							       (iter QUERY-ITERATOR))
+  (special ((*printReadably?* TRUE)
+	    (*printMode* :REALISTIC))
+    (let ((result (new |tuples|))
+	  (tuples (new (LIST OF |tuple|)))
+          (count (new |nresults|))
+	  (the-query (new |query|))
+          (query-pattern (new |pattern|))
+          (ss (new STRING-OUTPUT-STREAM))
+          (first? TRUE)
+	  (n 0))
+      
+      ;; Retrieve variable names from query:
+      (foreach var in (external-variables iter)
+        do (if first? 
+               (progn (print-stream ss "(" (skolem-name var))
+		      (setq first? false))
+               (print-stream ss " " (skolem-name var))))
+      (print-stream ss ")")
+        
+      (foreach answer in (consify-current-solutions iter)
+         do (++ n)
+            (push tuples (soap-encode-tuple answer)))
+      (setf (|textContent| count) (integer-to-string n))
+      (setf (/STELLA/XML-OBJECTS/XSI/|type| count) "XSD:int")
+      (setf (|textContent| the-query) query-string)
+      (setf (|textContent| query-pattern) (the-string ss))
+      (setf (nresults result) count)
+      (setf (query result) the-query)
+      (setf (pattern result) query-pattern)
+      (setf (tuple result) (reverse tuples))
+      (return result) )))
+
+
+;;;;
+;;;;  TESTING AND DEVELOPMENT
+;;;;
+
+(defun build-and-send-request ((target STRING) (type string) (content STRING))
+  (let ((req (create-test-string type content))
+        (res (http/do-http-request (concatenate "http://" target "/ploom/soap-rpc/powerloom-soap-service")
+                                   :method :post
+                                   :headers (make-soap-rpc-request-headers)
+                                   :content req))
+	(r-stream (new STRING-INPUT-STREAM :the-string res)))
+    (print "Sent" EOL req EOL)
+    (print EOL EOL "Received" EOL)
+    (foreach line in (lines r-stream)
+	     do (print line EOL))
+    (print EOL EOL)))
+
+(defun (create-test-string STRING) ((body-tag-name STRING) (content STRING))
+  (return (concatenate "<?xml version='1.0' encoding='UTF-8'?>
+  <SOAP-ENV:Envelope xmlns:SOAP-ENV='http://schemas.xmlsoap.org/soap/envelope/' xmlns:xsd='http://www.w3.org/2001/XMLSchema' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xmlns:enc='http://schemas.xmlsoap.org/soap/encoding/' xmlns:ns0='http://hello.org/wsdl' SOAP-ENV:encodingStyle='http://schemas.xmlsoap.org/soap/encoding/'>
+ <SOAP-ENV:Body>
+ <"
+body-tag-name
+  " xmlns='http://www.isi.edu/powerloom/'"
+  ">"
+content
+"</" body-tag-name ">
+</SOAP-ENV:Body></SOAP-ENV:Envelope>")))
+
+#|
+STELLA(52): (plsoap::build-and-send-request "localhost:8012" "ask" "<module>PL-USER</module><options></options>(relation relation)")
+127.0.0.1 - - [Sat, 06 Feb 2010 21:53:42 GMT] "POST /ploom/soap-rpc/powerloom-soap HTTP/1.0" 200 386
+Sent
+<?xml version='1.0' encoding='UTF-8'?>
+  <SOAP-ENV:Envelope xmlns:SOAP-ENV='http://schemas.xmlsoap.org/soap/envelope/' xmlns:xsd='http://www.w3.org/2001/XMLSchema' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xmlns:enc='http://schemas.xmlsoap.org/soap/encoding/' xmlns:ns0='http://hello.org/wsdl' SOAP-ENV:encodingStyle='http://schemas.xmlsoap.org/soap/encoding/'>
+ <SOAP-ENV:Body>
+ <ask xmlns='http://www.isi.edu/powerloom/'><module>PL-USER</module><options></options>(relation relation)</ask>
+</SOAP-ENV:Body></SOAP-ENV:Envelope>
+
+
+Received
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <SOAP-ENV:Body>
+    <PLSOAP:answer xmlns:PLSOAP="http://www.isi.edu/powerloom/">
+      <PLSOAP:query>(relation relation)</PLSOAP:query>
+      <PLSOAP:result>TRUE</PLSOAP:result>
+    </PLSOAP:answer>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
+
+
+CL:NIL
+STELLA(53):
+|#

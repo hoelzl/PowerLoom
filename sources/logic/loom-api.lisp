@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: loom-api.lisp,v 1.11 2006/05/11 07:05:19 hans Exp
+;;; Version: loom-api.lisp,v 1.12 2010/06/17 22:57:37 tar Exp
 
 ;; A Lisp API that enables PowerLoom to masquerade as Loom.
 
@@ -175,7 +175,7 @@
     (CL:typecase objectRef
       (CL:SYMBOL (setq string (CL:symbol-name objectRef)))
       (CL:STRING (setq string objectRef))
-      (CL:t (CL:error "Can't surrogatify non-symbol and non-string: " objectRef)))
+      (CL:t (CL:error "Can't surrogatify non-symbol and non-string: ~S" objectRef)))
     (intern-surrogate string)))
 
 (CL:defun cl-stringify (objectRef)
@@ -183,7 +183,7 @@
   (CL:typecase objectRef
     (CL:SYMBOL (CL:symbol-name objectRef))
     (CL:STRING objectRef)
-    (CL:t (CL:error "Can't stringify non-symbol and non-string: " objectRef))))
+    (CL:t (CL:error "Can't stringify non-symbol and non-string: ~S" objectRef))))
 
 (CL:defun stellify (object)
   "Convert Lisp object into a STELLA object."
@@ -195,7 +195,7 @@
     (CL:SYMBOL (intern-symbol (CL:symbol-name object)))
     ((CL:or CL:NUMBER CL:STRING) (wrap-literal object))
     (STELLA::OBJECT object)
-    (CL:t (CL:error "Can't stellify: " object))))
+    (CL:t (CL:error "Can't stellify: ~S" object))))
 
 ;; DEFINED IN STELLA:
 ;(defun (stellafy OBJECT) ((thing LISP-CODE) (targetType TYPE))
@@ -232,6 +232,7 @@
 
 (CL:defun loom:find-context (objectRef &key error-p)
   "Return the context referred to by `objectRef'"
+  (cl:declare (cl:ignore error-p))
   (loom:get-context objectRef))
 
 (CL:defun loom:parent-contexts (contextRef)
@@ -252,7 +253,7 @@ sensitive."
   (CL:let ((string (cl-stringify moduleName)))
     (CL:if string
       (stella::change-context string)
-      (CL:warn "The argument %S to 'change-context' is not a string."
+      (CL:warn "The argument ~S to 'change-context' is not a string."
                moduleName))))
 
 (CL:defun loom::change-kb (moduleName)
@@ -394,7 +395,7 @@ Keywords are not yet implemented."
   (CL:declare (CL:ignore clos-instance-p creation-policy))
   (lispify (create-instance (stellify name) (stellify conceptRef))))
 
-(CL:defun loom:createm (name conceptRef CL:&key kb add-suffix-p clos-instance-p creation-policy)
+(CL:defmacro loom:createm (name conceptRef CL:&key kb add-suffix-p clos-instance-p creation-policy)
   "Create an instance named 'name' of the class 'conceptRef'.
 Keywords are not yet implemented."
   (CL:declare (CL:ignore clos-instance-p creation-policy))
@@ -435,7 +436,10 @@ is an instance of the class referenced by 'classRef'."
 
 (CL:defun loom:get-types (instanceRef CL:&key direct-p)
   "Return a list of classes that 'instanceRef' belongs to."
-  (lispify (get-types (stellify instanceRef) (cl:not direct-p))))
+  (lispify (loom-api::get-types (stellify instanceRef)
+				(cl:if direct-p
+				       (stellify :DIRECT) 
+				       (stellify :ALL)))))
 
 (CL:defun loom:add-value (instanceRef relationRef valueRef)
   "Assert the tuple '(relationRef instanceRef valueRef)'."

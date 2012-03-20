@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: goal-caches.ste,v 1.17 2008/06/11 23:50:11 hans Exp
+;;; Version: goal-caches.ste,v 1.19 2010/10/11 20:32:52 hans Exp
 
 ;;; Caching of backchaining goals.
 
@@ -355,6 +355,7 @@ and set of input bindings."
 number of query clock ticks will be cached.")
 
 (defun (toggle-goal-caching STRING) ()
+  :command? TRUE
   (if *cache-succeeded-goals?*
     (progn
       (setq *cache-succeeded-goals?* FALSE)
@@ -388,6 +389,9 @@ and possibly open `proposition' relative to a set of variable `bindings'."
 (defun print-atomic-goal-cache
     ((self ATOMIC-GOAL-CACHE) (stream NATIVE-OUTPUT-STREAM))
   ;; Print `self' to `stream' (useful for debugging).
+  (when (null? (proposition self))
+    (print-native-stream stream "|GC|[NULL]")
+    (return))
   (print-native-stream
    stream
    "|GC|["
@@ -573,20 +577,26 @@ for some named description")
   ;; `success?' indicates whether `frame' failed or succeeded.
   ;; Creates a new cache entry or overwrites `cache' if it was supplied
   ;;    as non-NULL.
-  ;(when (defined? cache)
-  ;  (print "Collision: " (proposition frame) " " cache EOL))
-  (when (null? cache)
-    (setq cache (new ATOMIC-GOAL-CACHE)))
-  (let ((proposition (proposition frame)))
+  (let ((collision? (defined? cache))
+        (proposition (proposition frame)))
+    ;(when collision?
+    ;  (print "Collision: " proposition " " cache EOL))
+    (when (not collision?)
+      (setq cache (new ATOMIC-GOAL-CACHE)))
     (when success?
-      (when (defined? (next cache))
-        (setf (previous (next cache)) (previous cache))
-        (when (null? (previous cache))
-          (set-goal-cache-list (proposition (next cache)) (next cache))))
-      (when (defined? (previous cache))
-        (setf (next (previous cache)) (next cache)))
-      (setf (previous cache) NULL)
-      (setf (next cache) NULL)
+      (when collision?
+        ;; we are reusing a goal cache, so if it is part of a
+        ;; proposition cache list, we need to excise it from it:
+        (when (defined? (next cache))
+          ;; there are elements after it, reset their backpointer:
+          (setf (previous (next cache)) (previous cache)))
+        (if (null? (previous cache))
+            ;; it is the first element, pop the cache list:
+            (set-goal-cache-list (proposition cache) (next cache))
+          ;; there are elements before it, reset their next pointer:
+          (setf (next (previous cache)) (next cache)))
+        (setf (previous cache) NULL)
+        (setf (next cache) NULL))
       (let ((previousStart (get-goal-cache-list proposition)))
         (unless (eql? cache previousStart)
           (when (defined? previousStart)

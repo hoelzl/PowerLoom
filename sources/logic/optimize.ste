@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: optimize.ste,v 1.82 2009/02/07 06:06:24 hans Exp
+;;; Version: optimize.ste,v 1.83 2010/09/10 00:27:17 hans Exp
 
 ;;; PowerLoom Query Optimizer
 
@@ -78,7 +78,7 @@
   (safety 3 (or (null? (variable-value variable))
                 (not (isa? (variable-value variable) @PATTERN-VARIABLE)))
           "BUG: Need to rewrite the 'variable-bound?' procedure")
-  (return (or (defined? (bound-to variable))
+  (return (or (defined? (safe-bound-to variable))
               (defined? (variable-value variable)))) )
 
 (defun (argument-bound? BOOLEAN) ((argument OBJECT))
@@ -167,12 +167,25 @@
 (defun (computed-predicate? BOOLEAN) ((goal PROPOSITION))
   ;; Return TRUE if all input arguments to 'goal' must be bound
   ;;    for it to be evaluated.
-  (let ((description (get-description (relationRef goal))))
+  ;; TO DO: think about generating more general accessors that
+  ;;    transparently handle HOLDS (and VALUE?) with bound relations
+  (let ((operator (operator goal))
+        (description DESCRIPTION NULL))
+    (when (eql? operator PL-KERNEL/@HOLDS)
+      (let ((relationArg (argument-bound-to (first (arguments goal)))))
+        (cond ((and (defined? relationArg)
+                    (isa? relationArg @DESCRIPTION))
+               (setq description relationArg)
+               (setq operator (surrogate-value-inverse description)))
+              (otherwise
+               (return FALSE)))))
+    (when (null? description)
+      (setq description (get-description operator)))
     (return
       (and (defined? description)
            (or (computed-term? description)
-               (member? (quote (PL-KERNEL/@LISTOF PL-KERNEL/@SETOF))
-                        (surrogate-value-inverse description)))) )))
+               (eql? operator PL-KERNEL/@SETOF)
+               (eql? operator PL-KERNEL/@LISTOF))))))
 
 (defun (simulate-create-choice-point INTEGER) ()
   ;; Return the offset to the first unused location on the unbinding stack.
@@ -1459,6 +1472,18 @@ should be performed.")
 ;;;;;; Dynamic on-the-fly query optimizer
   ;;
 
+(defun (dynamically-estimate-inference-cost COST-ESTIMATE) ((self NAMED-DESCRIPTION))
+  ;; Estimate the cost of inferring the inferable relation `self'.
+  ;; Currently, this simply counts the number of backwards rules on `self'
+  ;;    and multiplies that with a base inference penalty cost.
+  ;; As most other things we do here, this is really only a rough estimate.
+  (let ((nofRules
+         (memoize (self *context*)
+                  :timestamps :IMPLIES-PROPOSITION-UPDATE
+                  :max-values 500
+                  (length (applicable-rules-of-description self :BACKWARD TRUE)))))
+  (return (max (* INFERABLE-PENALTY-COST nofRules) 1.0))))
+
 (defun (dynamically-estimate-goal-cost COST-ESTIMATE) ((goal PROPOSITION))
   ;; Estimate the cost of proving one ground instance of `goal'.
   ;; Mirror image of the static version for now.
@@ -1477,7 +1502,8 @@ should be performed.")
        (if (or (null? description)
                (not (inferable? description)))
          (return 1.0)
-         (return INFERABLE-PENALTY-COST))))
+         ;(return INFERABLE-PENALTY-COST)
+         (return (dynamically-estimate-inference-cost description)))))
     (:IMPLIES
      ;; could invoke expensive subsumption test:
      (return SUBSET-OF-PENALTY-COST))
@@ -1648,6 +1674,32 @@ should be performed.")
         (estimated-length (get-description-extension description TRUE))))
     (return estimate)))
 
+(defun (count-bound-arguments INTEGER) ((goal PROPOSITION))
+  ;; Count the number of bound arguments in `goal'.
+  ;; Conceivably, this functionality could be folded into
+  ;;    `dynamically-estimate-unbound-variable-penalty', but for
+  ;;    simplicity we keep it a separate function for now.
+  (let ((count 0))
+    (case (kind goal)
+      ((:NOT :FAIL)
+       (return (count-bound-arguments (first (arguments goal)))))
+      ((:AND :OR)
+       (foreach arg in (arguments goal)
+           do (++ count (count-bound-arguments arg))))
+      ((:FUNCTION :PREDICATE :EQUIVALENT :ISA)
+       (foreach arg in (arguments goal)
+           as i in (interval 0 NULL)
+           do (when (and (= i 0)
+                         (eql? (operator goal) PL-KERNEL/@HOLDS))
+                ;; don't count a bound relation variable:
+                (continue))
+              (unless (unbound-variable? arg)
+                (++ count))))
+      (otherwise
+       ;; arbitrary guess in lieu of deeper analysis:
+       (setq count 1)))
+    (return count)))
+
 (defun (dynamically-estimate-unbound-variable-penalty COST-ESTIMATE)
     ((goal PROPOSITION))
   ;; Calculate a penalty for the unbound variables in `goal' that can
@@ -1697,6 +1749,10 @@ should be performed.")
              ;;    the number 10 is a high penalty but still a low estimate:
              10
              0)))
+       (when (< lastKeyArgIndex firstKeyArgIndex)
+         ;; can happen in cases where we apply a function to a single
+         ;; argument only via a HOLDS:
+         (return 0.0))
        (foreach i in (interval firstKeyArgIndex lastKeyArgIndex)
            where (unbound-variable? (nth arguments i))
            do (++ nofUnboundVars))
@@ -1743,7 +1799,9 @@ should be performed.")
         (cost COST-ESTIMATE NULL)
         (fanout COST-ESTIMATE NULL)
         (unbound COST-ESTIMATE NULL)
+        (nofBoundArgs 0)
         (bestCost COST-ESTIMATE NULL)
+        (bestNofBoundArgs 0)
         (argument PROPOSITION NULL))
     (when (>= cursor lastArgIndex)
       (return))
@@ -1755,10 +1813,13 @@ should be performed.")
              (break))
            (setq unbound
              (dynamically-estimate-unbound-variable-penalty argument))
-           (if (= unbound 1.0)
-               ;; all variables are bound, shortcut fanout estimator:
-               (setq fanout 1.0)
-             (setq fanout (dynamically-estimate-goal-fanout argument)))
+           (cond ((= unbound 1.0)
+                  ;; all variables are bound, shortcut fanout estimator:
+                  (setq fanout 1.0)
+                  (setq nofBoundArgs (length (arguments argument))))
+                 (otherwise
+                  (setq fanout (dynamically-estimate-goal-fanout argument))
+                  (setq nofBoundArgs (count-bound-arguments argument))))
            (when (null? fanout)
              ;; can't be used as a generator:
              (continue))
@@ -1769,8 +1830,17 @@ should be performed.")
            ;; simple multiplication might be too crude:
            (setq cost (* cost fanout unbound))
            (when (or (null? bestCost)
-                     (< cost bestCost))
+                     ;; special case: a goal with higher cost but at least one
+                     ;; variable bound is preferable to a goal with lower cost
+                     ;; that doesn't have any variables bound:
+                     (and (< cost bestCost)
+                          (or (= bestNofBoundArgs 0)
+                              (not (= nofBoundArgs 0))))
+                     (and (>= cost bestCost)
+                          (= bestNofBoundArgs 0)
+                          (not (= nofBoundArgs 0))))
              (setq bestCost cost)
+             (setq bestNofBoundArgs nofBoundArgs)
              (setq cheapestArgIndex i)
              (when (= bestCost 1.0)
                ;; can't do better than that:
@@ -2217,7 +2287,10 @@ of order-dependent optimizations.")
            ;; happen if `createSkolem?' is FALSE:
            (when (null? argMapsTo)
              (return NULL))
-        collect argMapsTo into inputArgs)
+        ;; ensure we properly inherit structured arguments in case we
+        ;; had propositional arguments (e.g. a HOLDS proposition):
+        collect (inherit-proposition-argument argMapsTo self mapping)
+        into inputArgs)
     ;; Actually, `find-similar-proposition' can miss some which is why we call
     ;; `find-or-create-...' here instead of just `create-':
     (setq copy (find-or-create-function-proposition (relationRef self) inputArgs))
@@ -2258,7 +2331,7 @@ of order-dependent optimizations.")
  |#
  ))
 
-(defun (find-similar-proposition PROPOSITION) 
+(defun (old-find-similar-proposition PROPOSITION) 
        ((proposition PROPOSITION) (mapping ENTITY-MAPPING))
   ;; Look for a proposition attached to the first argument of 'proposition'
   ;;    that matches 'proposition', using 'mapping' to interpret variable
@@ -2331,6 +2404,67 @@ of order-dependent optimizations.")
                                arg1 arg2 mapping))))))))
       (otherwise NULL))
     (return NULL) ))
+
+(defun (new-find-similar-proposition PROPOSITION) ((proposition PROPOSITION)
+                                                   (mapping ENTITY-MAPPING))
+  ;; New hashed version of `find-similar-proposition' (really just
+  ;;    a variant of `find-duplicate-complex-proposition').
+  ;; Return a duplicate (or equivalent) of 'proposition' substituted by
+  ;;    `mapping' if there is one.
+  ;; Also finds duplicate function propositions that are identical to
+  ;;    `proposition' except for the last argument.
+  ;; NOTE: different from the old version, we do test whether any similar
+  ;;    propositions found are visible in the current module; otherwise,
+  ;;    a clear or delete operation in a different module might have
+  ;;    unintended consequences.
+  (when (eql? (kind proposition) :CONSTANT)
+    (return NULL))
+  (let ((index (wrap-integer (proposition-hash-index proposition mapping)))
+        (bucket (lookup *structured-objects-index* index))
+        (function? (eql? (kind proposition) :FUNCTION)))
+    (when (null? bucket)
+      (return NULL))
+    (let ((operator (operator proposition))
+          (arguments (arguments proposition))
+          (arity (length arguments)))
+      (foreach p in bucket
+          do (typecase p
+               (PROPOSITION
+                (when (and (eql? operator (operator p))
+                           (= arity (length (arguments p)))
+                           (or (and function?
+                                    ;; special equality test that ignores the last argument:
+                                    (forall arg1 in arguments
+                                        as arg2 in (arguments p)
+                                        as i in (interval 2 arity) ;; only compare n-1 args
+                                        always (eql? (mapped-value-of arg1 mapping FALSE)
+                                                     (value-of arg2))))
+                               (and (not function?)
+                                    (equivalent-propositions? proposition p mapping)))
+                           (subcontext? *module* (base-module (home-context p))))
+                  (return p)))
+             (otherwise NULL)))
+      (return NULL))))
+
+(defun (find-similar-proposition PROPOSITION) ((proposition PROPOSITION)
+                                               (mapping ENTITY-MAPPING))
+  ;; Look for a proposition attached to the first argument of 'proposition'
+  ;;    that matches 'proposition', using 'mapping' to interpret variable
+  ;;     values of arguments of 'proposition'.
+  ;; Used by 'inherit-xxx' routines to find duplicates.
+  ;; If 'mapping' is NULL, then 'proposition' is an already inherited
+  ;;     copy (probably created from a HOLDS) that requires a second
+  ;;     duplicate check.
+  ;; QUESTION: WE DON'T SEARCH UP 'inverse-variable-value' LINKS LOOKING FOR
+  ;;    DUPLICATES.  SHOULD WE???
+  (let ((result (new-find-similar-proposition proposition mapping)))
+    ;; test equivalence of old and new scheme (note, due to the additional
+    ;; subcontext test, we do not pick up some of the propositions that are
+    ;; found in the old scheme; however, after temporarily disabling that
+    ;; we get equivalent test-suite runs and results):
+    ;(when (not (eql? result (old-find-similar-proposition proposition mapping)))
+    ;  (cl:break))
+    (return result)))
 
 (defun (inherit-proposition-argument OBJECT) 
        ((argument OBJECT) (parent PROPOSITION) (mapping ENTITY-MAPPING))
@@ -2493,6 +2627,8 @@ of order-dependent optimizations.")
   ;; Copy 'proposition' onto its mappings or bindings.  Return a list
   ;;    of the top-level proposition(s) created.
   ;; Assumes that all variables within 'proposition' have bindings.
+  ;; NOTE: The order of the returned inherited propositions is relied
+  ;;    upon by `filter-implied-skolem-propositions' (which see).
   ;; CAUTION: Inherited propositions are NOT fastened down.
   (let ((resultList NIL))
     (when (null? mapping)
@@ -2515,27 +2651,20 @@ of order-dependent optimizations.")
     (return (reverse resultList))))
 
 
+;;; Filtering out implied skolem propositions
+
+#|
+;;; This is the simple version that doesn't care about non-skolem
+;;; propositions and simply asks for an instance of the whole
+;;; description; this is correct but less likely to suceed due to the
+;;; extra non-skolem constraints:
+
 (defun (filter-implied-skolem-propositions (CONS OF PROPOSITION))
     ((inheritedProps (CONS OF PROPOSITION))
      (description DESCRIPTION)
      (arguments VECTOR)
      (mapping ENTITY-MAPPING))
-  ;; Given a set of inherited propositions `inheritedProps' derived from
-  ;; instantiating `description' on `arguments', check whether any skolems
-  ;; were created from existential variables, and if so, whether the
-  ;; resulting propositions are redundant and implied by some already
-  ;; existing propositions.  For example, `(father-of fred joe)' would
-  ;; imply `(exists ?x (father-of fred ?x))' or `(father-of fred sk123)'.
-  ;; Giving that forward skolemization can quickly lead to lots and lots
-  ;; of garbage and unwanted recursion, filtering out such redundant skolem
-  ;; propositions is important for performance and inferential completeness.
-  ;; `mapping' is the mapping created during the instantiation of `description'.
-  ;; When redundant skolem propositions are detected, the subset of
-  ;; `inheritedProps' that is not redundant will be returned (currently,
-  ;; we simply return NIL in this case).
-  ;; TO DO: - special-case single propositions to not use a query but a lookup
-  ;;        - maybe handle independent skolem clusters, since one might fail
-  ;;          even though the other might succeed
+  ;; See more complicated version.
   (let ((createdSkolems (LIST OF SKOLEM)
                         (choose (defined? mapping)
                                 (lookup mapping :CREATED-SKOLEMS)
@@ -2569,18 +2698,188 @@ of order-dependent optimizations.")
           ;; something implies the skolem props, don't assert any of them:
           (setq filteredProps NIL))))
     (return filteredProps)))
+|#
+
+;;; Below is the more complicated version that separates out non-skolem
+;;; propositions.  For example, consider this (admittedly contrived) KB:
+#|
+(assert (=>> (parent ?p)
+             (exists (?c ?m ?f)
+               (and (father ?c ?f)
+                    (mother ?c ?m)
+                    (or (= ?p ?f)
+                        (= ?p ?m))
+                    (happy ?p)
+                    (happy (mother ?p))
+                    (happy (father ?f))))))
+
+;; triggers the rule:
+(assert (parent mom))
+
+;; implies the existential:
+(assert (and (father fred dad)
+             (mother fred mom)
+             (happy (father dad))))
+|#
+;;; From that we should be able to infer that `(happy mom)' and
+;;; `(happy (mother mom))' without creating any additional father
+;;; skolem propositions for `fred'.
+
+(defun (proposition-references-terms? BOOLEAN) ((self PROPOSITION)
+                                                (terms HASH-SET))
+  ;; Return TRUE if one or more `terms' are referenced by `self'.
+  (foreach arg in (arguments self)
+      do (when (member? terms arg)
+           (return TRUE))
+         (typecase arg
+           (PROPOSITION
+            (when (proposition-references-terms? arg terms)
+              (return TRUE)))
+           (SKOLEM
+            (let ((definingProp (defining-proposition arg)))
+              (when (and (defined? definingProp)
+                         (not (eql? definingProp self))
+                         (proposition-references-terms? definingProp terms))
+                (return TRUE))))
+           (otherwise NULL)))
+  (return FALSE))
+
+(defun (create-skolem-propositions-query CONS)
+    ((inheritedProps (CONS OF PROPOSITION))
+     (description DESCRIPTION)
+     (mapping ENTITY-MAPPING))
+  ;; Helper function for `filter-implied-skolem-propositions'.
+  ;; TO DO: maybe limit the expended effort by specifying a moveout.
+  (let ((createdSkolems (HASH-SET OF SKOLEM SKOLEM) NULL)
+        (skolemProps (CONS OF PROPOSITION) NIL)
+        (filteredPropsIndices (CONS OF INTEGER-WRAPPER) NIL))
+    (within-module *module* ;; don't create any objects in volatile caches
+      (case (kind (proposition description))
+        (:AND
+         ;; not all conjuncts might reference the skolems; so, first
+         ;; filter out those elements that don't reference any of the
+         ;; internal variables that created skolems (some of them might
+         ;; be due to function flattening).  This process is slightly
+         ;; more involved than we'd like, since propositions might not
+         ;; directly reference an internal variable but rather a function
+         ;; term which in turn references the skolem:
+         (setq createdSkolems (new HASH-SET))
+         (foreach skolem in (cast (lookup mapping :CREATED-SKOLEMS) LIST)
+             do (insert createdSkolems skolem))
+         ;; find inherited props that don't reference any skolems (assumes
+         ;; inherited props are in the same order as in the description):
+         (foreach iProp in inheritedProps
+             as iPropIndex in (interval 0 NULL)
+             as dProp in (cast (arguments (proposition description))
+                               (VECTOR OF PROPOSITION))
+             do (when (not (proposition-references-terms? iProp createdSkolems))
+                  (pushq filteredPropsIndices iPropIndex)
+                  (continue))
+             collect dProp into skolemProps)
+         (setq filteredPropsIndices (reverse filteredPropsIndices))
+         (when (non-empty? filteredPropsIndices)
+           ;; build a new description only containing skolem
+           ;; propositions we can use for querying - note that we
+           ;; don't have to worry about unused I/O variables, since
+           ;; they will be supplied with initial bindings:
+           (setq description
+             (new DESCRIPTION
+                  :io-variables (io-variables description)
+                  :proposition (conjoin-propositions skolemProps)))
+           ;; we might have lost some internal variables from function outputs -
+           ;; recompute them here to be sure they are accurate:
+           (compute-internal-variables description)))
+        ((:ISA :FUNCTION :PREDICATE) NULL)
+        ;; this case could be optimized to not use a query but
+        ;; something like `all-matching-propositions' - maybe later:
+        (otherwise NULL))
+      ;; we return a list here instead of multiple values to enable memoization:
+      (return
+        (cons-list
+         (initialize-query-iterator
+          (allocate-query-iterator)
+          description
+          ;; this initializes the `initial-bindings' slot:
+          (new ARGUMENTS-VECTOR :array-size (arity description)))
+         filteredPropsIndices)))))
+
+(defun (filter-implied-skolem-propositions (CONS OF PROPOSITION))
+    ((inheritedProps (CONS OF PROPOSITION))
+     (description DESCRIPTION)
+     (arguments VECTOR)
+     (mapping ENTITY-MAPPING))
+  ;; Given a set of inherited propositions `inheritedProps' derived from
+  ;; instantiating `description' on `arguments', check whether any skolems
+  ;; were created from existential variables, and if so, whether the
+  ;; resulting propositions are redundant and implied by some already
+  ;; existing propositions.  For example, `(father-of fred joe)' would
+  ;; imply `(exists ?x (father-of fred ?x))' or `(father-of fred sk123)'.
+  ;; Giving that forward skolemization can quickly lead to lots and lots
+  ;; of garbage and unwanted recursion, filtering out such redundant skolem
+  ;; propositions is important for performance and inferential completeness.
+  ;; `mapping' is the mapping created during the instantiation of `description'.
+  ;; When redundant skolem propositions are detected, the subset of
+  ;; `inheritedProps' that is not redundant will be returned.
+  ;; IMPORTANT: assumes that `inheritedProps' are in the same order as the
+  ;; elements of `(proposition description)'.
+  ;; TO DO: - handle independent skolem clusters, since one might fail
+  ;;          even though the other might succeed
+  ;;        - special-case single propositions to not use a query but a lookup
+  (let ((createdSkolems (LIST OF SKOLEM)
+                        (choose (defined? mapping)
+                                (lookup mapping :CREATED-SKOLEMS)
+                                NULL))
+        (filteredProps inheritedProps)
+        (filteredPropsIndices (CONS OF INTEGER-WRAPPER) NIL)
+        (query QUERY-ITERATOR NULL)
+        (cachedQueryRecord NIL))
+    (when (defined? createdSkolems)
+      (setq cachedQueryRecord
+        (memoize (description)
+                 ;; this remains valid as long as the description stays alive,
+                 ;; so, flushing it only with module clearing should be ok:
+                 :timestamps :MODULE-UPDATE ; :META-KB-UPDATE
+                 :max-values 500
+                 (create-skolem-propositions-query
+                  inheritedProps
+                  description
+                  mapping)))
+      (setq query (first cachedQueryRecord))
+      (setq filteredPropsIndices (second cachedQueryRecord))
+      ;; initialize external arguments; note, since we always bind the
+      ;; same variables, there is never the need for reoptimization as
+      ;; with general cached queries:
+      (foreach arg in arguments
+          as i in (interval 0 NULL)
+          do (setf (nth (initial-bindings query) i) arg))
+      (special (;; avoid type-check failures due to missing type assertion
+                ;; from one of the non-skolem propositions:
+                (*type-check-strategy* :NONE)
+                (*queryIterator* query)
+                (*reversePolarity?* FALSE)
+                (*inferenceLevel* SUBSUMPTION-INFERENCE)
+                (*generate-all-proofs?* FALSE))
+        (reset query)
+        (when (next? query)
+          ;; something implies the skolem props, collect what's not implied:
+          (setq filteredProps NIL)
+          (foreach i in filteredPropsIndices
+              collect (nth inheritedProps i) into filteredProps))))
+    (return filteredProps)))
 
 
   ;;
 ;;;;;; Inherit-description
   ;;
 
-(defun (map-and-enqueue-variable? BOOLEAN)
-       ((variable OBJECT) (localValue OBJECT)
-        (mapping ENTITY-MAPPING) (queue LIST))
+(defun (map-and-enqueue-variable? BOOLEAN) ((variable OBJECT)
+                                            (localValue OBJECT)
+                                            (mapping ENTITY-MAPPING))
   ;; Helping function for 'inherit-unnamed-description'.
-  ;; Record that 'variable' maps to 'localValue' in 'mapping' and push
-  ;;    'variable' onto 'queue'.
+  ;; Record that 'variable' maps to 'localValue' in 'mapping' (this used
+  ;;    to also push `variable' onto a queue - hence, the name - however,
+  ;;    we don't do that anymore due to the now precomputed evaluation
+  ;;    order of structural functions).
   ;; If 'localValue' is NULL, a skolem gets created (unless 'variable' maps
   ;;    to a constant).
   ;; A clash may occur if 'variable' already maps to another distinct value.
@@ -2613,15 +2912,12 @@ of order-dependent optimizations.")
                      (skolem? localValue)
                      (skolem? mapsToValue))))
         ((defined? localValue)
-         (insert-at mapping variable localValue)
-         (when (isa? localValue @LOGIC-OBJECT)
-           (push queue variable)))
+         (insert-at mapping variable localValue))
         (otherwise
          ;; create a skolem and map 'variable' to it:
          (let ((skolem
                 (create-variable-or-skolem (skolem-type variable) NULL)))
-           (insert-at mapping variable skolem)
-           (push queue variable))))))
+           (insert-at mapping variable skolem))))))
     (otherwise NULL))
   (return TRUE))
 
@@ -2630,8 +2926,6 @@ of order-dependent optimizations.")
   ;; Collect into 'structuralFunctions' all functions and predicates
   ;;    nested within 'proposition' that fix the meaning of a variable,
   ;;    so that inheritance can uniquely map onto the equivalent.
-  ;; Used by 'help-inherit-description' so that only 'top-level'
-  ;;    functions are used to define a mapping.
   (case (kind proposition)
     (:FUNCTION (insert structuralFunctions proposition))
     (:PREDICATE
@@ -2646,8 +2940,69 @@ of order-dependent optimizations.")
     ;; don't recurse into :OR, :NOT, etc:
     (otherwise NULL)) )
 
-(defun (map-functional-value? BOOLEAN)
-       ((proposition PROPOSITION) (mapping ENTITY-MAPPING) (queue LIST))
+(defun (compute-structural-function-evaluation-order (LIST OF PROPOSITION)) ((self DESCRIPTION))
+  ;; Compute an evaluation order for relevant structural functions of `self' (those that constrain
+  ;; an internal or external variable of `self' with their output argument), so that functions
+  ;; are only called once all their inputs are available (either from external bindings or from
+  ;; outputs of other structural functions).
+  ;; This now does statically what previously was done dynamically with every call to
+  ;; `inherit-description-propositions'.  The old scheme led to multiple redundant evaluations
+  ;; and also had very bad quadratic behavior in some cases (such as with PL-Mediator rules that
+  ;; had large numbers of big skolem functions that referenced all io-variables of `self').
+  ;; The evaluation order should also never change, hence it makes sense to compute it only once.
+  ;; The ordering algorithm below could lead to quadratic complexity for some large and strangely
+  ;; constructed propositions, but at least we will pay that cost only once per description.
+  (let ((structuralFunctions (new (LIST OF PROPOSITION)))
+        (ioVariables (io-variables self))
+        (internalVariables (internal-variables self))
+        (candidates (new (HASH-SET OF PROPOSITION PROPOSITION)))
+        (unboundInternals (new (HASH-SET OF PATTERN-VARIABLE PATTERN-VARIABLE)))
+        (sortedFunctions (new LIST))
+        (progress? TRUE))
+    (collect-structural-functions (proposition self) structuralFunctions)
+    (foreach function in structuralFunctions
+        where (or (member? ioVariables (last-argument function))
+                  (member? internalVariables (last-argument function)))
+        do (insert candidates function))
+    (foreach var in internalVariables
+        do (insert unboundInternals var))
+    (while progress?
+      (setq progress? FALSE)
+      ;; we do this in two steps: (1) we look for evaluable functions that
+      ;; further constrain something that is already bound, since that might
+      ;; give us a binding in case a previous function failed to generate one:
+      (foreach candidate in candidates
+          where (and (not (member? unboundInternals (last-argument candidate)))
+                     (forall arg in (arguments candidate)
+                         as i in (interval 2 (length (arguments candidate)))
+                         always (not (member? unboundInternals arg))))
+          do (push sortedFunctions candidate)
+             (remove candidates candidate)
+             (setq progress? TRUE))
+      ;; (2) look for all remaining candidates that can be evaluated now:
+      (foreach candidate in candidates
+          where (forall arg in (arguments candidate)
+                    as i in (interval 2 (length (arguments candidate)))
+                    always (not (member? unboundInternals arg)))
+          do (push sortedFunctions candidate)
+             (remove candidates candidate)
+             (remove unboundInternals (last-argument candidate))
+             (setq progress? TRUE)))
+    (return (reverse sortedFunctions))))
+
+(defslot DESCRIPTION structural-function-evaluation-order :type (LIST OF PROPOSITION))
+
+(defun (get-structural-function-evaluation-order (LIST OF PROPOSITION)) ((self DESCRIPTION))
+  ;; Get the evaluation order for relevant structural functions of `self'.
+  ;; Cache it on the description to compute it only once.
+  (let ((evaluationOrder (structural-function-evaluation-order self)))
+    (when (null-list? evaluationOrder)
+      (setq evaluationOrder (compute-structural-function-evaluation-order self))
+      (setf (structural-function-evaluation-order self) evaluationOrder))
+    (return evaluationOrder)))
+
+(defun (map-functional-value? BOOLEAN) ((proposition PROPOSITION)
+                                        (mapping ENTITY-MAPPING))
   ;; Called by 'inherit-unnamed-description' to find or create values of 
   ;;    functions and ranges of single-valued predicates as a prelude
   ;;    to inheriting propositions.
@@ -2662,7 +3017,7 @@ of order-dependent optimizations.")
         ;;    proposition:
         (return
           (map-and-enqueue-variable?
-           (last-argument proposition) localFunctionalValue mapping queue))))
+           (last-argument proposition) localFunctionalValue mapping))))
     (return TRUE)))
   
 (defun (inherit-description-propositions (CONS OF PROPOSITION) ENTITY-MAPPING)
@@ -2674,29 +3029,17 @@ of order-dependent optimizations.")
   ;;    `filter-implied-skolem-propositions'.
   ;; NOTE: This does not automatically assert any of the propositions
   ;;    it instantiated.
-  (let ((mapping (new ENTITY-MAPPING))
-        (variableQueue (new (LIST OF PATTERN-VARIABLE)))
-        (structuralFunctions (LIST OF PROPOSITION) (new LIST)))
+  (let ((mapping (new ENTITY-MAPPING)))
     ;; Map variables onto arguments:
     (foreach v in (io-variables description)
         as arg in arguments
-        do (unless (map-and-enqueue-variable? v arg mapping variableQueue)
+        do (unless (map-and-enqueue-variable? v arg mapping)
              (return NIL NULL)))
-    (foreach v in (internal-variables description)
-        collect v into variableQueue)
-    ;; For each variable in 'variableQueue', extend the mapping in 'mapping'
-    ;;    by following function and single-valued predicate links attached to
-    ;;    the variable:
-    (collect-structural-functions
-     (proposition description) structuralFunctions)
-    (loop
-      (when (empty? variableQueue)
-        (break))
-      (let ((variable PATTERN-VARIABLE (pop variableQueue)))
-        (foreach p in (unfiltered-dependent-propositions variable NULL)
-            where (member? structuralFunctions p)
-            do (unless (map-functional-value? p mapping variableQueue)
-                 (return NIL NULL)))))
+    ;; Extend the mapping in 'mapping' by following function and single-valued
+    ;; predicate links attached to top-level internal and external variables:
+    (foreach p in (get-structural-function-evaluation-order description)
+        do (unless (map-functional-value? p mapping)
+             (return NIL NULL)))
     ;; Done mapping variables; inherit the top-level proposition within
     ;;    'description' onto the instances mapped to within 'mapping':
     (let ((propositions (inherit-as-top-level-proposition

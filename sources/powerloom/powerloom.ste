@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: powerloom.ste,v 1.5 2006/11/22 01:41:02 hans Exp
+;;; Version: powerloom.ste,v 1.7 2010/09/11 00:36:25 hans Exp
 
 ;;; Top level shell to run PowerLoom and various extension systems.
 ;;; Eventually, most of the stuff in PL:sources;logic;powerloom.ste
@@ -65,7 +65,7 @@ dynamically (not yet in C++)."
 
 (defun load-all-extension-systems ()
   :documentation "Load and initialize all installed extension systems."
-  :public? TRUE
+  :public? TRUE :command? TRUE
   (foreach system in *powerloom-extension-systems*
       where (not (system-loaded-or-started-up? (string-downcase system)))
       do (print "Initializing " (unwrap-string system) "...")
@@ -77,6 +77,67 @@ dynamically (not yet in C++)."
              (print "FAILED")))
          (print EOL)))
 
+(defun load-all-extensions-option-handler ((option CMD-LINE-OPTION) (value OBJECT))
+  :documentation "Load and initialize all installed extension systems."
+  :public? TRUE
+  (ignore option value)
+  (load-all-extension-systems))
+
+(defun start-powerloom-gui-option-handler ((option CMD-LINE-OPTION) (value OBJECT))
+  :documentation "Start the PowerLoom GUI."
+  :public? TRUE
+  (ignore option value)
+  (set-configuration-property "powerloom.runInteractively" TRUE NULL)
+  (start-powerloom-gui))
+
+
+(startup-time-progn
+  (register-cmd-line-option
+   :key "--load-all-extensions"
+   :documentation "
+  Load all available PowerLoom extension systems."
+   :n-arguments 0
+   :handler (quote load-all-extensions-option-handler)
+   :error-action :error)
+  
+  (register-cmd-line-option
+   :key "--gui"
+   :documentation "
+  Launch the PowerLoom GUI in addition to the read/eval/print loop."
+   :n-arguments 0
+   :handler (quote start-powerloom-gui-option-handler)
+   :error-action :warn)
+   
+  (register-cmd-line-option
+   :key "-i" :key2 "--interactive"
+   :documentation "
+  Launch an interactive read/eval/print loop after all startup code and
+  command line arguments have been processed."
+   :n-arguments 0
+   :property "powerloom.runInteractively"
+   :value-type @BOOLEAN
+   :default-value TRUE)
+  
+  (register-cmd-line-option
+   :key "--batch"
+   :documentation "
+  Do not start an interactive read/eval/print loop.  Just evaluate all
+  command line arguments and main function code and then exit."
+   :n-arguments 0
+   :property "powerloom.runInteractively"
+   :value-type @BOOLEAN
+   :default-value FALSE)
+  
+  ;; this just updates the documentation, since we are running it in PL-USER:
+  (register-cmd-line-option
+   :key "-e" :key2 "--eval" :key3 "-eval"
+   :documentation "<s-expression>
+  Evaluate the STELLA <s-expression> in the PL-USER module."
+   :n-arguments 1
+   :handler (quote eval-option-handler)
+   :error-action :warn))
+
+
 (defmain (count arguments)
   :documentation "Main PowerLoom entry point."
   :public? TRUE :startup-system? FALSE
@@ -86,10 +147,9 @@ dynamically (not yet in C++)."
   (startup-logic-system)
   (startup-powerloom-extensions-system)
   (startup-powerloom-system)
-  (let ((cmdLineArgs (consify-command-line-arguments count arguments)))
-    (when (member? cmdLineArgs "--load-all-extensions")
-      (load-all-extension-systems))
-    (change-module "PL-USER") ;; do this before we run any -e commands
-    (interpret-command-line-arguments count arguments)
-    (unless (member? cmdLineArgs "--batch")
-      (/logic/powerloom))))
+  (change-module "PL-USER") ;; do this before we run any -e commands
+  (process-command-line-arguments count arguments :warn)
+  (when (and (not (eql? (get-property "powerloom.runInteractively") FALSE-WRAPPER))
+             (not (eql? (get-property "stella.showInfoOnly") TRUE-WRAPPER)))
+    (/logic/powerloom))
+  (run-hooks *stella-exit-hooks* NULL))

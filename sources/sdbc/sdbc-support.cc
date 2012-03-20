@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2010      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: sdbc-support.cc,v 1.8 2006/11/20 20:43:21 hans Exp
+// Version: sdbc-support.cc,v 1.10 2010/10/11 22:35:14 hans Exp
 
 // C Support file for sdbc.
 
@@ -259,7 +259,9 @@ int ODBC_Connect(char *connectionString, SQLHENV *henv, SQLHDBC *hdbc, int *conn
     return -6;
   }
 
-  SQLSetConnectOption (*hdbc, SQL_OPT_TRACEFILE, (UDWORD) "\\SQL.LOG");
+  // commented for now, since we can't cast the string to UDWORD in 64-bit environment
+  // - figure out how to do this right:
+  //SQLSetConnectOption (*hdbc, SQL_OPT_TRACEFILE, (UDWORD) "\\SQL.LOG");
 
   *connected = 1;
 

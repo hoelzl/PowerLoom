@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: kif-out.ste,v 1.83 2008/09/08 23:36:16 hans Exp
+;;; Version: kif-out.ste,v 1.85 2010/09/09 23:30:44 hans Exp
 
 ;;; Translation of logical STELLA parse trees to a KIF output stream.
 
@@ -387,7 +387,10 @@ forced to be turned off."
       (:NOT (setq operator (stringified-surrogate PL-KERNEL-KB/@NOT)))
       (:EQUIVALENT
        (setq operator "="))
-      ((:ISA :PREDICATE) (setq operator (stringified-kif-operator self)))
+      ((:ISA :PREDICATE)
+       (setq operator (stringified-kif-operator self))
+       (when (eql? (operator self) PL-KERNEL-KB/@FORK)
+         (setq separateLines? TRUE)))
       (:FUNCTION 
        (if *printFunctionsAsRelations?*
 	   ;; Print as a proposition
@@ -442,7 +445,7 @@ forced to be turned off."
              (isa? tailArg @DESCRIPTION))
       (print-descriptions-as-kif-rule headArg tailArg self FALSE)
       (print-kif-operator-with-arguments
-       "subset-of" (arguments self) TRUE FALSE))))
+       (stringified-surrogate PL-KERNEL/@SUBSET-OF) (arguments self) TRUE FALSE))))
 
 (defun print-kif-quantified-variables 
        ((variables (VECTOR OF SKOLEM)) (includeTypes? BOOLEAN))
@@ -711,10 +714,13 @@ forced to be turned off."
               (not reversePolarity?)))
         (reverseArguments?
          (or forwardArrow? reversePolarity?))
-        (mapHeadVariables? (named-description? head))
         (currentIndentCounter *indentCounter*)
         (operatorPrefix (choose-implication-operator rule forwardArrow?))
-	(operatorPrefixIndent (+ 2 (length (symbol-name operatorPrefix)))))
+	(operatorPrefixIndent (+ 2 (length (symbol-name operatorPrefix))))
+        (mapHeadVariables? (named-description? head))
+	(rule-variables (io-variables rule))
+	(headVariableMapping (ENTITY-MAPPING OF SKOLEM SKOLEM) NULL)
+	(tailVariableMapping (ENTITY-MAPPING OF SKOLEM SKOLEM) NULL))
     (when (or (deleted? head) (deleted? tail))
       (print-stream stream "(=> <DeLeTeD ArGuMeNt(S)>)")
       (return))
@@ -723,33 +729,39 @@ forced to be turned off."
         (setq head tail)
         (setq tail temp))
       (setq mapHeadVariables? (not mapHeadVariables?)))
+
+    ;; Set up the variable mapping
+    ;; Prefer a set of variables associated with RULE, otherwise generate them
+    ;;   by mapping the non-named description (if any).
+    (cond ((defined? rule-variables)
+	   (setq headVariableMapping 
+		 (create-skolem-mapping-table (io-variables head) rule-variables))
+	   (setq tailVariableMapping 
+		 (create-skolem-mapping-table (io-variables tail) rule-variables)))
+	  (mapHeadVariables?
+	   (setq rule-variables (io-variables tail))
+	   (setq headVariableMapping 
+		 (create-skolem-mapping-table (io-variables head) rule-variables)))
+	  (otherwise
+	   (setq rule-variables (io-variables head))
+	   (setq tailVariableMapping 
+		 (create-skolem-mapping-table (io-variables tail) rule-variables))))
+
     (special ((*indentCounter* currentIndentCounter))
       (print-stream stream "(" (stringified-surrogate PL-KERNEL-KB/@FORALL) " ")
-      (print-kif-quantified-variables
-       (choose mapHeadVariables? (io-variables tail) (io-variables head))
-       FALSE)
+      (print-kif-quantified-variables rule-variables FALSE)
       (print-stream stream EOL)
       (increase-indent NULL)
       (print-indent stream NULL)
       (print-stream stream "(" (stringified-surrogate operatorPrefix) " ")
       (increase-indent operatorPrefixIndent)
       ;; Print the head:
-      (special ((*skolemNameMappingTable*
-                 (choose mapHeadVariables?
-                         (create-skolem-mapping-table
-                          (io-variables head)
-                          (io-variables tail))
-                         NULL)))
+      (special ((*skolemNameMappingTable* headVariableMapping))
         (print-kif-description-proposition head reversePolarity?))
       (print-stream stream EOL)
       ;; Print the tail:
       (print-indent stream NULL)
-      (special ((*skolemNameMappingTable*
-                 (choose (not mapHeadVariables?)
-                         (create-skolem-mapping-table
-                          (io-variables tail)
-                          (io-variables head))
-                         NULL)))
+      (special ((*skolemNameMappingTable* tailVariableMapping))
         (print-kif-description-proposition tail reversePolarity?))
       (print-stream stream "))")
       (decrease-indent operatorPrefixIndent)
@@ -1155,7 +1167,7 @@ either be an output stream or a persistent OBJECT-STORE."
 	 (store-module-trailer store module))))))
 
 (defun save-module ((name NAME) (file STRING))
-  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :command? TRUE :public? TRUE
   :documentation
   "Save all definitions and assertions of module `name' to `file'."
   (let ((module (coerce-to-module name TRUE)))

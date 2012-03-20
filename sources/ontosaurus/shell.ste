@@ -1,0 +1,441 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2009-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: shell.ste,v 1.1 2010/02/12 20:32:13 hans Exp
+
+;;; Routines to support execution of OS shell commands (plus simple threading)
+;;; Currently, only Lisp (Allegro) and Java are supported.
+
+(in-package "STELLA")
+
+(in-module "ONTOSAURUS")
+
+
+;;; TO DO:
+;;; - define `multi-threading/shell-available?' predicates
+;;; - handle other Lisps and C++ if possible
+;;; - see also shell to-do's below
+
+
+  ;;
+;;;;;; Simple Threads Interface
+  ;;
+
+(defclass NATIVE-THREAD ()
+  :cl-native-type "#+allegro MP:PROCESS #-allegro CL:T"
+  :java-native-type "java.lang.Thread")
+
+(defclass THREAD (STANDARD-OBJECT)
+  :slots ((native-thread :type NATIVE-THREAD)
+          (run-function :type FUNCTION-CODE :required? TRUE)
+          (run-arguments :type VECTOR :required? TRUE))
+  :initializer initialize-thread)
+
+(defmethod initialize-thread ((self THREAD))
+  (when (null? (run-function self))
+    (error "initialize-thread: run-function not defined"))
+  (if-output-language
+   :common-lisp
+   (cl-initialize-thread self)
+   (if-output-language
+    :java
+    (java-initialize-thread self)
+    (error "initialize-thread: threads not yet supported"))))
+
+(defun cl-initialize-thread ((self THREAD))
+  (let ((name (yield-unique-gensym-name "STELLA-THREAD" NULL))
+        (thread NATIVE-THREAD
+                (verbatim
+                  :common-lisp "#+allegro (mp:make-process :name name) #-allegro NULL"
+                  :otherwise NULL))
+        (function (run-function self))
+        (arguments NIL))
+    (when (null? thread)
+      (error "initialize-thread: threads not yet supported in this Lisp dialect"))
+    (setf (native-thread self) thread)
+    (when (defined? (run-arguments self))
+      (setq arguments (consify (run-arguments self))))
+    (verbatim
+      :common-lisp "#+allegro (cl:apply #'mp:process-preset thread function arguments)"
+      :otherwise NULL)))
+
+(defun java-initialize-thread ((self THREAD))
+  (let ((name (yield-unique-gensym-name "STELLA-THREAD" NULL))
+        (thread NATIVE-THREAD NULL)
+        (function (run-function self))
+        (arguments (first-defined (run-arguments self) (vector)))
+        (natargs (the-array arguments)))
+    (verbatim
+     :java "final java.lang.reflect.Method fn = function;
+            final java.lang.Object[] args = natargs;
+            thread = new java.lang.Thread(name) {
+               public void run() {
+                 Native.funcall(fn, null, args);
+               }
+            }"
+     :otherwise NULL)
+    (setf (native-thread self) thread)))
+
+(defmethod start-thread ((self THREAD))
+  :documentation "Start execution of `self's run-function."
+  :public? TRUE
+  (let ((thread (native-thread self)))
+    (verbatim
+      :common-lisp "#+allegro (mp:process-enable thread)"
+      :java "thread.start()"
+      :otherwise NULL)))
+
+(defmethod stop-thread ((self THREAD))
+  :documentation "Stop execution of `self's run-function."
+  :public? TRUE
+  (let ((thread (native-thread self)))
+    (verbatim
+      :common-lisp "#+allegro (mp:process-disable thread)"
+      :java "thread.stop()" ;; deprecated since unsafe
+      :otherwise NULL)))
+
+(defmethod kill-thread ((self THREAD))
+  :documentation "Stop `self' and then destroy the associated thread object."
+  :public? TRUE
+  (let ((thread (native-thread self)))
+    (stop-thread self)
+    (verbatim
+      :common-lisp "#+allegro (mp:process-kill thread)"
+      :java "thread.destroy()" ;; deprecated since unsafe
+      :otherwise NULL)
+    (setf (native-thread self) NULL)))
+
+(defmethod wait-for-completion ((self THREAD))
+  :documentation "Suspend the current thread until `self' has completed execution."
+  :public? TRUE
+  (let ((thread (native-thread self)))
+    (verbatim
+      :common-lisp "#+allegro (mp:process-wait \"wait\" #'(cl:lambda (thread) (CL:not (mp:process-active-p thread))) thread)"
+      :java
+      "try {
+         thread.join();
+       } catch (InterruptedException e) {
+         Native.rethrowAsStellaException(e, StellaException.class, \"waitForCompletion: \", true);
+       }"
+      :otherwise NULL)))
+
+#|
+;;; Thread example:
+
+(defun subthread ((x object))
+  (print "  subthread: start, x=" x EOL)
+  (sleep 10)
+  (print "  subthread: stop, x=" x EOL))
+
+(defun test-threads ()
+  :command? TRUE :public? TRUE
+  (print "main-thread: start" EOL)
+  (let ((thread (new THREAD
+                     :run-function (the-code :function subthread)
+                     :run-arguments (vector (cons-list 1 2 3)))))
+    (start-thread thread)
+    (print "main-thread: waiting" EOL)
+    (wait-for-completion thread)
+    (print "main-thread: stop" EOL)))
+|#
+
+
+  ;;
+;;;;;; Shell Interface
+  ;;
+
+;;; Simple abstraction to execute shell commands in STELLA with their standard
+;;; input, output and error redirected from and to STELLA streams (if supplied).
+;;; This relies on simple threading support as supplied above.  If we want to
+;;; support this in Lisps that don't have threading, we might need some more
+;;; restricted interface functions that don't rely on threads.
+
+;;; TO DO:
+;;; - move this into STELLA somewhere
+;;; - make sure we properly handle binary output in Java
+;;; - handle Windows command frobbing for proper execution with `cmd.exe'
+;;;   (see http://www.franz.com/support/documentation/current/doc/operators/excl/run-shell-command.htm and
+;;;        http://www.javaworld.com/javaworld/jw-12-2000/jw-1229-traps.html?page=4)
+;;; + implement `wait-for-completion', `exit-status' and `destroy'
+;;; + make streams optional
+;;; + make sure we can set the working directory
+;;; + supply commands and args as vectors in Lisp, so we don't run the intermediate shell
+
+(defclass NATIVE-SHELL-PROCESS ()
+  :cl-native-type "INTEGER"
+  :java-native-type "java.lang.Process")
+
+(defclass SHELL-PROCESS (STANDARD-OBJECT)
+  :slots ((command :type (ARRAY () OF STRING))
+          (directory :type STRING :initially ".")
+          (native-process :type NATIVE-SHELL-PROCESS)
+          (input-stream :type INPUT-STREAM)
+          (native-stdin :type OUTPUT-STREAM) ;; we are writing to it
+          (output-stream :type OUTPUT-STREAM)
+          (native-stdout :type INPUT-STREAM) ;; we are reading from it
+          (error-stream :type OUTPUT-STREAM)
+          (native-stderr :type INPUT-STREAM) ;; we are reading from it
+          (exit-status :type INTEGER :initially NULL)))
+
+(defun (parse-shell-command (ARRAY () OF STRING)) ((command OBJECT))
+  ;; Convert `command' into the appropriate low-level array representation.
+  ;; Eventually, this will also take care of the Windows-specific jazz with `cmd.exe'.
+  (let ((parsedCommand (CONS OF STRING-WRAPPER) NIL)
+        (result (ARRAY () OF STRING) NULL))
+    (typecase command
+      (CONS (setq parsedCommand command))
+      (STRING-WRAPPER
+       ;; for now: simplistic parsing for test purposes:
+       (setq parsedCommand (split-string command #\space)))
+      (otherwise
+       (error "parse-shell-command: illegal shell command format: " command)))
+    (when (verbatim :common-lisp "#+allegro CL:t #-allegro CL:nil"
+                    :otherwise FALSE)
+      ;; Allegro-only: need to add command as the first element in array (rest are arg[0-N]:
+      (pushq parsedCommand (first parsedCommand)))
+    (setq result (new (ARRAY () OF STRING) :size (length parsedCommand)))
+    (foreach elt in parsedCommand
+        as i in (interval 0 NULL)
+        do (setf (aref result i) elt))
+    (return result)))
+
+(defmethod start-process ((self SHELL-PROCESS))
+  :documentation "Start execution of `self's `command'."
+  (let ((process NATIVE-SHELL-PROCESS NULL)
+        (command (command self))
+        (directory (directory self))
+        (input (input-stream self))
+        (output (output-stream self))
+        (error (error-stream self))
+        (stdin NATIVE-OUTPUT-STREAM NULL)
+        (stdout NATIVE-INPUT-STREAM NULL)
+        (stderr NATIVE-INPUT-STREAM NULL))
+    (verbatim
+      :common-lisp
+      "#+allegro
+       (CL:progn
+         (CL:setq stdin (CL:if (defined? input) :stream CL:nil))
+         (CL:setq stdout (CL:if (defined? output) :stream CL:nil))
+         (CL:setq stderr (CL:if (defined? error) :stream CL:nil))
+         (CL:multiple-value-setq (stdin stdout stderr process)
+            (excl:run-shell-command command :input stdin :output stdout :error-output stderr :separate-streams CL:t
+                                    :directory directory :wait CL:nil))
+         (CL:setq stdin (CL:or stdin NULL))
+         (CL:setq stdout (CL:or stdout NULL))
+         (CL:setq stderr (CL:or stderr NULL)))"
+      :java
+      ;; Java uses the opposite input/output terminology:
+      "try {
+         process = Runtime.getRuntime().exec(command, null, new java.io.File(directory));
+         if (input != null)
+            stdin = new java.io.PrintStream(process.getOutputStream());
+         if (output != null)
+            stdout = new java.io.PushbackInputStream
+                        (new edu.isi.stella.javalib.FlushableBufferedInputStream(process.getInputStream()));
+         if (error != null)
+            stderr = new java.io.PushbackInputStream
+                        (new edu.isi.stella.javalib.FlushableBufferedInputStream(process.getErrorStream()));
+       }
+       catch (java.io.IOException e) {
+          Native.rethrowAsStellaException(e, InputOutputException.class, \"ShellProcess.startProcess: \", true);
+       }"
+      :otherwise NULL)
+    (when (null? process)
+      (error "shell-process.start-process: not yet implemented"))
+    (setf (native-process self) process)
+    (when (defined? stdin)
+      (setf (native-stdin self) (new OUTPUT-STREAM :native-stream stdin)))
+    (when (defined? stdout)
+      (setf (native-stdout self) (new INPUT-STREAM :native-stream stdout :buffering-scheme :block)))
+    (when (defined? stderr)
+      (setf (native-stderr self) (new INPUT-STREAM :native-stream stderr :buffering-scheme :block)))))
+
+(defmethod wait-for-completion ((self SHELL-PROCESS))
+  :documentation "Suspend the current thread until `self' has completed execution."
+  :public? TRUE
+  (let ((process (native-process self))
+        (exit INTEGER NULL))
+     (verbatim
+       :common-lisp "#+allegro (CL:setq exit (sys:reap-os-subprocess :pid process :wait CL:t))"
+       :java
+       "try {
+          exit = process.waitFor();
+        } catch (InterruptedException e) {
+          Native.rethrowAsStellaException(e, StellaException.class, \"waitForCompletion: \", true);
+        }"
+      :otherwise NULL)
+     (setf (exit-status self) exit)))
+
+(defmethod destroy-process ((self SHELL-PROCESS))
+  :documentation "Stop `self' and then destroy the associated process object.
+In Lisp, this doesn't yet actually kill the shell process, it just waits for its
+completion.  Conceivably, we could execute a `kill' command to achieve that."
+  :public? TRUE
+  (let ((process (native-process self)))
+    (verbatim :common-lisp "#+allegro (sys:reap-os-subprocess :pid process :wait CL:t)"
+              :java "process.destroy()")
+    ;; NOTE: input/output/error streams are user-supplied and are not closed here
+    (when (defined? (native-stdin self))
+      (terminate-output-stream? (native-stdin self)))
+    (when (defined? (native-stdout self))
+      (terminate-input-stream? (native-stdout self))
+      (setf (tokenizer-state (native-stdout self)) NULL)) ;; add to terminate-input-stream? ?
+    (when (defined? (native-stderr self))
+      (terminate-input-stream? (native-stderr self))
+      (setf (tokenizer-state (native-stderr self)) NULL))
+    (setf (native-process self) NULL)))
+
+(defun (execute-shell-command INTEGER) ((command OBJECT)
+                                        (directory STRING)
+                                        (input INPUT-STREAM)
+                                        (output OUTPUT-STREAM)
+                                        (error OUTPUT-STREAM))
+  :documentation "Run `command' in a shell and return its exit status.  If `directory' is
+non-NULL, run it in that directory; if `input' is defined, feed `command's standard input
+from that stream; if `output' and/or `error' are defined, copy `commands' standard output/
+error to those streams.  It is the responsibility of the caller to close the supplied
+streams (if any) and do any shell error handling based on exit status or error output."
+  :public? TRUE
+  (let ((process
+         (new SHELL-PROCESS
+              :command (parse-shell-command command)
+              :directory (first-defined directory ".")
+              :input-stream input
+              :output-stream output
+              :error-stream error)))
+    (start-process process)
+    (let ((outputThread
+           (choose (defined? output)
+                   (new THREAD
+                        :run-function (the-code :function copy-stream-to-stream)
+                        :run-arguments (vector (native-stdout process) (output-stream process)))
+                   NULL))
+          (errorThread
+           (choose (defined? error)
+                   (new THREAD
+                        :run-function (the-code :function copy-stream-to-stream)
+                        :run-arguments (vector (native-stderr process) (error-stream process)))
+                   NULL)))
+      (when (defined? outputThread)
+        (start-thread outputThread))
+      (when (defined? errorThread)
+        (start-thread errorThread))
+      (when (defined? input)
+        (copy-stream-to-stream input (native-stdin process))
+        ;; this is important, without it the shell process waits for more input:
+        (close-stream (native-stdin process)))
+      (when (defined? outputThread)
+        (wait-for-completion outputThread))
+      (when (defined? errorThread)
+        (wait-for-completion errorThread))
+      (wait-for-completion process)
+      (destroy-process process)
+      (return (exit-status process)))))
+
+(defspecial *block-shell-command?* BOOLEAN FALSE
+  :documentation "Allow disabling of `shell-command' in remote execution contexts
+for security purposes.")
+
+(defun (shell-command STRING-WRAPPER) ((command OBJECT) &rest (options OBJECT))
+  :documentation "User-level command interface to `execute-shell-command' (which see).
+Runs `command' and returns its output (if any) as a string.  If the shell created
+a non-zero exit status or generated any error output, an exception will be raised.
+If `command' was a string, split it at spaces to determine its arguments (this is
+not sophisticated and does not handle quoting correctly).  For more complex commands,
+supply them as a list of strings representing the program and its arguments.  If any
+shell-level operations such as redirection are needed, use the `sh -c cmd' idiom.
+If :input is supplied as a non-null string, feed it to `command's standard input.
+If :directory is given, execute `command' in that directory."
+  :command? TRUE :public? TRUE
+  (when *block-shell-command?*
+    (error "Execution of `shell-command' is blocked in this context"))
+  (let ((theOptions
+         (parse-logic-command-options
+          (coerce-&rest-to-cons options)
+          (bquote (:directory @STRING
+                   :input @STRING))
+          TRUE FALSE))
+        (directory (unwrap-string (lookup theOptions :directory)))
+        (inputString (unwrap-string (lookup theOptions :input)))
+        (inputStream (choose (not (blank-string? inputString))
+                             (new STRING-INPUT-STREAM :the-string inputString)
+                             NULL))
+        (outputStream (new STRING-OUTPUT-STREAM))
+        (errorStream (new STRING-OUTPUT-STREAM))
+        (exit (execute-shell-command command directory inputStream outputStream errorStream))
+        (output (the-string outputStream))
+        (error (the-string errorStream)))
+    (when (defined? inputStream)
+      (close-stream inputStream))
+    (close-stream outputStream)
+    (close-stream errorStream)
+    (when (not (blank-string? error))
+      (error "shell-command: " error))
+    (when (not (= exit 0))
+      (error "shell-command: non-zero exit status=" exit))
+    (if (blank-string? output)
+        (return NULL)
+      (return output))))
+
+#|
+;;; Examples:
+
+STELLA(88): (eval (shell-command "cp x.html x.html.bak" :directory "/tmp"))
+NULL
+STELLA(89): (eval (shell-command "cat" :input "This is some line"))
+|L|"This is some line"
+STELLA(90): (eval (shell-command (bquote ("csh" "-f" "-c" "cat > x.out"))
+                                 :input "This is some line"
+                                 :directory "/tmp"))
+NULL
+STELLA(91): (eval (shell-command "cat" :input (shell-command "cat" :input "this is some line")))
+|L|"this is some line"
+STELLA(92): (eval (shell-command "cp x.html x.html" :directory "/tmp"))
+Error: shell-command: `cp: `x.html' and `x.html' are the same file
+'
+  [condition type: STELLA-EXCEPTION]
+
+Restart actions (select using :continue):
+ 0: Return to Top Level (an "abort" restart).
+ 1: Abort entirely from this (lisp) process.
+[1] STELLA(92):
+|#

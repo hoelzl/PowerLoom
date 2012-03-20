@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: translations.lisp,v 1.32 2006/05/21 07:07:08 hans Exp
+;;; Version: translations.lisp,v 1.33 2010/10/16 17:18:23 hans Exp
 
 ;;; Pathname translations for PowerLoom and related systems.
 
@@ -80,6 +80,7 @@
                #+:MCL            "mcl"
                #+:LISPWORKS4.1   "lw4.1"
                #+:LISPWORKS4.0   "lw4.0"
+               #+:CMU20          "cmu20"
                #+:CMU19          "cmu19"
                #+:CMU18          "cmu18"
                #+:CMU            "cmu"

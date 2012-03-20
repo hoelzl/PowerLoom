@@ -1,0 +1,2274 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2002-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: gui-server-api.ste,v 1.56 2010/02/12 22:43:04 hans Exp
+
+;;; PowerLoom server support functions.
+
+(in-package "STELLA")
+
+(IN-MODULE "GUI-SERVER")
+
+
+;;; NOTE: This code was initially written for a case-sensitive module
+;;;       but the current GUI-SERVER module is not case-sensitive anymore
+;;;       (thus, the non-uniform mixed-case notation).
+
+
+;;; TO DO:
+;;; - handle/properly display synonyms (e.g., the synonym could be an instance
+;;;   while the mother object is a concept or relation - handle that).
+;;; - space: currently, the finder dialog conses up potentially large lists
+;;;   of concepts/relations/instances instead of doing the matching directly
+;;;   on the iterators.
+;;; - improve continuation query mechanism, don't rely on *most-recent-query*
+;;;   kludge; allow other options such as timeouts, etc. to change also.
+;;; - implement renaming.
+;;; - display better statistics, e.g., the number of results in a query, the numbers
+;;;   of concepts/instances/relations in a module, the number of members in an extension, etc.
+;;; - result sorting:
+;;;   - is incorrect, A-10 comes before A-9
+;;;   - is annoying with continuation requests, since it's not visible what the new results are
+;;; - query result annotations:
+;;;   - display number of results, did we exhaust the search tree, was there a timeout, etc.
+;;; - multiple inheriting modules make things such as Group show up twice in
+;;;   the finder windows
+;;; - fix PowerLoom's `save-module' to do the right thing if a rule that was generated
+;;;   as part of a relation definition gets retracted.  currently, that rule gets saved
+;;;   as part of the original definition.
+;;; - fix PowerLoom's `save-module' to properly handle retracted propositions
+;;; - make gui-side parsing less fragile and restrictive; for example, it can't handle
+;;;   <=> connectives; actually, parsing of propositions (e.g., to determine at which
+;;;   relation the pointer is pointing or to determine free variables should really
+;;;   happen at the serve side!!!)
+
+
+  ;;
+;;;;;; Configurable parameters
+  ;;
+
+(DEFGLOBAL *ALLOW-REMOTE-FILEBROWSING* BOOLEAN FALSE)
+
+
+  ;;
+;;;;;; Logging
+  ;;
+
+(defglobal *server-log-file* string "PL:logs;powerloom-server.log")
+
+(startup-time-progn
+   (set-logging-parameters
+    "PL-Server"
+    :log-levels (quote (:none :low :medium :high))
+    :level (choose (eql? *powerloom-execution-mode* :development) :high :low)
+    :prefix "PL-Server"
+    :max-width 2000
+    :stream *server-log-file*))
+
+(defun server-log ((logLevel KEYWORD) &rest (message OBJECT))
+  ;; Log all elements of `message' to the current log stream if
+  ;;    `logLevel' is lower or the same as the current server log level.
+  (log-message "PL-Server" logLevel (coerce-&rest-to-cons message)))
+
+
+  ;;
+;;;;;; Server API
+  ;;
+
+;;; New support to deal with special names such as `12345' or `GROUPS/Agent'.
+;;; These functions should be wrapped around any calls that generate GUI strings
+;;; for named objects or lookup objects from such strings.
+;;; Not yet perfect, but will do for the moment.
+
+(defun (pl-object-to-gui-name STRING) ((x OBJECT))
+  ;; Given a named PowerLoom object `x', generate the string that should be displayed in the GUI.
+  ;; The displayed string must be something that `gui-name-to-pl-name' can convert into a
+  ;;    printed name representation suitable for object lookup.  Right now all we do is prefix
+  ;;    outside qualified names such as `GROUPS/Agent'.
+  ;; TO DO: MAKE THIS SMARTER ABOUT QUOTING `/' CHARACTERS IF WE QUALIFY THE NAME!!!
+  (let ((homeModule (home-module x))
+        (surrogate (object-surrogate x)))
+    (when (and (null? surrogate)
+               (surrogate? x))
+      (setq surrogate x))
+    (if (defined? surrogate)
+        (if (not (eql? homeModule (interned-in surrogate)))
+           (return (concatenate (module-name (interned-in surrogate)) "/" (symbol-name surrogate)))
+         (return (symbol-name surrogate)))
+      (return (PLI/object-to-string x)))))
+
+(defun (gui-name-to-pl-name STRING) ((name STRING))
+  ;; Given an GUI name generated by `pl-object-to-gui-name', generate a printed name suitable
+  ;;    for object lookup.
+  ;; TO DO: IMPROVE THIS SINCE IT WILL BREAK IN SOME CASES. UGLINESS...
+  (if (qualified-stella-name? name)
+      (mv-bind (bareName module type)
+          (parse-stella-name name FALSE)
+        (ignore type)
+        (if (eql? (nth bareName 0) #\|) ;; already quoted in a readably printed proposition
+            (return (concatenate module "/" bareName ""))
+          (return (concatenate module "/|" bareName "|"))))
+    (if (eql? (nth name 0) #\|)
+        (return name)
+      (return (concatenate "|" name "|")))))
+
+(DEFUN (SERVER-GET-MODULES |PLModuleContainer|) ()
+  :DOCUMENTATION "Get all the loaded modules, structured, hierarchically"
+  :PUBLIC? TRUE
+  (LET ((rootModule *ROOT-MODULE*))
+    (RETURN (GET-MODULES rootModule))))
+
+(DEFUN (SERVER-GET-CONCEPTS-FOR-MODULE |PLConceptContainer|) ((plString |PLString|))
+  :DOCUMENTATION "Get all the concepts in a module, structured hierarchically"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| plString) NULL)))
+    (WITHIN-MODULE module
+      (RETURN (GET-CONCEPTS module)))))
+
+(DEFUN (SERVER-GET-CONCEPT-COMPLETIONS |PLConceptContainer|) ((plModule |PLString|) (prefix |PLString|))
+  :DOCUMENTATION "Get all the concepts in a module and included/used modules that begin with 'prefix'"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| plModule) NULL)))
+    (WITHIN-MODULE module
+      (RETURN (GET-CONCEPTS-WITH-PREFIX module (|Value| prefix))))))
+
+;;; PROBLEM:
+;;; THERE IS A DISCREPANCY BETWEEN THE NAMED INSTANCES RETURNED BY
+;;; `ALL-INSTANCES' AND `ALL-NAMED-TERMS'.  FOR EXAMPLE, THE TOP PORTION
+;;; ARE INSTANCES ONLY REPORTED BY `ALL-INSTANCES' AND THE BOTTOM PORTION
+;;; ARE THOSE ONLY REPORTED BY `ALL-NAMED-TERMS' (`d' INDICATES DUPLICATES):
+
+;;; EXPLANATION: THE TERMS THAT ARE IN `ALL-INSTANCES' ARE ALL SYNONYMS.
+;;; THE TERMS THAT ARE ONLY IN `ALL-NAMED-TERMS' WERE INTRODUCED VIA A
+;;; `SETOF' EXPRESSION IN A RULE WHICH EXPLAINS THAT THEY WERE NOT INDEXED
+;;; SINCE WE DON'T GENERATE BACKLINKS FOR THOSE.  HOWEVER, LATER ON WHEN WE
+;;; ASSERT THINGS ABOUT THEM, THE INSTANCE ALREADY EXISTS AND THEREFORE
+;;; DOESN'T GET LOGGED.   FIX THAT!!!
+#|
++ |i|AIRPLANE          ;; synonym for FIXED-WING-AIRCRAFT
++ |i|AMRAAM            ;; synonym FOR AIM-120
++ |i|CLOSE-AIR-SUPPORT ;; synonym for CAS
++ |i|HARPOON           ;; synonym for AGM-84
++ |i|HELICOPTER        ;; synonym for ROTARY-WING-AIRCRAFT
++ |i|SUPPRESSION-OF-ENEMY-AIR-DEFENSE ;; synonym for SEAD
+-------------------------------------
++ |i|ACTIVE-RADAR-HOMING ;; guidance
+d |i|AGM-84            ;; probably due to synonym
+d |i|AIM-120           ;; probably due to synonym
++ |i|ANTI-RADIATION    ;; guidance
++ |i|ELECTRO-OPTICAL   ;; empty facts
++ |i|GPS               ;; empty facts
++ |i|HOME-ON-JAM       ;; empty facts
++ |i|IMAGING-IR        ;; guidance
++ |i|INERTIAL          ;; guidance
++ |i|IR-HOMING         ;; guidance
++ |i|SEMI-ACTIVE-LASER-HOMING ;; empty facts
++ |i|SEMI-ACTIVE-RADAR-HOMING ;; guidance
++ |i|TV                ;; guidance
+|#
+
+(DEFUN (SERVER-GET-INSTANCES-FOR-MODULE |PLInstanceContainer|) ((plString |PLString|))
+  :DOCUMENTATION "Get all the instances in a module, excluding skolems"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| plString) NULL))
+	(allInstances (ALL-INSTANCES module TRUE))
+	(nonSkolemInstances (NEW (LIST OF LOGIC-OBJECT)))
+	(result (NEW |PLInstanceContainer|))
+	(xmlInstances (NEW (LIST OF |PLInstance|))))
+       (FOREACH instance IN allInstances
+		WHERE (NOT (SKOLEM? instance))
+		COLLECT instance INTO nonSkolemInstances)
+       (SETQ xmlInstances (MAKE-PL-INSTANCES nonSkolemInstances TRUE))
+       (SETQ xmlInstances (SORT xmlInstances (THE-CODE :FUNCTION |PLInstance<|)))
+       (SETF (|PLInstance| result) xmlInstances)
+       (RETURN result)))
+
+(DEFUN (SERVER-GET-INSTANCE-COMPLETIONS |PLInstanceContainer|) ((plModule |PLString|) (prefix |PLString|))
+  :DOCUMENTATION "Get all the instances begining with 'prefix' in all modules accessible from 'plModule'."
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| plModule) NULL))
+	(allInstances (ALL-INSTANCES module FALSE))
+	(nonSkolemInstances (NEW (LIST OF LOGIC-OBJECT)))
+	(result (NEW |PLInstanceContainer|))
+	(xmlInstances (NEW (LIST OF |PLInstance|)))
+	(downcasedPrefix (STRING-DOWNCASE (|Value| prefix))))
+    (FOREACH instance IN allInstances
+      WHERE (AND (NOT (SKOLEM? instance))
+                 (STARTS-WITH? (GET-LOGIC-OBJECT-NAME instance "FALSE") downcasedPrefix 0))
+      COLLECT instance INTO nonSkolemInstances)
+    (SETQ xmlInstances (MAKE-PL-INSTANCES nonSkolemInstances TRUE))
+    (SETQ xmlInstances (SORT xmlInstances (THE-CODE :FUNCTION |PLInstance<|)))
+    (SETF (|PLInstance| result) xmlInstances)
+    (RETURN result)))
+
+(DEFUN (SERVER-GET-RELATIONS-FOR-MODULE |PLRelationContainer|) ((plString |PLString|))
+  :DOCUMENTATION "Get all the relations in a module, structured hierarchically"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| plString) NULL)))
+    (WITHIN-MODULE module
+      (RETURN (GET-RELATIONS module)))))
+
+(DEFUN (SERVER-GET-RELATION-COMPLETIONS |PLRelationContainer|) ((plModule |PLString|) (prefix |PLString|))
+  :DOCUMENTATION "Get all the relations in a module and included/used modules that begin with 'prefix'"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| plModule) NULL)))
+    (WITHIN-MODULE module
+      (RETURN (GET-RELATIONS-WITH-PREFIX module (|Value| prefix))))))
+
+(DEFUN (SERVER-GET-INSTANCES-FOR-CONCEPT |PLInstanceContainer|) ((moduleName |PLString|) (conceptName |PLString|))
+  :DOCUMENTATION "Get all the instances for a given module+concept"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL))
+	(iter (/PLI/GET-CONCEPT-INSTANCES
+	       (/PLI/GET-CONCEPT (|Value| conceptName) module NULL) module NULL))
+	(instances (NEW (LIST OF LOGIC-OBJECT)))
+	(result (NEW |PLInstanceContainer|))
+	(xmlInstances (NEW (LIST OF |PLInstance|))))
+    (FOREACH instance IN iter
+      COLLECT instance INTO instances)
+    (SETQ xmlInstances (MAKE-PL-INSTANCES instances TRUE))
+    (SETQ xmlInstances (SORT xmlInstances (THE-CODE :FUNCTION |PLInstance<|)))
+    (SETF (|PLInstance| result) xmlInstances)
+    (RETURN result)))
+
+(DEFUN (SERVER-GET-DIRECT-INSTANCES-FOR-CONCEPT |PLInstanceContainer|) ((moduleName |PLString|) (conceptName |PLString|))
+  :DOCUMENTATION "Get all the instances for a given module+concept"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL))
+	(iter (/PLI/GET-DIRECT-CONCEPT-INSTANCES
+	       (/PLI/GET-CONCEPT (|Value| conceptName) module NULL) module NULL))
+	(instances (NEW (LIST OF LOGIC-OBJECT)))
+	(result (NEW |PLInstanceContainer|))
+	(xmlInstances (NEW (LIST OF |PLInstance|))))
+    (FOREACH instance IN iter
+      COLLECT instance INTO instances)
+    (SETQ xmlInstances (MAKE-PL-INSTANCES instances TRUE))
+    (SETQ xmlInstances (SORT xmlInstances (THE-CODE :FUNCTION |PLInstance<|)))
+    (SETF (|PLInstance| result) xmlInstances)
+    (RETURN result)))
+
+(DEFUN (SERVER-GET-DOCUMENTATION-FOR-CONCEPT |PLString|) ((moduleName |PLString|) (conceptName |PLString|))
+  :DOCUMENTATION "Get the documentation string for module+concept"
+  :PUBLIC? TRUE
+  (RETURN (GET-DOCUMENTATION-FOR-OBJECT (|Value| moduleName) (|Value| conceptName))))
+
+(DEFUN (SERVER-GET-SOURCE-FOR-CONCEPT |PLString|) ((moduleName |PLString|) (conceptName |PLString|))
+  :DOCUMENTATION "Get the source string for module+concept"
+  :PUBLIC? TRUE
+  (LET ((result (NEW |PLString|))
+	(source (OBJECT-STRINGIFIED-SOURCE
+                 (/PLI/S-GET-CONCEPT (GUI-NAME-TO-PL-NAME (|Value| conceptName)) (|Value| moduleName) NULL))))
+       (SETF (|Value| result) (XMLIFY-STRING source))
+       (RETURN result)))
+
+(DEFUN (SERVER-GET-DOCUMENTATION-FOR-RELATION |PLString|) ((moduleName |PLString|) (relationName |PLString|))
+  :DOCUMENTATION "Get the documentation string for module+relation"
+  :PUBLIC? TRUE
+  (RETURN (GET-DOCUMENTATION-FOR-OBJECT (|Value| moduleName) (|Value| relationName))))
+
+(DEFUN (SERVER-GET-SUPERCONCEPTS-FOR-CONCEPT |PLSurrogateCollection|) ((moduleName |PLString|) (conceptName |PLString|))
+  :DOCUMENTATION "Get the superconcepts for module+concept"
+  :PUBLIC? TRUE
+  (LET ((concept (/PLI/S-GET-CONCEPT (GUI-NAME-TO-PL-NAME (|Value| conceptName)) (|Value| moduleName) NULL))
+	(module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+       (RETURN (CREATE-SUPERRELATIONS-CONTAINER concept module))))
+
+(DEFUN (SERVER-GET-SUPERRELATIONS-FOR-RELATION |PLSurrogateCollection|) ((moduleName |PLString|) (relationName |PLString|))
+  :DOCUMENTATION "Get the superrelations for module+relation"
+  :PUBLIC? TRUE
+  (LET ((relation (/PLI/S-GET-RELATION (GUI-NAME-TO-PL-NAME (|Value| relationName)) (|Value| moduleName) NULL))
+	(module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+       (RETURN (CREATE-SUPERRELATIONS-CONTAINER relation module))))
+
+(DEFUN (SERVER-GET-INCLUDES-FOR-MODULE |PLSurrogateCollection|) ((moduleName |PLString|))
+  :DOCUMENTATION "Get the includes for module"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+       (RETURN (CREATE-MODULE-COLLECTION (LISTIFY (/PLI/GET-PARENT-MODULES module))))))
+
+(DEFUN (SERVER-GET-USES-FOR-MODULE |PLSurrogateCollection|) ((moduleName |PLString|))
+  :DOCUMENTATION "Get the uses for module"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+       (RETURN (CREATE-MODULE-COLLECTION (USES module)))))
+
+(DEFUN (SERVER-GET-SHADOWED-SURROGATES-FOR-MODULE |PLSurrogateCollection|) ((moduleName |PLString|))
+  :DOCUMENTATION "Get the uses for module"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+       (RETURN (CREATE-SURROGATE-COLLECTION (SHADOWED-SURROGATES module)))))
+
+(DEFUN (SERVER-GET-VARIABLES-FOR-RELATION |PLVariableList|) ((moduleName |PLString|) (relationName |PLString|))
+  :DOCUMENTATION "Get the superrelations for module+relation"
+  :PUBLIC? TRUE
+  (LET ((relation
+         (/PLI/S-GET-RELATION (GUI-NAME-TO-PL-NAME (|Value| relationName)) (|Value| moduleName) NULL)))
+       (RETURN (CREATE-VARIABLES-LIST relation))))
+
+(DEFUN (SERVER-GET-PROPOSITIONS-FOR-MODULE |PLPropositionContainer|) ((moduleName |PLString|))
+  :DOCUMENTATION "Get all the propositions for a given module"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((iter (/PLI/GET-PROPOSITIONS-IN-MODULE module NULL))
+            (propositions (NEW (LIST OF PROPOSITION)))
+            (result (NEW |PLPropositionContainer|))
+            (xmlInstances (NEW (LIST OF |PLProposition|))))
+        (FOREACH proposition IN iter
+          COLLECT proposition INTO propositions)
+        (SETQ xmlInstances (MAKE-PL-PROPOSITIONS propositions module FALSE))
+        (SETF (|PLProposition| result) xmlInstances)
+        (RETURN result)))))
+
+;; Todo: upgrade this to produce surrogates, like get-relations-for-module
+(DEFUN (SERVER-GET-RELATIONS-FOR-CONCEPT |PLRelationContainer|) ((moduleName |PLString|)
+                                                               (conceptName |PLString|))
+  :DOCUMENTATION "Get all the direct relations which have 'conceptName' as their domain"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((concept (/PLI/GET-CONCEPT (|Value| conceptName) module NULL))
+            (xmlInstances (NEW (LIST OF |PLRelation|)))
+            (relations (GET-DIRECT-RELATIONS-FOR-CONCEPT module concept))
+            (container (NEW |PLRelationContainer|)))
+        (SETQ xmlInstances (MAKE-PL-RELATIONS relations (|Value| moduleName)))
+        (SETF (|PLRelation| container) xmlInstances)
+        (RETURN container)))))
+
+(DEFUN (SERVER-GET-INHERITED-RELATIONS-FOR-CONCEPT |PLRelationContainer|) ((moduleName |PLString|)
+									 (conceptName |PLString|))
+  :DOCUMENTATION "Get all the relations which have 'conceptName' as a subtype of their domain"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((concept (/PLI/GET-CONCEPT (|Value| conceptName) module NULL))
+            (xmlInstances (NEW (LIST OF |PLRelation|)))
+            (relations (GET-INHERITED-RELATIONS-FOR-CONCEPT module concept))
+            (container (NEW |PLRelationContainer|)))
+       (SETQ xmlInstances (MAKE-PL-RELATIONS relations (|Value| moduleName)))
+       (SETF (|PLRelation| container) xmlInstances)
+       (RETURN container)))))
+
+(DEFUN (SERVER-GET-PROPOSITIONS-FOR-INSTANCE |PLPropositionContainer|) ((moduleName |PLString|) (instanceName |PLString|))
+  :DOCUMENTATION "Get all the propositions for a given instance"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((propositions 
+	     (GET-PROPOSITIONS-FOR-OBJECT (|Value| moduleName) (|Value| instanceName) FALSE))
+	    (xmlInstances (NEW (LIST OF |PLProposition|)))
+	    (result (NEW |PLPropositionContainer|)))
+	(SETQ xmlInstances (MAKE-PL-PROPOSITIONS propositions module FALSE))
+	(SETF (|PLProposition| result) xmlInstances)
+	(RETURN result)))))
+
+(DEFUN (SERVER-GET-TYPES-FOR-INSTANCE |PLSurrogateCollection|) ((moduleName |PLString|) (instanceName |PLString|))
+  :DOCUMENTATION "Get all the types of an instance."
+  :PUBLIC? TRUE
+  (LET ((module (PLI/GET-MODULE (|Value| moduleName) NULL))
+	(instance (PLI/S-GET-OBJECT (GUI-NAME-TO-PL-NAME (|Value| instanceName)) (|Value| moduleName) NULL))
+	(types (LISTIFY (PLI/GET-DIRECT-TYPES instance module NULL))))
+    (WITHIN-MODULE module
+      (RETURN (CREATE-SURROGATE-COLLECTION-FOR-LOGIC-OBJECT types)))))
+
+(DEFUN (SERVER-GET-DOCUMENTATION-FOR-INSTANCE |PLString|) ((moduleName |PLString|) (instanceName |PLString|))
+  :DOCUMENTATION "Get the documentation string for module+instance."
+  :PUBLIC? TRUE
+  (RETURN (GET-DOCUMENTATION-FOR-OBJECT (|Value| moduleName) (|Value| instanceName))))
+
+(DEFUN (SERVER-GET-PROPOSITIONS-FOR-CONCEPT |PLPropositionContainer|) ((moduleName |PLString|) (instanceName |PLString|))
+  :DOCUMENTATION "Get all the propositions for a given concept"
+  :PUBLIC? TRUE
+  (RETURN (SERVER-GET-PROPOSITIONS-FOR-RELATION moduleName instanceName)))
+
+(DEFUN (SERVER-GET-PROPOSITIONS-FOR-RELATION |PLPropositionContainer|) ((moduleName |PLString|) (instanceName |PLString|))
+  :DOCUMENTATION "Get all the propositions for a given relation"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value| moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((propositions (GET-PROPOSITIONS-FOR-OBJECT (|Value| moduleName) (|Value| instanceName)
+                                                       TRUE))
+            (xmlInstances (NEW (LIST OF |PLProposition|)))
+            (result (NEW |PLPropositionContainer|)))
+        (SETQ xmlInstances (MAKE-PL-PROPOSITIONS propositions module FALSE))
+        (SETF (|PLProposition| result) xmlInstances)
+        (RETURN result)))))
+
+(DEFUN (SERVER-GET-RULES-FOR-CONCEPT |PLPropositionContainer|) ((moduleName |PLString|) (instanceName |PLString|))
+  :DOCUMENTATION "Get all the rules for a given concept"
+  :PUBLIC? TRUE
+  (RETURN (SERVER-GET-RULES-FOR-RELATION moduleName instanceName)))
+
+(DEFUN (SERVER-GET-RULES-FOR-RELATION |PLPropositionContainer|) ((moduleName |PLString|) (instanceName |PLString|))
+  :DOCUMENTATION "Get all the rules for a given relation"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((propositions
+             (GET-RELEVANT-RULES-FOR-RELATION (|Value| moduleName) (|Value| instanceName)))
+            (xmlInstances (NEW (LIST OF |PLProposition|)))
+            (result (NEW |PLPropositionContainer|)))
+        (SETQ xmlInstances (MAKE-PL-PROPOSITIONS propositions module TRUE))
+        (SETF (|PLProposition| result) xmlInstances)
+        (RETURN result)))))
+
+(DEFUN (SERVER-GET-PROPOSITIONS-FOR-INSTANCE-AND-RELATION |PLPropositionContainer|)
+    ((moduleName |PLString|) (instanceName |PLString|) (relationName |PLString|))
+  :DOCUMENTATION "Get all the propositions for a given instance and relation"
+  :PUBLIC? TRUE
+  (LET ((module (/PLI/GET-MODULE (|Value|  moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((propositions (GET-PROPOSITIONS-FOR-INSTANCE-AND-RELATION
+                           (|Value| moduleName) (|Value| instanceName)
+                           (|Value| relationName)))
+            (xmlInstances (NEW (LIST OF |PLProposition|)))
+            (result (NEW |PLPropositionContainer|)))
+        (SETQ xmlInstances (MAKE-PL-PROPOSITIONS propositions module FALSE))
+        (SETF (|PLProposition| result) xmlInstances)
+        (RETURN result)))))
+
+(DEFUN (SERVER-EVALUATE-LOGIC-COMMAND |PLString|) ((moduleName |PLString|) (commandString |PLString|))
+  :DOCUMENTATION "Evaluate 'commandString' and return the result"
+  :PUBLIC? TRUE
+  (LET ((command (|Value| commandString))
+	(module (|Value| moduleName))
+	(evalResult STRING NULL)
+	(result (NEW |PLString|)))
+    (SETQ evalResult (EVALUATE-LOGIC-COMMAND-IN-MODULE command module TRUE))
+    (SETF (|Value| result) (XMLIFY-STRING evalResult))
+    (RETURN result)))
+    
+(DEFUN (SERVER-GET-LOADABLE-KBS |PLModuleFileList|) ()
+  ;; Load the kb index
+  ;; construct the result from the index
+  :PUBLIC? TRUE
+  (LET ((fileDescriptions (LOAD-INDEX-FILE))
+	(result (NEW |PLModuleFileList|))
+	(plFiles (NEW (LIST OF |PLModuleFile|))))
+       (FOREACH desc IN fileDescriptions
+		DO (INSERT plFiles (MAKE-PL-FILE desc)))
+       (SETF (|PLModuleFile| result) plFiles)
+       (RETURN result)))
+
+(DEFUN (SERVER-LOAD-KB |PLString|) ((plKBName |PLString|))
+  ;; Load kb index
+  ;; lookup file name based on kbName
+  ;; load the file
+  ;; Return "OK" or "ERROR" depending on status of load
+  :PUBLIC? TRUE
+  (PRINT "in server-load-kb" EOL)
+  (LET ((kbName (|Value| plKBName))
+	(fileIndex (SERVER-GET-LOADABLE-KBS))
+	(fileName (FIND-FILENAME-FOR-KB fileIndex kbName))
+	(result (NEW |PLString|)))
+       (PRINT "kbName is:" kbName EOL)
+       (PRINT "fileName is:" fileName EOL)
+       (IF (DEFINED? fileName)
+	   (PROGN 
+	    (PRINT "Loading KB: " fileName EOL)
+	    (LOAD fileName)
+	    (SETF (|Value| result) "OK"))
+	   (PROGN
+	    (PRINT "Error: couldn't find fileName for " kbName)
+	    (SETF (|Value| result) "ERROR")))
+       (RETURN result)))
+
+;;; TO DO: this still needs to be renamed into something more meaningful, e.g.,
+;;;        server-load-client-side-kb, server-save-kb-to-client-side,...
+
+(DEFUN (SERVER-LOAD-KB2 |PLString|) ((file |PLFile|))
+  ;; This one takes a file instead of a kb name.
+  :PUBLIC? TRUE
+  (LET ((fileName (|FileName| file))
+        (content (|PLFileContent| file))
+	(result (NEW |PLString|)))
+    (cond ((and (defined? content)
+                (defined? (|textContent| content)))
+           (load-stream (new STRING-INPUT-STREAM :the-string (|textContent| content)))
+           (SETF (|Value| result)
+             (EXTRACT-MODULE-NAME-FROM-STREAM
+              (new STRING-INPUT-STREAM :the-string (|textContent| content)))))
+          ((defined? fileName)
+           (LOAD fileName)
+           (SETF (|Value| result) (EXTRACT-MODULE-NAME-FROM-FILE fileName))))
+    (RETURN result)))
+
+(DEFUN (SERVER-SAVE-KB |PLString|) ((plModuleName |PLString|) (plKBName |PLString|) (plDescription |PLString|))
+  ;; Lookup kbName in index
+  ;; if exists, replace it
+  ;; if it doesn't exist, add it to index, create a filename, and save kb
+  ;; if kb save is successful, save the index
+  :PUBLIC? TRUE
+  (LET ((kbName (|Value| plKBName))
+	(moduleName (|Value| plModuleName))
+	(module (PLI/GET-MODULE moduleName NULL))
+	(description (|Value| plDescription))
+	(rawFileIndex (LOAD-INDEX-FILE))
+	(fileIndex (SERVER-GET-LOADABLE-KBS))
+	(fileName (FIND-FILENAME-FOR-KB fileIndex kbName))
+	(result (NEW |PLString|)))
+       (IF (DEFINED? fileName)
+	   (PROGN
+	    (PRINT "Saving KB: " moduleName " to " fileName EOL)
+	    ;; Unlike SAVE-MODULE, this evalutes the "module" arg
+	    (LET ((stream (NEW OUTPUT-FILE-STREAM :FILENAME fileName)))
+	      (DO-SAVE-MODULE module stream)
+	      (FREE stream)))
+	   (LET ((newFile (CONCATENATE *KB-DIRECTORY* kbName ".ploom"))
+		 (newIndex (CONS (BQUOTE ( & kbName & moduleName & newFile
+					     & description)) rawFileIndex)))
+		(SAVE-INDEX-FILE newIndex)
+		(PRINT "Saving new KB: " moduleName " to " newFile EOL)
+		;; Unlike SAVE-MODULE, this evalutes the "module" arg
+		(LET ((stream (NEW OUTPUT-FILE-STREAM :FILENAME newFile)))
+		     (DO-SAVE-MODULE module stream)
+		     (FREE stream))
+		(PRINT "new index: " newIndex EOL)))
+       (SETF (|Value| result) "OK")
+       (RETURN result)))
+
+(DEFUN (SERVER-SAVE-KB2 |PLFile|) ((plModuleName |PLString|) (plFileName |PLString|))
+  :PUBLIC? TRUE
+  (LET ((moduleName (|Value| plModuleName))
+	(module (PLI/GET-MODULE moduleName NULL))
+	(fileName (|Value| plFileName))
+        (stream (NEW STRING-OUTPUT-STREAM))
+	(result (NEW |PLFile|)))
+  (PRINT "Saving KB: " moduleName " to " fileName EOL)
+    (DO-SAVE-MODULE module stream)
+    (setf (|FileName| result) filename)
+    (setf (|PLFileContent| result)
+      (new |PLFileContent| :|textContent| (the-string stream)))
+    (RETURN result)))
+
+(DEFUN (SERVER-CLEAR-KB |PLString|) ((module |PLModule|))
+  :PUBLIC? TRUE
+  (LET ((modName (|ModuleName| module))
+	(result (NEW |PLString|)))
+       (PLI/S-CLEAR-MODULE modName NULL)
+       (SETF (|Value| result) "OK")
+       (RETURN result)))
+
+(defglobal *query-session-timeout* INTEGER 86400)
+
+(defun (get-query-session HTTP/SESSION) ((query |PLQuery|) (error? BOOLEAN))
+  ;; Find or create a query session object for `query'.  If `error?', raise
+  ;; an error if no session object was found, or if the session timed out.
+  (let ((sessionName (|QueryName| query))
+        (session (HTTP/LOOKUP-SESSION sessionName FALSE)))
+    ;; NOTE: a null session can also happen if a query timed out and was later cleaned up:
+    (when (or (null? session)
+              (http/timed-out? session))
+      (if error?
+          (error "Query session expired")
+        (setq session (HTTP/CREATE-SESSION sessionName *query-session-timeout*))))
+    (return session)))
+
+(DEFUN (SERVER-QUERY |PLQueryResult|) ((plQuery |PLQuery|) (continueQuery? |PLString|))
+  :PUBLIC? TRUE
+  (LET ((continue? (STRING-EQL? (|Value| continueQuery?) "TRUE"))
+        (session (get-query-session plQuery continue?))
+        (result (NEW |PLQueryResult|))
+	(plTuples (NEW (LIST OF |PLTuple|)))
+	(query STRING NULL)
+	(moduleName (|Module| plQuery))
+	(queryResult CONS NULL)
+	(module (PLI/GET-MODULE moduleName NULL)))
+    (IF continue?
+        (SETQ query (CREATE-FOLLOWUP-QUERY-STRING plQuery))
+      (SETQ query (CREATE-QUERY-STRING plQuery)))
+    (SETQ queryResult 
+      (EVALUATE-QUERY-COMMAND-IN-MODULE session query moduleName continue? (IS-QUERY-PARTIAL? plQuery)))
+    (WITHIN-MODULE module
+      (FOREACH tuple IN queryResult
+        COLLECT (MAKE-PL-TUPLE tuple)
+        INTO plTuples)
+      (SETF (|PLTuple| result) plTuples)
+      (RETURN result))))
+
+
+(DEFUN (SERVER-SEARCH |PLSearchResult|) ((searchParameter |PLSearchParameter|))
+  :PUBLIC? TRUE
+  (LET ((moduleName (|ModuleName| searchParameter))
+	(searchString (|SearchString| searchParameter) )
+	(searchConcept? (|SearchConcept| searchParameter))
+	(searchRelation? (|SearchRelation| searchParameter))
+	(searchInstance? (|SearchInstance| searchParameter))
+	(caseSensitive? (|CaseSensitive| searchParameter))
+	(result (NEW |PLSearchResult|))
+	(searchResults (NEW (LIST OF |PLSearchResultItem|))))
+       (IF (STRING-EQL? moduleName "ALL")
+	   (SETQ searchResults (SEARCH-ALL-MODULES searchString
+						   searchInstance?
+						   searchConcept?
+						   searchRelation?
+						   caseSensitive?))
+	   (SETQ searchResults (SEARCH-MODULE moduleName searchString
+					      searchInstance? searchConcept?
+					      searchRelation?
+					      caseSensitive?)))
+       (SETF (|PLSearchResultItem| result) searchResults)
+       (RETURN result)))
+
+(DEFUN (SERVER-GET-EXTENSION-FOR-RELATION |PLQueryResult|) ((moduleName |PLString|) (relationName |PLString|))
+  :DOCUMENTATION "Get the extension for a relation"
+  :PUBLIC? TRUE
+  (LET ((module (PLI/GET-MODULE (|Value| moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((result (NEW |PLQueryResult|))
+            (plTuples (NEW (LIST OF |PLTuple|)))
+            (extension
+             (/PLI/S-GET-RELATION-EXTENSION (GUI-NAME-TO-PL-NAME (|Value| relationName)) module NULL)))
+        (FOREACH proposition IN extension 
+          COLLECT (MAKE-PL-TUPLE-FROM-PROPOSITION proposition)
+          INTO plTuples)
+        (SETF (|PLTuple| result) plTuples)
+        (RETURN result)))))
+
+(DEFUN (SERVER-DESTROY-OBJECT |PLString|) ((moduleName |PLString|) (objectName |PLString|))
+  :DOCUMENTATION "Destroy an object"
+  :PUBLIC? TRUE
+  (LET ((moduleString (|Value| moduleName))
+	(module (/PLI/GET-MODULE moduleString NULL))
+	(objectString (|Value| objectName))
+	(result (NEW |PLString|)))
+    (WITHIN-MODULE module
+      (/PLI/S-DESTROY-OBJECT objectString moduleString NULL)
+      (SETF (|Value| result) "OK")
+      (RETURN result))))
+
+(DEFUN (SERVER-GET-RELATION |PLRelationContainer|) ((moduleName |PLString|) (relationName |PLString|))
+  (LET ((module (/PLI/GET-MODULE (|Value| moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((result (NEW |PLRelationContainer|))
+            (relation
+             (/PLI/S-GET-RELATION (GUI-NAME-TO-PL-NAME (|Value| relationName)) (|Value| moduleName) NULL))
+            (xmlRelations (NEW (LIST OF |PLRelation|))))
+       (WHEN (DEFINED? relation)
+         (INSERT xmlRelations (MAKE-PL-RELATION relation (|Value| moduleName))))
+       (SETF (|PLRelation| result) xmlRelations)
+       (RETURN result)))))
+
+(DEFUN (SERVER-GET-CONCEPT |PLConceptContainer|) ((moduleName |PLString|) (conceptName |PLString|))
+  (LET ((module (/PLI/GET-MODULE (|Value| moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((result (NEW |PLConceptContainer|))
+            (concept
+             (/PLI/S-GET-CONCEPT (GUI-NAME-TO-PL-NAME (|Value| conceptName)) (|Value| moduleName) NULL))
+            (xmlConcepts (NEW (LIST OF |PLConcept|))))
+        (WHEN (DEFINED? concept)
+          (INSERT xmlConcepts (MAKE-PL-CONCEPT concept)))
+        (SETF (|PLConcept| result) xmlConcepts)
+        (RETURN result)))))
+
+(DEFUN (SERVER-GET-INSTANCE |PLInstanceContainer|) ((moduleName |PLString|) (instanceName |PLString|))
+  (LET ((module (/PLI/GET-MODULE (|Value| moduleName) NULL)))
+    (WITHIN-MODULE module
+      (LET ((result (NEW |PLInstanceContainer|))
+            (instance
+             (/PLI/S-GET-OBJECT (GUI-NAME-TO-PL-NAME (|Value| instanceName)) (|Value| moduleName) NULL))
+            (xmlInstances (NEW (LIST OF |PLInstance|))))
+        (WHEN (AND (ISA? instance @LOGIC-OBJECT) (DEFINED? instance))
+          (INSERT xmlInstances (MAKE-PL-INSTANCE instance)))
+        (SETF (|PLInstance| result) xmlInstances)
+        (RETURN result)))))
+
+(DEFUN (SERVER-GET-EXPLANATION-FOR-QUERY |PLString|) ((query |PLQuery|)
+                                                      (resultNumber |PLString|))
+  (LET ((session (get-query-session query TRUE))
+        (queryIterator (LOOKUP session "QueryIterator"))
+        (solutionIndex (1- (STRING-TO-INTEGER (|Value| resultNumber))))
+        (justifications (LIST OF JUSTIFICATION) NULL)
+        (explanation "No explanation available.")
+        (result (NEW |PLString|))
+	(moduleName (|Module| query))
+	(module (/PLI/GET-MODULE moduleName NULL)))
+    (WITHIN-MODULE module
+      (SETQ justifications
+        (GET-QUERY-JUSTIFICATIONS queryIterator solutionIndex NULL TRUE))
+      (WHEN (> (LENGTH justifications) 0)
+        (SETQ explanation (GET-JUSTIFICATION-STRING (FIRST justifications))))
+      (SETF (|Value| result) explanation)
+      (RETURN result))))
+
+(DEFUN (SERVER-GET-INFO |PLServerInfo|) ()
+  :DOCUMENTATION "Return a data structure describing the characteristics and capabilities of this server instance."
+  (LET ((result (NEW |PLServerInfo|)))
+       (IF *ALLOW-REMOTE-FILEBROWSING*
+	   (SETF (|AllowRemoteFileBrowsing| result) "TRUE")
+	   (SETF (|AllowRemoteFileBrowsing| result) "FALSE"))
+       (RETURN result)))
+
+  ;;
+;;;;;; Helpers
+  ;;
+
+(DEFUN (EXTRACT-MODULE-NAME-FROM-STREAM STRING) ((stream INPUT-STREAM))
+  ;; Extract the module name of the first IN-MODULE statement in `stream'.
+  ;; Return "**NOTFOUND**" if no such statements are found.
+  (FOREACH tree IN (S-EXPRESSIONS stream)
+      as i in (INTERVAL 1 20) ;; limit the search to the first 10 expressions
+      do (IGNORE i)
+         (TYPECASE tree
+           (CONS
+            (LET ((operator (FIRST tree))
+                  (moduleName STRING NULL))
+              (TYPECASE operator
+                (SYMBOL
+                 (CASE (CHOOSE (CASE-SENSITIVE? *MODULE*)
+                               (STRING-UPCASE (SYMBOL-NAME operator))
+                               (SYMBOL-NAME operator))
+                   ("IN-MODULE"
+                    (SETQ moduleName (coerce-to-module-name (second tree) FALSE))
+                    (if (null? moduleName)
+                        (signal-read-error "Illegal IN-MODULE declaration: " tree)
+                      (return moduleName)))
+                   (OTHERWISE NULL))) ;;ignore non-in-module stmts
+                (OTHERWISE NULL)))) ;; ignore non-symbol operators
+           (OTHERWISE NULL))) ;; ignore non-cons trees
+  (RETURN "**NOTFOUND**")) ;; no in-module found
+
+(DEFUN (EXTRACT-MODULE-NAME-FROM-FILE STRING) ((fileName STRING))
+  ;; Extract the module name of the first IN-MODULE statement in file `fileName'.
+  ;; Return "**NOTFOUND**" if no such statements are found.
+  (let ((moduleName STRING NULL))
+    (with-input-file (in fileName)
+      (setq moduleName (EXTRACT-MODULE-NAME-FROM-STREAM in)))
+    (return moduleName)))
+
+(DEFUN (CREATE-QUERY-STRING STRING) ((plQuery |PLQuery|))
+  ;; TO DO:
+  ;; - replace this and the follow-up version by a function that returns a query
+  ;;   iterator object (also taking the query session into account).  This would
+  ;;   allow us to clean up `EVALUATE-QUERY-COMMAND-IN-MODULE' in turn (e.g., the
+  ;;   ugly option processing).
+  ;; - clean up the option generation to not involve the generation of an
+  ;;   intermediate string.
+  (LET ((result STRING "")
+	(queryBody STRING NULL)
+	(howManyClause STRING "")
+	(inferenceLevelClause STRING "")
+	(minScoreClause STRING "")
+	(maxUnknownsClause STRING "")
+	(matchModeClause STRING "")
+	(timeoutClause STRING "")
+	(commandClause STRING "")
+	(moveoutClause STRING "")
+	(maximizeScoreClause STRING "")
+	(dontOptimizeClause STRING ""))
+       (WHEN (AND (DEFINED? (|NumResults| plQuery)) (> (LENGTH (|NumResults| plQuery)) 0)
+		  (NOT (STRING-EQL? (|NumResults| plQuery) "ALL")))
+         (SETQ howManyClause (CONCATENATE " :HOW-MANY " (|NumResults| plQuery))))
+       (WHEN (AND (DEFINED? (|Timeout| plQuery)) (> (LENGTH (|Timeout| plQuery)) 0))
+         (SETQ timeoutClause (CONCATENATE " :TIMEOUT " (|Timeout| plQuery))))
+       (WHEN (AND (DEFINED? (|Moveout| plQuery)) (> (LENGTH (|Moveout| plQuery)) 0))
+         (SETQ moveoutClause (CONCATENATE " :MOVEOUT " (|Moveout| plQuery))))
+       (WHEN (AND (DEFINED? (|MinScore| plQuery)) (> (LENGTH (|MinScore| plQuery)) 0))
+         (SETQ minScoreClause (CONCATENATE " :MINIMUM-SCORE " (|MinScore| plQuery))))
+       (WHEN (AND (DEFINED? (|MaximizeScore| plQuery)) (> (LENGTH (|MaximizeScore| plQuery)) 0))
+         (SETQ maximizeScoreClause (CONCATENATE " :MAXIMIZE-SCORE? " (|MaximizeScore| plQuery))))
+       (WHEN (AND (DEFINED? (|DontOptimize| plQuery)) (> (LENGTH (|DontOptimize| plQuery)) 0))
+         (SETQ dontOptimizeClause (CONCATENATE " :DONT-OPTIMIZE? " (|DontOptimize| plQuery))))
+       (WHEN (AND (DEFINED? (|MaxUnknowns| plQuery)) (> (LENGTH (|MaxUnknowns| plQuery)) 0))
+         (SETQ maxUnknownsClause (CONCATENATE " :MAXIMUM-UNKNOWNS " (|MaxUnknowns| plQuery))))
+        (WHEN (AND (DEFINED? (|MatchMode| plQuery)) (> (LENGTH (|MatchMode| plQuery)) 0))
+          (SETQ matchModeClause (CONCATENATE " :MATCH-MODE :" (|MatchMode| plQuery))))
+       (WHEN (AND (DEFINED? (|InferenceLevel| plQuery)) (> (LENGTH (|InferenceLevel| plQuery)) 0))
+         (SETQ inferenceLevelClause (CONCATENATE " :INFERENCE-LEVEL :" (|InferenceLevel| plQuery))))
+       (IF (AND (DEFINED? (|IsAsk| plQuery)) (STRING-EQL? (|IsAsk| plQuery) "TRUE"))
+           ;; still need to generalize ASK to allow partial queries:
+           (SETQ commandClause "/LOGIC/ASK ")
+           (SETQ commandClause "/LOGIC/RETRIEVE "))
+       (SETQ queryBody (CONCATENATE (|NumResults| plQuery) " " (|Query| plQuery)))
+       (SETQ result (CONCATENATE "(" commandClause queryBody howManyClause timeoutClause moveoutClause minScoreClause maximizeScoreClause dontOptimizeClause maxUnknownsClause matchModeClause inferenceLevelClause")"))
+       (RETURN result)))
+
+(DEFUN (CREATE-FOLLOWUP-QUERY-STRING STRING) ((plQuery |PLQuery|))
+  ;; Just uses the :how-many results for now.  IMPROVE THIS!
+  (LET ((result STRING "")
+	(queryBody STRING NULL)
+	(commandClause STRING NULL))
+       (SETQ commandClause "/LOGIC/RETRIEVE ")
+       (SETQ queryBody (CONCATENATE (|NumResults| plQuery) ""))
+       (SETQ result (CONCATENATE "(" commandClause queryBody")"))
+       (RETURN result)))
+
+(DEFUN (MAKE-PL-TUPLE-FROM-PROPOSITION |PLTuple|) ((proposition PROPOSITION))
+  (LET ((arguments (ARGUMENTS proposition))
+	(plObjectUnions (NEW (LIST OF |PLObjectUnion|)))
+	(result (NEW |PLTuple|)))
+       (FOREACH argument IN arguments
+		COLLECT (MAKE-PL-OBJECT-UNION argument)
+		INTO plObjectUnions)
+       (SETF (|PLObjectUnion| result) plObjectUnions)
+       (RETURN result)))
+
+(DEFUN (MAKE-PL-TUPLE |PLTuple|) ((tuple (CONS OF OBJECT)))
+  (LET ((result (NEW |PLTuple|))
+	(plObjectUnions (NEW (LIST OF |PLObjectUnion|))))
+       (FOREACH object IN tuple
+		COLLECT (MAKE-PL-OBJECT-UNION object)
+		INTO plObjectUnions)
+       (SETF (|PLObjectUnion| result) plObjectUnions)
+       (RETURN result)))
+
+(DEFUN (MAKE-PL-OBJECT-UNION |PLObjectUnion|) ((object OBJECT))
+  (LET ((result (NEW |PLObjectUnion|)))
+       (SETF (|LiteralValue| result) "")
+       (SETF (|Type| result) "")
+       (WHEN (NULL? object)
+	     (SETF (|LiteralValue| result) "")
+	     (SETF (|Type| result) "STRING")
+	     (RETURN result))
+       (WHEN (AND (SKOLEM? object)
+		  (DEFINED? (VARIABLE-VALUE (CAST object SKOLEM))))
+	     (SETQ object (VARIABLE-VALUE (CAST object SKOLEM))))
+       (TYPECASE object
+		 (INTEGER-WRAPPER
+		  (SETF (|LiteralValue| result) (STRINGIFY (WRAPPER-VALUE object)))
+		  (SETF (|Type| result) "INTEGER"))
+		 (FLOAT-WRAPPER
+		  (SETF (|LiteralValue| result) (STRINGIFY (WRAPPER-VALUE object)))
+		  (SETF (|Type| result) "FLOAT"))
+		 (STRING
+		  (SETF (|LiteralValue| result) object)
+		  (SETF (|Type| result) "STRING"))
+		 (TRUTH-VALUE
+		  (SETF (|LiteralValue| result) (GET-TRUTH-VALUE-STRING object))
+		  (SETF (|Type| result) "TRUTH-VALUE"))
+		 (NAMED-DESCRIPTION
+		  (SETF (|PLSurrogate| result) (MAKE-LOGIC-SURROGATE object))
+		  (IF (CLASS? object)
+		      (SETF (|Type| result) "CONCEPT")
+		      (SETF (|Type| result) "RELATION")))
+		 (SKOLEM  ;; todo? Mark this is a skolem (e.g., have isSkolem on |PLInstance|)
+		  (SETF (|PLSurrogate| result) (MAKE-LOGIC-SURROGATE object))
+		  (SETF (|Type| result) "INSTANCE"))
+		 (LOGIC-OBJECT
+		  (SETF (|PLSurrogate| result) (MAKE-LOGIC-SURROGATE object))
+		  (SETF (|Type| result) "INSTANCE"))
+		 (OTHERWISE  ;; We can't handle unknown types yet....
+		  (PRINT "This object has unknown type: " object " (type = " ")" EOL)
+		  (IF (NULL? object)
+		      (PRINT "make-pl-object-union: object is NOT defined" EOL)
+                    ;; kludge to not break on objects such as timepoints:
+                    (setq result (MAKE-PL-OBJECT-UNION (STRINGIFY object))))))
+       (RETURN result)))
+
+(DEFUN (GET-MODULES |PLModuleContainer|) ((module MODULE))
+  (LET ((allModules (COLLECT-ALL-MODULES module (NEW (LIST OF MODULE))))
+	(result (CREATE-MODULE-CONTAINER allModules)))
+       (RETURN result)))
+
+(DEFUN (CODE-MODULE? BOOLEAN) ((module MODULE))
+  (RETURN (OR (CODE-ONLY? module)
+	      ; (STRING-EQL? (MODULE-NAME module) "STELLA")
+	      (STRING-EQL? (MODULE-NAME module) "IDL-THEORY")
+	      ; (STRING-EQL? (MODULE-NAME module) "PLI")
+	      ; (STRING-EQL? (MODULE-NAME module) "COMMON-LISP")
+	      (STRING-EQL? (MODULE-NAME module) "IDL-USER-THEORY"))))
+
+(DEFUN (COLLECT-ALL-MODULES (LIST OF MODULE)) ((module MODULE) (collectedModules (LIST OF MODULE)))
+  ;(UNLESS (CODE-ONLY? module)
+  ;  (INSERT collectedModules module))
+  ;; Do this unconditionally, since the GUI code needs the Root to work properly!
+  (FOREACH child IN (/PLI/GET-CHILD-MODULES module)
+    WHERE (NOT (CODE-MODULE? child))
+    DO (COLLECT-ALL-MODULES child collectedModules))
+  (INSERT collectedModules module)
+  (RETURN collectedModules))
+
+(DEFUN (CREATE-MODULE-CONTAINER |PLModuleContainer|) ((collectedModules (LIST OF MODULE)))
+  (LET ((container (NEW |PLModuleContainer|))	
+	(plModules (NEW (LIST OF |PLModule|))))
+       (FOREACH module IN collectedModules
+		DO (LET
+		    ((plModule (NEW |PLModule|))
+		     (childModuleIter (/PLI/GET-CHILD-MODULES module))
+		     (surrogateChildren (NEW (LIST OF |PLSurrogate|))))
+		    (SETF (|ModuleName| plModule) (MODULE-NAME module))
+		    (IF (NULL? (MODULE-CPP-PACKAGE module))
+			(SETF (|CppPackage| plModule) "")
+			(SETF (|CppPackage| plModule) (MODULE-CPP-PACKAGE module)))
+		    (IF (NULL? (MODULE-LISP-PACKAGE module))
+			(SETF (|LispPackage| plModule) "")
+			(SETF (|LispPackage| plModule) (MODULE-LISP-PACKAGE module)))
+		    (IF (NULL? (JAVA-PACKAGE module))
+			(SETF (|JavaPackage| plModule) "")
+			(SETF (|JavaPackage| plModule) (JAVA-PACKAGE module)))
+		    (IF (NULL? (JAVA-FLOTSAM-CLASS module))
+			(SETF (|JavaCatchallClass| plModule) "")
+			(SETF (|JavaCatchallClass| plModule) (JAVA-FLOTSAM-CLASS module)))
+		    (IF (NULL? (DOCUMENTATION module))
+			(SETF (|Documentation| plModule) "")
+			(SETF (|Documentation| plModule) 
+			      (XMLIFY-STRING (DOCUMENTATION module))))
+		    (IF (CASE-SENSITIVE? module)
+			(SETF (|CaseSensitive| plModule) "TRUE")
+			(SETF (|CaseSensitive| plModule) "FALSE"))		    
+		    (IF (API? module)
+			(SETF (API plModule) "TRUE")
+			(SETF (API plModule) "FALSE"))
+		    (SETF (|SourceString| plModule) 
+			  (REPLACE-CHOKABLE-CHARS-WITH-ENTITIES (GET-STRINGIFIED-MODULE module)))
+		    (FOREACH child IN childModuleIter
+			     WHERE (NOT (CODE-MODULE? child))
+			     COLLECT (MAKE-MODULE-SURROGATE child)
+			     INTO surrogateChildren)
+		    (SETF (|PLSurrogate| plModule) surrogateChildren)
+		    (INSERT plModules plModule)))
+       (SETF (|PLModule| container) plModules)
+       (RETURN container)))
+
+(DEFUN (GET-STELLA-LITERAL-CONCEPTS (LIST OF NAMED-DESCRIPTION)) ()
+  ;; Get concepts that exist in the root module that have native-relations in Stella.
+  ;; For now, we only care about the literal sub-hierarchy.
+  (LET ((collectedConcepts (NEW (LIST OF NAMED-DESCRIPTION)))
+	(topConcept (GET-DESCRIPTION (SURROGATE-VALUE @LITERAL)))
+	(module (/PLI/GET-MODULE "PL-KERNEL-KB" NULL)))
+       (GET-STELLA-LITERAL-CONCEPTS-HELPER module topConcept collectedConcepts)
+       (RETURN collectedConcepts)))
+
+(DEFUN GET-STELLA-LITERAL-CONCEPTS-HELPER ((module MODULE) (concept NAMED-DESCRIPTION)
+					   (collectedConcepts (LIST OF NAMED-DESCRIPTION)))
+  (FOREACH child IN (/PLI/GET-DIRECT-SUBRELATIONS concept module NULL)
+	   DO (GET-STELLA-LITERAL-CONCEPTS-HELPER module child collectedConcepts))
+  (INSERT collectedConcepts concept))
+					   
+(DEFUN (GET-CONCEPTS |PLConceptContainer|) ((module MODULE))
+  (LET ((allConcepts (GET-ALL-CONCEPTS module TRUE))
+	(result |PLConceptContainer| NULL))
+       (WHEN (EQL? module (/PLI/GET-MODULE "PL-KERNEL-KB" NULL))
+	     (CONCATENATE allConcepts (GET-STELLA-LITERAL-CONCEPTS)))
+       (SETQ result (CREATE-CONCEPT-CONTAINER allConcepts module TRUE))
+       (RETURN result)))
+
+(DEFUN (GET-CONCEPTS-WITH-PREFIX |PLConceptContainer|) ((module MODULE) (prefix STRING))
+  (LET ((allConcepts (GET-ALL-CONCEPTS-WITH-PREFIX module FALSE prefix))
+	(result |PLConceptContainer| NULL))
+       (SETQ result (CREATE-CONCEPT-CONTAINER allConcepts module FALSE))
+       (RETURN result)))
+
+(DEFUN (CREATE-CONCEPT-CONTAINER |PLConceptContainer|) ((collectedConcepts (LIST OF DESCRIPTION)) (module MODULE) (includeChildren? BOOLEAN))
+  (LET ((container (NEW |PLConceptContainer|))	
+	(plConcepts (NEW (LIST OF |PLConcept|))))
+       (FOREACH concept IN collectedConcepts
+		DO (LET
+		    ((plConcept (NEW |PLConcept|))
+		     (childConceptIter (/PLI/GET-DIRECT-SUBRELATIONS concept module NULL))
+		     (surrogateChildren (NEW (LIST OF |PLSurrogate|))))
+                    (SETF (|ConceptName| plConcept) (XMLIFY-STRING (PL-OBJECT-TO-GUI-NAME concept)))
+		    (SETF (|Module| plConcept) (MODULE-FULL-NAME (HOME-MODULE concept)))
+		    (SETF (|SourceString| plConcept) "")
+		    (WHEN includeChildren?
+			  (FOREACH child IN childConceptIter
+				   ;; We may want to filter out children that aren't in 'module' here.
+				   WHERE (AND (CLASS? child)
+					      (NOT (DELETED-OBJECT? child)))
+				   COLLECT (MAKE-LOGIC-SURROGATE child)
+				   INTO surrogateChildren))
+		    (SETQ surrogateChildren (SORT surrogateChildren (THE-CODE :FUNCTION |PLSurrogate<|)))
+		    (SETF (|PLSurrogate| plConcept) surrogateChildren)
+		    (INSERT plConcepts plConcept)))
+       (SETQ plConcepts (SORT plConcepts (THE-CODE :FUNCTION |PLConcept<|)))
+       (SETF (|PLConcept| container) plConcepts)
+       (RETURN container)))
+
+(DEFUN (GET-RELATIONS |PLRelationContainer|) ((module MODULE))
+  (LET ((allRelations (GET-ALL-RELATIONS module))
+	(result (CREATE-RELATION-CONTAINER allRelations module TRUE)))
+       (RETURN result)))
+
+(DEFUN (GET-RELATIONS-WITH-PREFIX |PLRelationContainer|) ((module MODULE) (prefix STRING))
+  (LET ((allRelations (GET-ALL-RELATIONS-WITH-PREFIX module FALSE prefix))
+	(result |PLRelationContainer| NULL))
+       (SETQ result (CREATE-RELATION-CONTAINER allRelations module FALSE))
+       (RETURN result)))
+
+(DEFUN (CREATE-RELATION-CONTAINER |PLRelationContainer|) ((collectedRelations (LIST OF DESCRIPTION)) (module MODULE) (includeChildren? BOOLEAN))
+  (LET ((container (NEW |PLRelationContainer|))	
+	(plRelations (NEW (LIST OF |PLRelation|))))
+       (FOREACH relation IN collectedRelations
+		DO (LET
+		    ((plRelation (NEW |PLRelation|))
+		     (childRelationIter (/PLI/GET-DIRECT-SUBRELATIONS relation module NULL))
+		     (surrogateChildren (NEW (LIST OF |PLSurrogate|))))
+		    (IF (FUNCTION? relation)
+			(SETF (|IsFunction| plRelation) "TRUE")
+			(SETF (|IsFunction| plRelation) "FALSE"))
+		    (IF (CLOSED-TERM? relation)
+			(SETF (|IsClosed| plRelation) "TRUE")
+			(SETF (|IsClosed| plRelation) "FALSE"))		    
+                    (SETF (|RelationName| plRelation) (XMLIFY-STRING (PL-OBJECT-TO-GUI-NAME relation)))
+		    (SETF (|Module| plRelation) (MODULE-FULL-NAME (HOME-MODULE relation)))
+		    (SETF (|SourceString| plRelation) "")
+		    (WHEN includeChildren?
+			  (FOREACH child IN childRelationIter
+				   WHERE (AND (NOT (CLASS? child)) ; filter out concepts
+					      (NOT (DELETED-OBJECT? child)))
+				   COLLECT (MAKE-LOGIC-SURROGATE child)
+				   INTO surrogateChildren))
+		    (SETQ surrogateChildren (SORT surrogateChildren (THE-CODE :FUNCTION |PLSurrogate<|)))
+		    (SETF (|PLSurrogate| plRelation) surrogateChildren)
+		    (INSERT plRelations plRelation)))
+       (SETQ plRelations (SORT plRelations (THE-CODE :FUNCTION |PLRelation<|)))
+       (SETF (|PLRelation| container) plRelations)
+       (RETURN container)))
+
+(DEFUN (CREATE-MODULE-COLLECTION |PLSurrogateCollection|) ((modules (LIST OF MODULE)))
+  (LET ((surrogateChildren (NEW (LIST OF |PLSurrogate|)))
+	(plSurrogateCollection (NEW |PLSurrogateCollection|)))
+       (FOREACH module IN modules
+		COLLECT (MAKE-MODULE-SURROGATE module)
+		INTO surrogateChildren)
+       (SETQ surrogateChildren (SORT surrogateChildren (THE-CODE :FUNCTION |PLSurrogate<|)))
+       (SETF (|PLSurrogate| plSurrogateCollection) surrogateChildren)
+       (RETURN plSurrogateCollection)))
+
+(DEFUN (CREATE-SURROGATE-COLLECTION |PLSurrogateCollection|) ((surrogates (LIST OF SURROGATE)))
+  (LET ((surrogateChildren (NEW (LIST OF |PLSurrogate|)))
+	(plSurrogateCollection (NEW |PLSurrogateCollection|)))
+       (FOREACH surrogate IN surrogates
+		COLLECT (MAKE-SURROGATE-SURROGATE surrogate)
+		INTO surrogateChildren)
+       (SETQ surrogateChildren (SORT surrogateChildren (THE-CODE :FUNCTION |PLSurrogate<|)))
+       (SETF (|PLSurrogate| plSurrogateCollection) surrogateChildren)
+       (RETURN plSurrogateCollection)))
+
+(DEFUN (CREATE-SURROGATE-COLLECTION-FOR-LOGIC-OBJECT |PLSurrogateCollection|) ((relations (LIST OF LOGIC-OBJECT)))
+  (LET ((surrogateChildren (NEW (LIST OF |PLSurrogate|)))
+	(plSurrogateCollection (NEW |PLSurrogateCollection|)))
+       (FOREACH relation IN relations
+		COLLECT (MAKE-LOGIC-SURROGATE relation)
+		INTO surrogateChildren)
+       (SETQ surrogateChildren (SORT surrogateChildren (THE-CODE :FUNCTION |PLSurrogate<|)))
+       (SETF (|PLSurrogate| plSurrogateCollection) surrogateChildren)
+       (RETURN plSurrogateCollection)))
+
+(DEFUN (CREATE-SUPERRELATIONS-CONTAINER |PLSurrogateCollection|) ((relation LOGIC-OBJECT) (module MODULE))
+  (WITHIN-MODULE module
+		 (LET ((parentRelationIter (/PLI/GET-DIRECT-SUPERRELATIONS relation module NULL))
+		       (surrogateChildren (NEW (LIST OF |PLSurrogate|)))
+		       (plSurrogateCollection (NEW |PLSurrogateCollection|)))
+		      (FOREACH parent IN parentRelationIter
+			       COLLECT (MAKE-LOGIC-SURROGATE parent)
+			       INTO surrogateChildren)
+		      (SETQ surrogateChildren (SORT surrogateChildren (THE-CODE :FUNCTION |PLSurrogate<|)))
+		      (SETF (|PLSurrogate| plSurrogateCollection) surrogateChildren)
+		      (RETURN plSurrogateCollection))))
+
+(DEFUN (CREATE-VARIABLES-LIST |PLVariableList|) ((relation LOGIC-OBJECT))
+  (LET ((variables (NEW (LIST OF |PLVariable|)))
+	(plVariableList (NEW |PLVariableList|)))
+    (TYPECASE relation
+      (NAMED-DESCRIPTION
+       (FOREACH variableName IN (IO-VARIABLE-NAMES relation)
+		AS variableType IN (IO-VARIABLE-TYPES relation)
+		COLLECT (MAKE-PL-VARIABLE variableName variableType)
+		INTO variables))
+      (OTHERWISE NULL))
+    (SETF (|PLVariable| plVariableList) variables)
+    (RETURN plVariableList)))
+
+(DEFUN (MAKE-PL-VARIABLE |PLVariable|) ((variableName STRING) (variableType SURROGATE)) 
+  (LET ((result (NEW |PLVariable|))
+	(plVariableName (NEW |PLString|))
+	(plVariableType (NEW |PLSurrogate|)))
+       (SETF (|Value| plVariableName) variableName)
+       (SETF (ID plVariableType) (SURROGATE-NAME variableType))
+       (SETF (|VariableName| result) plVariableName)
+       (SETF (|VariableType| result) plVariableType)
+       (RETURN result)))
+
+(DEFUN (MAKE-PL-RELATION |PLRelation|) ((relation LOGIC-OBJECT) (moduleName STRING))
+  ;; Make an XML Relation
+  (IGNORE moduleName)
+  (LET ((xmlRelation (NEW |PLRelation|)))
+    (SETF (|Module| xmlRelation) (MODULE-FULL-NAME (HOME-MODULE relation)))
+    (IF (FUNCTION? relation)
+        (SETF (|IsFunction| xmlRelation) "TRUE")
+      (SETF (|IsFunction| xmlRelation) "FALSE"))
+    (IF (CLOSED-TERM? relation)
+        (SETF (|IsClosed| xmlRelation) "TRUE")
+      (SETF (|IsClosed| xmlRelation) "FALSE"))
+    (SETF (|SourceString| xmlRelation) "")
+    (SETF (|RelationName| xmlRelation) (XMLIFY-STRING (PL-OBJECT-TO-GUI-NAME relation)))
+    (RETURN xmlRelation)))
+
+(DEFUN (MAKE-PL-CONCEPT |PLConcept|) ((concept LOGIC-OBJECT))
+  ;; Make an XML Concept
+  (LET ((xmlConcept (NEW |PLConcept|)))
+    (SETF (|Module| xmlConcept) (MODULE-FULL-NAME (HOME-MODULE concept)))
+    (SETF (|SourceString| xmlConcept) "")
+    (SETF (|ConceptName| xmlConcept) (XMLIFY-STRING (PL-OBJECT-TO-GUI-NAME concept)))
+    (RETURN xmlConcept)))
+
+(DEFUN (MAKE-PL-RELATIONS (LIST OF |PLRelation|)) ((relations (LIST OF DESCRIPTION)) (moduleName STRING))
+  ;; Convert a list of relations into xml
+  (LET ((result (NEW (LIST OF |PLRelation|))))
+       (FOREACH relation IN relations
+		COLLECT (MAKE-PL-RELATION relation moduleName) INTO result)
+       (RETURN result)))
+
+(DEFUN (MAKE-MODULE-SURROGATE |PLSurrogate|) ((module MODULE))
+  (LET ((result |PLSurrogate| (NEW |PLSurrogate|)))
+       (SETF (ID result) (MODULE-NAME module))
+       (RETURN result)))
+
+(DEFUN (MAKE-SURROGATE-SURROGATE |PLSurrogate|) ((surrogate SURROGATE))
+  (LET ((result |PLSurrogate| (NEW |PLSurrogate|)))
+       (SETF (ID result) (XMLIFY-STRING (PL-OBJECT-TO-GUI-NAME surrogate)))
+       (RETURN result)))
+
+(DEFUN (MAKE-LOGIC-SURROGATE |PLSurrogate|) ((obj LOGIC-OBJECT))
+  (LET ((result |PLSurrogate| (NEW |PLSurrogate|)))
+       ;; For skolems, Just store the print-representation as the name
+       (WHEN (SKOLEM? obj)
+	     (LET ((resultStream (NEW STRING-OUTPUT-STREAM))
+		   (nativeStream (NATIVE-STREAM resultStream))
+		   (printName STRING NULL))
+		  (SPECIAL ((*PRINTREADABLY?* TRUE)
+			    (*PRINTPRETTY?* TRUE))
+			   ;; Deal with pretty-printing of Lisp conses -
+			   ;;    THIS NEEDS TO BE FIXED.
+			   (VERBATIM
+			    :COMMON-LISP
+			    "(CL:WHEN (USE-CL-CONSES?)
+			      (CL:LET ((CL:*PRINT-PRETTY* CL:T))
+				(PRINT-TOP-LEVEL-OBJECT obj nativeStream)))"
+			    :OTHERWISE NULL)
+			   (SETQ printName (XMLIFY-STRING (THE-STRING resultStream))))
+		  (SETF (ID result) printName)
+		  (RETURN result)))
+       ;; Not a surrogate:
+       (SETF (ID result) (XMLIFY-STRING (PL-OBJECT-TO-GUI-NAME obj)))
+       (RETURN result)))
+
+(DEFUN (GET-ALL-RELATIONS (LIST OF DESCRIPTION)) ((module MODULE))
+  (LET ((iter (ALL-NAMED-DESCRIPTIONS module TRUE))
+	(result (NEW (LIST OF DESCRIPTION))))
+       (FOREACH description IN iter 
+		WHERE (NOT (CLASS? description))
+		COLLECT description INTO result)
+       (RETURN result)))
+
+(DEFUN (GET-ALL-RELATIONS-WITH-PREFIX (LIST OF DESCRIPTION)) ((module MODULE) (local? BOOLEAN) (prefix STRING))
+  ;; Note: this is not case-sensitive.
+  (LET ((iter (ALL-NAMED-DESCRIPTIONS module local?))
+	(result (NEW (LIST OF DESCRIPTION)))
+	(downcasedPrefix (STRING-DOWNCASE prefix)))
+    (FOREACH description IN iter 
+      WHERE (AND (NOT (CLASS? description))
+                 (DEFINED? prefix)
+                 (STARTS-WITH? (GET-LOGIC-OBJECT-NAME description "FALSE") downcasedPrefix 0))
+      COLLECT description INTO result)
+    (RETURN result)))
+
+(DEFUN (GET-ALL-CONCEPTS (LIST OF DESCRIPTION)) ((module MODULE) (local? BOOLEAN))
+  (LET ((iter (ALL-NAMED-DESCRIPTIONS module local?))
+	(result (NEW (LIST OF DESCRIPTION))))
+       (FOREACH description IN iter 
+		WHERE (CLASS? description)
+		COLLECT description INTO result)
+       (RETURN result)))
+
+(DEFUN (GET-ALL-CONCEPTS-WITH-PREFIX (LIST OF DESCRIPTION)) ((module MODULE) (local? BOOLEAN) (prefix STRING))
+  ;; Note: this is not case-sensitive.
+  (LET ((iter (ALL-NAMED-DESCRIPTIONS module local?))
+	(result (NEW (LIST OF DESCRIPTION)))
+	(downcasedPrefix (STRING-DOWNCASE prefix)))
+    (FOREACH description IN iter 
+      WHERE (AND (CLASS? description)
+                 (DEFINED? prefix)
+                 (STARTS-WITH? (GET-LOGIC-OBJECT-NAME description "FALSE") downcasedPrefix 0))
+      COLLECT description INTO result)
+    (RETURN result)))
+
+(DEFUN (GET-SUBCONCEPTS (LIST OF DESCRIPTION)) ((concept DESCRIPTION) (module MODULE))
+  (LET ((iter (/PLI/GET-DIRECT-SUBRELATIONS concept module NULL))
+	(result (NEW (LIST OF DESCRIPTION))))
+       (FOREACH sub IN iter
+		COLLECT sub INTO result)
+       (RETURN result)))
+
+(DEFUN (GET-SUBRELATIONS (LIST OF DESCRIPTION)) ((relation DESCRIPTION) (module MODULE))
+  (LET ((iter (/PLI/GET-DIRECT-SUBRELATIONS relation module NULL))
+	(result (NEW (LIST OF DESCRIPTION))))
+       (FOREACH sub IN iter
+		COLLECT sub INTO result)
+       (RETURN result)))
+
+(DEFUN (GET-SUPERCONCEPTS (LIST OF DESCRIPTION)) ((concept DESCRIPTION) (module MODULE))
+  (LET ((iter (/PLI/GET-DIRECT-SUPERRELATIONS concept module NULL))
+	(result (NEW (LIST OF DESCRIPTION))))
+       (FOREACH super IN iter
+		COLLECT super INTO result)
+       (RETURN result)))
+
+(DEFUN (GET-SUPERRELATIONS (LIST OF DESCRIPTION)) ((relation DESCRIPTION) (module MODULE))
+  (LET ((iter (/PLI/GET-DIRECT-SUPERRELATIONS relation module NULL))
+	(result (NEW (LIST OF DESCRIPTION))))
+       (FOREACH super IN iter
+		COLLECT super INTO result)
+       (RETURN result)))
+
+(DEFUN (MAKE-PL-INSTANCE |PLInstance|) ((instance LOGIC-OBJECT))
+  ;; Make an XML Instance
+  (LET ((xmlInstance (NEW |PLInstance|)))
+       (SETF (|InstanceName| xmlInstance) (XMLIFY-STRING (PL-OBJECT-TO-GUI-NAME instance)))
+       (IF (DEFINED? (HOME-MODULE instance))
+	   (SETF (|Module| xmlInstance) (MODULE-FULL-NAME (HOME-MODULE instance)))
+	   (SETF (|Module| xmlInstance) ""))
+       (SETF (|SourceString| xmlInstance) (CONCATENATE "(DEFOBJECT " (|InstanceName| xmlInstance) ")"))
+       (RETURN xmlInstance)))
+
+(DEFUN (MAKE-PL-INSTANCES (LIST OF |PLInstance|)) ((instances (LIST OF LOGIC-OBJECT)) (skipUninternedInstances? BOOLEAN))
+  ;; Convert a list of instances into xml
+  (LET ((result (NEW (LIST OF |PLInstance|))))
+       (FOREACH instance IN instances
+		WHERE (OR (NOT skipUninternedInstances?) (DEFINED? (HOME-MODULE instance)))
+		COLLECT (MAKE-PL-INSTANCE instance) INTO result)
+       (RETURN result)))
+
+(DEFUN (MAKE-PL-PROPOSITION |PLProposition|) ((proposition PROPOSITION) (module MODULE) (isRule BOOLEAN))
+  ;; Make an XML Proposition
+  (LET ((xmlProposition (NEW |PLProposition|)))
+       (SETF (|PropositionName| xmlProposition) (GET-PROPOSITION-STRING proposition module))
+       (IF (/PLI/ASSERTED-AS-TRUE? proposition)
+	   (SETF (|IsAsserted| xmlProposition) "TRUE")
+	   (SETF (|IsAsserted| xmlProposition) "FALSE"))
+       (WITHIN-CONTEXT (GET-QUERY-CONTEXT)
+         (IF (/PLI/IS-STRICT (PROPOSITION-TRUTH-VALUE proposition))
+	     (SETF (|IsStrict| xmlProposition) "TRUE")
+	     (SETF (|IsStrict| xmlProposition) "FALSE")))
+       (IF isRule
+	   (SETF (|IsRule| xmlProposition) "TRUE")
+	   (SETF (|IsRule| xmlProposition) "FALSE"))
+       (RETURN xmlProposition)))
+
+(DEFUN (MAKE-PL-PROPOSITIONS (LIST OF |PLProposition|)) ((propositions (LIST OF PROPOSITION)) 
+						       (module MODULE)
+						       (isRule BOOLEAN))
+  ;; Convert a list of propositions into xml
+  (LET ((result (NEW (LIST OF |PLProposition|))))
+       (FOREACH proposition IN propositions
+		COLLECT (MAKE-PL-PROPOSITION proposition module isRule) INTO result)
+       (RETURN result)))
+
+(DEFUN (GET-DOCUMENTATION-FOR-OBJECT |PLString|) ((moduleName STRING) (objectName STRING))
+  ;; Collect all documentation strings for object `objectName' and concatenate them.
+  (LET ((result (NEW |PLString|))
+	(docString ""))
+    (FOREACH doc IN (/PLI/S-GET-INFERRED-BINARY-PROPOSITION-VALUES
+                     "DOCUMENTATION" (GUI-NAME-TO-PL-NAME objectName) moduleName NULL)
+      AS i IN (INTERVAL 1 NULL)
+      WHERE (STRING? doc)
+      DO (SETQ docString (CONCATENATE docString (CHOOSE (= i 1) "" EOL-STRING) doc)))
+    (SETF (|Value| result) (XMLIFY-FORMATTED-STRING docString))
+    (RETURN result)))
+
+(DEFUN (GET-DIRECT-RELATIONS-FOR-CONCEPT (LIST OF DESCRIPTION)) ((module MODULE) (concept LOGIC-OBJECT))
+  (WITHIN-MODULE module
+    (LET ((module (/PLI/GET-HOME-MODULE concept))
+          (allRelations (GET-ALL-RELATIONS module))
+          (result (NEW (LIST OF DESCRIPTION))))
+      (FOREACH relation IN allRelations
+        WHERE (EQL? concept (/PLI/GET-DOMAIN relation))
+        COLLECT relation INTO result)
+      (RETURN result))))
+
+(DEFUN (GET-INHERITED-RELATIONS-FOR-CONCEPT (LIST OF DESCRIPTION)) ((module MODULE) (concept LOGIC-OBJECT))
+  (WITHIN-MODULE module
+		 (LET ((module (/PLI/GET-HOME-MODULE concept))
+		       (allRelations (GET-ALL-RELATIONS module))
+		       (result (NEW (LIST OF DESCRIPTION))))
+		      (FOREACH relation IN allRelations
+			       WHERE (PLI/IS-SUBRELATION concept   ;; Thanks to Hans for the correct call
+							 (/PLI/GET-DOMAIN relation)
+							 module
+							 PLI/TAXONOMIC-ENV)
+			       COLLECT relation INTO result)
+		      (RETURN result))))
+
+(DEFUN (GET-PROPOSITIONS-FOR-OBJECT (LIST OF PROPOSITION)) ((moduleName STRING) (instanceName STRING) (relation? BOOLEAN))
+  :DOCUMENTATION "Get all the propositions for a given instance"
+  (IGNORE relation?)
+  (LET ((iter (/PLI/S-GET-PROPOSITIONS-OF (GUI-NAME-TO-PL-NAME instanceName) moduleName NULL))
+	(propositions (NEW (LIST OF PROPOSITION))))
+    (FOREACH prop IN iter
+      WHERE (NOT (RULE-PROPOSITION? prop))
+      COLLECT prop INTO propositions)
+    (RETURN (SORT propositions (THE-CODE :FUNCTION LOGIC/PROPOSITION-LESS-THAN?)))))
+
+;; Obsolete?
+(DEFUN (GET-RULES-FOR-RELATION (LIST OF PROPOSITION)) ((moduleName STRING) (instanceName STRING))
+  :DOCUMENTATION "Get all the rules for a given logic object"
+  (LET ((iter (/PLI/S-GET-RULES (GUI-NAME-TO-PL-NAME instanceName) moduleName NULL))
+	(rules (NEW (LIST OF PROPOSITION))))
+    (FOREACH rule IN iter
+      COLLECT rule INTO rules)
+    (RETURN (SORT rules (THE-CODE :FUNCTION LOGIC/PROPOSITION-LESS-THAN?)))))
+
+(DEFUN (RULE-PROPOSITION? BOOLEAN) ((proposition PROPOSITION))
+  ;; Return TRUE if `proposition' is a rule that should not be displayed in the
+  ;;    general propositions pane.
+  ;; TO DO: SHOULD GO INTO PLI and/or PowerLoom.
+  (CASE (KIND proposition)
+    ((:FORALL :EXISTS :IMPLIES)
+     (RETURN TRUE))
+    (OTHERWISE
+     (RETURN FALSE))))
+
+(DEFUN (SUBRELATION-RULE? BOOLEAN) ((rule PROPOSITION))
+  ;; Return TRUE if `rule' encodes a subrelation relationship.
+  ;; TO DO: SHOULD GO INTO PLI and/or PowerLoom.
+  (RETURN (AND (EQL? (KIND rule) :IMPLIES)
+               (ISA? (FIRST (ARGUMENTS rule)) @NAMED-DESCRIPTION)
+               (ISA? (SECOND (ARGUMENTS rule)) @NAMED-DESCRIPTION))))
+
+(DEFUN (GET-RELEVANT-RULES-FOR-RELATION (LIST OF PROPOSITION)) ((moduleName STRING)
+                                                                (relationName STRING))
+  :DOCUMENTATION "Get all the relevant rules for a given logic object."
+  ;; NOTE: This collects master propositions but not their normalizations (or satellites).
+  ;;    The latter are often useful to see for debugging, but operations on them are not
+  ;;    really useful since they are "derived" in a sense, and they also can "print funny"
+  ;;    with variable substitutions in case we had a constant somewhere.
+  ;;    Maybe there should be a separate GUI feature to access the satellites of a rule.
+  (LET ((module (/PLI/GET-MODULE moduleName NULL))
+        (relation (/PLI/S-GET-RELATION (GUI-NAME-TO-PL-NAME relationName) moduleName NULL))
+	(rules (NEW (LIST OF PROPOSITION))))
+    (WITHIN-MODULE module
+      (WITHIN-CONTEXT (GET-QUERY-CONTEXT)
+        (FOREACH rule IN (CALL-GET-RULES relation)
+          WHERE (AND (TRUE? rule)
+                     (NOT (SUBRELATION-RULE? rule)))
+          COLLECT (FIRST-DEFINED (MASTER-PROPOSITION rule) rule) INTO rules)
+        (REMOVE-DUPLICATES rules)
+        (RETURN (SORT rules (THE-CODE :FUNCTION LOGIC/PROPOSITION-LESS-THAN?)))))))
+
+(DEFUN (GET-PROPOSITIONS-FOR-INSTANCE-AND-RELATION (LIST OF PROPOSITION))
+    ((moduleName STRING) (instanceName STRING) (relationName STRING))
+  ;; Todo? construct expression based on arity of relation
+  (LET ((expressionString (CONCATENATE "(" (GUI-NAME-TO-PL-NAME relationName) " " (GUI-NAME-TO-PL-NAME instanceName)))
+	(relation DESCRIPTION (/PLI/S-GET-RELATION (GUI-NAME-TO-PL-NAME relationName) moduleName NULL))
+	(arity (ARITY relation))
+	(result (NEW (LIST OF PROPOSITION))))
+    (FOREACH i IN (INTERVAL 2 arity)
+      DO (IGNORE i)
+         (SETQ expressionString (CONCATENATE expressionString " NULL")))
+    (SETQ expressionString (CONCATENATE expressionString ")"))
+                                        ;(PRINT "expression is: " expressionString EOL)
+    (FOREACH prop IN (/PLI/S-GET-PROPOSITIONS expressionString moduleName NULL)
+      COLLECT prop INTO result)
+    (RETURN (SORT result (THE-CODE :FUNCTION LOGIC/PROPOSITION-LESS-THAN?)))))
+
+
+;;; Stolen from factory-support.ste
+(DEFUN (EVALUATE-LOGIC-COMMAND-IN-MODULE STRING)
+    ((command STRING) (moduleName STRING) (finalize? BOOLEAN))
+  (LET ((module (GET-STELLA-MODULE moduleName FALSE))
+        (result OBJECT NULL))
+    (WHEN (NULL? module)
+      (SETQ module *MODULE*))
+    (EXCEPTION-CASE
+        (WITHIN-MODULE module
+	  ;; This is necessary for newly-asserted rules (and maybe props) to be visible...
+;; this doesn't seem to work well...		       
+;          (SPECIAL ((*LAZY-SATELLITE-RULES?* FALSE))
+       	           (SETQ *LAZY-SATELLITE-RULES?* FALSE)
+		   (SETQ result
+			 (EVALUATE-LOGIC-COMMAND
+			  (READ-S-EXPRESSION 
+			   (NEW STRING-INPUT-STREAM :THE-STRING command))
+			  finalize?))
+;		   )
+          (COND ((NULL? result)
+                 (RETURN ""))
+                ((STRING? result)
+                 (RETURN
+                   (WRAPPER-VALUE (CAST result STRING-WRAPPER))))
+                (OTHERWISE
+                 ;; we need to stringify this here while the module is
+                 ;;    still bound correctly:
+                 (LET ((resultStream (NEW STRING-OUTPUT-STREAM))
+                       (nativeStream (NATIVE-STREAM resultStream)))
+                   (SPECIAL ((*PRINTREADABLY?* TRUE)
+                             (*PRINTPRETTY?* TRUE))
+                     ;; Deal with pretty-printing of Lisp conses -
+                     ;;    THIS NEEDS TO BE FIXED.
+                     (VERBATIM
+                       :COMMON-LISP
+                       "(CL:WHEN (USE-CL-CONSES?)
+                         (CL:LET ((CL:*PRINT-PRETTY* CL:T))
+                           (CL:PRIN1 result nativeStream)
+                           (SETQ result NULL)))"
+                       :OTHERWISE NULL)
+                     (WHEN (DEFINED? result)
+                       (PRINT-STREAM resultStream result)))
+                   (RETURN (THE-STRING resultStream))))))
+      (NATIVE-EXCEPTION (e)
+			(SIGNAL-EXCEPTION e)))))
+
+(DEFUN (IS-QUERY-PARTIAL? BOOLEAN) ((plQuery |PLQuery|))
+  (RETURN (AND (DEFINED? (|MatchMode| plQuery))
+	       (NOT (EQL? (|MatchMode| plQuery) "STRICT")))))
+
+(DEFUN (EVALUATE-QUERY-COMMAND-IN-MODULE CONS)
+    ((session HTTP/SESSION)
+     (query STRING) 
+     (moduleName STRING)
+     (continuationQuery? BOOLEAN)
+     (partialQuery? BOOLEAN))
+  ;; Return a list of result tuples for `query'.  For TRUE/FALSE queries
+  ;;    this will be a list containing a single tuple with a truth value
+  ;;    or partial match score.
+  (LET ((module (GET-STELLA-MODULE moduleName FALSE))
+        (queryTree CONS NIL)
+        (queryIterator QUERY-ITERATOR NULL)
+        (tuple NIL)
+	(result NIL))
+    (WHEN (NULL? module)
+      (SETQ module *MODULE*))
+    (EXCEPTION-CASE
+        (WITHIN-MODULE module
+          ;(SETQ *LAZY-SATELLITE-RULES?* FALSE)
+          (SETQ queryTree (UNSTRINGIFY query))
+          (IF (EQL? (FIRST queryTree) (QUOTE LOGIC/ASK))
+              (PROGN
+                (SETQ queryIterator (CREATE-ASK-QUERY (REST queryTree)))
+                (INSERT-AT session "QueryIterator" queryIterator)
+                (IF partialQuery?
+                    (SETQ result (CONS (CALL-ASK-PARTIAL queryIterator) NIL))
+                  (SETQ result (CONS (CALL-ASK queryIterator) NIL)))
+                (RETURN (CONS result NIL)))
+            (PROGN
+         ;;;; TO DO: FIX TO NOT USE THE `*MOST-RECENT-QUERY*' KLUDGE AND TO
+         ;;;;    TAKE ALL OPTION CHANGES INTO ACCOUNT.  CURRENTLY, WE NEED THIS
+         ;;;;    TO PROPERLY CHANGE OPTIONS VIA `CREATE-RETRIEVE-QUERY':
+              (IF continuationQuery?
+                (SETQ *MOST-RECENT-QUERY* (LOOKUP session "QueryIterator"))
+                (SETQ *MOST-RECENT-QUERY* NULL))
+              (SETQ queryIterator (CREATE-RETRIEVE-QUERY (REST queryTree)))
+              (INSERT-AT session "QueryIterator" queryIterator)
+              (IF partialQuery?
+                  (CALL-RETRIEVE-PARTIAL queryIterator)
+                (CALL-RETRIEVE queryIterator))
+              (FOREACH solution IN (SOLUTIONS queryIterator)
+                DO (SETQ tuple (CONSIFY (BINDINGS solution)))
+                   (WHEN partialQuery?
+                     (CONCATENATE tuple (CONS (MATCH-SCORE solution) NIL)))
+                COLLECT tuple INTO result)
+              (RETURN result))))
+      (NATIVE-EXCEPTION (e)
+        (SIGNAL-EXCEPTION e)))))
+
+(DEFUN (GET-PROPOSITION-STRING STRING) ((prop PROPOSITION) (module MODULE))
+  (WITHIN-MODULE module
+    (LET ((ss (NEW OUTPUT-STRING-STREAM)))
+      (SPECIAL ((*PRINTMODE* :ORIGINAL)
+                (*PRINTLOGICALFORMSTREAM* ss)
+                (*PRINTREADABLY?* TRUE))
+        (PRETTY-PRINT-LOGICAL-FORM prop ss))
+      (RETURN (XMLIFY-FORMATTED-STRING (THE-STRING ss))))))
+
+(DEFUN (GET-TRUTH-VALUE-STRING STRING) ((tv TRUTH-VALUE))
+  (LET ((ss (NEW OUTPUT-STRING-STREAM)))
+       (PRINT-TRUTH-VALUE tv ss)
+       (RETURN (THE-STRING ss))))
+
+(DEFUN (XMLIFY-STRING STRING) ((inString STRING))
+  ;; XML-ify `inString'.  It seems we don't need this anymore given that
+  ;;    the XML printing machinery supports proper quoting of special characters.
+  ;(RETURN (COMPACT-WHITESPACE
+  ;          (REPLACE-CHOKABLE-CHARS-WITH-ENTITIES (STRIP-NEWLINES inString))))
+  (return (COMPACT-WHITESPACE (STRIP-NEWLINES inString))))
+
+(DEFUN (XMLIFY-FORMATTED-STRING STRING) ((inString STRING))
+  ;; Like XMLIFY-STRING, but don't eliminate whitespace and newlines.
+  ;; Similar to XMLIFY-STRING, this shouldn't need to quote things anymore.
+  ;; BUG: `write-html-quoting-special-characters' doesn't quote newlines,
+  ;;      hence, they get lost in translation, so we keep this for now.
+  ;(RETURN (REPLACE-CHOKABLE-CHARS-WITH-ENTITIES inString))
+  ;; No, we don't, otherwise propositions and explanations don't print right - QUOTING IS A MESS!!!
+  (RETURN inString))
+
+(DEFUN (GET-STRINGIFIED-MODULE STRING) ((module MODULE)) 
+  (LET ((moduleName (MODULE-NAME module))
+	(parents (PARENT-MODULES module))
+	(uses (USES module))
+	(documentation (/STELLA/DOCUMENTATION module))
+	;(options (STRINGIFIED-OPTIONS module))
+	(parentStrings STRING "")
+	(usesStrings STRING "")
+	(result STRING NULL))
+    (FOREACH parent IN parents
+	DO (SETQ parentStrings (CONCATENATE parentStrings " " (MODULE-FULL-NAME parent))))
+    (FOREACH use IN uses
+	DO (SETQ usesStrings (CONCATENATE usesStrings " " (MODULE-NAME use))))
+    (SETQ result (CONCATENATE  "(defmodule " moduleName " :includes (" parentStrings ") :uses (" usesStrings ") "))
+    (WHEN (DEFINED? documentation)
+      (SETQ result (CONCATENATE result ":documentation \"" documentation "\"")))
+    (SETQ result (CONCATENATE result ")"))
+;    (return (bquote ( & moduleName & parentStrings & usesStrings & documentation)))
+    (RETURN result)
+))
+
+  
+(DEFUN (REPLACE-CHOKABLE-CHARS-WITH-ENTITIES STRING) ((inString STRING))
+  ;; Replace > < &, etc w/ &gt; etc.
+  (LET ((ss (NEW OUTPUT-STRING-STREAM)))
+       (WRITE-HTML-QUOTING-CHOKABLE-CHARACTERS (NATIVE-STREAM ss) inString)
+       (RETURN (THE-STRING ss))))
+
+;; In addition to quoting &, etc., replace weird non-latin characters with numerical entity codes
+(DEFUN WRITE-HTML-CHARACTER-QUOTING-CHOKABLE-CHARACTERS ((stream NATIVE-OUTPUT-STREAM) (ch CHARACTER))
+  :globally-inline? TRUE
+  (IF (OR 
+       (= (CHARACTER-CODE ch) 10)
+       (> (CHARACTER-CODE ch) 127))
+      (PRINT-STREAM stream "&#" (CHARACTER-CODE ch) ";")
+      (WRITE-HTML-CHARACTER-QUOTING-SPECIAL-CHARACTERS stream ch)))
+
+(DEFUN WRITE-HTML-QUOTING-CHOKABLE-CHARACTERS ((stream NATIVE-OUTPUT-STREAM) (input STRING))
+  (FOREACH ch IN input
+	   DO (WRITE-HTML-CHARACTER-QUOTING-CHOKABLE-CHARACTERS stream ch))
+  (RETURN))
+
+(DEFUN (COMPACT-WHITESPACE STRING) ((inString STRING))
+  ;; Compress all adjacent whitespace characters into a single whitespace
+  (LET ((count INTEGER 0)
+	(length (LENGTH inString))
+	(cursor 0)
+	(newCursor 0)
+	(result MUTABLE-STRING NULL))
+       (WHEN (= length 0)
+	     (RETURN ""))
+       ;; First, count number of excess blanks
+       (LOOP 
+	(WHEN (AND (> cursor 0)
+		   (STRING-EQL? (CHARACTER-TO-STRING (NTH inString cursor))
+			 " ")
+		   (STRING-EQL? (CHARACTER-TO-STRING (NTH inString (- cursor 1)))
+				" "))
+	      (++ count))
+	(WHEN (= cursor (- length 1))
+	  (BREAK))
+	(++ cursor))
+       ;; Next, create the new string of the correct size
+       (SETQ result (MAKE-RAW-MUTABLE-STRING (- length count)))
+       ;; Finally create the new string, skipping excess blanks
+       (SETQ cursor 0)
+       (LOOP 
+	(UNLESS (AND (> cursor 0)
+		     (STRING-EQL? (CHARACTER-TO-STRING (NTH inString cursor))
+				  " ")
+		     (STRING-EQL? (CHARACTER-TO-STRING (NTH inString (- cursor 1)))
+				  " "))
+		;(PRINT "Setting result[" newCursor "] to " (NTH inString cursor) EOL)
+		(SETF (NTH result newCursor) (NTH inString cursor))
+		(++ newCursor))
+	(WHEN (= cursor (- length 1))
+	      (BREAK))
+	(++ cursor))
+       (RETURN result)))
+
+(DEFUN (STRIP-NEWLINES STRING) ((inString STRING))
+  (RETURN (REPLACE-SUBSTRINGS inString " " #\Newline)))
+
+(DEFUN (STRIP-MODULE STRING) ((inString STRING) (module MODULE))
+  (LET ((modName (CONCATENATE (MODULE-FULL-NAME module) "/")))
+       (RETURN (REPLACE-SUBSTRINGS inString "" modName))))
+
+(DEFUN (REPLACE-DOUBLE-QUOTES-WITH-SINGLE-QUOTES STRING) ((inString STRING))
+  (RETURN (REPLACE-SUBSTRINGS inString "\'" "\"")))
+				
+
+;;; Load/save support (note, loading of named KBs is not supported anymore):
+
+(DEFGLOBAL *KB-FILENAME-INDEX* STRING "PL:kbs;kbs.ste")
+
+(DEFGLOBAL *KB-DIRECTORY* STRING "PL:kbs;")
+
+(DEFUN (LOAD-INDEX-FILE (CONS OF (CONS OF STRING-WRAPPER))) ()
+  (PRINT "Loading index " *KB-FILENAME-INDEX* "..." EOL)
+  (LET ((inStream (NEW FILE-INPUT-STREAM :FILENAME *KB-FILENAME-INDEX*))
+	(streamIter (S-EXPRESSIONS inStream)))
+       (FOREACH sexp IN streamIter
+		DO (RETURN sexp))
+       (RETURN NIL)))
+
+(DEFUN SAVE-INDEX-FILE ((index (CONS OF (CONS OF STRING-WRAPPER))))
+  (PRINT "Saving index " *KB-FILENAME-INDEX* "..." EOL)
+  (LET ((outStream (NEW FILE-OUTPUT-STREAM :FILENAME *KB-FILENAME-INDEX*)))
+       (PRINT-STREAM outStream "(" EOL)
+       (FOREACH tuple IN index DO
+		(PRINT-STREAM outStream "  (\"" (WRAPPER-VALUE (FIRST tuple))
+			      "\" \"" (WRAPPER-VALUE (SECOND tuple))
+			      "\" \"" (WRAPPER-VALUE (THIRD tuple))
+			      "\" \"" (WRAPPER-VALUE (FOURTH tuple))			      
+			      "\")" EOL))
+       (PRINT-STREAM outStream ")" EOL)
+       (CLOSE-STREAM outStream)))
+
+(DEFUN (MAKE-PL-FILE |PLModuleFile|) ((fileDescription (CONS OF STRING-WRAPPER)))
+  (LET ((kb (FIRST fileDescription))
+	(moduleName (SECOND fileDescription))
+	(fileName (THIRD fileDescription))
+	(description (FOURTH fileDescription))
+	(plFile (NEW |PLModuleFile|)))
+       (SETF (|ModuleName| plFile) moduleName)
+       (SETF (|FileName| plFile) fileName)
+       (SETF (|KBName| plFile) kb)
+       (SETF (|KBDescription| plFile) description)
+       (RETURN plFile)))
+
+(DEFUN (FIND-FILENAME-FOR-KB STRING) ((fileIndex |PLModuleFileList|) (kbName STRING))
+  (FOREACH plFile IN (|PLModuleFile| fileIndex)
+	   WHERE (STRING-EQL? (STRING-DOWNCASE kbName) (STRING-DOWNCASE (|KBName| plFile)))
+	   DO (RETURN (|FileName| plFile)))
+  (RETURN NULL))
+
+;;;; Search helpers
+
+;;; Parse string into list of wildcards and fragments, used by string match algorithm
+(DEFUN (PARSE-MATCH-STRING (CONS OF OBJECT)) ((matchString STRING) (caseSensitive? STRING))
+  (LET ((result NIL)
+	(wildCardPos 0)
+	(cursor 0)
+	(wildCard "*")
+	(fragment STRING NULL))
+       (WHILE (DEFINED? (SETQ wildCardPos (STRING-SEARCH matchString wildCard cursor)))
+	      (WHEN (> wildCardPos cursor) 
+		    (SETQ fragment (SUBSEQUENCE matchString cursor wildCardPos))
+		    (WHEN (STRING-EQL? caseSensitive? "FALSE")
+			(SETQ fragment (STRING-DOWNCASE fragment)))
+		    (SETQ result (CONS fragment result)))
+	      (SETQ result (CONS (QUOTE WILD) result))
+	      (SETQ cursor (+ wildCardPos 1)))
+       (WHEN (< cursor (LENGTH matchString))
+	     (SETQ fragment (SUBSEQUENCE matchString cursor (LENGTH matchString)))
+	     (SETQ result (CONS fragment result)))
+       (RETURN (REVERSE result))))
+
+;;; Determine if inputString and the matchList produced by parseMatchString match.
+(DEFUN (SEARCH-STRING-MATCH? BOOLEAN) ((inputString STRING) (matchList (CONS OF OBJECT)))
+  (WHEN (EMPTY? matchList)
+	(IF (= (LENGTH inputString) 0)
+	    (RETURN TRUE)
+	    (RETURN FALSE)))
+  (IF (SYMBOL? (FIRST matchList))  ;; first symbol is wildcard
+      (LET ((firstNonWild (GET-FIRST-NON-WILD matchList))
+	    (matchPos 0)
+	    (restOfInput STRING NULL))
+	   (WHEN (NULL? firstNonWild)    ;; if there are only wild chars, we have a match
+		 (RETURN TRUE))
+	   (WHEN (DEFINED? (SETQ matchPos 
+				 (STRING-SEARCH inputString (WRAPPER-VALUE firstNonWild) 0)))
+		 (SETQ restOfInput
+		       (SUBSEQUENCE inputString 
+				    (+ matchPos (LENGTH (WRAPPER-VALUE firstNonWild)))
+				    (LENGTH inputString)))
+		 (RETURN (SEARCH-STRING-MATCH? restOfInput 
+					       (GET-REST-AFTER-FIRST-NON-WILD matchList))))
+	   (RETURN FALSE))  ;; No match
+      (LET ((fragment STRING-WRAPPER (FIRST matchList)))     ;; first symbol is string
+	   (IF (> (LENGTH (WRAPPER-VALUE fragment))
+		  (LENGTH inputString))
+	       (RETURN FALSE)
+	       (LET ((inputStart (SUBSEQUENCE inputString 0 (LENGTH (WRAPPER-VALUE fragment))))
+		     (restOfInput (SUBSEQUENCE inputString (LENGTH (WRAPPER-VALUE fragment)) (LENGTH inputString))))
+		    (RETURN (AND (STRING-EQL? fragment inputStart)
+				 (SEARCH-STRING-MATCH? restOfInput (REST matchList)))))))))
+
+(DEFUN (GET-FIRST-NON-WILD STRING-WRAPPER) ((matchList (CONS OF OBJECT)))
+  (FOREACH candidate IN matchList
+	   WHERE (STRING? candidate)
+	   DO (RETURN (CAST candidate STRING-WRAPPER)))
+  (RETURN NULL))
+
+(DEFUN (GET-REST-AFTER-FIRST-NON-WILD (CONS OF OBJECT)) ((matchList (CONS OF OBJECT)))
+  (WHILE (DEFINED? matchList)
+	 (WHEN (STRING? (FIRST matchList))
+	       (RETURN (REST matchList)))
+	 (SETQ matchList (REST matchList)))
+  (RETURN NULL))
+
+(DEFUN (SEARCH-LOGIC-OBJECTS (LIST OF |PLSearchResultItem|)) ((moduleName STRING)
+							    (objects (LIST OF LOGIC-OBJECT)) 
+							    (matchList (CONS OF OBJECT))
+							    (caseSensitive? STRING))
+  (LET ((result (NEW (LIST OF |PLSearchResultItem|))))
+       (FOREACH object IN objects
+		WHERE (SEARCH-STRING-MATCH? (GET-LOGIC-OBJECT-NAME object caseSensitive?)
+					    matchList)
+		COLLECT (MAKE-SEARCH-RESULT-ITEM moduleName object) INTO result)
+       (RETURN result)))
+
+(DEFUN (GET-LOGIC-OBJECT-NAME STRING) ((object LOGIC-OBJECT) (caseSensitive? STRING))
+  (LET ((name (OBJECT-NAME-STRING object)))
+    (IF (EQL? caseSensitive? "TRUE")
+        (RETURN name)
+      (RETURN (STRING-DOWNCASE name)))))
+  
+(DEFUN (SEARCH-CONCEPTS (LIST OF |PLSearchResultItem|)) ((moduleName STRING) 
+						       (matchList (CONS OF OBJECT))
+						       (caseSensitive? STRING))
+  (LET ((module (PLI/GET-MODULE moduleName NULL)))
+       (RETURN (SEARCH-LOGIC-OBJECTS moduleName (GET-ALL-CONCEPTS module TRUE) matchList
+				     caseSensitive?))))
+
+(DEFUN (SEARCH-RELATIONS (LIST OF |PLSearchResultItem|)) ((moduleName STRING) 
+							(matchList (CONS OF OBJECT))
+							(caseSensitive? STRING))
+  (LET ((module (PLI/GET-MODULE moduleName NULL)))
+       (RETURN (SEARCH-LOGIC-OBJECTS moduleName (GET-ALL-RELATIONS module) matchList
+				     caseSensitive?))))
+
+(DEFUN (SEARCH-INSTANCES (LIST OF |PLSearchResultItem|)) ((moduleName STRING) 
+							(matchList (CONS OF OBJECT))
+							(caseSensitive? STRING))
+  (LET ((module (PLI/GET-MODULE moduleName NULL))
+	(allInstances (ALL-INSTANCES module TRUE))
+	(nonSkolemInstances (NEW (LIST OF LOGIC-OBJECT))))
+       (FOREACH instance IN allInstances
+		WHERE (NOT (SKOLEM? instance))
+		COLLECT instance INTO nonSkolemInstances)
+       (RETURN (SEARCH-LOGIC-OBJECTS moduleName nonSkolemInstances matchList caseSensitive?))))
+
+(DEFUN (SEARCH-ALL-MODULES (LIST OF |PLSearchResultItem|)) 
+    ((searchString STRING) 
+     (searchInstance? STRING) (searchConcept? STRING) 
+     (searchRelation? STRING) (caseSensitive? STRING))
+  (LET ((rootModule *ROOT-MODULE*)
+	(allModules (COLLECT-ALL-MODULES rootModule (NEW (LIST OF MODULE))))
+	(result (NEW (LIST OF |PLSearchResultItem|))))
+       (FOREACH module IN allModules
+		DO (CONCATENATE result (SEARCH-MODULE (MODULE-NAME module) searchString
+						      searchInstance? searchConcept? searchRelation? caseSensitive?)))
+       (RETURN result)))
+
+(DEFUN (SEARCH-MODULE (LIST OF |PLSearchResultItem|)) 
+    ((moduleName STRING) (searchString STRING) 
+			 (searchInstance? STRING) (searchConcept? STRING) 
+			 (searchRelation? STRING) (caseSensitive? STRING))
+  (LET ((conceptResults (NEW (LIST OF |PLSearchResultItem|)))
+	(relationResults (NEW (LIST OF |PLSearchResultItem|)))
+	(instanceResults (NEW (LIST OF |PLSearchResultItem|)))
+	(matchList (PARSE-MATCH-STRING searchString caseSensitive?))
+	(result (NEW (LIST OF |PLSearchResultItem|)))
+	(module (PLI/GET-MODULE moduleName NULL)))
+       (WITHIN-MODULE module
+		      (WHEN (STRING-EQL? searchInstance? "TRUE")
+			    (SETQ instanceResults (SEARCH-INSTANCES moduleName matchList caseSensitive?)))
+		      (WHEN (STRING-EQL? searchRelation? "TRUE")
+			    (SETQ relationResults (SEARCH-RELATIONS moduleName matchList caseSensitive?)))
+		      (WHEN (STRING-EQL? searchConcept? "TRUE")
+			    (SETQ conceptResults (SEARCH-CONCEPTS moduleName matchList caseSensitive?)))
+		      (SETQ result (CONCATENATE conceptResults instanceResults relationResults))
+		      (RETURN result))))
+
+(DEFUN (MAKE-SEARCH-RESULT-ITEM |PLSearchResultItem|) ((moduleName STRING) (object LOGIC-OBJECT))
+  (LET ((union (MAKE-PL-OBJECT-UNION object))
+	(result (NEW |PLSearchResultItem|)))
+       (SETF (|ModuleName| result) moduleName)
+       (SETF (|PLObjectUnion| result) union)
+       (RETURN result)))
+
+;;;
+;;; Directory navigation for loading/saving kbs
+;;;
+
+(DEFGLOBAL *DEFAULT-KB-DIRECTORY* STRING "/nfs/topaz/melz/")
+
+(DEFUN (GET-DIRECTORY-LISTING (LIST OF LIST)) ((currentDirectory STRING))
+  ;; Return list with two sublists: the first is the files in the directory, and the second is the
+  ;; directories in the directory.
+  (LET ((filesInDir (NEW (LIST OF STRING-WRAPPER)))
+	(dirsInDir (NEW (LIST OF STRING-WRAPPER)))
+	(result (NEW (LIST OF LIST))))
+       (VERBATIM :COMMON-LISP
+"		  (cl:LET ((dirListing (cl:directory currentDirectory)))
+			  (cl:loop for file in dirListing 
+				   do 
+                               (cl:let ((wrapper (STELLA::NEW-STRING-WRAPPER 
+                                           (cl:subseq (cl:namestring file) 
+                                                      (cl:1+ (cl:position (cl:character \"/\") 
+                                                                    (cl:namestring file)
+                                                                    :from-end cl:t)))))
+                                        (directoryP (cl:probe-file 
+                                                      (cl:concatenate (cl:quote cl:string) 
+                                                                (cl:namestring file) \"/\"))))
+                                   (cl:if directoryP
+                                       (STELLA::INSERT dirsInDir wrapper)
+                                       (STELLA::INSERT filesInDir wrapper)))))"
+                 ;; Todo: Implment verbatims for java and c++
+		 :OTHERWISE NULL)
+       (INSERT result dirsInDir)
+       (INSERT result filesInDir)
+       (RETURN result)))
+
+(DEFUN (SERVER-GET-DIRECTORY-LISTING |PLDirectoryContents|) ((currentDirectory |PLString|) (extensionFilter |PLString|))
+  :PUBLIC? TRUE
+  :DOCUMENTATION "Return the files and directories in 'currentDirectory'."
+  (LET ((directoryListing (GET-DIRECTORY-LISTING (|Value| currentDirectory)))
+	(plDirectoryListing (NEW |PLDirectoryContents|))
+	(plFiles (NEW (LIST OF |PLFile|)))
+	(plDirectories (NEW (LIST OF |PLDirectory|)))
+	(matchList (PARSE-MATCH-STRING (|Value| extensionFilter) "FALSE")))
+       (SETF (|DirectoryName| plDirectoryListing) (|Value| currentDirectory))
+       (FOREACH fileName IN (FIRST directoryListing)
+		WHERE (SEARCH-STRING-MATCH? fileName matchList)
+		DO (LET ((plFile (NEW |PLFile|)))
+			(SETF (|FileName| plFile) fileName)
+			(INSERT plFiles plFile)))
+       (FOREACH dirName IN (SECOND directoryListing)
+		DO (LET ((plDirectory (NEW |PLDirectory|)))
+			(SETF (|DirectoryName| plDirectory) dirName)
+			(INSERT plDirectories plDirectory)))
+       (SETF (|PLFile| plDirectoryListing) plFiles)
+       (SETF (|PLDirectory| plDirectoryListing) plDirectories)
+       (RETURN plDirectoryListing)))
+
+(DEFUN (SERVER-GET-DEFAULT-DIRECTORY-LISTING |PLDirectoryContents|) ((extensionFilter |PLString|))
+  :PUBLIC? TRUE
+  :DOCUMENTATION "Return the files and directories in the directory designated by '*DEFAULT-KB-DIRECTORY*'."
+  (LET ((dir (NEW |PLString|)))
+       (SETF (|Value| dir) *DEFAULT-KB-DIRECTORY*)
+       (RETURN (SERVER-GET-DIRECTORY-LISTING dir extensionFilter))))
+
+
+  ;;
+;;;;;; Server Support methods
+  ;;
+
+(DEFGLOBAL *SERVER-DISPATCH-TABLE*
+    (STRING-HASH-TABLE OF STRING FUNCTION-CODE-WRAPPER)
+    (NEW (STRING-HASH-TABLE OF STRING FUNCTION-CODE-WRAPPER))
+  :DOCUMENTATION 
+  "Hash Table for used for dispatching server API methods.")
+
+
+(DEFUN (DISPATCH-CALL OBJECT) ((functionName STRING) (args CONS))
+  (LET ((code (LOOKUP *SERVER-DISPATCH-TABLE* functionName)))
+    (IF (NULL? code)
+        (ERROR "Couldn't find function " functionName " for dispatch.")
+	(RETURN (APPLY code args)))))
+
+(DEFUN INITIALIZE-DISPATCH-TABLE ()
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-MODULES" (THE-CODE :FUNCTION SERVER-GET-MODULES))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-CONCEPTS-FOR-MODULE" (THE-CODE :FUNCTION SERVER-GET-CONCEPTS-FOR-MODULE))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-INSTANCES-FOR-MODULE" (THE-CODE :FUNCTION SERVER-GET-INSTANCES-FOR-MODULE))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-RELATIONS-FOR-MODULE" (THE-CODE :FUNCTION SERVER-GET-RELATIONS-FOR-MODULE))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-DIRECT-INSTANCES-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-DIRECT-INSTANCES-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-INSTANCES-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-INSTANCES-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-PROPOSITIONS-FOR-MODULE" (THE-CODE :FUNCTION SERVER-GET-PROPOSITIONS-FOR-MODULE))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-RELATIONS-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-RELATIONS-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-INHERITED-RELATIONS-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-INHERITED-RELATIONS-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-DOCUMENTATION-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-DOCUMENTATION-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-SOURCE-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-SOURCE-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-DOCUMENTATION-FOR-RELATION" (THE-CODE :FUNCTION SERVER-GET-DOCUMENTATION-FOR-RELATION))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-DOCUMENTATION-FOR-INSTANCE" (THE-CODE :FUNCTION SERVER-GET-DOCUMENTATION-FOR-INSTANCE))  
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-SUPERCONCEPTS-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-SUPERCONCEPTS-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-SUPERRELATIONS-FOR-RELATION" (THE-CODE :FUNCTION SERVER-GET-SUPERRELATIONS-FOR-RELATION))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-INCLUDES-FOR-MODULE" (THE-CODE :FUNCTION SERVER-GET-INCLUDES-FOR-MODULE))  
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-USES-FOR-MODULE" (THE-CODE :FUNCTION SERVER-GET-USES-FOR-MODULE))  
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-SHADOWED-SURROGATES-FOR-MODULE" (THE-CODE :FUNCTION SERVER-GET-SHADOWED-SURROGATES-FOR-MODULE))    
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-VARIABLES-FOR-RELATION" (THE-CODE :FUNCTION SERVER-GET-VARIABLES-FOR-RELATION))  
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-PROPOSITIONS-FOR-INSTANCE" (THE-CODE :FUNCTION SERVER-GET-PROPOSITIONS-FOR-INSTANCE))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-TYPES-FOR-INSTANCE" (THE-CODE :FUNCTION SERVER-GET-TYPES-FOR-INSTANCE))  
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-PROPOSITIONS-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-PROPOSITIONS-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-PROPOSITIONS-FOR-RELATION" (THE-CODE :FUNCTION SERVER-GET-PROPOSITIONS-FOR-RELATION))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-RULES-FOR-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-RULES-FOR-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-RULES-FOR-RELATION" (THE-CODE :FUNCTION SERVER-GET-RULES-FOR-RELATION))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-PROPOSITIONS-FOR-INSTANCE-AND-RELATION" (THE-CODE :FUNCTION SERVER-GET-PROPOSITIONS-FOR-INSTANCE-AND-RELATION))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-EVALUATE-LOGIC-COMMAND" (THE-CODE :FUNCTION SERVER-EVALUATE-LOGIC-COMMAND))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-LOADABLE-KBS" (THE-CODE :FUNCTION SERVER-GET-LOADABLE-KBS))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-LOAD-KB" (THE-CODE :FUNCTION SERVER-LOAD-KB))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-LOAD-KB2" (THE-CODE :FUNCTION SERVER-LOAD-KB2))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-SAVE-KB" (THE-CODE :FUNCTION SERVER-SAVE-KB))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-SAVE-KB2" (THE-CODE :FUNCTION SERVER-SAVE-KB2))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-CLEAR-KB" (THE-CODE :FUNCTION SERVER-CLEAR-KB))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-QUERY" (THE-CODE :FUNCTION SERVER-QUERY))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-SEARCH" (THE-CODE :FUNCTION SERVER-SEARCH))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-DIRECTORY-LISTING" (THE-CODE :FUNCTION SERVER-GET-DIRECTORY-LISTING))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-DEFAULT-DIRECTORY-LISTING" (THE-CODE :FUNCTION SERVER-GET-DEFAULT-DIRECTORY-LISTING))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-EXTENSION-FOR-RELATION" (THE-CODE :FUNCTION SERVER-GET-EXTENSION-FOR-RELATION))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-RELATION" (THE-CODE :FUNCTION SERVER-GET-RELATION))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-CONCEPT" (THE-CODE :FUNCTION SERVER-GET-CONCEPT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-INSTANCE" (THE-CODE :FUNCTION SERVER-GET-INSTANCE))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-CONCEPT-COMPLETIONS" (THE-CODE :FUNCTION SERVER-GET-CONCEPT-COMPLETIONS))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-RELATION-COMPLETIONS" (THE-CODE :FUNCTION SERVER-GET-RELATION-COMPLETIONS))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-INSTANCE-COMPLETIONS" (THE-CODE :FUNCTION SERVER-GET-INSTANCE-COMPLETIONS))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-DESTROY-OBJECT" (THE-CODE :FUNCTION SERVER-DESTROY-OBJECT))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-EXPLANATION-FOR-QUERY" (THE-CODE :FUNCTION SERVER-GET-EXPLANATION-FOR-QUERY))
+  (INSERT-AT *SERVER-DISPATCH-TABLE* "SERVER-GET-INFO" (THE-CODE :FUNCTION SERVER-GET-INFO))
+  )
+
+(STARTUP-TIME-PROGN
+    (INITIALIZE-DISPATCH-TABLE))
+
+
+  ;;
+;;;;;; Tests
+  ;;
+
+(DEFUN MEMBER-TEST ((concept |PLConcept|))
+  (LET ((conceptList (NEW (LIST OF |PLConcept|)))
+	(newConc (NEW |PLConcept|)))
+       (SETF (|ConceptName| newConc) (|ConceptName| concept))
+       (INSERT conceptList concept)
+       (PRINT "IDENTICAL MEMBER: " (MEMBER? conceptList concept) EOL)
+       (PRINT "NONIDENTICAL MEMBER: " (MEMBER? conceptList newConc) EOL)))
+
+(DEFUN (TEST-SERVER-GET-CONCEPTS-FOR-MODULE |PLConceptContainer|) () 
+  (LET ((plString (NEW |PLString|)))
+       (SETF (|Value| plString) "EELD")
+;       (SETF (|Value| plString) "PL-KERNEL-KB")       
+       (RETURN (SERVER-GET-CONCEPTS-FOR-MODULE plString))))
+
+(DEFUN (TEST-SERVER-GET-INSTANCES-FOR-MODULE |PLInstanceContainer|) () 
+  (LET ((plString (NEW |PLString|)))
+;       (SETF (|Value| plString) "AIRCRAFT-KB")
+       (SETF (|Value| plString) "LOGIC")
+       (RETURN (SERVER-GET-INSTANCES-FOR-MODULE plString))))
+
+(DEFUN (TEST-SERVER-GET-RELATIONS-FOR-MODULE |PLRelationContainer|) () 
+  (LET ((plString (NEW |PLString|)))
+       (SETF (|Value| plString) "PL-KERNEL-KB")
+       (RETURN (SERVER-GET-RELATIONS-FOR-MODULE plString))))
+	
+(DEFUN (TEST-SERVER-GET-DIRECT-INSTANCES-FOR-CONCEPT |PLInstanceContainer|) () 
+  (LET ((module (NEW |PLString|))
+	(concept (NEW |PLString|)))
+       (SETF (|Value| module) "AIRCRAFT-KB")
+       (SETF (|Value| concept) "AIRCRAFT")
+       (RETURN (SERVER-GET-DIRECT-INSTANCES-FOR-CONCEPT module concept))))
+
+(DEFUN (TEST-SERVER-GET-INSTANCES-FOR-CONCEPT |PLInstanceContainer|) () 
+  (LET ((module (NEW |PLString|))
+	(concept (NEW |PLString|)))
+       (SETF (|Value| module) "AIRCRAFT-KB")
+       (SETF (|Value| concept) "AIRCRAFT")
+       (RETURN (SERVER-GET-INSTANCES-FOR-CONCEPT module concept))))
+
+(DEFUN (TEST-SERVER-GET-PROPOSITIONS-FOR-MODULE |PLPropositionContainer|) () 
+  (LET ((plString (NEW |PLString|)))
+       (SETF (|Value| plString) "AIRCRAFT-KB")
+       (RETURN (SERVER-GET-PROPOSITIONS-FOR-MODULE plString))))
+
+(DEFUN (TEST-SERVER-GET-PROPOSITIONS-FOR-INSTANCE |PLPropositionContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| instanceString) "F-117")
+       (RETURN (SERVER-GET-PROPOSITIONS-FOR-INSTANCE modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-TYPES-FOR-INSTANCE |PLSurrogateCollection|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| instanceString) "A-10")
+       (RETURN (SERVER-GET-TYPES-FOR-INSTANCE modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-DOCUMENTATION-FOR-INSTANCE |PLString|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "EELD")
+       (SETF (|Value| instanceString) "Action_105")
+       (RETURN (SERVER-GET-DOCUMENTATION-FOR-INSTANCE modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-RELATIONS-FOR-CONCEPT |PLRelationContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| instanceString) "ENGINE")
+;       (SETF (|Value| instanceString) "PHYSICAL-ENTITY")
+;       (SETF (|Value| instanceString) "AIR-ORGANIZATION")
+       (RETURN (SERVER-GET-RELATIONS-FOR-CONCEPT modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-INHERITED-RELATIONS-FOR-CONCEPT |PLRelationContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| instanceString) "AIRCRAFT")
+;       (SETF (|Value| instanceString) "PHYSICAL-ENTITY")
+;       (SETF (|Value| instanceString) "AIR-ORGANIZATION")
+       (RETURN (SERVER-GET-INHERITED-RELATIONS-FOR-CONCEPT modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-DOCUMENTATION-FOR-CONCEPT |PLString|) () 
+  (LET ((modString (NEW |PLString|))
+	(conceptString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+;       (SETF (|Value| conceptString) "AIR-ORGANIZATION")
+       (SETF (|Value| conceptString) "JFC9")
+       (RETURN (SERVER-GET-DOCUMENTATION-FOR-CONCEPT modString conceptString))))
+
+(DEFUN (TEST-SERVER-GET-SOURCE-FOR-CONCEPT |PLString|) () 
+  (LET ((modString (NEW |PLString|))
+	(conceptString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| conceptString) "AIR-ORGANIZATION")
+       (RETURN (SERVER-GET-SOURCE-FOR-CONCEPT modString conceptString))))
+
+(DEFUN (TEST-SERVER-GET-DOCUMENTATION-FOR-RELATION |PLString|) () 
+  (LET ((modString (NEW |PLString|))
+	(relationString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| relationString) "ORDNANCE")
+       (RETURN (SERVER-GET-DOCUMENTATION-FOR-RELATION modString relationString))))
+
+(DEFUN (TEST-SERVER-GET-SUPERCONCEPTS-FOR-CONCEPT |PLSurrogateCollection|) () 
+  (LET ((modString (NEW |PLString|))
+	(conceptString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| conceptString) "AIR-ORGANIZATION")
+       (RETURN (SERVER-GET-SUPERCONCEPTS-FOR-CONCEPT modString conceptString))))
+
+(DEFUN (TEST-SERVER-GET-SUPERRELATIONS-FOR-RELATION |PLSurrogateCollection|) () 
+  (LET ((modString (NEW |PLString|))
+	(relationString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| relationString) "AG-ORDNANCE")
+       (RETURN (SERVER-GET-SUPERRELATIONS-FOR-RELATION modString relationString))))
+
+(DEFUN (TEST-SERVER-GET-INCLUDES-FOR-MODULE |PLSurrogateCollection|) () 
+  (LET ((modString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (RETURN (SERVER-GET-INCLUDES-FOR-MODULE modString))))
+
+(DEFUN (TEST-SERVER-GET-SHADOWED-SURROGATES-FOR-MODULE |PLSurrogateCollection|) () 
+  (LET ((modString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (RETURN (SERVER-GET-SHADOWED-SURROGATES-FOR-MODULE modString))))
+
+(DEFUN (TEST-SERVER-GET-USES-FOR-MODULE |PLSurrogateCollection|) () 
+  (LET ((modString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (RETURN (SERVER-GET-USES-FOR-MODULE modString))))
+
+(DEFUN (TEST-SERVER-GET-VARIABLES-FOR-RELATION |PLVariableList|) () 
+  (LET ((modString (NEW |PLString|))
+	(relationString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| relationString) "STORES")
+       (RETURN (SERVER-GET-VARIABLES-FOR-RELATION modString relationString))))
+
+(DEFUN (TEST-SERVER-GET-PROPOSITIONS-FOR-CONCEPT |PLPropositionContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "SUBMOD1")
+       (SETF (|Value| instanceString) "WIDTH-RELATION")
+       (RETURN (SERVER-GET-PROPOSITIONS-FOR-CONCEPT modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-RULES-FOR-CONCEPT |PLPropositionContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| instanceString) "WIDTH-RELATION")
+;       (SETF (|Value| instanceString) "HELICOPTER-MANUFACTURER")
+       (RETURN (SERVER-GET-RULES-FOR-CONCEPT modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-PROPOSITIONS-FOR-RELATION |PLPropositionContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| instanceString) "ABCD")
+       (RETURN (SERVER-GET-PROPOSITIONS-FOR-RELATION modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-RULES-FOR-RELATION |PLPropositionContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| instanceString) "SMART-BOMB")
+       (RETURN (SERVER-GET-RULES-FOR-RELATION modString instanceString))))
+
+(DEFUN (TEST-SERVER-GET-PROPOSITIONS-FOR-INSTANCE-AND-RELATION |PLPropositionContainer|) () 
+  (LET ((modString (NEW |PLString|))
+	(relationString (NEW |PLString|))
+	(instanceString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| relationString) "FLEET-SIZE")
+       (SETF (|Value| instanceString) "USAF")
+       (RETURN (SERVER-GET-PROPOSITIONS-FOR-INSTANCE-AND-RELATION modString instanceString
+								  relationString))))
+
+(DEFUN (TEST-SERVER-EVALUATE-LOGIC-COMMAND |PLString|) ((command STRING))
+  (LET ((modString (NEW |PLString|))
+	(commandString (NEW |PLString|)))
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| commandString) command)
+       (RETURN (SERVER-EVALUATE-LOGIC-COMMAND modString commandString))))
+
+(DEFUN (TEST-SERVER-LOAD-KB |PLString|) ()
+  (LET ((kbString (NEW |PLString|)))
+       (SETF (|Value| kbString) "aircraft-kb")
+       (RETURN (SERVER-LOAD-KB kbString))))
+
+(DEFUN TEST-SERVER-CLEAR-KB ()
+  (LET ((mod (NEW |PLModule|)))
+       (SETF (|ModuleName| mod) "AIRCRAFT-KB")
+       (SERVER-CLEAR-KB mod)))
+
+(DEFUN (TEST-SERVER-SAVE-KB |PLString|) ()
+  (LET ((kbString (NEW |PLString|))
+	(modString (NEW |PLString|))
+	(descString (NEW |PLString|)))
+       (SETF (|Value| kbString) "aircraft-kb10")
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (SETF (|Value| descString) "groovy new desc for aircraft-kb10")
+       (RETURN (SERVER-SAVE-KB modString kbString descString))))
+
+(DEFUN (TEST-SERVER-SAVE-KB2 |PLFile|) ()
+  (LET ((fileString (NEW |PLString|))
+	(modString (NEW |PLString|)))
+       (SETF (|Value| fileString) "/nfs/topaz/melz/cvscheckout/powerloom/sources/logic/demos/aircraft.ploom")
+       (SETF (|Value| modString) "AIRCRAFT-KB")
+       (RETURN (SERVER-SAVE-KB2 modString fileString))))
+
+(DEFUN (MAKE-PL-QUERY |PLQuery|) ()
+  (LET ((plQuery (NEW |PLQuery|)))
+;       (SETF (|Query| plQuery) "(?x ?y) (COST ?X ?Y)")
+;       (SETF (|Query| plQuery) "(= (COST C-21) 2800000)")
+       (SETF (|Query| plQuery) "(HAPPY ?X)")
+       (SETF (|NumResults| plQuery) "ALL")
+       (SETF (|Module| plQuery) "SUBMOD1")
+       (SETF (|IsAsk| plQuery) "FALSE")
+       (SETF (|QueryName| plQuery) "")
+       (SETF (|InferenceLevel| plQuery) "")
+       (SETF (|Timeout| plQuery) "")
+       (SETF (|Moveout| plQuery) "")
+       (SETF (|MatchMode| plQuery) "PARTIAL")
+       (SETF (|MinScore| plQuery) "")
+       (SETF (|MaxUnknowns| plQuery) "")
+       (SETF (|MaximizeScore| plQuery) "")
+       (SETF (|DontOptimize| plQuery) "")
+       (RETURN plQuery)))
+
+(DEFUN (TEST-SERVER-QUERY |PLQueryResult|) () 
+  (LET ((result |PLQueryResult| NULL)
+	(continueQuery? (NEW |PLString|))
+	(plQuery (MAKE-PL-QUERY)))
+    (SETF (|Value| continueQuery?) "FALSE")
+    (PRINT "result1 is: " (SERVER-QUERY plQuery continueQuery?) EOL)
+    (RETURN result)))
+       
+
+(DEFUN (TEST-SERVER-SEARCH1 |PLSearchResult|) () 
+  (LET ((searchParameter (NEW |PLSearchParameter|)))
+       (SETF (|ModuleName| searchParameter) "AIRCRAFT-KB")
+       (SETF (|SearchString| searchParameter) "*pod*")
+       (SETF (|SearchConcept| searchParameter) "TRUE")
+       (SETF (|SearchRelation| searchParameter) "FALSE")
+       (SETF (|SearchInstance| searchParameter) "FALSE")
+       (SETF (|CaseSensitive| searchParameter) "FALSE")
+       (RETURN (SERVER-SEARCH searchParameter))))
+
+(DEFUN (TEST-SERVER-GET-DEFAULT-DIRECTORY-LISTING |PLDirectoryContents|) ()
+  (LET ((extension (NEW |PLString|)))
+       (SETF (|Value| extension) "*.edu")
+       (RETURN (SERVER-GET-DEFAULT-DIRECTORY-LISTING extension))))
+
+(DEFUN (TEST-SERVER-GET-EXTENSION-FOR-RELATION |PLQueryResult|) () 
+  (LET ((mod (NEW |PLString|))
+	(relation (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| relation) "cost")
+       (RETURN (SERVER-GET-EXTENSION-FOR-RELATION mod relation))))
+
+(DEFUN (TEST-SERVER-GET-RELATION |PLRelationContainer|) () 
+  (LET ((mod (NEW |PLString|))
+	(relation (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| relation) "DUPLICATE-FREE")
+       (RETURN (SERVER-GET-RELATION mod relation))))
+
+(DEFUN (TEST-SERVER-GET-CONCEPT |PLConceptContainer|) () 
+  (LET ((mod (NEW |PLString|))
+	(concept (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| concept) "DUPLICATE-FREE")
+       (RETURN (SERVER-GET-CONCEPT mod concept))))
+
+(DEFUN (TEST-SERVER-GET-INSTANCE |PLInstanceContainer|) () 
+  (LET ((mod (NEW |PLString|))
+	(instance (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| instance) "A-10")
+       (RETURN (SERVER-GET-INSTANCE mod instance))))
+
+(DEFUN (TEST-SERVER-GET-CONCEPT-COMPLETIONS |PLConceptContainer|) ()
+  (LET ((mod (NEW |PLString|))
+	(prefix (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| prefix) "CO")
+       (RETURN (SERVER-GET-CONCEPT-COMPLETIONS mod prefix))))
+
+(DEFUN (TEST-SERVER-GET-RELATION-COMPLETIONS |PLRelationContainer|) ()
+  (LET ((mod (NEW |PLString|))
+	(prefix (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| prefix) "CO")
+       (RETURN (SERVER-GET-RELATION-COMPLETIONS mod prefix))))
+
+(DEFUN (TEST-SERVER-GET-INSTANCE-COMPLETIONS |PLInstanceContainer|) ()
+  (LET ((mod (NEW |PLString|))
+	(prefix (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| prefix) "A")
+       (RETURN (SERVER-GET-INSTANCE-COMPLETIONS mod prefix))))
+
+(DEFUN (TEST-SERVER-DESTROY-OBJECT |PLString|) ()
+  (LET ((mod (NEW |PLString|))
+	(object (NEW |PLString|)))
+       (SETF (|Value| mod) "AIRCRAFT-KB")
+       (SETF (|Value| object) "SWING-WING")
+       (RETURN (SERVER-DESTROY-OBJECT mod object))))
+
+(DEFUN (TEST-SERVER-GET-EXPLANATION-FOR-QUERY |PLString|) ()
+  (LET ((plQuery (MAKE-PL-QUERY))
+	(resultNum (NEW |PLString|)))
+       (SETF (|Value| resultNum) "4")
+       (RETURN (SERVER-GET-EXPLANATION-FOR-QUERY plQuery resultNum))))
+
+(DEFUN (TEST-SERVER-GET-INFO |PLServerInfo|) ()
+  (LET ((result (SERVER-GET-INFO)))
+       (RETURN result)))

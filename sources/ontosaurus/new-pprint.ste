@@ -1,0 +1,757 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2000-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: new-pprint.ste,v 1.12 2010/01/12 04:41:33 hans Exp
+
+(in-package "STELLA")
+
+(in-module "ONTOSAURUS")
+
+
+;;;; TEMPORARY PATCH TO GET ONTOSAURUS TO WORK:
+;;;;
+(defconstant REUSABLE-SKOLEM-MAPPING-TABLE (ENTITY-MAPPING OF SKOLEM SKOLEM)
+  (new ENTITY-MAPPING)
+  :documentation "Stores reusable key-value list for use by
+'print-descriptions-as-kif-rule'.")
+
+(defspecial *pprint-atomic-object-renderer* FUNCTION-CODE NULL
+  :public? TRUE
+  :documentation "A function that takes two arguments, a Stella Object
+and a NATIVE-(?) OUTPUT-STREAM, and writes a representation of that
+object on that stream.  This will only be called on `atomic' Stella
+objects -- compound objects like Conses, Propositions, etc. are handled
+by the outer code.")
+
+(defspecial *pprint-before-proposition-function* FUNCTION-CODE NULL
+  :public? TRUE
+  :documentation "A function that takes two arguments, a Stella Proposition
+and a NATIVE-(?) OUTPUT-STREAM, and writes something that precedes the
+normal printed representation of a proposition.   This will only be called 
+on `PROPOSITION' objects.")
+
+(defspecial *pprint-after-proposition-function* FUNCTION-CODE NULL
+  :public? TRUE
+  :documentation "A function that takes two arguments, a Stella Proposition
+and a NATIVE-(?) OUTPUT-STREAM, and writes something that precedes the
+normal printed representation of a proposition.   This will only be called 
+on `PROPOSITION' objects.")
+
+(defspecial *pprint-before-definition-function* FUNCTION-CODE NULL
+  :public? TRUE
+  :documentation "A function that takes two arguments, a Stella Definition
+and a NATIVE-(?) OUTPUT-STREAM, and writes something that precedes the
+normal printed representation of a definition.   This will only be called 
+on `DEFINITION' objects.")
+
+(defspecial *pprint-after-definition-function* FUNCTION-CODE NULL
+  :public? TRUE
+  :documentation "A function that takes two arguments, a Stella Definition
+and a NATIVE-(?) OUTPUT-STREAM, and writes something that precedes the
+normal printed representation of a definition.   This will only be called 
+on `DEFINITION' objects.")
+
+
+
+(defspecial *pprint-indent* INTEGER 0)
+
+(defun pprint-newline ((stream NATIVE-OUTPUT-STREAM))
+  (print-stream stream EOL)
+  (print-spaces stream *pprint-indent*))
+
+(defun pprint-atomic-object ((self OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  (unless (null? self)
+    (typecase self
+      (LITERAL-WRAPPER
+       (pprint-literal-wrapper self stream))
+      (PATTERN-VARIABLE 
+       (cond ((and (defined? *skolemNameMappingTable*)
+                   (defined? (lookup *skolemNameMappingTable* self)))
+              (print-stream stream (generate-name-of-variable 
+                                    (lookup *skolemNameMappingTable* self))))
+             ((and (printing-justification?)
+                   (defined? (justification-argument-bound-to self NULL)))
+              (pprint-object
+               (justification-argument-bound-to self NULL) stream))
+             (otherwise
+              (print-stream stream (generate-name-of-variable self)))))
+      (SKOLEM   ;; Revisit    revisited tar 11/3/00, 9/28/04
+       (cond ((defined? (native-value-of self))
+	      (pprint-atomic-object (native-value-of self) stream))
+	     ((defined? (innermost-of self))
+	      (print-stream stream (string-downcase (get-skolem-print-name self)))
+              (cond ((not (eq? (innermost-of self) self))
+		     (print-stream stream VALUE-OF-SEPARATOR)
+		     (pprint-object (innermost-of self) stream))
+                    ((defined? (defining-proposition self))
+                     (print-stream stream VALUE-OF-SEPARATOR)
+                     (pprint-function-term (defining-proposition self) stream))
+                    (otherwise NULL)))
+	     (otherwise 
+	      (print-stream stream (generate-skolem self)))))
+      (LOGIC-OBJECT
+       (if (defined? (surrogate-value-inverse self))
+	   (print-stream stream (surrogate-to-symbol
+				 (surrogate-value-inverse self)))
+	 (print-stream stream "Unamed_Object")))
+      (SURROGATE 
+       (print-stream stream (operator-to-string self)))
+      (LOGIC-THING
+       (cond ((defined? (generate-term self))
+              (pprint-object (generate-term self) stream))
+             ((defined? (surrogate-value-inverse self))
+              (print-stream stream  (surrogate-value-inverse self)))
+             (otherwise
+              (print-stream stream self))))
+      (THING
+       (if (defined? (surrogate-value-inverse self))
+	   (print-stream stream (surrogate-value-inverse self))
+	   (print-stream stream self)))
+      (otherwise
+       (print-stream stream self)))) )
+
+(defun pprint-literal-wrapper ((self LITERAL-WRAPPER) (stream NATIVE-OUTPUT-STREAM))
+  (typecase self
+    (BOOLEAN-WRAPPER (print-stream stream (wrapper-value self)))
+    (INTEGER-WRAPPER (print-stream stream (wrapper-value self)))
+    (FLOAT-WRAPPER   (print-stream stream (wrapper-value self)))
+    ;; TO DO: Maybe print this differently?
+    (CHARACTER-WRAPPER (print-stream stream (wrapper-value self)))
+    (STRING-WRAPPER
+     (if *printreadably?*
+       (print-stream stream "\"" (wrapper-value self) "\"")
+       (print-stream stream (wrapper-value self))))
+    (MUTABLE-STRING-WRAPPER 
+     (if *printreadably?*
+       (print-stream stream "\"" (wrapper-value self) "\"")
+       (print-stream stream (wrapper-value self))))))
+
+(defun (pprint-as-atomic-object? BOOLEAN) ((self OBJECT))
+  ;; Returns TRUE if OBJECT is pprinted as an atomic object.
+  ;; Needs to be kept in sync with pprint-composite-object.
+  (typecase self
+    (NAMED-DESCRIPTION 
+     (return TRUE))
+    ((PROPOSITION DESCRIPTION /STELLA/COLLECTION CONS)
+     (return FALSE))
+    (otherwise
+     (return TRUE))))
+
+(defun pprint-composite-object ((self OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  ;; Note that calls to this are gated by pprint-as-atomic-object?, so
+  ;;  these two functions need to be kept in sync.
+  (typecase self
+    (PROPOSITION (pprint-proposition self stream))
+    (DESCRIPTION (pprint-description self stream))
+    (/STELLA/COLLECTION (pprint-stella-collection self stream))
+    (CONS (pprint-stella-cons self stream))
+    (otherwise
+     (warn "UNKNOWN composite object: " self))))
+
+(defun pprint-object ((self OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  (cond ((null? self)  )
+	((not (pprint-as-atomic-object? self))
+	 (pprint-composite-object self stream))
+	((defined? *pprint-atomic-object-renderer*)
+	 (funcall *pprint-atomic-object-renderer* self stream))
+	(otherwise
+	 (pprint-atomic-object self stream))))
+
+(defun pprint-arguments ((arguments ARGUMENTS-VECTOR)
+			 (separateLines? BOOLEAN)
+			 (omitLastArgument? BOOLEAN)
+			 (stream NATIVE-OUTPUT-STREAM))
+  ;; Print a list of visible arguments to 'stream'.
+  ;; If all arguments are invisible, print them all visibly to
+  ;;    ensure that we have at least some arguments (unless there
+  ;;    aren't any at all).
+  (when (null? arguments)
+    (return))
+  (let ((argumentsIterator
+         (choose omitLastArgument?
+                 (but-last arguments)
+                 (allocate-iterator arguments)))
+        (visibleArgCount (visible-arguments-count arguments))
+        (argIndex 0))
+    (when (and omitLastArgument?
+               (visible-argument? (last arguments)))
+      (-- visibleArgCount))
+    (foreach arg in argumentsIterator
+        where (or (visible-argument? arg)
+                  (= visibleArgCount 0))
+        do (++ argIndex)
+           (when (> argIndex 1)
+             (if separateLines?
+		 (pprint-newline stream)
+	       (print-stream stream " ")))
+           (pprint-object arg stream)) ))
+
+(defun (short-term? BOOLEAN) ((arg OBJECT))
+  (typecase arg
+    (LITERAL-WRAPPER
+     (typecase arg
+       ((STRING-WRAPPER MUTABLE-STRING-WRAPPER)
+        (return (< (length (wrapper-value arg)) 9)))
+       (otherwise
+        (return TRUE))))
+    (SYMBOL
+     (return (< (length (symbol-name arg)) 9)))
+    (PATTERN-VARIABLE
+     (return (< (length (symbol-name (variable-name arg))) 9)))
+    (LOGIC-OBJECT
+     (let ((name (object-name arg)))
+       (if (defined? name)
+         (return (< (length (symbol-name name)) 9))
+         (return FALSE))))
+    (otherwise
+     (return FALSE))))
+
+(defglobal *downcase-standard-kif-operators?* BOOLEAN TRUE)
+
+(defun (operator-to-string STRING) ((operator OBJECT))
+  ;; This is a variant of `stringified-kif-operator' that generates a printable
+  ;; string for `operator'.  If it is a standard KIF operator and
+  ;; `*downcase-standard-kif-operators?*' is true, it will be downcased for a
+  ;; more pleasing appearance (needs to be generalized and unified with the
+  ;; behavior of the standard KIF printing engine).
+  (when (null? operator)
+      (return "NULL"))
+  (typecase operator
+    (SURROGATE
+     (let ((printName (stringified-surrogate operator)))
+       (case operator
+         ((PL-KERNEL-KB/@AND PL-KERNEL-KB/@OR PL-KERNEL-KB/@NOT PL-KERNEL-KB/@FAIL
+           PL-KERNEL-KB/@FORALL PL-KERNEL-KB/@EXISTS PL-KERNEL-KB/@KAPPA
+           PL-KERNEL-KB/@SUBSET-OF
+           PL-KERNEL-KB/@SETOF PL-KERNEL-KB/@LISTOF PL-KERNEL-KB/@BAGOF
+           PL-KERNEL-KB/@TRUE PL-KERNEL-KB/@FALSE)
+          (when *downcase-standard-kif-operators?*
+            (setq printName (string-downcase printName))))
+         (PL-KERNEL-KB/@EQUIVALENT
+          (setq printName "="))
+         (otherwise NULL))
+       (return printName)))
+    (SYMBOL
+     (return (maybe-downcase (symbol-name operator))))))
+
+(defun pprint-operator-with-arguments ((operatorName STRING)
+				       (arguments ARGUMENTS-VECTOR)
+				       (separateLines? BOOLEAN)
+				       (omitLastArgument? BOOLEAN)
+				       (stream NATIVE-OUTPUT-STREAM))
+  ;; Print `operator' with its `arguments'.
+  ;; If `separateLines?' is TRUE, put individual arguments onto
+  ;;    separate lines.
+  ;; If `omitLastArgument?' is TRUE, don't print the last argument.
+  (let ((operatorIndent (+ (length operatorName) 2)))
+    (print-stream stream "(" operatorName " ")
+    (++ *pprint-indent* operatorIndent)
+    (pprint-arguments arguments separateLines? omitLastArgument? stream)
+    (-- *pprint-indent* operatorIndent)
+    (print-stream stream ")") ))
+
+
+(defun pprint-relation-proposition ((self PROPOSITION) (stream NATIVE-OUTPUT-STREAM))
+  ;; Helping function for pprint-proposition.  Assumes that this is a proposition
+  ;;   that should be printed in a relational form.
+  (let ((nArgs (length (arguments self))))
+    (print-stream stream "(")
+    (pprint-object (operator self) stream)
+    (++ *pprint-indent* 3)
+    (if (or (>= nArgs 4)
+            (and (= nArgs 3)
+                 (forall arg in (arguments self)
+                     always (not (short-term? arg)))))
+        (foreach arg in (arguments self)
+            do (pprint-newline stream)
+               (pprint-object arg stream))
+      ;; length or args <= 2 or =3 w/ a short argument.
+      (foreach arg in (arguments self)
+          do (if (pprint-as-atomic-object? arg)
+                 (print-stream stream " ")
+               (pprint-newline stream))
+             (pprint-object arg stream)))
+    (-- *pprint-indent* 3)
+    (print-stream stream ")")))
+
+(defun pprint-function-term ((self PROPOSITION) (stream NATIVE-OUTPUT-STREAM))
+  ;; Helping function for pprint-proposition.  Assumes that this is a function proposition
+  ;;   that should be printed with = and a functional call.
+  (print-stream stream "(")
+  (pprint-object (operator self) stream)
+  (if (or (>= (length (arguments self)) 5)
+          (and (= (length (arguments self)) 4)
+               (forall arg in (arguments self)
+                       always (not (short-term? arg)))))
+    (let ((indent (+ (length (symbol-name (operator self))) 2))
+          (first? TRUE))
+      (++ *pprint-indent* indent)
+      (foreach arg in (but-last (arguments self))
+        do (if first?
+             (progn (print-stream stream " ") (setq first? false))
+             (pprint-newline stream))
+        (pprint-object arg stream))
+        (-- *pprint-indent* indent))
+    (foreach arg in (but-last (arguments self))
+      do (print-stream stream " ")
+      (pprint-object arg stream)))
+    (print-stream stream ")"))
+
+(defun pprint-function-proposition ((self PROPOSITION) (stream NATIVE-OUTPUT-STREAM))
+  ;; Helping function for pprint-proposition.  Assumes that this is a function proposition
+  ;;   that should be printed with = and a functional call.
+  (let ((lastArg (last (arguments self))))
+    (print-stream stream "(= ")
+    (++ *pprint-indent* 3)
+    (pprint-function-term self stream)
+    (if (pprint-as-atomic-object? lastArg)
+	(print-stream stream " ")
+        (pprint-newline stream))
+    (pprint-object lastArg stream)
+    (-- *pprint-indent* 3)
+    (print-stream stream ")")))
+
+(defun pprint-proposition ((self PROPOSITION) (stream NATIVE-OUTPUT-STREAM))
+  (when (defined?  *pprint-before-proposition-function*)
+    (funcall *pprint-before-proposition-function* self stream))
+  (case (kind self)
+    ((:PREDICATE :ISA)
+     (pprint-relation-proposition self stream))
+    (:FUNCTION
+     (if *printFunctionsAsRelations?*
+       (pprint-relation-proposition self stream)
+       (pprint-function-proposition self stream)))
+    (:AND
+     (print-stream stream "(")
+     (pprint-object (operator self) stream)
+     (++ *pprint-indent* 5)
+     (print-stream stream " ")
+     (pprint-arguments (arguments self) TRUE FALSE stream)
+     (-- *pprint-indent* 5)
+     (print-stream stream ")"))
+    (:OR
+     (print-stream stream "(")
+     (pprint-object (operator self) stream)
+     (++ *pprint-indent* 4)
+     (print-stream stream " ")
+     (pprint-arguments (arguments self) TRUE FALSE stream)
+     (-- *pprint-indent* 4)
+     (print-stream stream ")"))
+    (:NOT
+     (print-stream stream "(")
+     (pprint-object (operator self) stream)
+     (++ *pprint-indent* 5)
+     (print-stream stream " ")
+     (pprint-object (nth (arguments self) 0) stream)
+     (-- *pprint-indent* 5)
+     (print-stream stream ")"))
+    (:EQUIVALENT
+     (print-stream stream "(=")
+     (++ *pprint-indent* 3)
+     (print-stream stream " ")
+     (pprint-arguments (arguments self) FALSE FALSE stream)
+     (-- *pprint-indent* 3)
+     (print-stream stream ")"))
+    (:FAIL
+     (print-stream stream "(")
+     (pprint-object (operator self) stream)
+     (++ *pprint-indent* 6)
+     (print-stream stream " ")
+     (pprint-proposition (nth (arguments self) 0) stream)
+     (-- *pprint-indent* 6)
+     (print-stream stream ")"))
+    (:CONSTANT (pprint-object (generate-operator self) stream))
+    (:EXISTS
+     (print-stream stream "(")
+     (pprint-object (operator self) stream)
+     (++ *pprint-indent* 8)
+     (print-stream stream " ")
+     (pprint-quantified-variables (io-variables self) FALSE stream)
+     (-- *pprint-indent* 5)
+     (pprint-newline stream)
+     (pprint-proposition (nth (arguments self) 0) stream)
+     (-- *pprint-indent* 3)
+     (print-stream stream ")"))
+    (:FORALL
+     (print-stream stream "(")
+     (pprint-object (operator self) stream)
+     (++ *pprint-indent* 8)
+     (print-stream stream " ")
+     (pprint-quantified-variables (io-variables self) FALSE stream)
+     (-- *pprint-indent* 5)
+     (pprint-newline stream)
+     (print-stream stream "(=> ")
+     (++ *pprint-indent* 4)
+     (pprint-proposition (nth (arguments self) 0) stream)
+     (pprint-newline stream)
+     (pprint-proposition (nth (arguments self) 1) stream)
+     (-- *pprint-indent* 7)
+     (print-stream stream ")"))
+    (:IMPLIES
+     (pprint-implies-proposition self stream)
+     )
+    )
+  (when (defined?  *pprint-after-proposition-function*)
+    (funcall *pprint-after-proposition-function* self stream))
+  )
+
+(defun pprint-quantified-variables 
+    ((variables (VECTOR OF SKOLEM)) (includeTypes? BOOLEAN) 
+     (stream NATIVE-OUTPUT-STREAM))
+  ;; Print list of typed variables for use in FORALL or EXISTS or KAPPA.
+  ;; Allow skolems as variables to handle printing of top-level `exists'
+  ;;    propositions.
+  (when (null? variables)               ; allow printing in debug mode
+    (return))                           ;    before proposition is ready
+  (print-stream stream "(")
+  (++ *pprint-indent* 1)
+  (foreach vbl in variables
+      as i in (interval 1 NULL)
+      do (when includeTypes?
+	   (print-stream stream "("))
+	 (typecase vbl
+	   (PATTERN-VARIABLE
+	    (pprint-object vbl stream))
+	   (SKOLEM
+	    ;; TO DO: IMPLEMENT SOMETHING LIKE THE FOLLOWING:
+	    ;;(print-value-of-chain vbl stream vbl)
+	    (pprint-object vbl stream)
+	    ))
+	 (when includeTypes?
+	   (pprint-object (logical-type vbl) stream)
+	   (print-stream stream ")"))
+	 (when (< i (length variables))
+	   (if includeTypes?
+	       (pprint-newline stream)
+	     (print-stream stream " "))))
+  (-- *pprint-indent* 1)
+  (print-stream stream ")") )
+
+(defun pprint-named-description 
+    ((self NAMED-DESCRIPTION) (stream NATIVE-OUTPUT-STREAM))
+  (if (defined? *pprint-atomic-object-renderer*)
+      (funcall *pprint-atomic-object-renderer* self stream)
+    (pprint-atomic-object self stream)))
+
+(defun pprint-description ((self DESCRIPTION) (stream NATIVE-OUTPUT-STREAM))
+  (cond
+   ((named-description? self)
+    (pprint-named-description self stream))
+   ((defined? (relative-complement self))
+    (print-stream stream "(" (operator-to-string PL-KERNEL-KB/@NOT) " ")
+    (++ *pprint-indent* 5)
+    (pprint-object (relative-complement self) stream)
+    (-- *pprint-indent* 5)
+    (print-stream stream ")"))
+   (otherwise
+    (print-stream stream "(" (operator-to-string PL-KERNEL-KB/@KAPPA) " ")
+    (++ *pprint-indent* 7)
+    (pprint-object (io-variables self) stream)
+    (-- *pprint-indent* 4)
+    (pprint-object (proposition self) stream)
+    (-- *pprint-indent* 3)
+    (print-stream stream ")"))) )
+
+(defun pprint-description-body ((description DESCRIPTION) (stream NATIVE-OUTPUT-STREAM))
+  ;; Helping function for 'print-descriptions-as-rule'.
+  ;; Handles the case when 'description' does not have a body.
+  (cond ((null? (proposition description))
+	 (print-stream stream "(")
+	 (pprint-object (surrogate-value-inverse description)
+			stream)
+	 (++ *pprint-indent* 3)
+	 ;; TO DO: Maybe check length and add line breaks?
+	 (if (defined? *skolemNameMappingTable*)
+	     (foreach var in (io-variables (cast description NAMED-DESCRIPTION))
+		 do (print-stream stream " ")
+		    (if (defined? (lookup *skolemNameMappingTable* var))
+			(pprint-object (lookup *skolemNameMappingTable* var) stream)
+		      (pprint-object var stream)))
+	   (foreach name in (io-variable-names (cast description NAMED-DESCRIPTION))
+		 do (print-stream stream " ")
+		    (pprint-object name stream)))
+	 (print-stream stream ")")
+	 (++ *pprint-indent* 3))
+	(otherwise
+	 (pprint-proposition (proposition description) stream))) )
+
+(defun pprint-named-descriptions-as-rule ((head NAMED-DESCRIPTION)
+                                          (tail NAMED-DESCRIPTION)
+                                          (operatorPrefix STRING)
+                                          (stream NATIVE-OUTPUT-STREAM))
+  ;; Helping function for 'print-descriptions-as-kif-rule', for the case
+  ;;    when there are no description bodies.
+  (let ((operatorIndent INTEGER (+ (length operatorPrefix) 2))
+        (variables NIL))
+    (foreach v in SYSTEM-DEFINED-ARGUMENT-NAMES
+             as i on (interval 1 (arity head))
+             collect v into variables)
+    (++ *pprint-indent* 3)
+    (print-stream stream "(" (operator-to-string PL-KERNEL-KB/@FORALL) " (")
+    (pprint-object (first variables) stream)
+    (foreach v in (rest variables) 
+	do (print-stream stream " ") 
+	   (pprint-object v stream))
+    (print-stream stream ")")
+    (pprint-newline stream)
+    (print-stream stream "(" operatorPrefix " (")
+    (pprint-object head stream)		; Was: (description-name head)
+    (++ *pprint-indent* operatorIndent)
+    (foreach v in variables 
+	do (print-stream stream " ") 
+	   (pprint-object v stream))
+    (print-stream stream ")")
+    (pprint-newline stream)
+    (print-stream stream "(")
+    (pprint-object tail stream)		; Was:  (description-name tail)
+    (foreach v in variables 
+	do (print-stream stream " ") 
+	   (pprint-object v stream))
+    (print-stream stream "))")
+    (-- *pprint-indent* operatorIndent)
+    (-- *pprint-indent* 3) ))
+
+(defun help-pprint-descriptions-as-rule 
+    ((desc DESCRIPTION) (stream NATIVE-OUTPUT-STREAM))
+  ;; Helping function for 'pprint-descriptions-as-rule', which
+  ;;  prints out the head or tail as a description.
+  (let ((existentials 
+	 (copy-cons-list-to-variables-vector 
+	  (top-level-existential-variables desc)))
+	(existentialVariables? (non-empty? existentials)))
+      (when existentialVariables?
+	(print-stream stream "(" (operator-to-string PL-KERNEL-KB/@EXISTS) " ")
+	(++ *pprint-indent* 8)
+	(pprint-quantified-variables existentials FALSE stream)
+	(-- *pprint-indent* 5)
+	(pprint-newline stream))
+      (pprint-description-body desc stream)
+      (when existentialVariables?
+	(print-stream stream ")")
+	(-- *pprint-indent* 3)) ))
+
+(defun pprint-descriptions-as-rule
+    ((head DESCRIPTION) (tail DESCRIPTION) (rule PROPOSITION) 
+     (stream NATIVE-OUTPUT-STREAM))
+  ;; Called by 'pprint-implies-proposition'.
+  ;; BUG: EXCEPT FOR HORN RULES, DOESN'T INSURE THAT VARIABLES IN THE TWO
+  ;;     DESCRIPTIONS MATCH UP. FIX INVOLVES SOME KIND OF MAPPING OPERATION.
+  ;; BUG2: ELIMINATE THE REUSABLE-SKOLEM-MAPPING-TABLE  KLUDGE SIMILAR TO
+  ;;     WHAT WE ARE DOING IN `kif-out.ste' (`print-descriptions-as-kif-rule').
+  (let ((headVariables VARIABLES-VECTOR NULL)
+        (tailVariables VARIABLES-VECTOR NULL)
+        (forwardRule? (forward-only? rule))
+        (operatorPrefix (symbol-name (choose-implication-operator rule forwardRule?)))
+	(operatorIndent INTEGER (+ (length operatorPrefix) 2)))
+    (when (or (deleted? head) (deleted? tail))
+      (special ((*printReadably?* FALSE))
+	(pprint-object "(=> <DeLeTeD ArGuMeNt(S)>)" stream))
+      (return))
+    (when forwardRule?
+      ;; swap 'head' and 'tail' so that rule can be printed with forward arrow:
+      (let ((temp head))
+        (setq head tail)
+        (setq tail temp)))
+    (when (and (null? (proposition tail))
+               (null? (proposition head)))
+      (pprint-named-descriptions-as-rule head tail operatorPrefix stream)
+      (return))
+    (setq headVariables (io-variables head))
+    (setq tailVariables (io-variables tail))
+    ;; ensure that we have two non-empty lists of variables:
+    (cond
+     ((null? (proposition tail))
+      (setq tailVariables headVariables))
+     ((null? (proposition head))
+      (setq headVariables tailVariables)))
+    (clear REUSABLE-SKOLEM-MAPPING-TABLE)
+    (foreach tailVbl in tailVariables
+	as headVbl in headVariables
+	do (insert-at REUSABLE-SKOLEM-MAPPING-TABLE headVbl tailVbl))
+    (print-stream stream "(" (operator-to-string PL-KERNEL-KB/@FORALL) " ")
+    (++ *pprint-indent* 8)
+    (pprint-quantified-variables tailVariables FALSE stream)
+    (-- *pprint-indent* 5)
+    (pprint-newline stream)
+    (print-stream stream "(")
+    (special ((*printReadably?* FALSE))
+      (pprint-object operatorPrefix stream))
+    (print-stream stream " ")
+    (++ *pprint-indent* operatorIndent)
+    ;; Print the head:
+    (special ((*skolemNameMappingTable* REUSABLE-SKOLEM-MAPPING-TABLE))
+      (help-pprint-descriptions-as-rule head stream))
+    ;; signal that list is free for reuse:
+    (clear REUSABLE-SKOLEM-MAPPING-TABLE)
+    ;; Print the tail:
+    (pprint-newline stream)
+    (help-pprint-descriptions-as-rule tail stream)
+    (-- *pprint-indent* operatorIndent)
+    (-- *pprint-indent* 3)
+    (print-stream stream "))") ))
+
+(defun pprint-implies-proposition ((self PROPOSITION) (stream NATIVE-OUTPUT-STREAM))
+  (let ((tailArg (nth (arguments self) 0))
+        (headArg (nth (arguments self) 1)))
+    (if (and (isa? headArg @DESCRIPTION)
+             (isa? tailArg @DESCRIPTION))
+      (pprint-descriptions-as-rule headArg tailArg self stream)
+      (pprint-operator-with-arguments
+       (operator-to-string PL-KERNEL-KB/@SUBSET-OF)
+       (arguments self) FALSE FALSE stream)
+      ) ))
+
+
+(defun pprint-stella-collection 
+    ((self COLLECTION) (stream NATIVE-OUTPUT-STREAM))
+  (let ((set? (no-duplicates? self))
+	(first? TRUE))
+    (if set?
+	(progn (print-stream stream "(" (operator-to-string PL-KERNEL-KB/@SETOF))
+	       (++ *pprint-indent* 7))
+      (progn (print-stream stream "(" (operator-to-string PL-KERNEL-KB/@LISTOF))
+	     (++ *pprint-indent* 8)))
+    (case (length self)
+      (0 )
+      (1 (foreach m in self
+	   do (pprint-object m stream)))
+      ((2 3) (foreach m in self
+	       do (print-stream stream " ")
+	          (pprint-object m stream)))
+      (otherwise
+       (foreach m in self
+	   do (if first?
+                (progn (print-stream stream " ") (setq first? FALSE))
+                (pprint-newline stream))
+	      (pprint-object m stream))))
+    (print-stream stream ")")
+    (if set?
+	(-- *pprint-indent* 7)
+      (-- *pprint-indent* 8)) ))
+
+(defun pprint-stella-cons ((self CONS) (stream NATIVE-OUTPUT-STREAM))
+  (print-stream stream "(")
+  (++ *pprint-indent*)
+  (case (length self)
+    (0 )
+    (1 (pprint-object (first self) stream))
+    (2 (pprint-object (first self) stream)
+       (print-stream stream " ")
+       (pprint-object (second self) stream))
+    (3 (pprint-object (first self) stream)
+       (print-stream stream " ")
+       (pprint-object (second self) stream)
+       (print-stream stream " ")
+       (pprint-object (third self) stream))
+    ((4 5)
+     (pprint-object (first self) stream)
+     (foreach obj in (rest self)
+	 do (if (> *pprint-indent* 2)
+		(pprint-newline stream)
+	      (print-stream stream " "))
+	    (pprint-object obj stream)))
+    (otherwise
+     (pprint-object (first self) stream)
+     (foreach obj in (rest self)
+	 do (pprint-newline stream)
+	    (pprint-object obj stream))))
+  (print-stream stream ")")
+  (-- *pprint-indent*))
+
+(defun pprint-definition ((self CONS) (hasVariables? BOOLEAN) (stream NATIVE-OUTPUT-STREAM))
+  ;; A definition has one of the forms: 
+  ;; hasVariables? = TRUE:    (def... <name> <variable list>  <key1> <value1> <key2> <value2> ...)
+  ;; hasVariables? = FALSE:   (def... <name> <key1> <value1> <key2> <value2> ...)
+  (when (defined? *pprint-before-definition-function*)
+    (funcall *pprint-before-definition-function* self stream))
+  (print-stream stream "(")
+  (pprint-object (first self) stream)
+  (print-stream stream " ")
+  ;; TO DO:  Should this pprint-atomic-object for the name?
+  (if (isa? (second self) @SYMBOL)
+      (pprint-atomic-object (second self) stream)
+    (pprint-object (second self) stream))
+  (cond ((not hasVariables?)
+	 (setq self (rest (rest self)))
+	 (++ *pprint-indent* 3))
+	((> (length (cast (third self) CONS)) 5)
+	 (++ *pprint-indent* 10)
+	 (pprint-newline stream)
+	 (pprint-object (third self) stream)
+	 (setq self (rest (rest (rest self))))
+	 (-- *pprint-indent* 7))
+	(otherwise
+	 (print-stream stream " ")
+	 (pprint-object (third self) stream)
+	 (setq self (rest (rest (rest self))))
+	 (++ *pprint-indent* 3)))
+  (while (not (empty? self))
+    (pprint-newline stream)
+    (pprint-object (first self) stream)
+    (print-stream stream " ")
+    (++ *pprint-indent* 8)  ;; Should be length of (first self)
+    (pprint-object (second self) stream)
+    (-- *pprint-indent* 8)
+    (setq self (rest (rest self))))
+  (-- *pprint-indent* 3)
+  (print-stream stream ")")
+  (when (defined?  *pprint-after-definition-function*)
+    (funcall *pprint-after-definition-function* self stream)))
+
+(defun pprint-ontosaurus-object ((self OBJECT) (stream OUTPUT-STREAM))
+  (special ((*logic-dialect* :KIF)
+            (*pprint-atomic-object-renderer*
+             (the-code :function pprint-atomic-object-for-html)))
+    (typecase self
+      (PROPOSITION
+       (case (kind self)
+         ((:ISA :FUNCTION :PREDICATE :NOT :EQUIVALENT :FAIL) NULL)
+         (otherwise
+          (with-html-tag ("PRE" stream true)
+            (pprint-object self stream))
+          (return))))
+      (otherwise NULL))
+    (pprint-object self stream)))
+
+(startup-time-progn
+  (register-logic-dialect-print-function
+   :KIF-ONTOSAURUS (the-code :function pprint-ontosaurus-object)))

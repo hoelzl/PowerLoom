@@ -1,0 +1,730 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2000-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: visualize.ste,v 1.3 2010/09/11 02:28:10 hans Exp
+
+;;; Routines to support visualization of PowerLoom ontologies.
+
+;;; Derived from Michael Sintek's PLViz.java which he wrote during his
+;;; visit to ISI in 2002.
+
+(in-package "STELLA")
+
+(in-module "ONTOSAURUS")
+
+
+;;; TO DO:
+;;; - in `viz-export-concept-tree', try to determine what we want as
+;;;   the root in the display, and export that node first, since it
+;;;   seems to influence the `dot' layout (we might also force layout
+;;;   more explicitly using rank constraints).
+;;; - figure out whether this should be merged in some form with the
+;;;   KB-to-graph translation and graph export machinery defined in
+;;;   KOJAK (which would support other graph formats such as Pajek).
+
+
+;;; Default values for various switches:
+
+(defglobal *viz-show-relations?* BOOLEAN FALSE
+  :documentation "If true, show binary relations between domain and range concepts as edges.")
+
+(defglobal *viz-show-attributes?* BOOLEAN FALSE
+  :documentation "If true, show binary relations as attributes (2nd box in a concept label).")
+
+(defglobal *viz-show-rules?* BOOLEAN FALSE
+  :documentation "If true, show defining rules (3rd box in a concept label).")
+
+(defglobal *viz-add-top?* BOOLEAN FALSE
+  :documentation "If true, put everything under artificial TOP node.")
+
+(defglobal *viz-node-color* STRING "yellow")
+
+(defglobal *viz-relation-color* STRING "blue")
+
+(defglobal *viz-relation-style* STRING "dashed")
+
+(defglobal *viz-font-size* INTEGER 7)
+
+(defclass VIZ-INFO (STANDARD-OBJECT)
+  :documentation "Encapsulates all the options and local state information needed to
+visualize a set of concepts as a graph."
+  :slots ((stream :type OUTPUT-STREAM)
+          (allowed-objects :type HASH-SET)
+          (show-relations? :type BOOLEAN :initially *viz-show-relations?*)
+          (show-attributes? :type BOOLEAN :initially *viz-show-attributes?*)
+          (show-rules? :type BOOLEAN :initially *viz-show-rules?*)
+          (add-top? :type BOOLEAN :initially *viz-add-top?*)
+          (node-color :type STRING :initially *viz-node-color*)
+          (relation-color :type STRING :initially *viz-relation-color*)
+          (relation-style :type STRING :initially *viz-relation-style*)
+          (font-size :type INTEGER :initially *viz-font-size*)))
+
+
+  ;;
+;;;;;; Utilities
+  ;;
+
+(defglobal VIZ-TOP STRING "top")
+(defglobal VIZ-UNKNOWN STRING "unknown")
+
+(defun (viz-get-object-name STRING) ((object OBJECT))
+  ;; Return a name for `object' that we can use as a node label.
+  (when (null? object)
+    (return VIZ-UNKNOWN))
+  (let ((name (object-name-string object)))
+    (when (null? name)
+      (setq name (stringify object)))
+    (return name)))
+
+(defmethod (viz-generate-ontosaurus-handle STRING) ((self VIZ-INFO) (object STANDARD-OBJECT))
+  ;; Generate an Ontosaurus URL for `object' (useful in an image map so we can browse to it).
+  (let ((url (new STRING-OUTPUT-STREAM)))
+    (html-write-url url "show" object)
+    (return (the-string url))))
+
+(defmethod (viz-get-binary-relations-of (CONS OF LOGIC-OBJECT)) ((self VIZ-INFO) (concept LOGIC-OBJECT))
+  ;; Return a list of binary relations that have `concept' as their domain.
+  ;; It seems that we should have this in PLI in some form or other.
+  (return
+    (memoize (concept *context*)
+             :timestamps :META-KB-UPDATE :max-values 1000
+             (apply-retrieve
+              (?relation ?domain)
+              (pl-kernel/and (pl-kernel/nth-domain ?relation 0 ?domain)
+                             (binary-relation ?relation))
+              (NULL concept)
+              :singletons? TRUE :inference-level :shallow))))
+
+(defun (viz-dot-string STRING) ((name STRING))
+  ;; Convert `name' that can be used as a node label acceptable by `dot'.
+  ;; Remove returns, escape special characters, etc.
+  (let ((buffer (make-raw-mutable-string (* (length name) 2)))
+        (i -1)
+        (sol? FALSE)) ;; start of line
+    (foreach char in name
+        do (case char
+             (#\space
+              (if sol?
+                  ;; HACK: `dot' collapses multiple spaces into one, so we use .'s here:
+                  (setf (nth buffer (++ i)) #\.)
+                (setf (nth buffer (++ i)) char)))
+             ((#\newline #\return)
+              (setf (nth buffer (++ i)) #\\)
+              (setf (nth buffer (++ i)) #\l)
+              (setq sol? TRUE))
+             ((#\" #\{ #\} #\| #\< #\> #\\)
+              (setf (nth buffer (++ i)) #\\)
+              (setf (nth buffer (++ i)) char)
+              (setq sol? FALSE))
+             (otherwise
+              (setf (nth buffer (++ i)) char)
+              (setq sol? FALSE))))
+    (return (subsequence buffer 0 (1+ i)))))
+
+(defun (viz-dot-object-name STRING) ((object OBJECT))
+  ;; Convenience function.
+  (return (viz-dot-string (viz-get-object-name object))))
+
+
+  ;;
+;;;;;; Inclusion and Exclusion
+  ;;
+
+(defglobal *viz-excluded-modules* (LIST OF MODULE) (list)
+  :documentation "Set of PowerLoom logic modules that shouldn't be visualized.
+By default this is empty but it could be used to customize the visualizer.")
+
+(defmethod (viz-excluded-module? BOOLEAN) ((self VIZ-INFO) (module MODULE))
+  ;; Return TRUE if the contents of `module' cannot be visualized.
+  (return (or (member? *viz-excluded-modules* module)
+              (not (logic-module? module)))))
+
+(defmethod (viz-allowed-object? BOOLEAN) ((self VIZ-INFO) (object OBJECT))
+  ;; Return TRUE if `object' can be included in a visualization.
+  (return (choose (null? (allowed-objects self))
+                  (not (viz-excluded-module? self (home-module object)))
+                  (member? (allowed-objects self) object))))
+
+(defmethod viz-allow-object ((self VIZ-INFO) (object OBJECT))
+  ;; Include `object' in `self's allowed-objects list.
+  ;; NOTE: as a side-effect, if `self's allowed-objects list was NULL so far,
+  ;;       all other objects become automatically disallowed until they are
+  ;;       explicitly added to the list.
+  (let ((allowedObjects (allowed-objects self)))
+    (when (null? allowedObjects)
+      (setq allowedObjects (new HASH-SET))
+      (setf (allowed-objects self) allowedObjects))
+    (insert allowedObjects object)))
+
+(defmethod viz-exclude-object ((self VIZ-INFO) (object OBJECT))
+  ;; Remove `object' from `self's allowed-objects list.
+  ;; NOTE: as a side-effect, if `self's allowed-objects list was NULL so far,
+  ;;       all other objects become automatically disallowed until they are
+  ;;       explicitly added to the list.
+  (let ((allowedObjects (allowed-objects self)))
+    (when (null? allowedObjects)
+      (setq allowedObjects (new HASH-SET))
+      (setf (allowed-objects self) allowedObjects))
+    (remove allowedObjects object)))
+
+
+  ;;
+;;;;;; Visualizing a concept in `dot'
+  ;;
+
+(defmethod viz-concept-to-dot-node ((self VIZ-INFO) (concept LOGIC-OBJECT) (module MODULE))
+  ;; Create a `dot' node representation for `concept' relative to `module'.
+  ;; In the simplest case, we create a box with `concept's name.
+  ;; Depending on options, we might also create a box with attributes (binary relations
+  ;; that have `concept' as their domain) and a third box with rules.
+  (let ((stream (stream self))
+        (conceptName (viz-dot-object-name concept))
+        (conceptColor (node-color self))
+        (conceptUrl (viz-generate-ontosaurus-handle self concept)))
+    (cond ((or (show-attributes? self)
+               (show-rules? self))
+           ;; Generate a UML-like box with subboxes:
+           (print-stream stream
+                         "  \""
+                         conceptName
+                         "\" ["
+                         "shape=record, style=filled, fillcolor="
+                         conceptColor
+                         ", "
+                         "URL=\"")
+           (print-stream stream conceptUrl)
+           (print-stream stream "\", label=\"{" conceptName "|")
+           (when (show-attributes? self)
+             (viz-add-concept-attributes-to-dot-node self concept module))
+           (when (show-rules? self)
+             (when (show-attributes? self)
+               (print-stream stream "|"))
+             (viz-add-concept-rules-to-dot-node self concept module))
+           (print-stream stream "}\"]" EOL))
+          (otherwise
+           ;; Generate a simple box:
+           (print-stream stream "  \"" conceptName "\" ["
+                         "shape=box, style=filled, fillcolor="
+                         conceptColor ", "
+                         "URL=\"" conceptUrl "\"]")))))
+
+(defmethod viz-add-concept-attributes-to-dot-node ((self VIZ-INFO)
+                                                   (concept LOGIC-OBJECT)
+                                                   (module MODULE))
+  ;; Add a list of relevant attribute relations to `concept's `dot' node in a second box.
+  (let ((stream (stream self))
+        (range LOGIC-OBJECT NULL))
+    (within-module module
+      (foreach relation in (viz-get-binary-relations-of self concept)
+          do (setq range (PLI/get-range relation))
+             (print-stream stream
+                           (viz-dot-object-name relation)
+                           ": "
+                           (viz-dot-object-name range)
+                           "\\l")))))
+
+(defmethod viz-add-concept-rules-to-dot-node ((self VIZ-INFO)
+                                              (concept LOGIC-OBJECT)
+                                              (module MODULE))
+  ;; Add a list of relevant rules to `concept's `dot' node in a third box.
+  (let ((stream (stream self))
+        (first? TRUE))
+    (within-module module
+      (special ((*prettyPrintLogicalForms?* TRUE))
+        (foreach rule in (PLI/get-rules concept module null)
+            where (not (simple-subrelation-proposition? rule))
+            do (unless first?
+                 (print-stream stream "\\l"))
+               (setq first? FALSE)
+               (print-stream stream (viz-dot-string (stringify rule))))))))
+
+(defmethod viz-concept-links-to-dot-edges ((self VIZ-INFO) (concept LOGIC-OBJECT) (module MODULE))
+  ;; Add `dot' edges to represent sub->super concept links as well as (depending on whether
+  ;; `show-relations?' is true) binary relations that have `concept' as their domain and
+  ;; some other allowed concept as their range.
+  (let ((stream (stream self))
+        (count 0))
+    (foreach super in (PLI/get-direct-superrelations concept module NULL)
+        do (typecase super
+             (NAMED-DESCRIPTION
+              (cond ((viz-allowed-object? self super)
+                     (print-stream stream "  \""
+                                   (viz-dot-object-name super)
+                                   "\" -> \""
+                                   (viz-dot-object-name concept)
+                                   "\" [dir=back]" EOL)
+                     (++ count))
+                    (otherwise
+                     ;; super isn't normally graphed, but include it for reference:
+                     (print-stream stream
+                                   "  \""
+                                   (viz-dot-object-name super)
+                                   "\" ["
+                                   "shape=box, style=filled, fillcolor=grey,"
+                                   "URL=\""
+                                   (viz-generate-ontosaurus-handle self super)
+                                   "\"]")
+                     (print-stream stream
+                                   "  \""
+                                   (viz-dot-object-name super)
+                                   "\" -> \""
+                                   (viz-dot-object-name concept)
+                                   "\" [dir=back]" EOL)
+                     (++ count))))
+             (otherwise 
+              (error "viz-concept-links-to-dot-edges: unhandled super concept: " super))))
+    (when (and (= count 0)
+               (add-top? self))
+      ;; no super concepts -> put under TOP:
+      (print-stream stream "  \""
+                    VIZ-TOP
+                    "\" -> \""
+                    (viz-dot-object-name concept)
+                    "\" [dir=back]" EOL))
+    (when (show-relations? self)
+      (let ((range LOGIC-OBJECT NULL)
+            (relColor (relation-color self))
+            (relStyle (relation-style self)))
+        (within-module module
+          (foreach relation in (viz-get-binary-relations-of self concept)
+              do (setq range (PLI/get-range relation))
+                 (when (viz-allowed-object? self relation)
+                   (print-stream stream
+                                 "  \""
+                                 (viz-dot-object-name concept)
+                                 "\" -> \"" 
+                                 (viz-dot-object-name range) ;; TOP default?
+                                 "\" [label=\""
+                                 (viz-dot-object-name relation)
+                                 "\", color="
+                                 relColor
+                                 ", style="
+                                 relStyle
+                                 "]" EOL))))))))
+
+(defmethod viz-export-concept-to-dot ((self VIZ-INFO) (concept LOGIC-OBJECT) (module MODULE))
+  ;; Generate a `dot' graph representation for `concept' (relative to `module').
+  (viz-concept-to-dot-node self concept module)
+  (viz-concept-links-to-dot-edges self concept module))
+
+(defmethod viz-export-dot-header ((self VIZ-INFO))
+  ;; Generate a `dot' file header.
+  (let ((stream (stream self)))
+    (print-stream stream "digraph Ontology {" EOL)
+    (print-stream stream
+                  "  node [fontname = Arial, fontsize="
+                  (font-size self)
+                  ", shape=box, style=filled, fillcolor="
+                  (node-color self)
+                  ", height=0.2" ;; experiment: min-height in inches
+                  "];" EOL)
+    (print-stream stream
+                  "  edge [fontname = Arial, fontsize="
+                  (font-size self)
+                  "];" EOL)))
+
+(defmethod viz-export-dot-trailer ((self VIZ-INFO))
+  ;; Generate a `dot' file trailer.
+  (print-stream (stream self) "}" EOL))
+
+
+  ;;
+;;;;;; General concept and module visualization
+  ;;
+
+;;; We are trying to decouple the generation of concepts we want to
+;;; see in a visualization from the actual formatting for a particular
+;;; graphing environment (such as `dot').  The decoupling isn't quite
+;;; complete and could also include the generation of relevant rules
+;;; and relations here instead of in the dot-specific functions above.
+
+(defmethod viz-export-concept ((self VIZ-INFO) (concept LOGIC-OBJECT) (module MODULE))
+  ;; For now we hardwire DOT translation, could make this more flexible later.
+  (viz-export-concept-to-dot self concept module))
+
+(defmethod viz-export-concept-tree ((self VIZ-INFO) (concept LOGIC-OBJECT) (module MODULE))
+  ;; Find supers and subs of `concept' and display it in that context.
+  ;; NOTE: dot layout seems to depend on the order of mention of nodes in the dot file.
+  ;;       What we want to be the root in the graph should be first in the file (for the
+  ;;       standard dot layout, there is no node option to control that).
+  (setf (node-color self) "palegreen") ;; mark `concept' with special color
+  (viz-export-concept self concept module)
+  (setf (node-color self) "yellow")
+  (viz-allow-object self concept)
+  (foreach super in (pli/get-proper-superrelations concept module NULL)
+      do (viz-allow-object self super))
+  (foreach sub in (pli/get-proper-subrelations concept module NULL)
+      do (viz-allow-object self sub))
+  ;; export superconcepts:
+  (foreach super in (pli/get-proper-superrelations concept module NULL)
+      do (typecase super
+           (LOGIC-OBJECT
+            (viz-export-concept self super module))
+           (otherwise
+            (error "viz-export-concept-tree: concept not handled: " super))))
+  ;; export subconcepts:
+  (foreach sub in (pli/get-proper-subrelations concept module NULL)
+      do (typecase sub
+           (LOGIC-OBJECT
+            (viz-export-concept self sub module))
+           (otherwise
+            (error "viz-export-concept-tree: concept not handled: " sub)))))
+
+(defmethod viz-export-concepts ((self VIZ-INFO) (module MODULE))
+  ;; Export all concepts defined in `module'.
+  (foreach concept in (pli/get-concept-instances (get-instance pl-kernel/@concept) module null)
+      do (typecase concept
+           (LOGIC-OBJECT
+            (when (and (eql? (home-module concept) module)
+                       (viz-allowed-object? self concept))
+              (viz-export-concept self concept module)))
+           (otherwise
+            (error "viz-export-concepts: concept not handled: " concept)))))
+
+(defmethod viz-export-module ((self VIZ-INFO) (module MODULE))
+  ;; Export the ontology defined in `module'.
+  (pl-log :medium "powerloom-viz: exporting module: " module)
+  (within-module module
+    (viz-export-concepts self module)))
+
+(defmethod viz-export-header ((self VIZ-INFO))
+  ;; Generate a visualization file header.
+  (viz-export-dot-header self))
+
+(defmethod viz-export-trailer ((self VIZ-INFO))
+  ;; Generate a visualization file trailer.
+  (viz-export-dot-trailer self))
+
+
+  ;;
+;;;;;; Top Level
+  ;;
+
+;;; TO DO:
+;;; - generalize, finish and document these
+;;; - we might want to have a user-level `visualize' command that takes a specification
+;;;   of a set of concepts as inputs, accepts various options such as :show-rules?, etc.
+;;;   and then generates a dot file and - ideally - immediately visualizes the result.
+
+(defun viz-export-module-to-file ((module MODULE) (file STRING))
+  (with-output-file (out file)
+    (within-module module
+      (let ((info (new VIZ-INFO
+                       :show-relations? TRUE
+                       ;:show-attributes? TRUE
+                       ;:show-rules? TRUE
+                       :stream out)))
+        (viz-export-header info)
+        (viz-export-module info module)
+        (viz-export-trailer info)))))
+
+(defun viz-export-concept-to-file ((concept LOGIC-OBJECT) (module MODULE) (file STRING))
+  (with-output-file (out file)
+    (within-module module
+      (let ((info (new VIZ-INFO
+                       :show-relations? TRUE
+                       :show-attributes? TRUE
+                       :show-rules? TRUE
+                       :stream out)))
+        (viz-export-header info)
+        (viz-export-concept-tree info concept module)
+        (viz-export-trailer info)))))
+
+
+  ;;
+;;;;;; Serving dot images to Ontosaurus
+  ;;
+
+;;; TO DO:
+;;; - Check windows support and how switches need to be supplied
+;;;   (also whether version prints to stderr there)
+;;; - Document specificity override with handler paths (relied upon
+;;;   by the "/ploom/graph/" directory export
+;;; - temp directory cleanup (there are servlets in some Java versions)
+
+(defglobal *viz-dot-program* STRING "dot")
+
+(defglobal *viz-server-enabled?* BOOLEAN TRUE
+  :documentation "If true, visualization requests are enabled.")
+
+(defglobal *viz-server-image-maps-enabled?* BOOLEAN TRUE
+  :documentation "If true, visualization images will be linked with a
+clickable image map."
+  :public? TRUE)
+
+(startup-time-progn
+  (exception-case
+      ;; `dot' writes its version to stderr - confirm that for Windows:
+      (shell-command (bquote (& *viz-dot-program* "-V")))
+    (STELLA-EXCEPTION (e)
+      (unless (defined? (string-search (string-downcase (exception-message e)) "graphviz" NULL))
+        ;; `dot' not available, disable graphing:
+        (setq *viz-server-enabled?* FALSE)))))
+
+(defun (viz-server-available? BOOLEAN) ()
+  ;; Return TRUE if graphing is enabled and possible.
+  (return *viz-server-enabled?*))
+
+(defun viz-server-export-module ((module MODULE) (out OUTPUT-STREAM))
+  ;; Ontosaurus interface to `viz-export-module'.
+  (within-module module
+    (let ((info (new VIZ-INFO
+                     :show-relations? TRUE
+                     ;:show-attributes? TRUE
+                     ;:show-rules? TRUE
+                     :stream out)))
+      (viz-export-header info)
+      (viz-export-module info module)
+      (viz-export-trailer info))))
+
+(defun viz-server-export-concept ((concept LOGIC-OBJECT) (module MODULE) (out OUTPUT-STREAM))
+  ;; Ontosaurus interface to `viz-export-concept-tree'.
+  (within-module module
+    (let ((info (new VIZ-INFO
+                     :show-relations? TRUE
+                     ;:show-attributes? TRUE
+                     ;:show-rules? TRUE
+                     :stream out)))
+      (viz-export-header info)
+      (viz-export-concept-tree info concept module)
+      (viz-export-trailer info))))
+
+(defun (viz-server-export-object STRING) ((object OBJECT) (module MODULE))
+  ;; Generic memoizable entry point.  The main reason we memoize is to avoid
+  ;; duplicate export when we serve the image associated with an image map.
+  (return
+    (memoize (object module)
+             :timestamps :META-KB-UPDATE :max-values 20
+             (help-viz-server-export-object object module))))
+
+(defun (help-viz-server-export-object STRING) ((object OBJECT) (module MODULE))
+  (let ((dotOut (new STRING-OUTPUT-STREAM)))
+    (if (isa? object @MODULE)
+        (viz-server-export-module object dotOut)
+      (viz-server-export-concept object module dotOut))
+    (return (the-string dotOut))))
+
+
+(defun viz-server-handler ((xchg HTTP/HTTP-EXCHANGE))
+  ;; HTTP server handler for ontology visualization requests.
+  (unless (viz-server-available?)
+    (http/generate-error-response
+     xchg :NOT-IMPLEMENTED
+     (concatenate "Graphing not supported, program `" *viz-dot-program* "' not found"))
+    (return))
+  (let  ((keys (http/parse-and-decode-url-arguments (http/get-request-uri-query xchg) #\+)))
+    (when (< (length keys) 4)
+      ;; let it do the error handling for this case:
+      (do-action-handler xchg))
+    (let ((action (first keys))
+          (objectType (second keys))
+          (moduleName (third keys))
+          (objectName (fourth keys))
+          (stream (http/get-reply-stream xchg))
+          (module (pli/get-module moduleName NULL))
+          (visualizedObject OBJECT NULL)
+          (generateMap?
+           (and *viz-server-image-maps-enabled?*
+                (eql? action "graph"))))
+      (when (null? module)
+        (html-unknown-object-response :context moduleName stream)
+        (return))
+      (case objectType
+        ("context"
+         (setq visualizedObject module))
+        (("relation" "concept")
+         (setq visualizedObject (pli/get-relation objectName module NULL)))
+        (otherwise
+         (http/generate-error-response
+          xchg :BAD-REQUEST
+          (concatenate "Malformed URL, graph of type `" objectType "' is not supported."))
+         (return)))
+      (when (null? visualizedObject)
+        (html-unknown-object-response (choose (null? module) :context :relation)
+                                      (choose (null? module) moduleName objectName)
+                                      stream)
+        (return))
+      (if generateMap?
+          (viz-server-serve-image-plus-map xchg visualizedObject module)
+        (viz-server-serve-image xchg visualizedObject module)))))
+
+(defun viz-server-serve-image ((xchg HTTP/HTTP-EXCHANGE) (object OBJECT) (module MODULE))
+  ;; Generate a visualization image for `object' relative to `module' and serve it directly
+  ;; to `xchg' as a binary object.
+  ;; IMPORTANT: by having `execute-shell-command' output to the reply stream directly, this
+  ;; will do the right thing for binary output in Java.  If we had used an intermediary
+  ;; string stream, we would have to implement a `the-byte-array' method and output the
+  ;; resulting array in order to not get any erroneous byte-to-char conversions in Java.
+  (let ((stream (http/get-reply-stream xchg))
+        (dotCommands (viz-server-export-object object module))
+        (dotExit 0))
+    (when (blank-string? dotCommands) ;; be paranoid
+      (http/generate-error-response xchg :BAD-REQUEST "Nothing to graph")
+      (return))
+    (http/set-reply-header-value xchg :content-type (http/get-http-mime-type :IMAGE-GIF NULL))
+    (setq dotExit
+      (execute-shell-command (bquote (& *viz-dot-program* "-Tgif")) "."
+                             (new STRING-INPUT-STREAM :the-string dotCommands)
+                             (new OUTPUT-STREAM :native-stream stream)
+                             NULL)) ;; just check exit status
+    (unless (= dotExit 0)
+      ;; this will only work right if nothing has been written to `stream' by `dot':
+      (http/generate-error-response xchg :INTERNAL-ERROR "Problem running `dot'")
+      (return))))
+
+;;; Misc references:
+
+;;; See this for image maps: http://www.javascriptkit.com/howto/imagemap.shtml
+;;; See this for in-line images: http://www.websiteoptimization.com/speed/tweak/inline-images/
+;;; See this for useful pointers: http://developer.yahoo.com/performance/rules.html
+;;; See this for multipart-mixed transmission of inline images:
+;;;     http://forums.mozillazine.org/viewtopic.php?f=25&t=1484995
+;;;     http://www.mail-archive.com/mozilla-netlib@mozilla.org/msg02541.html
+;;;     (looks like this is generally not (yet) supported)
+
+(defun viz-server-serve-image-plus-map ((xchg HTTP/HTTP-EXCHANGE) (object OBJECT) (module MODULE))
+  ;; Generate a visualization image for `object' relative to `module' and serve it to `xchg'
+  ;; together with an image map to make it clickable.
+  (let ((uri (unescape-url-string (http/get-request-uri xchg)))
+        (stream (http/get-reply-stream xchg))
+        (dotCommands (viz-server-export-object object module))
+        (imageMap STRING NULL))
+    (when (blank-string? dotCommands) ;; be paranoid
+      (http/generate-error-response xchg :BAD-REQUEST "Nothing to graph")
+      (return))
+    (exception-case
+        (setq imageMap
+          (shell-command (bquote (& *viz-dot-program* "-Tcmap"))
+                         :input dotCommands))
+      (STELLA-EXCEPTION (e)
+        (http/generate-error-response xchg :INTERNAL-ERROR (exception-message e))
+        (return)))
+    (http/set-reply-header-value xchg :content-type (http/get-http-mime-type :HTML NULL))
+    (with-html-tag ("HTML" stream true)
+      (with-html-tag ("HEAD" stream true)
+        (print-stream stream "<TITLE>PowerLoom Graph</TITLE>" EOL)
+        (print-stream stream "<BASE TARGET='content'>" EOL))
+      (with-html-tag ("BODY" stream true)
+        (with-html-tag ("MAP NAME='ontomap'" stream true)
+          (print-stream stream imageMap))
+        ;; TRICKY: the URL below "recursively" calls to `viz-server-handler',
+        ;; but the `graph-bare' action will only serve a bare image;
+        ;; this scheme avoids the need for a temporary file:
+        (print-stream stream
+                      "<IMG SRC='"
+                      (replace-substrings uri "/do-action?graph-bare+" "/do-action?graph+")
+                      "' border='1' usemap='#ontomap'>" EOL)))))
+
+#|
+;;; Generating Image Maps via Temporary Files
+
+;;; We now figured out how to avoid this, but we leave the code here
+;;; in case we need temp files some time down the road.
+
+;;; The code below generates an image plus an associated image map
+;;; which makes the image clickable.  The problem with that is that it
+;;; currently requires the use of a temporary file that can be
+;;; referenced by the <IMG> directive.  The problem with temp files is
+;;; that (1) we need to use a temp directory that is accessible to the
+;;; HTTP server, and (2) that we need to clean them up periodically.
+
+(defglobal *viz-server-temp-directory* STRING
+           (choose (eql? (operating-system) :windows)
+                   "C:\\WINDOWS\\Temp\\ontoviztmp\\"
+                   "/tmp/ontoviztmp/"))
+
+(defun (viz-server-make-temp-file STRING) ((extension STRING))
+  (return (make-temporary-file-name
+           (concatenate *viz-server-temp-directory* "file-")
+           extension)))
+
+(defun viz-server-serve-image-plus-map-via-temp-file ((xchg HTTP/HTTP-EXCHANGE)
+                                                      (object OBJECT)
+                                                      (module MODULE))
+  ;; Generate a visualization image for `object' relative to `module' and serve it to `xchg'
+  ;; together with an image map to make it clickable.  Unfortunately, this currently requires
+  ;; the use of a new temporary file for each request which creates a cleanup problem and
+  ;; also requires the export of the temporary directory.
+  (let ((stream (http/get-reply-stream xchg))
+        (tmpImageFile (viz-server-make-temp-file ".gif"))
+        (dotOut (new STRING-OUTPUT-STREAM))
+        (dotCommands STRING NULL)
+        (imageMap STRING NULL))
+    (if (isa? object @MODULE)
+        (viz-server-export-module object dotOut)
+      (viz-server-export-concept object module dotOut))
+    (setq dotCommands (the-string dotOut))
+    (when (blank-string? dotCommands) ;; be paranoid
+      (http/generate-error-response xchg :BAD-REQUEST "Nothing to graph")
+      (return))
+    (exception-case
+        (progn
+          (shell-command (bquote (& *viz-dot-program* "-Tgif" "-o" & tmpImageFile))
+                         :input dotCommands)
+          (setq imageMap
+            (shell-command (bquote (& *viz-dot-program* "-Tcmap"))
+                           :input dotCommands)))
+      (STELLA-EXCEPTION (e)
+        (http/generate-error-response xchg :INTERNAL-ERROR (exception-message e))
+        (return)))
+    (http/set-reply-header-value xchg :content-type (http/get-http-mime-type :HTML NULL))
+    (with-html-tag ("HTML" stream true)
+      (with-html-tag ("HEAD" stream true)
+        (print-stream stream "<TITLE>PowerLoom Graph</TITLE>" EOL)
+        (print-stream stream "<BASE TARGET='content'>" EOL))
+      (with-html-tag ("BODY" stream true)
+        (with-html-tag ("MAP NAME='ontomap'" stream true)
+          (print-stream stream imageMap))
+        (print-stream stream
+                      "<IMG SRC='/ploom/graph/"
+                      (file-name-without-directory tmpImageFile)
+                      "' usemap='#ontomap'>" EOL)))))
+
+(startup-time-progn
+  ;; ensure the temporary directory exists:
+  (let ((tmpFile (viz-server-make-temp-file ".dir")))
+    (with-output-file (out tmpFile)
+      (print-stream out "created"))
+    (delete-file tmpFile))
+  ;; NOTE: this relies on a specificity override, since "/ploom/" is also published:
+  (http/publish-directory "/ploom/graph/" *viz-server-temp-directory*))
+|#

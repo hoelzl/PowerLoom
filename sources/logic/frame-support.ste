@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: frame-support.ste,v 1.32 2008/09/08 23:35:04 hans Exp
+;;; Version: frame-support.ste,v 1.33 2010/09/09 23:11:23 hans Exp
 
 ;;; Routines that compute various levels of canned queries.
 
@@ -789,29 +789,37 @@ of the slot 'relation' applied to 'self'."
     (return (filter-out-unnamed-descriptions valueTypes)) ))
 
 
-;-----------------------------------------------------------------------
-;; STUB RELATIONS UNTIL WE HAVE TIME TO REWRITE THEM TO DO BACKCHAINING.
-;; RIGHT NOW, ALL INFERENCE DEFAULTS TO SUBSUMPTION LEVEL:
-
   ;;
 ;;;;;; Methods for NORMAL-INFERENCE mode
   ;;
+
+;;; BUG: the problem with these is that they don't do proper recursive subgoal
+;;;      handling, since that machinery only works within a single query and
+;;;      not across recursive query invocations on the function stack.
+
+(defglobal *levellized-backchaining-enabled?* BOOLEAN FALSE
+  :documentation "KLUDGE: until we know how to handle recursive subgoals
+across recursive query invocations, this allows us to disable chaining.")
 
 (defmethod (levellized-test-type-on-instance? BOOLEAN)
            ((level NORMAL-INFERENCE-LEVEL) (self OBJECT) (type SURROGATE))
   ;; Return TRUE if an asserted type for 'self' subsumes 'type'.
   ;; Implements SHALLOW and SUBSUMPTION methods.
+  (unless *levellized-backchaining-enabled?*
+    (return (levellized-test-type-on-instance? SUBSUMPTION-INFERENCE self type)))
   (return (apply-ask (?concept ?instance)
                      (?concept ?instance)
-                     (type self))) )
+                     (type self))))
 
 (defmethod (levellized-all-class-instances CONS)
            ((level NORMAL-INFERENCE-LEVEL) (type SURROGATE))
   ;; Return a list of instances that belong to the class 'type'
   ;;    or to its subclasses.
- (return (apply-retrieve (?concept ?x)
-                         (?concept ?x)
-                         (type NULL))))
+  (unless *levellized-backchaining-enabled?*
+    (return (levellized-all-class-instances SUBSUMPTION-INFERENCE type)))
+  (return (apply-retrieve (?concept ?x)
+                          (?concept ?x)
+                          (type NULL))))
 
 (defmethod (levellized-all-relation-values CONS)
            ((level NORMAL-INFERENCE-LEVEL) 
@@ -820,6 +828,8 @@ of the slot 'relation' applied to 'self'."
   ;;    (a surrogate) applied to 'nMinusOneArguments' plus that last value.
   ;; Defined so that code for BACKTRACKING and NORMAL levels is combined into
   ;;    this one method.
+  (unless *levellized-backchaining-enabled?*
+    (return (levellized-all-relation-values SUBSUMPTION-INFERENCE relation nMinusOneArguments)))
   (case (length nMinusOneArguments)
     (0 (return (apply-retrieve (?relation ?x)
                                (?relation ?x)
@@ -849,6 +859,8 @@ of the slot 'relation' applied to 'self'."
             (relation SURROGATE) (arguments CONS))
   ;; Defined so that code for BACKTRACKING and NORMAL levels is combined into
   ;;    this one method.
+  (unless *levellized-backchaining-enabled?*
+    (return (levellized-test-relation-on-arguments? SUBSUMPTION-INFERENCE relation arguments)))
   (case (length arguments)
     (1 (let ((arg1 (first arguments)))
          (return (apply-ask (?relation ?x)
@@ -881,6 +893,8 @@ of the slot 'relation' applied to 'self'."
            ((level NORMAL-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
   ;; Compute min cardinality based on shallow min cardinality assertions and
   ;;    counting the number of fillers.
+  (unless *levellized-backchaining-enabled?*
+    (return (levellized-get-slot-minimum-cardinality SUBSUMPTION-INFERENCE self relation)))
   (let ((n (apply-retrieve (?relation ?object ?n)
                            (RANGE-MIN-CARDINALITY ?relation ?object ?n)
                            (relation self NULL))))
@@ -895,6 +909,8 @@ of the slot 'relation' applied to 'self'."
   ;;    or is a function.
   ;; Note: If 'relation' is both closed and a function, we may return zero.
   ;;    This may or may not be desirable semantics.
+  (unless *levellized-backchaining-enabled?*
+    (return (levellized-get-slot-maximum-cardinality SUBSUMPTION-INFERENCE self relation)))
   (let ((n (apply-retrieve (?relation ?object ?n)
                           (RANGE-MAX-CARDINALITY ?relation ?object ?n)
                           (relation self NULL))))
@@ -909,6 +925,8 @@ of the slot 'relation' applied to 'self'."
   ;;    assertions, and if 'relation' is closed, search for types
   ;;    that subsume all slot fillers.
   ;; Note: We do NOT filter out all but the most specific types here.
+  (unless *levellized-backchaining-enabled?*
+    (return (levellized-all-slot-value-types SUBSUMPTION-INFERENCE self relation)))
   (return (apply-retrieve (?relation ?object ?type)
                           (AND (RANGE-TYPE ?relation ?object ?type) 
                                (BOUND-VARIABLES ?type)

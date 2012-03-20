@@ -1,0 +1,156 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2002-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: sessions.ste,v 1.4 2010/02/10 23:43:09 hans Exp
+
+;;; Simple HTTP Session utilities
+
+(in-package "STELLA")
+
+(in-module "HTTP")
+
+
+(defglobal *session-table* (KEY-VALUE-MAP OF STRING-WRAPPER SESSION)
+           (new KEY-VALUE-MAP)
+  :documentation "System-wide session table; each session is indexed on a
+globally unique session name.")
+
+(defglobal *sessions-lock* PROCESS-LOCK-OBJECT (make-process-lock))
+  
+(defclass SESSION (DICTIONARY)
+  :documentation "Object storing the state associated with a single session.
+All session-related information is stored in a table indexed on string keys."
+  :parameters ((any-key :type STRING-WRAPPER)
+               (any-value :type OBJECT))
+  :slots 
+  ((name :type STRING :initially NULL :public? TRUE
+         :documentation "UUID uniquely identifying this session.")
+   (timeout :type TIME-DURATION :initially NULL
+	    :documentation "Timeout duration of session; NULL means no timeout.")
+   (timestamp :type CALENDAR-DATE :initially (make-current-date-time)
+	      :documentation "Time this object was last accessed.")
+   (objects :type (KEY-VALUE-MAP OF STRING-WRAPPER OBJECT)
+            :documentation "Table of session-related objects indexed on string keys."
+            :initially (new KEY-VALUE-MAP))))
+
+(defglobal *session-table-cleanup-counter* INTEGER 0)
+
+(defun cleanup-session-table ()
+  (++ *session-table-cleanup-counter*)
+  (when (= (mod *session-table-cleanup-counter* 100) 0)
+    (with-process-lock *sessions-lock*
+      (foreach (name session) in *session-table*
+          where (timed-out? session)
+          do (remove-at *session-table* name)))))
+
+(defun (lookup-session SESSION) ((name STRING) (errorIfTimeout? BOOLEAN))
+  :documentation "Retrieve an existing session object with `name' if it exists, NULL otherwise.
+If a session was found but has timed out, raise an error if `errorIfTimeout?' is true,
+otherwise, return the timed-out session.  Bumps the timestamp on existing sessions that
+haven't yet timed out."
+  :public? TRUE
+  (let ((session (lookup *session-table* name)))
+    (when (defined? session)
+      (if (timed-out? session)
+          ;; NOTE: we don't bump the timestamp on a timed-out session
+          ;; even if we don't raise an error:
+          (when errorIfTimeout?
+            (signal-exception
+             (new TIMEOUT-EXCEPTION
+                  :message (concatenate "lookup-session: session timed out: " name))))
+        (refresh session)))
+    (return session)))
+
+(defun (create-session SESSION) ((name STRING) (timeout INTEGER))
+  :documentation "Create a new session object with `name' (replacing any existing
+sessions with the same name).  If `name' is NULL, generate a random UUID for it.
+Timeout after `timeout' seconds or never in case the value is <= 0 or undefined."
+  :public? TRUE
+  (let ((session (new SESSION)))
+    (when (null? name)
+      (setq name (generate-random-uuid)))
+    (setf (name session) name)
+    (when (> timeout 0) ;; also covers NULL-INTEGER
+      (setf (timeout session) (make-time-duration 0 (* timeout 1000))))
+    (with-process-lock *sessions-lock*
+      (insert-at *session-table* name session))
+    (cleanup-session-table)
+    (return session)))
+
+(defun (get-session SESSION) ((name STRING) (errorIfTimeout? BOOLEAN) (timeout INTEGER))
+  :documentation "Retrieve an existing session object with `name' if it exists or create a new one.
+If `name' is NULL, generate a random UUID for it.  If an existing object was found but has timed
+out, raise an error if `errorIfTimeout?' is true.  If a new object is created, initialize its
+timeout field with `timeout' seconds (0 or undefined means no timeout)."
+  :public? TRUE
+  (if (null? name)
+      (return (create-session NULL timeout))
+    (let ((session (lookup-session name errorIfTimeout?)))
+      (when (null? session)
+        (setq session (create-session name timeout)))
+      (return session))))
+
+(defmethod (timed-out? BOOLEAN) ((session SESSION))
+  :documentation "Return TRUE if `session' has timed out."
+  :public? TRUE
+  (let ((timeout (timeout session))
+        (timestamp (timestamp session)))
+    (if (null? timeout)
+        (return FALSE)
+      (return (greater? (time-subtract (make-current-date-time) timestamp) timeout)))))
+
+(defmethod refresh ((session SESSION))
+  :documentation "Bump the timestamp of `session'."
+  :public? TRUE
+  (let ((timeout (timeout session)))
+    (when (defined? timeout)
+      (setf (timestamp session) (make-current-date-time)))))
+
+(defmethod (lookup OBJECT) ((session SESSION) (key STRING-WRAPPER))
+  :documentation "Retrieve a value from a `session' based on `key'."
+  :public? TRUE
+  (return (lookup (objects session) key)))
+
+(defmethod insert-at ((session SESSION) (key STRING-WRAPPER) (value OBJECT))
+  :documentation "Associate `key' with `value' on `session'."
+  :public? TRUE
+  (insert-at (objects session) key value))

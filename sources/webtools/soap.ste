@@ -1,0 +1,181 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2003-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: soap.ste,v 1.10 2010/03/05 23:08:24 hans Exp
+
+;;; Support for rpc-style messaging with SOAP.
+
+(in-package "STELLA")
+
+(in-module "SOAP")
+
+
+;;; NOTES:
+;;; - the XML-OBJECT and SOAP-ENV modules are visible from SOAP, however,
+;;;   we still prefix the respective objects to document their origin.
+;;; - some of the modules involved are case-sensitive, thus, the mixed-case
+;;;   code in this file.
+
+
+  ;;
+;;;;;; Server-side support
+  ;;
+
+(DEFCLASS SOAP-FAULT-EXCEPTION (STELLA-EXCEPTION)
+  :PUBLIC-SLOTS
+  ((FAULT :TYPE SOAP-ENV/|Fault|)))
+
+(defun process-soap-rpc-request ((soapString STRING) (supressNamespaces? BOOLEAN) (stream OUTPUT-STREAM))
+  :documentation "'envelope' is a string-representation of SOAP envelope containing an
+RPC request.  This functions writes a SOAP envelope containing a service response to `stream'."
+  :public? TRUE
+  (let ((soapObject (from-xml-string soapString))
+	(resultObject (dispatch-rpc-call soapObject)))
+    (special ((XML-OBJECTS/*SUPRESS-NAMESPACES?* supressNamespaces?))
+      (print-xml-expression stream (to-xml resultObject NIL) 0))))
+
+(defun (get-rpc-method SYMBOL) ((envelope SOAP-ENV/|Envelope|))
+  (let ((contents (SOAP-ENV/GET-BODY-CONTENTS envelope))
+	(type (PRIMARY-TYPE contents)))
+    (return (TYPE-TO-SYMBOL type))))
+
+(defun (get-rpc-arguments (CONS OF XML-OBJECTS/|XMLObject|)) ((envelope SOAP-ENV/|Envelope|))
+  (let ((result NIL)
+	(contents (SOAP-ENV/GET-BODY-CONTENTS envelope)))
+    (foreach slot in (get-mapped-slots contents)
+      where (element-slot? slot)
+      collect (get-object-slot-value contents slot)
+      into result)
+    (return result)))
+
+(defun (dispatch-rpc-call SOAP-ENV/|Envelope|) ((envelope SOAP-ENV/|Envelope|))
+  ;; Given a SOAP envelope as input, call the correct procedure with the correct arguments
+  ;; and return a soap envelope as a result.
+  (let ((method (get-rpc-method envelope))
+	(arguments (get-rpc-arguments envelope))
+	(result (dispatch-call-with-method-and-args method arguments)))
+    (return result)))
+
+(defun (dispatch-call-with-method-and-args SOAP-ENV/|Envelope|) ((methodName SYMBOL)
+                                                                 (arguments (CONS OF XML-OBJECTS/|XMLObject|)))
+  (let ((function (function-code (lookup-function methodName)))
+	(rawResult (apply function arguments))
+	(packagedResult (create-soap-envelope rawResult)))
+    (return packagedResult)))
+
+(defun (create-soap-envelope SOAP-ENV/|Envelope|) ((contents XML-OBJECTS/|XMLObject|))
+  (let ((body (new SOAP-ENV/|Body| :|contents| contents))
+	(result (new SOAP-ENV/|Envelope| :|body| body)))
+    (return result)))
+
+(defun (create-soap-fault SOAP-ENV/|Fault|) ((fcode STRING)
+                                             (fstring STRING)
+                                             (factor STRING)
+                                             (fdetail XML-OBJECTS/|XMLObject|))
+  :documentation "Create a SOAP Fault object.  `fcode' and `fstring' are required.
+`factor' and `fdetail' are optional fields.  Fault code should be one of
+\"SOAP-ENV:VersionMismatch\", \"SOAP-ENV:MustUnderstand\" \"SOAP-ENV:Client\" or
+\"SOAP-ENV:Server\".  These may change to keywords in the future."
+  :public? TRUE
+  ;; TO DO: fix Java class qualification bug when we call these parameters by
+  ;;        the same name as the classes, e.g., `faultcode'.
+  (let ((fault (new SOAP-ENV/|Fault|
+                    :|faultcode| (new SOAP-ENV/|faultcode| 
+                                      :|textContent| fcode)
+                    :|faultstring| (new SOAP-ENV/|faultstring| 
+                                        :|textContent| fstring))))
+    (when (defined? factor)
+      (setf (SOAP-ENV/|faultactor| fault)
+        (new SOAP-ENV/|faultactor| 
+             :|textContent| factor)))
+    (when (defined? fdetail)
+      (setf (SOAP-ENV/|detail| fault)
+        (new SOAP-ENV/|detail| 
+             :|contents| fdetail)))
+    (return fault)))
+
+
+;;; The soap-rpc servlet:
+
+(defun soap-rpc-request-handler ((xchg HTTP-EXCHANGE))
+  :documentation "Handle a request encoded by a SOAP message envelope in the body of an HTTP POST
+command, unpack the envelope, dispatch the request, and return the result as SOAP envelope."
+  :public? TRUE
+  (let ((reply (new OUTPUT-STREAM :native-stream (get-reply-stream xchg))))
+    (process-soap-rpc-request (get-request-body xchg) TRUE reply)))
+
+(startup-time-progn
+  (publish-handler "/ploom/soap-rpc/generic-soap-service"
+                   (the-code :function soap-rpc-request-handler)
+                   :content-type (get-http-mime-type :xml null)
+                   :documentation "Generic SOAP RPC handler."))
+
+
+  ;;
+;;;;;; Client-side support
+  ;;
+
+(defun (call-webservice XML-OBJECTS/|XMLObject|) ((callObject XML-OBJECTS/|XMLObject|)
+                                                  (url STRING))
+  :documentation "Package `callObject' into a SOAP envelope, send it to the webservice at `url'."
+  :public? TRUE
+  (let ((debug? TRUE)
+	(requestEnvelopeObject (create-soap-envelope callObject))
+	(requestString (to-xml-string requestEnvelopeObject))
+	(headers (make-soap-rpc-request-headers))
+	(responseEnvelopeString
+         (do-http-request url
+                          :method :POST
+                          :headers headers
+                          :content requestString))
+	(responseEnvelopeObject (from-xml-string responseEnvelopeString))
+	(responseObject (SOAP-ENV/GET-BODY-CONTENTS responseEnvelopeObject)))
+    (when debug?
+      (print "response received: " EOL responseEnvelopeString EOL))
+    (return responseObject)))
+
+(defun (make-soap-rpc-request-headers HTTP-HEADERS) ()
+  ;; Make headers for use during POST operation when calling remote webservices.
+  (let ((result (new HTTP-HEADERS)))
+    (insert-at result "content-type" "text/xml; charset=utf-8")
+    (insert-at result "SoapAction" "")
+    (return result)))

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: strategies.ste,v 1.78 2008/10/24 01:05:25 hans Exp
+;;; Version: strategies.ste,v 1.82 2010/09/10 22:45:56 hans Exp
 
 ;;; Routines that implement alternate proof strategies for query processing
 
@@ -264,6 +264,8 @@
        (setq result (continue-clustered-conjunction-proof frame lastMove)))
       (:CONDITIONAL-ANTECEDENT
        (setq result (continue-conditional-antecedent-proof frame lastMove)))
+      (:DISJUNCTIVE-IMPLICATION-INTRODUCTION
+       (setq result (resume-disjunctive-implication-proof frame lastMove)))
       (otherwise
        ;; We succeeded with an atomic substrategy, propagate the truth value:
        (propagate-frame-truth-value (result frame) frame)
@@ -525,10 +527,15 @@ control stack before executing.")
         (result :FAILURE))
     (when (and (defined? specialistCode)
                (specialist-applicable? description proposition))
-      (exception-case 
-       (setq result (funcall specialistCode frame lastMove))
-       (NATIVE-EXCEPTION (ne)
-          (warn "Exception executing specialist for " description ": " EOL ne)))
+      (if (eql? *powerloom-execution-mode*
+                (if-output-language :common-lisp :development :debug))
+          ;; make sure we raise the errors if we are developing in Lisp:
+          (setq result (funcall specialistCode frame lastMove))
+        ;; otherwise catch them and just print a warning:
+        (exception-case 
+            (setq result (funcall specialistCode frame lastMove))
+          (NATIVE-EXCEPTION (ne)
+            (warn "Exception executing specialist for " description ": " EOL ne))))
       ;; if the specialist didn't assign a truth value, do it here:
       (when (null? (truth-value frame))
         (case result
@@ -650,7 +657,13 @@ control stack before executing.")
                 (not (cache-query-results?))
                 (null? (get-goal-cache-list proposition)))
         (return :FAILURE))))
-  (return (scan-cached-goals frame)) )
+  ;; kludge: for now only scan cached goals for single-valued propositions, since
+  ;; our incomplete caching scheme only creates inefficency for the other cases:
+  (when (all-key-arguments-bound? (proposition frame))
+    (if (eql? (scan-cached-goals frame) :FAILURE)
+        (return :FAILURE)
+      (return :FINAL-SUCCESS)))
+  (return :FAILURE))
 
 (defun (try-lookup-ground-assertions-proof KEYWORD) ((frame CONTROL-FRAME))
   ;; Try to prove the proposition in 'frame' (or generate bindings for its
@@ -726,15 +739,41 @@ control stack before executing.")
       (push-next-strategy frame :SCAN-FOR-VALUE-CLASH))
     (when (not (eql? result :FAILURE))
       (let ((truthValue (propositions-iterator-truth-value iterator))
-            (weight (weight (cast (value iterator) PROPOSITION))))
+            (matching-proposition PROPOSITION (value iterator))
+            (weight (weight matching-proposition)))
         (when (default-truth-value? truthValue)
           ;; try to generate a strict proof:
           (special ((*dontUseDefaultKnowledge?* TRUE))
             (setq iterator (all-matching-propositions proposition))
             (when (next? iterator)
               (setq truthValue (propositions-iterator-truth-value iterator))
-              (setq weight (weight (cast (value iterator) PROPOSITION))))))
+              (setq matching-proposition (value iterator))
+              (setq weight (weight matching-proposition)))))
         (setf (truth-value frame) truthValue)
+        ;; We need to record the forward justifications here, because they
+        ;; are associated with the MATCHING-PROPOSITION and not with the
+        ;; frame's proposition.  The frame's proposition is a description
+        ;; (pattern) with a variable.
+        ;; TODO: Decide if we want more than one.  For now just record
+        ;;       one since that is what is expected by the explanation.
+	(when (record-justifications?)
+	  (foreach fj in (forward-justifications matching-proposition)
+		   do (push (justifications frame) fj)
+		   (break))
+	  ;; Insert the special purpose SUBSET-OF explanation code
+	  ;; based on the propositions being different and one being a
+	  ;; subset of the other.  This picked up here, because the
+	  ;; actual subsumption reasoning happens deep within the
+	  ;; reasoning mechanism, when finding matching propsitions.
+	  ;; This is a convenient place to identify those implicit
+	  ;; reasoning steps and provide a justifications for them.
+	  (let ((subset-justification (create-subset-justification proposition
+								   matching-proposition)))
+	    (when (defined? subset-justification)
+	      (push (justifications frame) subset-justification)))
+
+	  )		     ; End (when (record-justifications?) ...)
+
         (when (defined? (partial-match-frame frame))
           (when (null? weight)
             (setq weight 1.0))
@@ -1282,7 +1321,7 @@ control stack before executing.")
 
 ;;;; TO DO: ADAPT THESE TO BE ABLE TO DEAL WITH DEFAULTS!!!
 
-(defun (extract-collection-argument NAMED-DESCRIPTION) ((proposition PROPOSITION))
+(defun (extract-collection-argument DESCRIPTION) ((proposition PROPOSITION))
   ;; Helping function that extracts  collection
   ;;    argument from an :ISA or MEMBER-OF proposition.
   (case (kind proposition)
@@ -1879,6 +1918,23 @@ control stack before executing.")
                (setf (argument-cursor frame) i)
                (break))
       (return :MOVE-DOWN)) ))
+
+(defun (resume-disjunctive-implication-proof KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Special resumption method, since we need to make sure we are not propagating a false
+  ;; truth value in case we found that based on the hypothetical falsity of other disjuncts.
+  ;; I.e., (OR A B) should be UNKNOWN (not FALSE) if A is UNKNOWN and B is FALSE.
+  (case lastMove
+    (:UP-TRUE
+     (propagate-frame-truth-value (result frame) frame)
+     (when (defined? (partial-match-frame (result frame)))
+       (propagate-frame-partial-truth
+        (partial-match-frame (result frame)) frame))
+     (if (defined? (down frame))
+         (return :CONTINUING-SUCCESS)
+       (return :FINAL-SUCCESS)))
+    (:UP-FAIL
+     (return :FAILURE))))
+
 
 ;;; Holds names of anonymous objects to avoid (unlikely) accidental clashes;
 ;;; the only minor problem with this approach is that the anonymous surrogates

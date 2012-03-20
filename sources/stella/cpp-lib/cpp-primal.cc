@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2008      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2010      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: cpp-primal.cc,v 1.66 2008/09/09 00:53:37 hans Exp
+// Version: cpp-primal.cc,v 1.68 2010/09/08 21:33:50 hans Exp
 
 // Native C++ support for STELLA
 
@@ -467,8 +467,7 @@ char native_read_character(std::istream* stream, boolean& eofP) {
 ///// File operations
  //
 
-boolean probeFileP(char* filename) {
-  filename = translateLogicalPathname(filename);
+boolean nativeProbeFileP(char* filename) {
   std::ifstream fStream;
   fStream.open(filename, std::ios::in);
   if (!fStream)
@@ -482,49 +481,32 @@ boolean probeFileP(char* filename) {
 #include <sys/stat.h>
 namespace stella {
 
-CalendarDate* fileWriteDate(char* filename) {
+CalendarDate* nativeFileWriteDate(char* filename) {
   // Return the time of the last modification of `filename' if available.
   // Return NULL otherwise.
-  filename = translateLogicalPathname(filename);
   struct stat status;
   if (stat(filename, &status) == 0)
      return nativeDateTimeToCalendarDate(status.st_mtime);
   return (NULL);
 }
 
-long long int fileLength(char* filename) {
-  // NOTE: Using 'int' to store sizes might not be sufficient!!
-  if (!probeFileP(filename)) {
-   //// WE SHOULD THROW AN EXCEPTION HERE!!
-    std::cerr << "ERROR in 'file_length': File '"
-         << filename << "' does not exist!" << std::endl;
-    exit(1);
-  }
-  else {
-    filename = translateLogicalPathname(filename);
-    std::ifstream fStream(filename);
-    fStream.seekg(0, std::ios::end);
-    return (fStream.tellg());
-  }
+long long int nativeFileLength(char* filename) {
+  // Return the length of file `fileName' in bytes.
+  std::ifstream fStream(filename);
+  fStream.seekg(0, std::ios::end);
+  return (fStream.tellg());
 }
 
 #include <cstdio>
 
-void deleteFile(char* filename) {
-  if (!probeFileP(filename)) {
-    std::cerr << "ERROR in 'delete_file': File '"
-              << filename << "' does not exist!" << std::endl;
-  //// WE SHOULD THROW AN EXCEPTION HERE!!
-    exit(1);
-  }
-  else {
-    filename = translateLogicalPathname(filename);
-    // this is only available in g++ 3 and later:
-    //std::remove(filename);
-    // this seems to work in in earlier and later versions
-    // in combination with using <cstdio>:
-    remove(filename);
-  }
+void nativeDeleteFile(char* filename) {
+  // Delete `filename'.
+  remove(filename);
+}
+
+void nativeRenameFile(char* fromfile, char* tofile) {
+  // Rename `fromfile' to `tofile'.
+  rename(fromfile, tofile);
 }
 
   //
@@ -543,7 +525,8 @@ double ticktockDifference (clock_t t1, clock_t t2) {
     return (((double)(t2 - t1)) / CLOCKS_PER_SEC);
   }
   else if (sizeof(long) == sizeof(clock_t)) {  // Wrapped around with longs
-    return (((double) ((LONG_MAX - t1) + (t2 - LONG_MIN) - 1)) / CLOCKS_PER_SEC) ;
+    return (((double) ((std::numeric_limits<long long int>::max() - t1) + 
+                       (t2 - std::numeric_limits<long long int>::min()) - 1)) / CLOCKS_PER_SEC) ;
   }
   else { // We don't know the real size of the clock data type
     std::cerr << "ERROR: Clock time wrapped around and we don't know the size of clock_t" << std::endl;

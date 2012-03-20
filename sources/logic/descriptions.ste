@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: descriptions.ste,v 1.99 2009/01/20 23:30:05 hans Exp
+;;; Version: descriptions.ste,v 1.100 2010/09/09 23:02:56 hans Exp
 
 ;;; Named and unnamed descriptions and related support.
 
@@ -730,14 +730,6 @@ a list of quantified, typed variables.")
 ;;;;;; 'equivalent-formulae?'
   ;;
 
-(deftype ENTITY-MAPPING (KEY-VALUE-LIST OF OBJECT OBJECT)
-  :documentation "Used to keep track of copied or substituted variables
-and propositions within 'copy-description', etc.  This needs to be a
-subtype of DICTIONARY.  KEY-VALUE-LIST is a good choice for most cases,
-however, for very high-arity relations and descriptions we do get bad performance
-during copying and equivalence checking and KEY-VALUE-MAP (though more
-heavy-weight) would be the better option.")
-
 (defun (equivalent-holds-proposition? BOOLEAN) ;; HOLDS-KLUDGE
        ((self PROPOSITION) (other PROPOSITION) (mapping ENTITY-MAPPING))
   ;; Helping function for 'equivalent-propositions?'.
@@ -1004,7 +996,13 @@ heavy-weight) would be the better option.")
          (return (extract-goal-description proposition NULL))))
       (otherwise
        (when (same-and-unique-arguments? (io-variables self) (arguments proposition))
-         (return (extract-goal-description proposition NULL)))))
+         ;; check whether the defined arity of the named description matches the one of
+         ;; `self' which might not be the case for variable-arity descriptions.  In that
+         ;; case we want to keep `self', otherwise QUERY might not work correctly:
+         (let ((namedDescription (extract-goal-description proposition NULL)))
+           (when (and (defined? namedDescription)
+                      (= (length (io-variables self)) (length (io-variables namedDescription))))
+             (return namedDescription))))))
     (return NULL) ))
 
 ;;; FIGURE OUT: COMPLEMENT DESCRIPTIONS NOW WIND UP IN THE STRUCTURED OBJECT
@@ -1013,7 +1011,7 @@ heavy-weight) would be the better option.")
 (defun (find-duplicate-complex-description DESCRIPTION) ((self DESCRIPTION))
   ;; Return a duplicate (or equivalent) of 'self' if there is one.
   ;; If not, add 'self' to `*structured-objects-index*'.
-  (let ((index (wrap-integer (proposition-hash-index (proposition self))))
+  (let ((index (wrap-integer (proposition-hash-index (proposition self) NULL)))
         (bucket (lookup *structured-objects-index* index))
         (homeModule (base-module (home-context self)))
         (mapping (new ENTITY-MAPPING)))
@@ -1063,6 +1061,11 @@ heavy-weight) would be the better option.")
   ;;    a function proposition as an argument.
   ;; Assumes that we won't encounter a :FUNCTION argument (or if we do, it
   ;;    itself contains no nested arguments).
+  ;; HC: this last sentence is somewhat strange, particularly, since this
+  ;;     function will always return true when called with a function
+  ;;     proposition (since its output will have a defining prop);
+  ;;     however, excluding that case screwed up one case in the test suite
+  ;;     so we leave it as is for now.
   (case (kind proposition)
     ((:ISA :FUNCTION :PREDICATE :EQUIVALENT :IMPLIES)
      (foreach term in (arguments proposition)
@@ -1346,18 +1349,25 @@ WARNING: Potentially problematic implication rule, consequent variable(s)
        (safety 3 (description-mode?) "BUG: Not in description mode.")
        (let ((arg1 (innermost-of (first arguments)))
              (arg2 (innermost-of (second arguments))))
-         (if (member? ioVariables arg1)
-             (if (member? ioVariables arg2)
-                 ;; both args are io-vars, equate unless in the head of a rule:
-                 (unless (eql? kind :HEAD)
-                   (equate-values arg1 arg2))
-               ;; equivalence between an io-var and an internal var or other object;
-               ;; choose argument order so an internal variable will point to the
-               ;; io-variable, otherwise, bad things might happen during collapsing:
-               (equate-values arg2 arg1))
-           ;; otherwise, arg1 is an internal variable, etc., equate with proper
-           ;; argument order in case arg2 is an io-variable (see above comment):
-           (equate-values arg1 arg2))))
+         ;; ensure both arguments are variables or fully ground constants
+         ;; (i.e., exclude propositions and descriptions with external vars,
+         ;; since those need to be instantiated during inference):
+         (when (and (or (variable? arg1)
+                        (argument-bound? arg1))
+                    (or (variable? arg2)
+                        (argument-bound? arg2)))
+           (if (member? ioVariables arg1)
+               (if (member? ioVariables arg2)
+                   ;; both args are io-vars, equate unless in the head of a rule:
+                   (unless (eql? kind :HEAD)
+                     (equate-values arg1 arg2))
+                 ;; equivalence between an io-var and an internal var or other object;
+                 ;; choose argument order so an internal variable will point to the
+                 ;; io-variable, otherwise, bad things might happen during collapsing:
+                 (equate-values arg2 arg1))
+             ;; otherwise, arg1 is an internal variable, etc., equate with proper
+             ;; argument order in case arg2 is an io-variable (see above comment):
+             (equate-values arg1 arg2)))))
       (:AND
        (foreach arg in arguments
            do (equate-top-level-equivalences arg ioVariables kind)))

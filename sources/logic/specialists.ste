@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: specialists.ste,v 1.88 2009/08/21 20:23:03 tar Exp
+;;; Version: specialists.ste,v 1.90 2010/10/11 20:35:29 hans Exp
 
 ;;; Specialists that perform procedural computations to evaluate
 ;;;    relational queries.
@@ -301,6 +301,22 @@ keyword indicating success or failure of a proof."
       (setq p1 (string-search super sub (+ p1 1))))
     (return count)))
 
+(defun (computation-input-bound? BOOLEAN) ((value OBJECT))
+  ;; Return true if `value' is considered a bound input for a computation.
+  ;; This requires that it is defined, and, if it is a skolem, it has to
+  ;; represent a bonafide term such as a list or output of a total function.
+  (when (null? value)
+    (return FALSE))
+  (typecase value
+    (SKOLEM
+     (when (logical-collection? value)
+       (return TRUE))
+     (let ((prop (defining-proposition value)))
+       (return (and (defined? prop)
+                    (test-property? (get-description (relationRef prop)) PL-KERNEL/@TOTAL)))))
+    (otherwise
+     (return TRUE))))
+
 (defun (compute-relation-value OBJECT) ((proposition PROPOSITION)
                                         (code FUNCTION-CODE)
                                         (error? BOOLEAN))
@@ -342,11 +358,7 @@ keyword indicating success or failure of a proof."
                (setq argType (first-defined (pop argTypesIter) argType))
              (setq argType (popq argTypes)))
            (setq value (safe-argument-bound-to arg))
-           (when (or (null? value)
-                     (and (skolem? value)
-                          ;; we allow SETOF terms, since those represent themselves;
-                          ;; maybe generally allow function outputs of total functions?
-                          (not (logical-collection? value))))
+           (unless (computation-input-bound? value)
              ;; unbound input argument, fail:
              (return NULL))
            (when (not (check-strict-type? value argType TRUE))
@@ -356,13 +368,17 @@ keyword indicating success or failure of a proof."
                (return NULL)))
         collect value into boundArguments)
     (when variableArity?
-      (if-output-language :java
-          ;; KLUDGE to handle variable args in Java passed as lists:
-          (let ((nFixed (- (length argTypes) (choose function? 2 1))))
-            ;; e.g., nFixed=2 then (1 2 3 4) => (1 2 (3 4))
-            (setf (nth-rest boundArguments nFixed)
-              (cons (nth-rest boundArguments nFixed) NIL)))
-          NULL))
+      ;; KLUDGE to handle variable args passed to computations as a list
+      ;; since `apply' can't transparently deal with them yet in C++ or Java:
+      (let ((nFixed (- (length argTypes) (choose function? 2 1))))
+        ;; e.g., nFixed=2 then (1 2 3 4) => (1 2 (3 4))
+        (cond ((= nFixed 0)
+               (setq boundArguments (cons boundArguments NIL)))
+              ((>= (length boundArguments) nFixed) ;; be safe
+               (setf (nth-rest boundArguments nFixed)
+                 (cons (nth-rest boundArguments nFixed) NIL)))
+              (otherwise
+               (return NULL)))))
     (setq value (apply computationCode boundArguments))
     (return value)))
 
@@ -835,8 +851,7 @@ keyword indicating success or failure of a proof."
 ;;;;;; 'holds' specialist
   ;;
 
-(defun (/PL-KERNEL-KB/HOLDS-specialist KEYWORD)
-       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+(defun (/PL-KERNEL-KB/HOLDS-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; When the first argument to a HOLDS proposition is bound, applies
   ;;    the description in the first argument to the remaining
   ;;    arguments.
@@ -904,13 +919,12 @@ keyword indicating success or failure of a proof."
                            (eql? backlinkedArg (argument-bound-to arg)))))
             (setq iterator
               (allocate-iterator
-               (collect prop in (unfiltered-dependent-propositions
-                                 backlinkedArg NULL)
+               (collect prop in (unfiltered-dependent-propositions backlinkedArg NULL)
                         where (and (or (eql? (kind prop) :FUNCTION)
                                        (eql? (kind prop) :PREDICATE)
                                        (eql? (kind prop) :ISA))
                                    (= (length (arguments prop)) holdsArity)
-                                   (true? prop)
+                                   (true-proposition? prop)
                                    (= (position (arguments prop) backlinkedArg 0)
                                       backlinkedArgPosition))))))
           (setf (iterator frame) iterator))
@@ -932,6 +946,35 @@ keyword indicating success or failure of a proof."
                    (unbind-variables-beginning-at
                     patternRecord (1+ ubStackOffset))))))))
     (return :FAILURE) ))
+
+
+  ;;
+;;;;;; Proposition accessors
+  ;;
+
+(defun (/PL-KERNEL-KB/PROPOSITION-RELATION-computation OBJECT) ((p PROPOSITION))
+  ;; NOTE: constant propositions such as TRUE will return themselves.
+  (let ((operator (operator p)))
+    (typecase operator
+      (SURROGATE (return (surrogate-value operator)))
+      (otherwise (return NULL)))))
+
+(defun (/PL-KERNEL-KB/PROPOSITION-ARGUMENT-computation OBJECT) ((p PROPOSITION) (i INTEGER-WRAPPER))
+  ;; Conceivably, this could be a general specialist similar to `nth-element-specialist' that
+  ;; could also find positions of arguments.  For now, this can be achieved by using
+  ;; `proposition-arguments' and then the list accessors.
+  (let ((arguments (arguments p)))
+    (if (and (>= i 0)
+             (< i (length arguments)))
+        (return (nth arguments i))
+      (return NULL))))
+
+(defun (/PL-KERNEL-KB/PROPOSITION-ARGUMENTS-computation SKOLEM) ((p PROPOSITION))
+  (return (create-logical-list (listify (arguments p)))))
+
+(defun (/PL-KERNEL-KB/PROPOSITION-ARITY-computation INTEGER-WRAPPER) ((p PROPOSITION))
+  (return (length (arguments p))))
+
 
   ;;
 ;;;;;; 'cut' specialist
@@ -983,6 +1026,11 @@ keyword indicating success or failure of a proof."
 ;;;;;; 'fork' specialist
   ;;
 
+(defclass FORK-PROOF-ADJUNCT (PROOF-ADJUNCT)
+  ;; Stores and restores the justification of the FORK frame if necessary.
+  :slots ((condition-justification :type justification)
+          (down-frame :type CONTROL-FRAME)))
+
 (defun (/PL-KERNEL-KB/FORK-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; Evaluate the first argument.  If true, return the result of
@@ -990,28 +1038,67 @@ keyword indicating success or failure of a proof."
   ;;    of evaluating the third argument.
   ;; TO DO: consider overlaying the condition frame with the
   ;;    THEN or ELSE goal.
-  (case lastMove
-    (:DOWN (return :MOVE-DOWN))
-    (:UP-TRUE
-     (when (> (argument-cursor frame) 0)
-       (if (defined? (down frame))
-           (return :CONTINUING-SUCCESS)
-         (return :FINAL-SUCCESS)))
-     ;; must be that the (first) test argument succeeded:
-     (setf (down frame) NULL)
-     (setf (argument-cursor frame) 1)
-     (return :MOVE-DOWN))
-    (:UP-FAIL
-     (when (> (argument-cursor frame) 0)
-       (return :FAILURE))
-     ;; must be that the (first) test argument failed:
-     (setf (down frame) NULL)
-     (setf (argument-cursor frame) 2)
-     (return :MOVE-DOWN))) )
+  (let ((recordJustifications? (record-justifications?))
+        (adjunct FORK-PROOF-ADJUNCT (proof-adjunct frame)))
+    (case lastMove
+      (:DOWN
+       (when recordJustifications?
+         (when (null? adjunct)
+           (setq adjunct (new FORK-PROOF-ADJUNCT))
+           (setf (proof-adjunct frame) adjunct))
+         (setf (down frame) (down-frame adjunct)))
+       (return :MOVE-DOWN))
+      (:UP-TRUE
+       (when (> (argument-cursor frame) 0)
+         (when recordJustifications?
+           (setf (down-frame adjunct) (down frame))
+           ;; conceivably, we should take the truth value of the condition into account here:
+           (propagate-frame-truth-value (result frame) frame)
+           (record-goal-justification
+            frame
+            (new JUSTIFICATION
+                 :inference-rule
+                 (choose (eql? (inference-rule (condition-justification adjunct)) :FAIL-INTRODUCTION)
+                         :FORK-ELSE
+                         :FORK-THEN)
+                 :antecedents (cons (condition-justification adjunct)
+                                    (cons (justification (result frame)) NIL)))))
+         (cond ((defined? (down frame))
+                (when recordJustifications?
+                  (setf (down frame) NULL))
+                (return :CONTINUING-SUCCESS))
+               (otherwise
+                (return :FINAL-SUCCESS))))
+       ;; must be that the (first) test argument succeeded:
+       (when recordJustifications?
+         (setf (condition-justification adjunct) (justification (result frame))))
+       (setf (down frame) NULL)
+       (setf (argument-cursor frame) 1)
+       (return :MOVE-DOWN))
+      (:UP-FAIL
+       (when (> (argument-cursor frame) 0)
+         (return :FAILURE))
+       ;; must be that the (first) test argument failed:
+       (when recordJustifications?
+         (record-FAIL-justification (result frame) :UP-FAIL)
+         (setf (condition-justification adjunct) (justification (result frame))))
+       (setf (down frame) NULL)
+       (setf (argument-cursor frame) 2)
+       (return :MOVE-DOWN)))))
+
+(startup-time-progn
+  (define-explanation-phrase :FORK-THEN :technical
+    "by FORK-introduction of its THEN argument")
+  (define-explanation-phrase :FORK-THEN :lay
+    "since the condition and THEN-clause of a FORK-proposition succeeded")
+  (define-explanation-phrase :FORK-ELSE :technical
+    "by FORK-introduction of its ELSE argument")
+  (define-explanation-phrase :FORK-ELSE :lay
+    "since the condition and ELSE-clause of a FORK-proposition succeeded"))
 
 
   ;;
-;;;;;; EXPERIMENTAL 'query' specialist
+;;;;;; 'query' specialist
   ;;
 
 ;;; TO DO:
@@ -1157,10 +1244,14 @@ keyword indicating success or failure of a proof."
       (collect-free-variables proposition ioVariables (list) (list))
       (setf (query-specialist-io-variables frame) ioVariables)
       (special ((*evaluationMode* :DESCRIPTION))
-	(setq subQueryDescription
-	      (new DESCRIPTION
-		   :io-variables (copy-list-to-arguments-vector ioVariables)
-		   :proposition proposition)))
+        ;; invoke description mode to prevent logging of query description:
+        (setq subQueryDescription
+          (new DESCRIPTION
+               :io-variables (copy-list-to-arguments-vector ioVariables)
+               :proposition proposition))
+        (setq subQueryDescription
+          (first-defined (find-duplicate-description subQueryDescription)
+                         subQueryDescription)))
       (compute-internal-variables subQueryDescription)
       (setq ioVariableBindings (new VECTOR :array-size (length ioVariables)))
       (setq trueFalseQuery? TRUE)
@@ -1291,6 +1382,92 @@ keyword indicating success or failure of a proof."
              (return :CONTINUING-SUCCESS)))
           (otherwise
            (return :TERMINAL-FAILURE)))))
+
+
+  ;;
+;;;;;; Inference-level-controlled queries
+  ;;
+
+(defclass SAVED-INFERENCE-LEVEL-PROOF-ADJUNCT (PROOF-ADJUNCT)
+  ;; Stores the saved old inference level for a leveled proof.
+  :slots ((saved-inference-level :type INFERENCE-LEVEL)
+          (inference-level :type INFERENCE-LEVEL)
+          (down-frame :type CONTROL-FRAME)))
+
+(defun (leveled-query-relation-to-inference-level INFERENCE-LEVEL) ((relation SURROGATE))
+  ;; Translate a leveled query `relation' into the according inference level.
+  (case relation
+    (PL-KERNEL/@ASSERTION-QUERY    (return ASSERTION-INFERENCE))
+    (PL-KERNEL/@SHALLOW-QUERY      (return SHALLOW-INFERENCE))
+    (PL-KERNEL/@SUBSUMPTION-QUERY  (return SUBSUMPTION-INFERENCE))
+    (PL-KERNEL/@BACKTRACKING-QUERY (return BACKTRACKING-INFERENCE))
+    (PL-KERNEL/@NORMAL-QUERY       (return NORMAL-INFERENCE))
+    (PL-KERNEL/@REFUTATION-QUERY   (return REFUTATION-INFERENCE))
+    (otherwise
+     (return
+       (get-inference-level
+        (keywordify (first (split-string (symbol-name relation) #\-))))))))
+
+(defun (PL-KERNEL/LEVELED-QUERY-specialist KEYWORD) ((frame CONTROL-FRAME)
+                                                     (lastMove KEYWORD))
+  ;; Argument is a proposition which needs to be bound.  Try to prove it
+  ;; according to the inference level indicated by the relation name.
+  ;; Modeled after IST-specialist.
+  (let ((proposition (proposition frame))
+        (adjunct SAVED-INFERENCE-LEVEL-PROOF-ADJUNCT (proof-adjunct frame)))
+    (case lastMove
+      (:DOWN
+       (when (null? adjunct)
+         ;; first time through:
+         (let ((argPropValue (argument-bound-to (first (arguments proposition)))))
+           (when (or (null? argPropValue)
+                     (not (isa? argPropValue @PROPOSITION)))
+             (return :TERMINAL-FAILURE))
+           (setq adjunct
+             (new SAVED-INFERENCE-LEVEL-PROOF-ADJUNCT
+                  :saved-inference-level (current-inference-level)
+                  :inference-level
+                  (leveled-query-relation-to-inference-level (relationRef proposition))
+                  :down-frame (create-down-frame frame argPropValue)))
+           ;; save current inference level and down frame so we can switch back and forth:
+           (setf (proof-adjunct frame) adjunct)))
+       (setf (down frame) (down-frame adjunct))
+       (call-set-inference-level (keyword (inference-level adjunct)) NULL)
+       (setq *inferenceLevel* (inference-level adjunct))
+       (return :MOVE-DOWN))
+      ;; returning from below:
+      (:UP-TRUE
+       (propagate-frame-truth-value (result frame) frame)
+       (when (partial-match-mode?)
+         (propagate-frame-partial-truth
+          (partial-match-frame (result frame)) frame))
+       (when (record-justifications?)
+         (record-goal-justification
+          frame
+          (new JUSTIFICATION
+               :inference-rule :LEVELED-QUERY
+               :antecedents (cons (justification (result frame)) NIL))))
+       (call-set-inference-level (keyword (saved-inference-level adjunct)) NULL)
+       (setq *inferenceLevel* (saved-inference-level adjunct))
+       (cond ((defined? (down frame))
+              ;; save the current down frame and set the `down' frame of this `frame' to
+              ;; NULL, so it will be reentered upon the next down move; this ensures that
+              ;; we'll properly establish the context before retrieving the next solution:
+              (setf (down-frame adjunct) (down frame))
+              (setf (down frame) NULL)
+              (return :CONTINUING-SUCCESS))
+             (otherwise
+              (return :FINAL-SUCCESS))))
+      (:UP-FAIL
+       (propagate-frame-truth-value (result frame) frame)
+       (when (partial-match-mode?)
+         (propagate-frame-partial-truth
+          (partial-match-frame (result frame)) frame))
+       (when (record-justifications?)
+         (record-primitive-justification frame :UP-FAIL))
+       (call-set-inference-level (keyword (saved-inference-level adjunct)) NULL)
+       (setq *inferenceLevel* (saved-inference-level adjunct))
+       (return :FAILURE))) ))
 
        
   ;;
@@ -1626,73 +1803,109 @@ keyword indicating success or failure of a proof."
                (defined? (pattern-record frame))
                (defined? (collection-list (pattern-record frame)))))) 
 
-(defun (/PL-KERNEL-KB/COLLECT-INTO-SET-specialist KEYWORD)
+(defun (/PL-KERNEL-KB/COLLECT-MEMBERS-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; Compute as many members of the first collection argument as possible,
-  ;;    remove duplicates, and bind the second argument to a set containing them.
+  ;;    and bind the second argument to a list or set containing them.
+  ;; The type of result and whether duplicates will be removed depends
+  ;;    on the operator of the proposition.
   (let ((proposition (proposition frame))
         (collectionArg (first (arguments proposition)))
         (collectionValue (argument-bound-to collectionArg))
-        (listArg (second (arguments proposition))))
+        (listArg (second (arguments proposition)))
+        (list? FALSE)
+        (unique? TRUE)
+        (members LIST NULL)
+        (result OBJECT NULL))
     (ignore lastMove)
     (when (null? collectionValue)
       (return :TERMINAL-FAILURE))
-;    (when (defined? (argument-bound-to listArg))
-;      (inform 
-;       EOL "User bug: 'collect-into-set' called with bound second argument." EOL)
-;      (return :TERMINAL-FAILURE))
-    (when (null? (iterator frame))      ; first time through
-      ;; Optimization: if we are passed an explicitly enumerated set,
-      ;;    simply return it instead of generating an identical copy:
-      (when (and (enumerated-set? collectionValue)
-                 ;; check for equivalents:
-                 (empty? (variable-value-inverse
-                          (cast collectionValue LOGIC-OBJECT))))
-        (bind-argument-to-value? listArg collectionValue TRUE)
-        (return :FINAL-SUCCESS))
-      (typecase collectionValue
-        ((STELLA/COLLECTION SKOLEM)
-         (let ((members (asserted-collection-members collectionValue FALSE)))
-           (when (null? members)
-             (return :TERMINAL-FAILURE))
-           (bind-argument-to-value?
-            listArg (create-enumerated-set members) TRUE)
-           (return :FINAL-SUCCESS)))
-        (DESCRIPTION
-         (when (and (defined? (external-variables collectionValue))
-                    (exists v in (external-variables collectionValue)
-                            where (not (defined? (argument-bound-to v)))))
-           (return :TERMINAL-FAILURE))
-         (if (inferable? collectionValue)
-           (progn
-             (create-collect-description-extension-frame frame collectionValue)
-             ;; tiny kludge: set '(iterator frame)' so we know
-             ;;    when we are returning from a collection proof:
-             (setf (iterator frame) EMPTY-PROPOSITIONS-ITERATOR)
-             (return :MOVE-DOWN))
-           ;; must be a non-inferable named description, where a simple scan of
-           ;;    isa's down the hierarchy suffices:
-           (let ((members (asserted-collection-members collectionValue FALSE)))
-             (when (null? members)
-               (return :TERMINAL-FAILURE))
-             (bind-argument-to-value? 
-              listArg (create-enumerated-set members) TRUE)
-             (return :FINAL-SUCCESS))))
-        (otherwise
-         (return :FAILURE))))
-    ;; we have collected instances of a named description:
-    (when (null? (down frame))
-      (return :FAILURE))
-    (let ((patternFrame (down frame))
-          (list (collection-list (pattern-record patternFrame))))
-      ;; we are now done with :PATTERN frame:
-      (pop-frames-up-to patternFrame)
-      (when (defined? (inference-cutoff-reason patternFrame))
-        (return :FAILURE))
-      ;; NOTE: this doesn't yet eliminate (some) skolems - should it?
-      (setq list (reverse (remove-duplicates list)))
-      (bind-argument-to-value? listArg (create-enumerated-set list) TRUE)
-      (return :FINAL-SUCCESS)) ))
+    (case (operator proposition)
+      (PL-KERNEL/@COLLECT-INTO-LIST
+       (setq list? TRUE)
+       (setq unique? FALSE))
+      (PL-KERNEL/@COLLECT-INTO-ORDERED-SET
+       (setq list? TRUE))
+      (otherwise NULL))
+    (cond ((and (null? (iterator frame))
+                ;; first time through:
+                (or (and (enumerated-set? collectionValue)
+                         (not list?))
+                    (and (enumerated-list? collectionValue)
+                         (not unique?))) ;; if unique we might have to remove duplicates
+                ;; check for equivalents:
+                (empty? (variable-value-inverse (cast collectionValue LOGIC-OBJECT))))
+             ;; Optimization: if we are passed a matching explicitly enumerated list or set,
+             ;;    simply return it instead of generating an identical copy:
+           (setq result collectionValue))
+          ((null? (iterator frame))
+           (typecase collectionValue
+             ((STELLA/COLLECTION SKOLEM)
+              (setq members (asserted-collection-members collectionValue FALSE))
+              (when (null? members)
+                (return :TERMINAL-FAILURE)))
+             (DESCRIPTION
+              (when (and (defined? (external-variables collectionValue))
+                         (exists v in (external-variables collectionValue)
+                             where (not (defined? (argument-bound-to v)))))
+                (return :TERMINAL-FAILURE))
+              (cond ((inferable? collectionValue)
+                     (create-collect-description-extension-frame frame collectionValue)
+                     ;; tiny kludge: set '(iterator frame)' so we know
+                     ;;    when we are returning from a collection proof:
+                     (setf (iterator frame) EMPTY-PROPOSITIONS-ITERATOR)
+                     (return :MOVE-DOWN))
+                    (otherwise
+                     ;; must be a non-inferable named description, where a simple scan of
+                     ;;    isa's down the hierarchy suffices:
+                     (setq members (asserted-collection-members collectionValue FALSE))
+                     (when (null? members)
+                       (return :TERMINAL-FAILURE))
+                     (setq unique? FALSE))))
+             (otherwise
+              (return :FAILURE))))
+          (otherwise
+           ;; we have collected instances of a named description:
+           (when (null? (down frame))
+             (return :FAILURE))
+           (let ((patternFrame (down frame)))
+             (setq members (reverse (collection-list (pattern-record patternFrame))))
+             ;; we are now done with :PATTERN frame:
+             (pop-frames-up-to patternFrame)
+             (when (defined? (inference-cutoff-reason patternFrame))
+               (return :FAILURE)))))
+    ;; NOTE: this doesn't yet eliminate (some) skolems - should it?
+    (when (null? result)
+      (when unique?
+        (setq members
+          (choose (cons? (first members))
+                  ;; we had a non-unary description; handling these allows us
+                  ;; to compute cardinality, but the set term created below
+                  ;; will be nonsense; think about how to address this correctly:
+                  (remove-duplicates-equal members)
+                  (remove-duplicates members))))
+      (setq result (choose list?
+                           (create-logical-list members)
+                           (create-enumerated-set members))))
+    (let ((success (select-test-result (bind-argument-to-value? listArg result TRUE) TRUE frame)))
+      (when (and (record-justifications?)
+                 (not (eql? success :TERMINAL-FAILURE)))
+        ;;; TO DO: figure out how to best remove justifications for duplicates that
+        ;;;        were removed above - ok for now, it's not wrong but redundant:
+        (let ((justification (new JUSTIFICATION :inference-rule :COLLECT-MEMBERS))
+              (antecedents (choose (defined? (result frame))
+                                   (justification (result frame))
+                                   NULL)))
+          (when (defined? antecedents)
+            (setf (antecedents justification) (cons antecedents NIL)))
+          (record-goal-justification frame justification)))
+      (return success))))
+
+(startup-time-progn
+  (define-explanation-phrase :COLLECT-MEMBERS :technical
+    "since it was proven by the COLLECT-MEMBERS specialist")
+  (define-explanation-phrase :COLLECT-MEMBERS :lay
+    "because of a specialized COLLECT-MEMBERS reasoning procedure"))
 
 (defun (/PL-KERNEL-KB/LENGTH-OF-LIST-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
@@ -1716,6 +1929,122 @@ keyword indicating success or failure of a proof."
       (setq len (length (cast listValue STELLA/LIST)))
       (return (select-test-result (bind-argument-to-value? lengthArg len TRUE)
 				  TRUE frame))) ))
+
+(defun (/PL-KERNEL-KB/NTH-ELEMENT-specialist KEYWORD) ((frame CONTROL-FRAME)
+                                                       (lastMove KEYWORD))
+  ;; Computes the n-th element of the list, or the position of some element,
+  ;; or enumerates position/element pairs.  If N is negative, counts from
+  ;; the end of the list.
+  (let ((proposition (proposition frame))
+        (collectionArg (first (arguments proposition)))
+        (collection (argument-bound-to collectionArg))
+        (nArg (second (arguments proposition)))
+        (n (argument-bound-to nArg))
+        (elementArg (third (arguments proposition)))
+        (element (argument-bound-to elementArg)))
+    (ignore lastMove)
+    (when (logical-collection? collection)
+      (let ((theN INTEGER NULL)
+            (arguments (arguments (defining-proposition (cast collection SKOLEM))))
+            (nArgs (1- (length arguments)))) ;; exclude output skolem
+        (cond ((integer? n)
+               (setq theN (unwrap-integer n))
+               (when (< theN 0)
+                 ;; if N is negative, count from end of the list:
+                 (setq theN (+ nArgs theN)))
+               (when (and (>= theN 0)
+                          (< theN nArgs))
+                 (return (select-test-result
+                          (bind-argument-to-value? elementArg (nth arguments theN) TRUE)
+                          TRUE frame))))
+              ((and (null? n)
+                    (defined? element))
+               (foreach arg in arguments
+                   as i in (interval 0 (1- nArgs))
+                   where (eql? (argument-bound-to arg) element)
+                   do (return (select-test-result
+                               (bind-argument-to-value? nArg i TRUE)
+                               TRUE frame))))
+              ((and (null? n)
+                    (null? element))
+               (let ((iterator ALL-PURPOSE-ITERATOR (iterator frame)))
+                 (when (null? iterator)
+                   ;; first time around:
+                   (setq iterator (allocate-iterator arguments))
+                   (setf (iterator frame) iterator))
+                 (setq theN (iterator-integer iterator))
+                 (when (and (< theN nArgs)
+                            (next? iterator))
+                   (setq element (value iterator))
+                   (when (and (bind-argument-to-value? nArg theN TRUE)
+                              (bind-argument-to-value? elementArg element TRUE))
+                     (return :CONTINUING-SUCCESS))))))))
+    (return :TERMINAL-FAILURE)))
+
+(defun (/PL-KERNEL-KB/NTH-HEAD-computation SKOLEM) ((list SKOLEM) (nArg INTEGER-WRAPPER))
+  ;; Given a `list' return a list representing its `n'-th rest.
+  ;; Note that we fail on sets, since - given that their order gets normalized in a way
+  ;;    that's not controllable by the user - a rest operation does't make sense.
+  ;;    Maybe we'll relax our view on this sometime down the road.
+  (unless (enumerated-list? list)
+    (return NULL))
+  (let ((n INTEGER nArg)
+        (elements (arguments (defining-proposition list)))
+        (nElements (1- (length elements)))
+        (headElements (new LIST)))
+    (when (< n 0)
+      (setq n (+ nElements n)))
+    (when (or (< n 0)
+              (> n nElements))
+      (return NULL))
+    (foreach i in (interval 0 (1- n))
+        collect (nth elements i) into headElements)
+    (return (create-logical-list headElements))))
+
+(defun (/PL-KERNEL-KB/NTH-REST-computation SKOLEM) ((list SKOLEM) (nArg INTEGER-WRAPPER))
+  ;; Given a `list' return a list representing its `n'-th rest.
+  ;; Note that we fail on sets, since - given that their order gets normalized in a way
+  ;;    that's not controllable by the user - a rest operation does't make sense.
+  ;;    Maybe we'll relax our view on this sometime down the road.
+  (unless (enumerated-list? list)
+    (return NULL))
+  (let ((n INTEGER nArg)
+        (elements (arguments (defining-proposition list)))
+        (nElements (1- (length elements)))
+        (restElements (new LIST)))
+    (when (< n 0)
+      (setq n (+ nElements n)))
+    (when (or (< n 0)
+              (> n nElements))
+      (return NULL))
+    (foreach i in (interval n (1- nElements))
+        collect (nth elements i) into restElements)
+    (return (create-logical-list restElements))))
+
+(defun (/PL-KERNEL-KB/INSERT-ELEMENT-computation SKOLEM) ((list SKOLEM)
+                                                          (nArg INTEGER-WRAPPER)
+                                                          (element OBJECT))
+  ;; Add `element' at position `n' to `list' and return the result.
+  ;; Shifts the remaining elements right.
+  (unless (enumerated-list? list)
+    (return NULL))
+  (let ((n INTEGER nArg)
+        (elements (arguments (defining-proposition list)))
+        (nElements (1- (length elements)))
+        (newElements (new LIST)))
+    (when (< n 0)
+      (setq n (+ nElements n 1)))
+    (when (or (< n 0)
+              (> n nElements))
+      (return NULL))
+    (foreach elt in elements
+        as i in (interval 0 (1- nElements))
+        do (when (= i n)
+             (push newElements element))
+           (push newElements elt))
+    (when (= n nElements)
+      (push newElements element))
+    (return (create-logical-list (reverse newElements)))))
 
 (defun (/PL-KERNEL-KB/MINIMUM-OF-NUMBERS-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
@@ -1821,23 +2150,17 @@ keyword indicating success or failure of a proof."
         (listArg (first (arguments proposition)))
         (listSkolem (argument-bound-to listArg))
         (sumArg (second (arguments proposition)))
-        (sum NUMBER-WRAPPER NULL))
+        (sum NUMBER-WRAPPER 0))
     (ignore lastMove)
     (when (and (defined? listSkolem)
                (not (logical-collection? listSkolem)))
       (inform EOL "Non list appears in second argument to 'SUM-OF-NUMBERS'" EOL)
       (return :TERMINAL-FAILURE))
     (let ((listValue (asserted-collection-members listSkolem TRUE)))
-      (when (empty? listValue)
-        (return :TERMINAL-FAILURE))
       (foreach v in listValue
 	  do (if (isa? v @NUMBER-WRAPPER)
-	       (if (null? sum)
-		 (setq sum (cast v @NUMBER-WRAPPER))
-		 (setq sum (pl-kernel/plus-computation (cast v @NUMBER-WRAPPER) sum)))
-	       (return :FAILURE)))	; :TERMINAL-FAILURE ?
-      (when (null? sum)
-        (return :TERMINAL-FAILURE))
+		 (setq sum (pl-kernel/plus-computation (cast v @NUMBER-WRAPPER) sum))
+	       (return :TERMINAL-FAILURE)))
       (return
        (select-test-result (bind-argument-to-value? sumArg sum TRUE) TRUE frame))) ))
 
@@ -2531,14 +2854,20 @@ specialists.")
   ;; TO DO: conceivably, we might want to have a variant of this that uses a print
   ;;    name as its argument.
   (within-module (base-module *context*) ;; don't create in inference caches...
-    (let ((instance (get-instance nameArg))
-          (nameArgString STRING NULL))
-      (when (defined? instance)
-        (return instance))
-      (setq nameArgString (pli/object-to-string nameArg))
+    (when (not (string? nameArg))
+      ;; we have some kind of object, try to lookup the instance
+      ;; directly without converting to a string first:
+      (let ((instance (get-instance nameArg)))
+        (when (defined? instance)
+          (return instance))))
+    ;; we didn't find an existing instance or `nameArg' was a string:
+    (let ((nameArgString (pli/object-to-string nameArg))
+          ;; we lookup a surrogate first to avoid breakage in case the
+          ;; name string contained any funny charcters (e.g., a `/'):
+          (instanceName (lookup-surrogate nameArgString)))
       (return
         (first-defined
-         (get-instance nameArgString)
+         (get-instance instanceName) ;; can handle NULL ref
          (create-logic-instance
           (intern-surrogate-in-module nameArgString *module* TRUE)
           NULL))))))

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: pl-kernel-kb.ste,v 1.70 2009/04/01 19:26:30 tar Exp
+;;; Version: pl-kernel-kb.ste,v 1.72 2010/09/11 02:20:55 hans Exp
 
 ;;; Support to bootstrap the built-in PL-KERNEL KB that defines a fairly
 ;;; minimal set of mathematical and logical definitions.
@@ -370,8 +370,36 @@ to `?term'.  Retraction eliminates a synonym relation.")
 
 
   ;;
+;;;;;; Skolem functions
+  ;;
+
+(defconcept SKOLEM-FUNCTION (?x FUNCTION)
+  :documentation "Skolem function meta class to annotate user-defined skolem
+functions.  Using this is generally not necessary given the generic `skolem-fn'
+definitiont below."
+  :=>> (total ?x)) ;; generates new skolem for each set of inputs
+
+(deffunction skolem-fn (?id ?args ?sk)
+  :documentation "A generic skolem function that can be instantiated into
+a unique skolem function term by providing an appropriately unique ?id.
+?args are the universally quantfied arguments relative to which we postulate
+the existence of ?sk.  For example, to represent the rule `every person
+has a mother' we could write:
+  (=> (and (person ?x) (skolem-fn $skfn ?x ?m)) (mother ?x ?m)).
+Note the use of the automatic instance `$skfn' to uniquely identify this
+skolem function term.  Any other unique ID could have been used as well."
+  :variable-arity TRUE
+  ;; this would tell the optimizer that all inputs have to be bound, but that
+  ;; prevents us to generate input variables from previously generated skolems:
+  ;:computed TRUE
+  :total TRUE)
+
+
+  ;;
 ;;;;;; Collection-forming functions
   ;;
+
+;;; TO DO: ALLOW `(SETOF)' AND `(LISTOF)' TERMS.
 
 (deffunction collectionof (?m) :-> (?c COLLECTION)
   :documentation "Abstract function existing to subsume 'SETOF'
@@ -453,6 +481,32 @@ a rule that accesses a `patient-record' relation in a module called
   :axioms (and (relation-specialist IST IST-specialist)
                (handles-reverse-polarity IST-specialist)))
 
+;;; Accessors to deconstruct propositions:
+
+(deffunction proposition-relation ((?p PROPOSITION) (?op RELATION))
+  :documentation "Return the predicate operator ?op of ?p."
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation proposition-relation-computation)
+
+(deffunction proposition-argument ((?p PROPOSITION) (?i INTEGER) ?arg)
+  :documentation "Return the ?i-th ?arg of ?p (zero-based)."
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation proposition-argument-computation)
+
+(deffunction proposition-arguments ((?p PROPOSITION) (?args LIST))
+  :documentation "Return all arguments of ?p as a list ?args."
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation proposition-arguments-computation)
+
+(deffunction proposition-arity ((?p PROPOSITION) (?arity INTEGER))
+  :documentation "Return the number of arguments in ?p."
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation proposition-arity-computation)
+
 
   ;;
 ;;;;;; Inference/search control
@@ -487,8 +541,8 @@ an example that uses `bound-variables'."
   :axioms (relation-specialist FORK fork-specialist))
 
 (defrelation QUERY ((?prop PROPOSITION) ?options)
-  :documentation "EXPERIMENTAL search-control relation that allows one to prove
-or retrieve bindings for ?prop with modified search control ?options.  The list
+  :documentation "Search-control relation that allows one to prove or
+retrieve bindings for ?prop with modified search control ?options.  The list
 of accepted ?options is currently the same as are legal for a top-level `ask'
 or `retrieve' query.  The special option value :INHERIT inherits the option
 value from the parent or top-level query.  The option pair :INHERIT :ALL
@@ -502,6 +556,36 @@ generated eagerly, therefore, a default of generating all solutions is not
 desirable."
   :variable-arity TRUE
   :relation-specialist query-specialist)
+
+(defrelation ASSERTION-QUERY ((?prop PROPOSITION))
+  :documentation "Query ?prop with :inference-level set to :assertion.
+Equivalent to `(query ?prop :inference-level :assertion)' but more efficient."
+  :relation-specialist leveled-query-specialist)
+
+(defrelation SHALLOW-QUERY ((?prop PROPOSITION))
+  :documentation "Query ?prop with :inference-level set to :shallow.
+Equivalent to `(query ?prop :inference-level :shallow)' but more efficient."
+  :relation-specialist leveled-query-specialist)
+
+(defrelation SUBSUMPTION-QUERY ((?prop PROPOSITION))
+  :documentation "Query ?prop with :inference-level set to :subsumption.
+Equivalent to `(query ?prop :inference-level :subsumption)' but more efficient."
+  :relation-specialist leveled-query-specialist)
+
+(defrelation BACKTRACKING-QUERY ((?prop PROPOSITION))
+  :documentation "Query ?prop with :inference-level set to :backtracking.
+Equivalent to `(query ?prop :inference-level :backtracking)' but more efficient."
+  :relation-specialist leveled-query-specialist)
+
+(defrelation NORMAL-QUERY ((?prop PROPOSITION))
+  :documentation "Query ?prop with :inference-level set to :normal.
+Equivalent to `(query ?prop :inference-level :normal)' but more efficient."
+  :relation-specialist leveled-query-specialist)
+
+(defrelation REFUTATION-QUERY ((?prop PROPOSITION))
+  :documentation "Query ?prop with :inference-level set to :refutation.
+Equivalent to `(query ?prop :inference-level :refutation)' but more efficient."
+  :relation-specialist leveled-query-specialist)
 
      
   ;;
@@ -533,8 +617,7 @@ be used to generate concept values of ?c, given an instance ?x."
 
 (defrelation type-of ((?c COLLECTION) (?x THING))
   :documentation "True if ?x is a member of the concept ?c."
-  :<<=>> (instance-of ?x ?c)
-  :axioms (inverse instance-of type-of))
+  :inverse instance-of)
 
 (defrelation subset-of ((?sub COLLECTION) (?super COLLECTION))
   :documentation "True if ?sub is a subset of ?super.  For performance
@@ -614,8 +697,11 @@ proof strategy which returns TRUE if `Fred' cannot be proved to be happy.
 Also, if the relation `children' is closed, then a value for the expression
 `(range-max-cardinality children Fred)' can be inferred merely by
 counting the number of fillers of the `children' role on `Fred'."
-  :axioms (and (handles-reverse-polarity closed-specialist)
-               (relation-specialist CLOSED closed-specialist)))
+  ;; this is too strong, we might not be able to determine whether something
+  ;; is closed, but that doesn't necessarily mean that it is not closed:
+  ;:closed TRUE
+  :relation-specialist closed-specialist
+  :axioms (handles-reverse-polarity closed-specialist))
 
 (defrelation empty ((?c COLLECTION))
   :documentation "The collection ?c is empty if it has no members.  Note
@@ -1182,7 +1268,91 @@ in `?r' applied to the instance in `?i'.  `collect-into-set' causes
 the extension of this (dynamically-defined) unary relation to be
 computed.  Note the use of `bound-variables' to screen out unbound
 variables before they are passed to the `setofall' term."
-  :axioms (relation-specialist COLLECT-INTO-SET collect-into-set-specialist))
+  :relation-specialist collect-members-specialist)
+
+(deffunction collect-into-list ((?c COLLECTION)) :-> (?l LIST)
+  :documentation "Infer as many members of ?c as possible and
+collect them into a list ?l.  This is similar to `collect-into-set'
+but collects members in the order they are encountered.  If a member
+is derived multiple times, all occurrences are kept.  This is
+useful, for example, to collect and then sum up number-valued
+attributes of objects."
+  :relation-specialist collect-members-specialist)
+
+(deffunction collect-into-ordered-set ((?c COLLECTION)) :-> (?l LIST)
+  :documentation "This is similar to `collect-into-list', but if a
+member is derived multiple times, only the first occurrence is kept
+- hence, the name, even though ordered sets are represented as lists."
+  :relation-specialist collect-members-specialist)
+
+(deffunction collect-into-ascending-set ((?c COLLECTION) (?sortBy RELATION) (?orderedSet LIST))
+  :documentation "Collect elements of ?c into an ascending ?orderedSet where the position of each
+element is determined by the value computed for it by the ?sortBy relation.  Ordering is done via
+sorting (as opposed to using a comparison relation) similar to the :sort-by option to the `retrieve'
+command.  If ?sortBy is not single-valued, the position of an element is determined by its largest
+?sortBy value.  Note that, similar to other `collect-into-...' functions, ?c can be a named concept,
+a `setofall' or an enumerated collection, and ?sortBy can be a named relation or a `kappa'."
+  :<<= (collect-into-ordered-set
+        (setofall (?element)
+          (exists ?value
+            (query (and (fail (bound-variables ?value)) ;; kludge to get output variable order right
+                        (member-of ?element ?c)
+                        (holds ?sortby ?element ?value))
+                   :how-many :all :sort-by :values-ascending)))
+        ?orderedset)
+  :computed TRUE)
+
+(deffunction collect-into-descending-set ((?c COLLECTION) (?sortBy RELATION) (?orderedSet LIST))
+  :documentation "Collect elements of ?c into a descending ?orderedSet where the position of each
+element is determined by the value computed for it by the ?sortBy relation.  Ordering is done via
+sorting (as opposed to using a comparison relation) similar to the :sort-by option to the `retrieve'
+command.  If ?sortBy is not single-valued, the position of an element is determined by its largest
+?sortBy value.  Note that, similar to other `collect-into-...' functions, ?c can be a named concept,
+a `setofall' or an enumerated collection, and ?sortBy can be a named relation or a `kappa'."
+  :<<= (collect-into-ordered-set
+        (setofall (?element)
+          (exists ?value
+            (query (and (fail (bound-variables ?value)) ;; kludge to get output variable order right
+                        (member-of ?element ?c)
+                        (holds ?sortBy ?element ?value))
+                   :how-many :all :sort-by :values-descending)))
+        ?orderedSet)
+  :computed TRUE)
+
+(defrelation minimum-element ((?c COLLECTION) (?sortBy RELATION) ?element)
+  :documentation "Find those ?element(s) of ?c with the minimum ?sortBy value, for example,
+`(retrieve (minimum-element relation arity ?x))' (see also `collect-into-ascending-set')."
+  :<<= (exists (?orderedSet ?firstElement ?minValue)
+         (and (collect-into-ascending-set ?c ?sortBy ?orderedSet)
+              (nth-element ?orderedSet 0 ?firstElement)
+              (fork (single-valued ?sortBy)
+                    (holds ?sortBy ?firstElement ?minValue)
+                    ;; if we might have multiple ?sortBy values for ?firstElement,
+                    ;; we need another subquery to find the smallest one:
+                    (and (query (holds ?sortBy ?firstElement ?minValue)
+                                :how-many :all :sort-by :values-ascending)
+                         (cut)))
+              (member-of ?element ?orderedSet)
+              (holds ?sortBy ?element ?minValue)))
+  :computed TRUE)
+
+(defrelation maximum-element ((?c COLLECTION) (?sortBy RELATION) ?element)
+  :documentation "Find those ?element(s) of ?c with the maximum ?sortBy value, for example,
+`(retrieve (maximum-element relation arity ?x))' (see also `collect-into-descending-set')."
+  :<<= (exists (?orderedSet ?firstElement ?maxValue)
+         (and (collect-into-descending-set ?c ?sortBy ?orderedSet)
+              (nth-element ?orderedSet 0 ?firstElement)
+              (fork (single-valued ?sortBy)
+                    (holds ?sortBy ?firstElement ?maxValue)
+                    ;; if we might have multiple ?sortBy values for ?firstElement,
+                    ;; we need another subquery to find the largest one:
+                    (and (query (holds ?sortBy ?firstElement ?maxValue)
+                                :how-many :all :sort-by :values-descending)
+                         (cut)))
+              (member-of ?element ?orderedSet)
+              (holds ?sortBy ?element ?maxValue)))
+  :computed TRUE)
+
 
 ;;; TO DO: SHOULD BE REPLACED BY `LENGTH':
 (defrelation length-of-list ((?l COLLECTION) (?length INTEGER))
@@ -1191,6 +1361,76 @@ variables before they are passed to the `setofall' term."
                (relation-specialist
                 LENGTH-OF-LIST length-of-list-specialist)
                (single-valued LENGTH-OF-LIST)))
+
+(deffunction nth-element ((?l COLLECTION) (?n INTEGER) (?e THING))
+  :documentation "Return the ?n-th element ?e of ?l (zero-based).
+Count from end of the list if ?n is negative.  If ?n is unbound
+and ?e is bound, this computes the position of ?e.  If both are
+unbound, collection elements and their respective positions will
+be enumerated."
+  :relation-specialist nth-element-specialist)
+
+(deffunction first-element ((?l COLLECTION) (?e THING))
+  :documentation "Return the first element ?e of ?l."
+  :computed TRUE
+  :<=> (nth-element ?l 0 ?e))
+
+(deffunction second-element ((?l COLLECTION) (?e THING))
+  :documentation "Return the second element ?e of ?l."
+  :computed TRUE
+  :<=> (nth-element ?l 1 ?e))
+
+(deffunction third-element ((?l COLLECTION) (?e THING))
+  :documentation "Return the third element ?e of ?l."
+  :computed TRUE
+  :<=> (nth-element ?l 2 ?e))
+
+(deffunction fourth-element ((?l COLLECTION) (?e THING))
+  :documentation "Return the fourth element ?e of ?l."
+  :computed TRUE
+  :<=> (nth-element ?l 3 ?e))
+
+(deffunction fifth-element ((?l COLLECTION) (?e THING))
+  :documentation "Return the fifth element ?e of ?l."
+  :computed TRUE
+  :<=> (nth-element ?l 4 ?e))
+
+(deffunction nth-head ((?l LIST) (?n INTEGER) (?h LIST))
+  :documentation "Return the ?n head elements ?h of ?l.
+Count from end of the list if ?n is negative."
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation nth-head-computation)
+
+(deffunction nth-rest ((?l LIST) (?n INTEGER) (?r LIST))
+  :documentation "Return the ?n-th rest ?r of ?l (zero-based).
+Count from end of the list if ?n is negative."
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation nth-rest-computation)
+
+(deffunction insert-element ((?l LIST) (?n INTEGER) (?e THING) (?r LIST))
+  :documentation "Add ?e at position ?n (zero-based) to ?l to construct ?r
+ (shifts the remaining elements right).  Count from end of the list and shift
+left if ?n is  negative such that -1 inserts at the end of the list, -2 second
+to last, etc."
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation insert-element-computation)
+
+(deffunction list-concatenate ((?x COLLECTION) (?y COLLECTION) (?r LIST))
+  :documentation "Concatenate lists ?x and ?y into ?r.  If ?x and/or ?y
+are not lists but sets or more general collections, the order of the
+elements in the result list ?r will be arbitrary."
+  ;; implement like this for now; if necessary we can generalize this
+  ;; and use a specialist similar to `string-concatenate'.
+  :<<= (COLLECT-INTO-LIST
+        (SETOFALL ?e
+          ;; exploits deterministic nature of PL inference engine:
+          (OR (MEMBER-OF ?e ?x)
+              (MEMBER-OF ?e ?y)))
+        ?r)
+  :computed TRUE)
 
 (defrelation minimum-value ((?l COLLECTION) (?min NUMBER))
   :documentation "Binds ?min to the minimum of the numbers in the list ?l."
@@ -1250,11 +1490,13 @@ of ?c and collect them into a list ?l. "
 ;;;;;; Literal manipulations
   ;;
 
-(deffunction string-concatenate ((?x1 STRING) (?x2 STRING)) :-> (?x3 STRING)
-  :documentation "Concatenate strings ?x1 and ?x2 and bind ?x3 to the result."
-  :axioms (and (computed string-concatenate)
-               (relation-constraint STRING-CONCATENATE concatenate-constraint)
-               (relation-specialist STRING-CONCATENATE constraint-specialist)))
+(deffunction string-concatenate ((?x THING) (?y THING)) :-> (?z STRING)
+  :documentation "Concatenate ?x and zero or more strings ?y (variable arity)
+and bind ?z to the result.  Coerces any type argument to a string if necessary."
+  :variable-arity TRUE
+  :computed TRUE
+  :relation-specialist computation-specialist
+  :relation-computation string-concatenate-computation)
 
 (deffunction substring ((?s STRING) (?start INTEGER) (?end INTEGER))
   :-> (?sub STRING)
@@ -1398,7 +1640,8 @@ collection object.  The main use for this is to state and test pairwise
 inequalities between N entities without having to generate O(N**2) statements."
   :variable-arity TRUE
   :computed TRUE
-  :relation-specialist different-specialist)
+  :relation-specialist different-specialist
+  :axioms (handles-reverse-polarity different-specialist))
 
 (defrelation ordered ((?c COLLECTION))
   :documentation "?c is ordered if the ordering of its
@@ -1409,8 +1652,11 @@ members is significant.  Lists are ordered, while sets are not.")
 invariant with any permutation of its arguments."
   ;; TO DO: Add a rule or specialist to handle this case.
   ;; Also, should this have a definition for functions as well?
-  :=>> (=> (binary-relation ?r)
-           (symmetric ?r)))
+  :axioms (=>> (and (commutative ?r)
+                    ;; don't use `binary-relation' here, because it can't
+                    ;; be evaluated in shallow inference mode:
+                    (= (arity ?r) 2))
+               (symmetric ?r)))
 
 (defrelation reflexive ((?r RELATION))
   :documentation "A binary relation ?r is reflexive if it is always true when

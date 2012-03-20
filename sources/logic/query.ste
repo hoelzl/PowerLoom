@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: query.ste,v 1.185 2009/06/25 23:22:09 hans Exp
+;;; Version: query.ste,v 1.190 2010/09/10 02:30:11 hans Exp
 
 ;;; Incremental backward chaining.
 
@@ -324,7 +324,9 @@ consified (and printed) as atoms instead of singleton lists.")
      :documentation "If defined, timeout after that many :DOWN moves.")
    (current-clock-ticks :type INTEGER :initially 0)
    (timeout? :type BOOLEAN
-     :documentation "Set to TRUE if query times out."))
+     :documentation "Set to TRUE if query times out.")
+   (depth-cutoffs? :type BOOLEAN
+     :documentation "Set to TRUE if one or more depth cutoffs occurred."))
   :print-form (print-query-iterator self stream))
 
 ;;; Needs to preceed first reference:
@@ -848,23 +850,35 @@ all boolean vectors.")
      (return (value-of self)))
     (DESCRIPTION
      ;; if 'self' is a description containing a HOLDS relation, look
-     ;;    for a duplicate - hc: not sure this is ever exercised:
+     ;;    for a duplicate - hc: not sure this is ever exercised, but
+     ;;    this might be another place to instantiate descriptions
+     ;;    with external variables:
      (when (and (defined? (external-variables self)) ;; HOLDS-KLUDGE
                 (contains-operator? (proposition self) PL-KERNEL/@HOLDS))
        (return (first-defined (find-duplicate-description self) self)))
      (return (value-of self)))
     (otherwise (return (value-of self)))) )
 
-(defun (safe-argument-bound-to OBJECT) ((arg OBJECT))
+(defun (safe-argument-bound-to OBJECT) ((self OBJECT))
   ;; Safe version of `argument-bound-to' (which see) that does not
   ;; break if we are called outside of a query or on a variable
   ;; that isn't allocated on the binding stack.
-  (if (variable? arg)
-      (if (and (defined? *queryIterator*)
-               (defined? (bound-to-offset (cast arg PATTERN-VARIABLE))))
-          (return (argument-bound-to arg))
-        (return NULL))
-    (return (argument-bound-to arg))))
+  (typecase self
+    (PATTERN-VARIABLE
+     ;; we mirror the variable case, since we still want to pick up
+     ;; `variable-value's:
+     (let ((value OBJECT NULL))
+       (when (and (defined? *queryIterator*)
+                  (defined? (bound-to-offset self)))
+         (setq value (bound-to self)))
+       (when (and (null? value)
+                  (defined? (variable-value self)))
+         (setq value (value-of self))         
+         (when (skolem? value)
+           (setq value NULL)))
+       (return value)))
+    (otherwise
+     (return (argument-bound-to self)))))
 
 (defun (help-unify-attributes? BOOLEAN) ((value1 OBJECT) (value2 OBJECT))
   ;; Helping function for 'help-bind-variable-to-value?'.
@@ -998,7 +1012,9 @@ all boolean vectors.")
   ;; If the unification operation fails at any point, return FALSE.
   ;; If 'autoCleanup?, all bindings are undone upon occurrence of unification
   ;;    failure.  Otherwise, the caller assumes responsibility for cleaning up.
-  (when (null? value)
+  (when (or (null? value)
+            ;; guard against descriptions and propositions with unbound external vars:
+            (not (argument-bound? value)))
     (when (and (partial-match-mode?)
                (allow-unbound-variables?
                 (partial-match-strategy *queryIterator*)))
@@ -1006,6 +1022,8 @@ all boolean vectors.")
     (signal-proposition-warning
      "Tried to bind " variable " to NULL value.  Potentially a PowerLoom bug")
     (return FALSE))
+  ;; instantiate any external variables in descriptions and propositions:
+  (setq value (instantiate-external-bindings value))
   (if autoCleanup?
     (let ((patternRecord (current-pattern-record *queryIterator*))
           (ubStackOffset (top-unbinding-stack-offset patternRecord))
@@ -1038,6 +1056,8 @@ all boolean vectors.")
     (signal-proposition-warning
      "Tried to bind " argument " to NULL value.  Potentially a PowerLoom bug")
     (return FALSE))
+  ;; instantiate any external variables in descriptions and propositions:
+  (setq value (instantiate-external-bindings value))
   (typecase argument
     (PATTERN-VARIABLE
      (return (bind-variable-to-value? argument value autoCleanup?)))
@@ -1214,12 +1234,12 @@ variable bindings appear relative to the frame '*printInFrame*'.")
 
 (defun unwind-to-choice-points-below-frame ((frame CONTROL-FRAME))
   ;; Unwind variables bound after each choice point established at
-  ;;    and below 'frame'.
+  ;;    the farthest down frame below 'frame'.
   ;; Called by 'trace-goal-tree' to allow bindings to be seen accurately
   ;;    as we move down the control stack.
-  (when (defined? frame)
-    (unwind-to-choice-point frame)
-    (unwind-to-choice-points-below-frame (down frame))) )
+  (while (defined? (down frame))
+    (setq frame (down frame)))
+  (unwind-to-choice-point frame))
 
 (defun trace-goal-tree ((frame CONTROL-FRAME) (depth INTEGER) (lastMove KEYWORD))
   ;; Print out a trace of backtracking goals and successes/failures.
@@ -2023,7 +2043,11 @@ variable bindings appear relative to the frame '*printInFrame*'.")
          (return (continue-partial-NOT-proof frame lastMove))
        (return (continue-NOT-proof frame lastMove))))
     ((:ISA :FUNCTION :PREDICATE :EQUIVALENT :IMPLIES)
-     (create-choice-point frame)
+     ;; Moved creation of choicepoint into `initiate-atomic-goal-proofs' after
+     ;; yield-goal-bindings is called, otherwise, bindings cached during that step (e.g.,
+     ;; from description variables being bound to computed values) will immediately
+     ;; be undone in `continue-strategies-proofs':
+     ;(create-choice-point frame)
      (return (initiate-atomic-goal-proofs frame)))
     ((:ATOMIC-GOAL :STRATEGY)
      (if (partial-match-mode?)
@@ -2184,7 +2208,10 @@ variable bindings appear relative to the frame '*printInFrame*'.")
                   (closed-proposition? proposition))
          (return (overlay-with-fail-frame frame proposition)))
        ;; evaluate next disjunct or previously-successful disjunct:
-       (create-choice-point frame)
+       (unless (defined? (down frame))
+         ;; only create a choice point if we are moving down to a new goal,
+         ;; otherwise the creation might undo variable bindings we still need:
+         (create-choice-point frame))
        (return :MOVE-DOWN))
       (:UP-TRUE
        (setf (truth-value frame) (truth-value (result frame)))
@@ -2274,7 +2301,9 @@ variable bindings appear relative to the frame '*printInFrame*'.")
     (:UP-FAIL
      (setf (truth-value frame)
        (invert-truth-value (truth-value (result frame))))
-     (when (record-justifications?)
+     (when (and (record-justifications?)
+                ;; This will not be defined for UNKNOWN or INCONSISTENT results:
+                (defined? (justification (result frame))))
        (record-DISPROOF-justification frame lastMove))
      (return :FAILURE))))
 
@@ -2364,6 +2393,7 @@ variable bindings appear relative to the frame '*printInFrame*'.")
              (setq inferenceLevel :SHALLOW))
             (:DUPLICATE-GOALS-WITH-CACHING
              (setf (state frame) :SCAN-CACHED-BINDINGS)
+             (create-choice-point frame)
              (return :MOVE-IN-PLACE))))
         (case inferenceLevel
           ((:NORMAL :BACKTRACKING)
@@ -2382,9 +2412,11 @@ variable bindings appear relative to the frame '*printInFrame*'.")
                  ;; it in non-chaining inference modes, otherwise we can get unexpected
                  ;; results if, for example, we are looking for assertions only; the
                  ;; proper fix would be to build this into the caching machinery:
+                 ;; PROBLEM: IF WE HAVE RECURSIVE RULES, WE NEED PREVIOUSLY CACHED RESULTS
+                 ;; WHEN WE CUT OFF A DUPLICATE SUBGOAL; IN FACT, WE NEED COMPLETE
+                 ;; CACHED RESULTS AND NOT THE INCOMPLETE VERSION WE ARE USING NOW...
                  (quote
-                  (:SPECIALIST #|:LOOKUP-GOAL-CACHES|# :LOOKUP-ASSERTIONS
-                               :SHALLOW-DISPROOF)))))
+                  (:SPECIALIST :LOOKUP-GOAL-CACHES :LOOKUP-ASSERTIONS :SHALLOW-DISPROOF)))))
         (when (and (eql? (kind proposition) :FUNCTION)
                    (not *reversePolarity?*))
           (setq strategies
@@ -2399,6 +2431,8 @@ variable bindings appear relative to the frame '*printInFrame*'.")
      ;;    proof strategies.
      (setf (next-strategies frame) strategies)
      (setf (state frame) :ATOMIC-GOAL)
+     ;; moved here from `evaluate-next-move' (which see):
+     (create-choice-point frame)
      (return :MOVE-IN-PLACE) )))
 
 (defun (all-arguments-bound? BOOLEAN) ((goal PROPOSITION))
@@ -2499,7 +2533,7 @@ variable bindings appear relative to the frame '*printInFrame*'.")
     (when (null? externalArguments)
       (return NIL))
     (foreach arg in externalArguments
-        collect (instantiate-external-bindings (argument-bound-to arg))
+        collect (instantiate-external-bindings (safe-argument-bound-to arg))
         into externalBindings)
     (return externalBindings) ))
 
@@ -2526,7 +2560,7 @@ variable bindings appear relative to the frame '*printInFrame*'.")
        (let ((mapping (new ENTITY-MAPPING)))
          (foreach var in (external-variables self)
              where (argument-bound? var)
-             do (insert-at mapping var (argument-bound-to var)))
+             do (insert-at mapping var (safe-argument-bound-to var)))
          (unless (empty? mapping)
            (return (instantiate-external-variables self mapping))))))
     ;; some day we might also want to do this for propositions:
@@ -2804,9 +2838,20 @@ variable bindings appear relative to the frame '*printInFrame*'.")
                (not (relation-implies-relation? desc1 desc2))
                (not (relation-implies-relation? desc2 desc1)))) )
 
+(defglobal *trace-disjointness-subgoals?* BOOLEAN FALSE
+  :documentation "If true and goal tracing is on, subgoals of disjointness
+queries will also be traced."
+  :public? TRUE)
+
 (defun (disjoint-terms? BOOLEAN) ((d1 DESCRIPTION) (d2 DESCRIPTION))
   :documentation "Return TRUE if 'd1' and 'd2' belong to disjoint partitions."
   :public? TRUE
+  ;; TO DO: this gets some caching from the goal-caches machinery, but it probably
+  ;;    should be memoized; the question is what timestamp to use, since even
+  ;;    META-KB-UPDATE gets bumped frequently during forward inference.
+  (when (null? (surrogate-value PL-KERNEL/@PARTITION-MEMBERSHIP))
+    ;; prevent crash during kernel bootstrap:
+    (return FALSE))
   (when-cyc-kludges-enabled
    (when (and (isa? d1 @NAMED-DESCRIPTION)
               (isa? d2 @NAMED-DESCRIPTION))
@@ -2816,10 +2861,23 @@ variable bindings appear relative to the frame '*printInFrame*'.")
        (true-truth-value?
         (evaluate-selection-pattern
          (make-relation-pattern-2 PL-KERNEL/@DISJOINT d1 d2))))))
-  (return
-    (apply-ask (?d1 ?d2)
-               (disjoint ?d1 ?d2)
-               (d1 d2))))
+  (let ((tracedKeywords *traced-keywords*)
+        (disjoint? FALSE))
+    (unless *trace-disjointness-subgoals?*
+      (setq *traced-keywords* NULL))
+    ;; EXPERIMENT: memoize this even though the cache will be wiped out often:
+    (special ((*evaluationMode* :EXTENSIONAL-ASSERTION))
+      (setq disjoint?
+        (memoize (d1 d2 *context*)
+                 ;; NOTE: :META-KB-UPDATE gets bumped during forward inference, e.g.,
+                 ;; if we infer `duplicate-free' for some collection - so, not too useful:
+                 :timestamps :META-KB-UPDATE
+                 :max-values 10000
+                 (apply-ask (?d1 ?d2)
+                            (disjoint ?d1 ?d2)
+                            (d1 d2)))))
+    (setq *traced-keywords* tracedKeywords)
+    (return disjoint?)))
 
 (defun (expensive-disjoint-terms? BOOLEAN)
        ((d1 DESCRIPTION) (d2 DESCRIPTION))
@@ -3177,6 +3235,8 @@ description extension iterator is switched from a list to a hash table")
     (dont-cache-goal-failure-between-frames
      frame (base-control-frame *queryIterator*)))
   (register-inference-cutoff frame :DEPTH-VIOLATION)
+  ;; register it on the query iterator so we can tell the user:
+  (setf (depth-cutoffs? *queryIterator*) TRUE)
   (cond
    ((or (eql? *duplicate-subgoal-strategy* :DUPLICATE-GOALS)
         (eql? *duplicate-subgoal-strategy* :DUPLICATE-GOALS-WITH-CACHING))
@@ -3445,7 +3505,9 @@ result will be in ascending order."
   :slots ((the-table :type QUERY-SOLUTION-TABLE)
           (cursor :type QUERY-SOLUTION)))
 
-(defmethod (allocate-iterator DICTIONARY-ITERATOR) ((self QUERY-SOLUTION-TABLE))
+(defmethod (allocate-iterator (DICTIONARY-ITERATOR OF (LIKE (any-key self))
+                                                      (LIKE (any-value self))))
+    ((self QUERY-SOLUTION-TABLE))
   (return (new QUERY-SOLUTION-TABLE-ITERATOR :the-table self)))
 
 (defmethod (next? BOOLEAN) ((self QUERY-SOLUTION-TABLE-ITERATOR))
@@ -3554,8 +3616,16 @@ with a full stack of control frames."
        (print-stream stream "There are " nOfSolutions " solutions")))
     (unless exhausted?
       (print-stream stream " so far"))
-    (when (timeout? self)
-      (print-stream stream " (timeout)"))
+    (when (or (timeout? self)
+              (depth-cutoffs? self))
+      (print-stream stream " (")
+      (when (timeout? self)
+        (print-stream stream "timeout")
+        (when (depth-cutoffs? self)
+          (print-stream stream ", ")))
+      (when (depth-cutoffs? self)
+        (print-stream stream "depth cutoffs"))
+      (print-stream stream ")"))
     (when (= nOfSolutions 0)
       (print-stream stream "." EOL)
       (return))
@@ -3992,6 +4062,7 @@ with a full stack of control frames."
          initialFrame (description patternRecord) (external-arguments patternRecord))))
     (setf (exhausted? self) FALSE)
     (setf (timeout? self) FALSE)
+    (setf (depth-cutoffs? self) FALSE)
     (clear (solutions self))
     (setf (truth-value initialFrame) NULL)
     (setf (augmented-goal-cache? self) FALSE)
@@ -4078,7 +4149,10 @@ with a full stack of control frames."
   (let ((firstArg (first query&Options))
         (variables OBJECT NULL)
         (proposition OBJECT NULL)
-        (options (new PROPERTY-LIST)))
+        (options (new PROPERTY-LIST))
+        (handleNonMatchingVariables? FALSE)
+        (freeVariables (LIST OF SYMBOL) NULL)
+        (declaredVariables CONS NULL))
     (typecase firstArg
       (INTEGER-WRAPPER
        (insert-at options :HOW-MANY firstArg)
@@ -4106,34 +4180,29 @@ with a full stack of control frames."
       (setq proposition variables)
       (setq variables NULL))
     (when (cons? proposition)
-      ;; determine or check free query variables:
-      (let ((freeVariables (new (LIST OF SYMBOL)))
-            (declaredVariables CONS NULL))
-        (cond ((null? variables)
-               (setq declaredVariables NIL))
-              ((not (cons? variables))
-               (setq declaredVariables (cons variables NIL)))
-              (otherwise
-               (setq declaredVariables variables)))
-        (setq declaredVariables
-          (extract-variables-from-declarations declaredVariables))
-        (collect-undeclared-variables proposition NIL freeVariables)
-        (cond
-         ((and (empty? declaredVariables)
-               (non-empty? freeVariables))
-          (if (= (length freeVariables) 1)
-              ;; assume atomic singletons if no variables were declared:
-              (setq variables (first freeVariables))
-            (setq variables (the-cons-list freeVariables))))
-         ((and (empty? declaredVariables)
-               (empty? freeVariables))
-          NULL)
-         ((not (equivalent-sets? (the-cons-list freeVariables) declaredVariables))
-          (signal-parsing-error
-           "Declared query variables " declaredVariables " do not match" EOL
-           "   the free variables " (the-cons-list freeVariables)
-           " referenced in the query body." EOL
-           "   To simply use the free variables, omit the declaration")))))
+      ;; determine free query variables:
+      (setq freeVariables (new LIST))
+      (cond ((null? variables)
+             (setq declaredVariables NIL))
+            ((not (cons? variables))
+             (setq declaredVariables (cons variables NIL)))
+            (otherwise
+             (setq declaredVariables variables)))
+      (setq declaredVariables
+        (extract-variables-from-declarations declaredVariables))
+      (collect-undeclared-variables proposition NIL freeVariables)
+      (cond ((and (empty? declaredVariables)
+                  (non-empty? freeVariables))
+             (if (= (length freeVariables) 1)
+                 ;; assume atomic singletons if no variables were declared:
+                 (setq variables (first freeVariables))
+               (setq variables (the-cons-list freeVariables))))
+            ((and (empty? declaredVariables)
+                  (empty? freeVariables))
+             NULL)
+            ((not (equivalent-sets? (the-cons-list freeVariables) declaredVariables))
+             ;; we defer this until option parsing is comlete:
+             (setq handleNonMatchingVariables? TRUE))))
     (while (non-empty? query&Options)
       (when (not (keyword? (first query&Options)))
         (signal-parsing-error "Illegal query option: " (first query&Options)))
@@ -4141,6 +4210,19 @@ with a full stack of control frames."
         (signal-parsing-error "Missing value for option " (first query&Options)))
       (insert-at options (first query&Options) (second query&Options))
       (setq query&Options (rest (rest query&Options))))
+    (when handleNonMatchingVariables?
+      (if (coerce-to-boolean (first-defined (lookup options :check-variables?) FALSE))
+          ;; we are required to report a mismatch:
+          (signal-parsing-error
+           "Declared query variables " declaredVariables " do not match" EOL
+           "   the free variables " (the-cons-list freeVariables)
+           " referenced in the query body." EOL
+           "   To simply use the free variables, omit the declaration")
+        ;; we simply quantify the free non-output variable with an exists:
+        (setq proposition
+          (bquote (pl-kernel/exists & (difference (the-cons-list freeVariables)
+                                                  declaredVariables)
+                                    & proposition)))))
     (return variables proposition options)))
 
 (defun process-query-options ((query QUERY-ITERATOR) (options OBJECT))
@@ -4194,12 +4276,20 @@ with a full stack of control frames."
               (insert-at theOptions key value)
               (when (eql? value TRUE-WRAPPER)
                 (setf (iterative-deepening? query) TRUE)))
-             (:SINGLETONS? ;; Special option of `apply-cached-retrieve'
+             ((:SINGLETONS? :ATOMIC-SINGLETONS?) ;; Special option of `apply-cached-retrieve'
               (insert-at theOptions key (coerce-to-boolean value))
               (setf (atomic-singletons? query) (eql? value TRUE-WRAPPER)))
              (:DONT-OPTIMIZE?
               (setq value (coerce-to-boolean value))
               ;; handled later during initialization:
+              (insert-at theOptions key value))
+             (:ALL-PROOFS?
+              (setq value (coerce-to-boolean value))
+              ;; handled later during initialization:
+              (insert-at theOptions key value))
+             (:CHECK-VARIABLES?
+              ;; we already looked at this option during query parsing:
+              (setq value (coerce-to-boolean value))
               (insert-at theOptions key value))
              (:HOW-MANY
               (typecase value
@@ -4343,16 +4433,6 @@ with a full stack of control frames."
      (return (unstringify self)))
     (otherwise
      (return self))) )
-
-(defun (coerce-to-string STRING) ((self OBJECT))
-  ;; Helping function for top-level functions.
-  ;; Turn a wrapped string, symbol or surrogate into a string.
-  ;; If can't coerce, signal an exception.
-  (typecase self
-    (STRING-WRAPPER (return (wrapper-value self)))
-    ((SYMBOL KEYWORD SURROGATE) (return (symbol-name self)))
-    (otherwise
-     (signal-parsing-error "Can't convert " self " into a string"))))
 
 (defun (create-ask-query QUERY-ITERATOR) ((query OBJECT))
   ;; Convert `query' into a QUERY-ITERATOR.  If it is already, simply return it.
@@ -4511,7 +4591,8 @@ queries and logical expressions."
               ;; initialize these for the sake of recursive queries:
               (*reversePolarity?* FALSE)
               (*inferenceLevel* (current-inference-level))
-              (*generate-all-proofs?* FALSE))
+              (*generate-all-proofs?*
+               (test-query-option? theQuery :ALL-PROOFS?)))
       (foreach i in (interval 1 (lookup-how-many-solutions *queryIterator*))
           as solution in *queryIterator*
           do (when (trace-keyword? :TRACE-SOLUTIONS)
@@ -4670,14 +4751,39 @@ list of lists for tuples of arity=1."
 ;;;;;; In-line queries
   ;;
 
-(defglobal *query-cache* (HASH-TABLE OF SYMBOL QUERY-ITERATOR) (new HASH-TABLE)
-  :documentation "Caches in-line queries, so that they
-don't have to be reparsed and reoptimized each time they
-are invoked.")
+;;; Note: we need an allocation scheme that can handle recursive calls
+;;; of the same cached query with different arguments while the ones
+;;; from earlier calls are still active.
 
-(defun flush-inline-query-caches ()
+(defglobal *inline-query-cache* (KEY-VALUE-MAP OF SYMBOL (LIST OF QUERY-ITERATOR))
+           (new KEY-VALUE-MAP)
+  :documentation "Caches queries used in-line by code, so that they don't have to
+be reparsed and reoptimized each time they are invoked."
+  :thread-local? TRUE)
+
+(defun clear-inline-query-caches ()
   ;; Clear all cached queries (they will regenerate themselves).
-  (setq *query-cache* (new HASH-TABLE)) )
+  (clear *inline-query-cache*))
+
+(defun (find-cached-query QUERY-ITERATOR) ((queryID SYMBOL))
+  ;; If there are any cached queries available for `queryID',
+  ;; return one of them and remove it from the cache.
+  (let ((queries (lookup *inline-query-cache* queryID)))
+    (if (defined? queries)
+        (return (pop queries))
+      (return NULL))))
+
+(defglobal *max-cached-queries-per-id* INTEGER 10)
+
+(defun free-cached-query ((query QUERY-ITERATOR) (queryID SYMBOL))
+  ;; Return `query' to the query cache for `queryID'.
+  (let ((queries (lookup *inline-query-cache* queryID)))
+    (when (null? queries)
+      (setq queries (new LIST))
+      (insert-at *inline-query-cache* queryID queries))
+    ;; guard against excessive consumption in case we have very deep recursion:
+    (when (< (length queries) *max-cached-queries-per-id*)
+      (push queries query))))
 
 (defun (make-cached-query QUERY-ITERATOR)
        ((variables CONS) (queryBody CONS) (inputBindings CONS)
@@ -4685,7 +4791,7 @@ are invoked.")
   ;; Make a cached query.
   ;; Called by 'apply-cached-retrieve' and 'apply-cached-ask'.
   :public? TRUE
-  (let ((queryIterator (lookup *query-cache* cacheID))
+  (let ((queryIterator (find-cached-query cacheID))
         (cursor inputBindings))
     (when (not (eql? (length variables)
                      (length inputBindings)))
@@ -4714,9 +4820,7 @@ are invoked.")
                           options))
          (LOGIC-EXCEPTION (e)
 	   (print-stream STANDARD-ERROR (exception-message e))
-           (return NULL)))
-        (when (defined? cacheID)
-          (insert-at *query-cache* cacheID queryIterator)))
+           (return NULL))))
       (progn
         (foreach newB in inputBindings
             as i in (interval 0 NULL)
@@ -4726,14 +4830,16 @@ are invoked.")
       (process-query-options queryIterator options))
     (return queryIterator) ))
 
-(defun (apply-cached-retrieve CONS CONS)
+(defun (apply-cached-retrieve CONS CONS CONS)
     ((variables CONS) (queryBody CONS) (inputBindings CONS)
      (options OBJECT) (cacheID SYMBOL))
   :public? TRUE
   ;; Execute the query consisting of 'variables' and 'queryBody'.
   ;; Bind some of 'variables' to 'inputBindings'.
-  ;; Return a list of lists of bindings for the unbound variables,
-  ;;    or a list of values if only one variable is unbound.
+  ;; Return (1) a list of lists of bindings for the unbound variables,
+  ;;            or a list of values if only one variable is unbound.
+  ;;        (2) a list of corresponding truth values
+  ;;        (3) a list of corresponding justifications, if enabled
   ;; Tricky: Uses 'cacheID' to index into a cache of queries.  Expansion
   ;;    of the macro 'apply-retrieve' creates a new gensym, so a new query
   ;;    gets generated each time an embedded call to 'apply-retrieve' is
@@ -4742,16 +4848,20 @@ are invoked.")
         (bindingsCount 0)
         (outputBindings NIL)
         (truthValues NIL)
-        (forceSingletons? FALSE))
+        (justifications NIL)
+        (forceSingletonTuples? FALSE))
     (foreach it on inputBindings
         where (defined? (value it))
         do (++ bindingsCount))
     (setq queryIterator
       (make-cached-query variables queryBody inputBindings options cacheID))
     (when (null? queryIterator)
-      (return NIL NIL))
-    (when (eql? (lookup (options queryIterator) :SINGLETONS?) TRUE-WRAPPER)
-      (setq forceSingletons? TRUE))
+      (return NIL NIL NIL))
+    ;; by default, we return singletons if there is only one variable,
+    ;; but we can turn that off if we set :SINGLETONS? to FALSE:
+    (when (or (eql? (lookup (options queryIterator) :SINGLETONS?) FALSE-WRAPPER)
+              (eql? (lookup (options queryIterator) :ATOMIC-SINGLETONS?) FALSE-WRAPPER))
+      (setq forceSingletonTuples? TRUE))
     (special ((*queryIterator* queryIterator)
               ;; initialize this for the sake of recursive queries:
               (*reversePolarity?* FALSE))
@@ -4759,7 +4869,7 @@ are invoked.")
       (while (next? queryIterator)))
     (let ((tuple OBJECT NULL)
           (atomicSingletons? (and (eql? (length inputBindings) (1+ bindingsCount))
-                                  (not forceSingletons?))))
+                                  (not forceSingletonTuples?))))
       (foreach s in (solutions queryIterator)
           do (if atomicSingletons?
                 (foreach v in (bindings s)
@@ -4773,8 +4883,11 @@ are invoked.")
                     collect v into values)
                 (setq tuple values)))
              (pushq outputBindings tuple)
-             (pushq truthValues (truth-value s))))
-    (return (reverse outputBindings) (reverse truthValues))))
+             (pushq truthValues (truth-value s))
+             (when (record-justifications?)
+               (pushq justifications (justification s)))))
+    (free-cached-query queryIterator cacheID)
+    (return (reverse outputBindings) (reverse truthValues) (reverse justifications))))
 
 (defun (apply-cached-ask BOOLEAN TRUTH-VALUE)
        ((inputVariables CONS) (queryBody CONS) (inputBindings CONS)
@@ -4791,10 +4904,12 @@ are invoked.")
   (let ((queryIterator
          (make-cached-query
           inputVariables queryBody inputBindings options cacheID)))
-    (when (null? queryIterator)
-      (return FALSE NULL))
-    (return (true-truth-value? (call-ask queryIterator))
-            (truth-value (value queryIterator)))))
+    (cond ((defined? queryIterator)
+           (let ((truthValue (call-ask queryIterator)))
+             (free-cached-query queryIterator cacheID)
+             (return (true-truth-value? truthValue) truthValue)))
+          (otherwise
+           (return FALSE NULL)))))
 
         
   ;;
@@ -5105,7 +5220,8 @@ Constraint propagation happens only if it is enabled prior to calling
     ((query QUERY-ITERATOR)
      (description DESCRIPTION)
      (module MODULE)
-     (updateMode KEYWORD))
+     (updateMode KEYWORD)
+     (recordJustifications? BOOLEAN))
   ;; For each solution in `query' build a corresponding proposition and
   ;;    assert or retract it in `module' according to `updateMode'.
   ;; If `description' is NULL, the proposition for each solution will be
@@ -5182,6 +5298,7 @@ Constraint propagation happens only if it is enabled prior to calling
                        prop dontCheckDuplicates?))
                     (let ((thisUpdateMode updateMode)
                           (truthValue (truth-value solution))
+                          (justification (justification solution))
                           (equivalence? (eql? (kind prop) :EQUIVALENT)))
                       (when (false-truth-value? truthValue)
                         (setq thisUpdateMode
@@ -5189,16 +5306,40 @@ Constraint propagation happens only if it is enabled prior to calling
                       (when (default-truth-value? truthValue)
                         (setq thisUpdateMode
                           (defaultify-update-mode thisUpdateMode)))
-                      (if equivalence?
-                          (update-equivalence-proposition prop thisUpdateMode)
-                        (update-proposition-truth-value prop thisUpdateMode))
+                      (when equivalence?
+                        (update-equivalence-proposition prop thisUpdateMode))
+                      ;; always call this, since `update-equivalence-proposition'
+                      ;; is a no-op if both arguments are skolems:
+                      (update-proposition-truth-value prop thisUpdateMode)
                       (when partial?
                         ;; does update mode really matter here?
                         (setf (weight prop) (match-score solution)))
+                      ;; We need to add this here to get the same automatic argument type
+                      ;; assertions as we get with manual top-level assertions; however,
+                      ;; just as at the top-level this is not fully correct and needs fixing:
+                      (verify-argument-types-and-count prop)
+                      (when (and recordJustifications?
+                                 (defined? justification))
+                        (let ((resultJustification
+                               (new JUSTIFICATION
+                                    :inference-rule :assert-from-query
+                                    :proposition prop
+                                    ;; TO DO: this is not quite done yet, we need to link in `proposition'
+                                    ;; from the assertion pattern and also explain the substitutions somehow:
+                                    :antecedents (cons justification NIL)
+                                    :substitution (copy mapping)
+                                    :truth-value truthValue)))
+                          (add-forward-justifications prop resultJustification)))
                       (pushq propositions prop)))))
     (when terminateLine?
       (trace-if :UPDATE-FROM-QUERY EOL))
     (return (reverse propositions))))
+
+(startup-time-progn
+  (define-explanation-phrase :assert-from-query :technical
+    "because it was asserted from a query")
+  (define-explanation-phrase :assert-from-query :lay
+    "because it was asserted from a query"))
 
 (defun (get-query-iterator-from-command QUERY-ITERATOR) ((query CONS))
   ;; Evaluate the `query' command and return its associated query iterator.
@@ -5228,7 +5369,8 @@ is as follows:
  (assert-from-query <query-command>
                     [:relation <relation-name>]
                     [:pattern <description-term>]
-                    [:module <module-name>])
+                    [:module <module-name>]
+                    [:record-justifications? TRUE|FALSE])
 	
 <query-command> has to be a strict or partial retrieval command. If a
 :relation option is supplied, <relation-name> is used as the relation
@@ -5245,8 +5387,10 @@ generated in that module.  Note that for this to work the relations
 referenced in the query proposition or pattern have to be visible in
 the module.  Also, instances will not be copied to the target module,
 therefore, the resulting propositions might reference external
-out-of-module objects in case they are not visible there.
-Here are some examples:
+out-of-module objects in case they are not visible there.  If
+:record-justifications? is TRUE, justifications will be recorded
+for the query and the resulting justifications will be linked to
+the asserted propositions.  Here are some examples:
 	 
  (assert-from-query (retrieve all (foo ?x ?y)))
  (assert-from-query (retrieve all (?y ?x)
@@ -5268,19 +5412,26 @@ Here are some examples:
              (parse-logic-command-options
               (coerce-&rest-to-cons options)
               (bquote (:module @MODULE
-                       :relation @NAMED-DESCRIPTION
-                       :pattern @CONS))
+                       :relation @SYMBOL
+                       :pattern @CONS
+                       :record-justifications? @BOOLEAN))
               TRUE FALSE))
-            (queryIterator (get-query-iterator-from-command query))
-            (pattern DESCRIPTION NULL))
+            (pattern DESCRIPTION NULL)
+            (recordJustifications?
+             (lookup-with-default theOptions :record-justifications? FALSE)))
         (when (defined? (lookup theOptions :pattern))
           (setq pattern (conceive-term (lookup theOptions :pattern))))
-        (return
-          (update-propositions-from-query
-           queryIterator
-           (first-defined pattern (lookup theOptions :relation))
-           (lookup theOptions :module)
-           :ASSERT-TRUE)))
+        (special ((*record-justifications?*
+                   (or *record-justifications?*
+                       recordJustifications?)))
+          (return
+            (update-propositions-from-query
+             (get-query-iterator-from-command query)
+             (coerce-to-description
+               (first-defined pattern (lookup theOptions :relation)) NULL)
+              (lookup theOptions :module)
+             :ASSERT-TRUE
+             recordJustifications?))))
     (LOGIC-EXCEPTION (e)
       (print-stream STANDARD-ERROR (exception-message e))))
   (return NULL))
@@ -5298,7 +5449,7 @@ available command options."
              (parse-logic-command-options
               (coerce-&rest-to-cons options)
               (bquote (:module @MODULE
-                       :relation @NAMED-DESCRIPTION
+                       :relation @SYMBOL
                        :pattern @CONS))
               TRUE FALSE))
             (queryIterator (get-query-iterator-from-command query))
@@ -5308,9 +5459,11 @@ available command options."
         (return
           (update-propositions-from-query
            queryIterator
-           (first-defined pattern (lookup theOptions :relation))
+           (coerce-to-description
+             (first-defined pattern (lookup theOptions :relation)) NULL)
            (lookup theOptions :module)
-           :RETRACT-TRUE)))
+           :RETRACT-TRUE
+           FALSE)))
     (LOGIC-EXCEPTION (e)
       (print-stream STANDARD-ERROR (exception-message e))))
   (return NULL))

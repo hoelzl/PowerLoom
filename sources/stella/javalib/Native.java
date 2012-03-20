@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: Native.java,v 1.58 2010/02/10 22:12:39 hans Exp
+// Version: Native.java,v 1.59 2010/04/26 21:45:15 hans Exp
 
 // Native Java stuff for STELLA
 
@@ -430,53 +430,27 @@ public class Native {
   ///// File operations
    //
 
-  public static boolean probeFileP(String filename) {
-    filename = Stella.translateLogicalPathname(filename);
+  public static boolean nativeProbeFileP(String filename) {
     return (new File(filename)).exists();
   }
 
-  public static CalendarDate fileWriteDate(String filename) {
-    filename = Stella.translateLogicalPathname(filename);
+  public static CalendarDate nativeFileWriteDate(String filename) {
     return CalendarDate.nativeDateTimeToCalendarDate ((new File(filename)).lastModified());
   }
 
-  public static long fileLength(String filename) {
-    // NOTE: Using 'int' to store sizes might not be sufficient!!
-    //  Java interface contract specifies long!!
-    filename = Stella.translateLogicalPathname(filename);
-    return (int) (new File(filename)).length();
+  public static long nativeFileLength(String filename) {
+    return (new File(filename)).length();
   }
 
-  public static void deleteFile(String filename) {
-    filename = Stella.translateLogicalPathname(filename);
+  public static void nativeDeleteFile(String filename) {
     (new File(filename)).delete();
   }
 
-
-  /*
-  public static void copyFile(String fromFilename, String toFilename) {
-    java.io.FileInputStream fromFile = null;
-    java.io.FileOutputStream toFile = null;
-    byte buffer [] = new byte[1024];
-    int bytesRead = 0;
-
-    try {
-      fromFile = new FileInputStream(Stella.translateLogicalPathname(fromFilename));
-      toFile  = new FileOutputStream(Stella.translateLogicalPathname(toFilename));
-      while (bytesRead >= 0) {
-        bytesRead = fromFile.read(buffer, 0, 1024);
-        if (bytesRead > 0) toFile.write(buffer, 0, bytesRead);
-      }
-    } catch (java.lang.FileNotFoundException fnf) {
-      throw (NoSuchFileException) NoSuchFileException.newNoSuchFileException(fnf.getMessage()).fillInStackTrace();
-    } catch (java.lang.IOException ioe) {
-      throw (InputOutputException) InputOutputException.newInputOutputException("copyFile: " + e.getMessage()).fillInStackTrace();
-    } finally {
-      if (fromFile != null) fromFile.close();
-      if (toFile != null) toFile.close();
-    }
+  public static void nativeRenameFile(String fromfile, String tofile) {
+    (new File(fromfile)).renameTo(new File(tofile));
   }
-  */
+
+
     //
   ///// Exception-handling support
    //

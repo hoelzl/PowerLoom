@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: walk.ste,v 1.298 2008/12/19 23:27:33 tar Exp
+;;; Version: walk.ste,v 1.300 2010/09/20 21:27:34 hans Exp
 
 ;;; Stella code walker.
 
@@ -2137,29 +2137,23 @@ locate a coersion method.")
   (let ((slotType returnType)
         (canonicalSlot (canonical-slot slot))
         (nativeSlotHome CLASS NULL))
-    (unless (eql? (translator-output-language) :common-lisp)
-      (when (native-slot? canonicalSlot)
-        (setq nativeSlotHome
-          (native-slot-home slot (type-spec-to-class firstArgType))))
-      (if (defined? nativeSlotHome)
-          (setq slotType
-            (type-spec-to-base-type
-             (compute-return-type-spec
-              (lookup-slot nativeSlotHome (slot-name canonicalSlot))
-              (class-type nativeSlotHome))))
+    (when (native-slot? canonicalSlot)
+      (setq nativeSlotHome
+        (native-slot-home slot (type-spec-to-class firstArgType))))
+    (if (defined? nativeSlotHome)
         (setq slotType
           (type-spec-to-base-type
            (compute-return-type-spec
-            slot (type-spec-to-base-type firstArgType)))))
-      ;; Check whether there really was a base type difference, and
-      ;; keep the original (possibly parametric) type if there wasn't:
-      (when (eql? slotType (type-spec-to-base-type returnType))
-        (setq slotType returnType)))
-    ;; Check whether we have a renamed slot with possibly narrower type
-    ;; (this also makes some sense in Common-Lisp, since we might want
-    ;; to have a cast for run-time type checking, so always do it):
-    (unless (eql? slot canonicalSlot)
-      (setq slotType (slot-base-type canonicalSlot)))
+            (lookup-slot nativeSlotHome (slot-name canonicalSlot))
+            (class-type nativeSlotHome))))
+      (setq slotType
+        (type-spec-to-base-type
+         (compute-return-type-spec
+          slot (type-spec-to-base-type firstArgType)))))
+    ;; Check whether there really was a base type difference, and
+    ;; keep the original (possibly parametric) type if there wasn't:
+    (when (eql? slotType (type-spec-to-base-type returnType))
+      (setq slotType returnType))
     (return slotType)))
 
 (defun (sys-tree-if-needed OBJECT TYPE-SPEC)
@@ -5293,15 +5287,6 @@ during bootstrap when only some class objects are defined.")
                 operator (cons-list parenthesizedTree (nth operands i)))))
     (return parenthesizedTree)))
 
-(defun (coerce-to-float FLOAT) ((number NUMBER-WRAPPER))
-  :documentation "Coerce `number' to a float value."
-  :public? TRUE
-  (typecase number
-    ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER)
-     (return (* (wrapper-value number) 1.0)))
-    (FLOAT-WRAPPER
-     (return (wrapper-value number)))))
-
 (defun (walk-arithmetic-tree OBJECT TYPE) ((tree CONS))
   ;; Walk an arithmetic tree of the form '(+|-|*|/ <arg>*)'.
   ;; All operators behave exactly like their Common-Lisp analogues, with
@@ -7334,6 +7319,10 @@ holding its expander function."
 ;;;;;; 'walk-deftype-tree'
   ;;
 
+;;; NOTE: to properly dereference defined types when walking code,
+;;;       `yield-type-specifier' should be used; see the function
+;;;       `get-method-with-identical-signature' for an example.
+
 (defun walk-deftype-tree ((tree CONS))
   ;; Define a type from 'tree' and create a new unit containing the
   ;;    defined type and its defining tree.
@@ -8780,7 +8769,7 @@ indicates whether an error occurred during the evaluation.  Expressions
 are simple to program in Common Lisp, since they are built into the language,
 and relatively awkward in Java and C++.  Users of either of those 
 languages are more likely to want to call `evaluate-string'."
-  :lisp-macro? TRUE :public? TRUE 
+  :command? TRUE :public? TRUE 
   (let ((oTree OBJECT NULL))
     (when (defined? expression)
       (typecase expression
@@ -8827,11 +8816,28 @@ evaluation strategies."
       (typecase operatorName
         (SYMBOL
          (case operatorName
-           ;; Special-case 'quote' instead of defining it as a command:
+           ;; Special-case certain operators (mostly to support bquote):
            (QUOTE
             (when (eq? (length arguments) 1)
               (return (value arguments) (primary-type (value arguments))))
             (evaluation-error "Illegal QUOTE expression"))
+           (BQUOTE
+            (return (evaluate-bquote-tree tree)))
+           (CONS
+            (let ((arg1 (evaluate-argument-tree (first arguments) TRUE))
+                  (arg2 (evaluate-argument-tree (second arguments) TRUE)))
+              (when (and (cons? arg2)
+                         (empty? (rest (rest arguments))))
+                (return (cons arg1 arg2) @CONS))
+              (evaluation-error "Illegal CONS expression")))
+           (APPEND
+            (let ((arg1 (evaluate-argument-tree (first arguments) TRUE))
+                  (arg2 (evaluate-argument-tree (second arguments) TRUE)))
+              (when (and (cons? arg1)
+                         (cons? arg2)
+                         (empty? (rest (rest arguments))))
+                (return (append arg1 arg2) @CONS))
+              (evaluation-error "Illegal APPEND expression")))
            (PROGN
              (foreach arg in arguments
                  do (evaluate arg))
@@ -8925,6 +8931,7 @@ evaluation strategies."
        (case tree
          ;; Special-case a few constants:
          (NULL (return tree @UNKNOWN))
+         (NIL (return NIL @CONS))
          (TRUE (return TRUE-WRAPPER @BOOLEAN))
          (FALSE (return FALSE-WRAPPER @BOOLEAN))
          (otherwise
@@ -8938,6 +8945,46 @@ evaluation strategies."
        (return tree (wrapped-type-to-type (primary-type tree))))
       (otherwise
        (evaluation-error "Unknown atomic expression type: " tree)))))
+
+(defun (make-evaluatable-bquote-tree OBJECT) ((tree OBJECT))
+  ;; Return 'tree' with 'cons' replacing 'list*' and
+  ;; `quote' to represent symbol references.
+  (typecase tree
+    (CONS
+     (case (first tree)
+       (GET-SYM
+        (return (bquote (QUOTE & (get-sym (second tree))))))
+       (GET-SGT
+        (return (get-sgt (second tree))))
+       (GET-KWD
+        (return (get-kwd (second tree))))
+       (otherwise
+        (let ((args NIL))
+          (foreach arg in (rest tree)
+              collect (make-evaluatable-bquote-tree arg) into args)
+          (case (first tree)
+            (LIST*
+             (when (empty? (rest args))
+               (return (first args)))
+             (setq args (reverse args))
+             (let ((consTree (bquote (cons & (second args) & (first args)))))
+               (foreach arg in (rest (rest args))
+                   do (setq consTree (bquote (cons & arg & consTree))))
+               (return consTree)))
+            (CONCATENATE
+             ;; map `concatenate' onto `append', since it is a function: 
+             (return (bquote (append & (first args) & (second args)))))
+            (otherwise
+             (return (cons (first tree) args))))))))
+    (otherwise
+     (return tree))))
+  
+(defun (evaluate-bquote-tree OBJECT TYPE-SPEC) ((tree CONS))
+  ;; Normalize and evaluate the bquote `tree' `(bquote ...)'.
+  (let ((argTree OBJECT NULL))
+    (special ((*useHardcodedSymbols?* true))
+      (setq argTree (make-evaluatable-bquote-tree (expand-bquote-tree (second tree)))))
+    (return (evaluate-argument-tree argTree TRUE))))
 
 (defun (coerce-evaluated-tree OBJECT TYPE-SPEC)
     ((tree OBJECT) (sourceTree OBJECT)

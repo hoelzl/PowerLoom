@@ -1,6 +1,6 @@
 ;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
 
-;;; Version: test-suite.plm,v 1.40 2009/06/25 23:31:48 hans Exp
+;;; Version: test-suite.plm,v 1.44 2010/09/11 02:24:36 hans Exp
 
 ;;; Various PowerLoom tests
 ;;; =======================
@@ -165,6 +165,10 @@
 (ask (or (not (married fred))
          (happy fred)))
 
+(ask (or (not (married fred))
+         (happy fred))
+     :inference-level :refutation)
+
 (clear-module "TEST")
 
 (defconcept PERSON (?p)
@@ -184,6 +188,10 @@
 (assert (married fred))
 
 (ask (happy fred))
+
+(clear-caches)
+(ask (happy fred)
+     :inference-level :refutation)
 
 
 ;;; STRESS DUPLICATE SUBGOAL MECHANISM:
@@ -1310,6 +1318,8 @@
 
 ;;; 3-VALUED TRUTH-VALUE PROPAGATION
 
+(clear-module "TEST")
+
 (defrelation happy (?x))
 
 (assert (not (happy joe)))
@@ -1322,9 +1332,11 @@
 (ask (not (and (happy fred) (happy joe))))
 (ask (and (happy fred) (happy joe)) :three-valued? true)
 
-;; SHOULD BOTH BE UNKNOWN:
+;; SHOULD ALL BE UNKNOWN:
 (ask (or (happy fred) (happy joe)))
+(ask (or (happy fred) (happy joe)) :inference-level :refutation)
 (ask (or (happy joe) (happy fred)))
+(ask (or (happy joe) (happy fred)) :inference-level :refutation)
 ;; SHOULD BE FALSE:
 (ask (or (happy joe) (happy susi)))
 
@@ -1660,7 +1672,7 @@
                          (v2 ?s ?d ?c)
                          (>= ?y 1990))))))
 
-;;; INCORRECT NORMALIZATION OF FUNCTION-INDUCED EXISTENTIALS
+;;; FIX: INCORRECT NORMALIZATION OF FUNCTION-INDUCED EXISTENTIALS
 ;;; KNOWN BUG (SEE `invert-proposition'):
 
 (clear-module "TEST")
@@ -1671,7 +1683,8 @@
 
 (assert (=>> (poor ?x) (not (happy ?x))))
 
-;;; THIS RETURNS FALSE AS IT SHOULD:
+;;; THIS RETURNS FALSE AS IT SHOULD - NOT ANYMORE, SINCE WE "FIXED" OR-INTRODUCTION
+;;; TO NOT PROPAGATE UP FALSITY OF THE TO-BE-PROVEN DISJUNCT:
 (ask (=> (poor fred)
          (happy fred))
      :inference-level :refutation)
@@ -1784,16 +1797,39 @@
 
 (clear-module "TEST")
 
-(deffunction father (?f ?c))
-(deffunction mother (?m ?c))
-(assert (=>> (mother ?m ?c)
-             (exists ?f
-               (father ?f ?c))))
-(assert (father dad fred))
-(assert (mother mom fred))
+(defconcept parent)
+(defrelation happy (?p))
+(deffunction father (?c ?f))
+(deffunction mother (?c ?m))
+
+(assert (=>> (parent ?p)
+             (exists (?c ?m ?f)
+               (and (father ?c ?f)
+                    (mother ?c ?m)
+                    (or (= ?p ?f)
+                        (= ?p ?m))
+                    (happy ?p)
+                    (happy (mother ?p))
+                    (happy (father ?f))))))
+
+;; TRIGGERS THE RULE:
+(assert (parent mom))
+;; implies the existential:
+(assert (and (father fred dad)
+             (mother fred mom)
+             (happy (father dad))))
+
+;;; TRIGGER FORWARD INFERENCE:
+(process-definitions)
+(all-facts-of mom)
 
 ;;; WE SHOULD ONLY GET ONE SOLUTION HERE AND NO SKOLEM:
-(retrieve all (father ?x fred))
+(retrieve all (father fred ?x))
+
+;;; ADDITIONAL FACTS WE INFERRED:
+(retrieve all (and (happy ?p)
+                   (happy (mother ?p)))
+          :inference-level :assertion)
 
 
 ;;; FORWARD EXISTENTIALS AND SINGLE-VALUEDNESS
@@ -2282,6 +2318,8 @@
 (retrieve all (and (ist TEST (company-name ?x ?y))
                    (fail (ist ALTERNATE-TEST (company-name ?x ?y)))))
 
+(clear-module "ALTERNATE-TEST")
+
 ;;; BUG WITH CONCEPT-PROTOTYPE SPECIALIST
 
 (clear-module "TEST")
@@ -2295,3 +2333,185 @@
 
 (retrieve all (and (= (concept-prototype concept) ?p1)
                    (= (concept-prototype concept) ?p2)))
+
+;;;;
+;;;;  Testing of forward rule justifications
+;;;;
+
+(clear-module "TEST")
+(cc TEST)
+
+(set-feature :justifications)
+
+(defconcept person)
+(defrelation happy ((?x person)))
+(defrelation jolly ((?x person)))
+(defrelation busy ((?x person)))
+(defrelation has-kids ((?x person)))
+(defrelation has-job ((?x person)))
+(defrelation married ((?x person) (?y person)))
+(defrelation friends ((?x person) (?y person)))
+
+(assert (=>> (married ?x ?y) (happy ?x)))
+(assert (=>> (happy ?x) (jolly ?x)))
+(assert (=>> (and (married ?x ?y) (has-kids ?x) (has-job ?x))
+             (busy ?x)))
+(assert (<<= (friends ?y ?x) (married ?x ?y)))
+(assert (=>> (and (query (friends ?x ?y) :inference-level :normal)
+                  (has-kids ?x)
+                  (has-job ?x))
+             (busy ?x)))
+
+(assert (married fred ginger))
+(assert (has-job fred))
+(assert (has-kids fred))
+(assert (has-job ginger))
+
+;; Simple, one-step inference.  Works
+ (ask (happy fred))
+ (why)
+
+;; Simple, chained inference.  Works
+ (ask (jolly fred))
+ (why)
+
+;; More complicated rule with forward inference.  Works
+ (ask (busy fred))
+ (why)
+
+;; Mixed forward & backward inference with more effort for the backward part.
+ (ask (busy ginger))
+ (assert (has-kids ginger))
+ (ask (busy ginger))
+ (why)
+
+;; Now just do a straight-forward subsumption justification 
+(defrelation r (?x))
+(defrelation p (?x) :=> (r ?x))
+
+(assert (p fred))
+(ask (r fred))
+(why)
+
+(unset-feature :justifications)
+
+;;; HOLDS ON INFERABLE DESCRIPTION TERMS
+
+(clear-module "TEST")
+
+(defrelation r (?x ?y))
+
+(deffunction par-r (?par (?rel RELATION))
+  :<= (= ?rel (kappa (?x)
+                (r ?par ?x))))
+
+(assert (and (r a 1)
+             (r a 2)
+             (r b 1)
+             (r b 2)))
+
+;;; THIS SHOULD SUCCEED:
+(retrieve all (par-r a ?r))
+
+;;; THIS SHOULD FAIL, SINCE ?r WILL BE AN "UNBOUND/OPEN" DESCRIPTION:
+(retrieve all (par-r ?p ?r))
+
+(retrieve all (and (par-r a ?r)
+                   (holds ?r ?x)))
+
+(retrieve all (exists ?p
+                (and (= ?p a)
+                     (par-r ?p ?r)
+                     (holds ?r ?x))))
+
+(retrieve all (exists ?p
+                (and (= ?p a)
+                     (holds (kappa (?x)
+                              (r ?p ?x))
+                            ?x))))
+
+(retrieve all (and (= ?p a)
+                   (holds (kappa (?x)
+                            (r ?p ?x))
+                          ?x)))
+
+;;; FIX: THIS FAILS BUT SHOULDN'T, THE BUILD-TIME EVALUATION OF THE
+;;; FUNCTION TERM PASSED TO THE HOLDS TRIPS US UP:
+(retrieve all (holds (par-r a) ?x))
+
+;;; NOW WHAT WORKED BEFORE ALSO FAILS, SINCE WE FIND A RELATION TERM
+;;; AND `PAR-R' IS SINGLE VALUED:
+(retrieve all (and (par-r a ?r)
+                   (holds ?r ?x)))
+
+;;; CHECKING AGAIN WITH A DIFFERENT PARAMETER, EVERYTHING IS FINE:
+(retrieve all (and (par-r b ?r)
+                   (holds ?r ?x)))
+
+;;; BUT NOW WE FAIL AGAIN:
+(retrieve all (holds (par-r b) ?x))
+
+;;; AND NOW THIS FAILS ALSO:
+(retrieve all (and (par-r b ?r)
+                   (holds ?r ?x)))
+
+
+;;; VARIABLE UNBINDING BUG IN NESTED OR EXPRESSION
+
+(clear-module "TEST")
+
+(defrelation primary-organization (?e ?o))
+(defrelation affiliation (?p ?o))
+(defrelation participant (?e ?p))
+(defrelation connected-person (?e ?p))
+
+(assert (primary-organization e1 the-cell))
+(assert (and (affiliation p1 the-cell)
+             (participant e2 p1)))
+(assert (participant e2 p2))
+(assert (connected-person e3 p3))
+
+;;; THIS DOES THE RIGHT THING (RETURNING E2):
+(retrieve all (exists ?p
+                (and (affiliation ?p the-cell)
+                     (or (participant ?e ?p)
+                         (connected-person ?e ?p))))
+          :sort-by :values)
+
+;;; THIS SHOULD RETURN E1 AND E2 ONLY:
+(retrieve all (or (primary-organization ?e the-cell)
+                  (exists ?p
+                    (and (affiliation ?p the-cell)
+                         (or (participant ?e ?p)
+                             (connected-person ?e ?p)))))
+          :sort-by :values)
+
+;;; HOLDS HANDLING IN UPDATE-TUPLE
+
+(clear-module "TEST")
+
+(deffunction sense-instance ((?s concept) ?i)
+   :total true
+   ;; this creates a rule that makes `holds' a superrelation to `sense-instance', and
+   ;; which is instantiated via named-description inheritance using update-tuple;
+   ;; hence, we have to make sure `update-tuple' can handle HOLDS relations:
+   :=>> (holds ?s ?i))
+
+(defconcept s1)
+(assert (sense-instance s1 s1-inst))
+
+;;; SHOULD RETURN TRUE:
+(ask (s1 s1-inst))
+
+;;; SORTED COLLECTION UTILITIES:
+
+(clear-module "TEST")
+
+(retrieve all (minimum-element relation (kappa (?r ?v) (- 10 (arity ?r) ?v)) ?e))
+(retrieve all (minimum-element relation (kappa (?r ?v) (- (arity ?r) 10 ?v)) ?e))
+(retrieve all (maximum-element relation (kappa (?r ?v) (- 10 (arity ?r) ?v)) ?e))
+(retrieve all (maximum-element relation (kappa (?r ?v) (- (arity ?r) 10 ?v)) ?e))
+
+;;;;
+;;;; EOF
+;;;;

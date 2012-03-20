@@ -1,0 +1,820 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2009-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: http-server.ste,v 1.6 2010/10/11 21:39:28 hans Exp
+
+;;; Abstract HTTP server and request/exchange API.  These methods need
+;;; to be implemented by each supported server implementation.  We
+;;; keep the API fairly minimal for now to support what is needed
+;;; without requiring a significant programming effort for each server
+;;; implementation.
+
+(in-package "STELLA")
+
+(in-module "HTTP")
+
+
+;;; TO DO:
+;;; - handlers should take a :lock argument to support synchronization/locking
+;;;   when parallel requests come in
+;;; - should handle native exceptions in the servlets if this isn't already natively
+;;;   supported, so that we can (maybe on a switch) display the exception on the server
+;;;   (e.g., the Sun server currently fails silently in the background)
+;;; - document/rethink the reply stream buffering: the problem with that is that we
+;;;   might not get any incremental loading/chunking with large response pages.  One
+;;;   possible way around the issue would be to change the protocol, so that on the
+;;;   first call to `getReplyStream' all headers established so far get written.
+;;;   In Java that'd be straight-forward, in Allegro we'd have to figure out how
+;;;   to avoid writing out duplicate headers; for some servers, we might still have
+;;;   to resort to buffering though if we don't have access to this level of detail
+;;;   in the API.  In Allegro, we could advise NET.ASERVE::SEND-RESPONSE-HEADERS
+;;;   or temporarily bind it to a dummy, so we have control on when it is called.
+
+
+  ;;
+;;;;;; Server operations
+  ;;
+
+(defclass HTTP-SERVER (STANDARD-OBJECT)
+  :documentation
+  "Abstract class that will be implemented by specific server implementations
+and instantiated with a single instance used to dispatch all API methods."
+  :abstract? TRUE
+  :public? TRUE)
+
+(defglobal *http-server-implementation* HTTP-SERVER NULL
+  :documentation "Server instance used for method dispatch - not to be confused
+with an actual native server object.")
+
+(defun (get-default-http-server-impl STRING) ((error? BOOLEAN))
+  :documentation "Return a default HTTP server implementation system for the case
+where none has been loaded yet.  If `error?' is TRUE, raise an error if none
+is defined for the current native language environment."
+  :public? TRUE
+  (if-output-language :common-lisp
+     (if (verbatim
+	  :common-lisp "(CL:or (CL:member :allegro CL:*features*)
+                               (CL:find-package :net.aserve)
+                               (CL:let ((loader-function-symbol (CL:find-symbol \"LOAD-ASERVE\"
+                                                                                \"CL-USER\")))
+                                   (CL:and loader-function-symbol
+                                           (CL:fboundp loader-function-symbol))))")
+         (return "webtools-aserve")
+       (when error?
+         (error "HTTP server not supported in this Lisp")))
+     (if-output-language :java
+        (return "webtools-sun")
+        (if error?
+            (error "HTTP server not supported in C++")
+          (return NULL)))))
+
+(defglobal *default-http-server-port* INTEGER 9090)
+
+(defun (start-http-server STRING) ((port INTEGER))
+  :documentation "Start an HTTP server running at `port'.  If there is already
+a server instance running, it will be stopped first.  If `port' is <= 0 or
+NULL, use the value of `*default-http-server-port*'.  Returns the listening
+address of the started server instance."
+  :public? TRUE :command? TRUE
+  (when (null? *http-server-implementation*)
+    ;; Tricky: we autoload an undefined function for the side-effect of loading the system:
+    (autoload "HTTP-SERVER-IMPL-SYSTEM" (get-default-http-server-impl TRUE) NULL FALSE)
+    (when (null? *http-server-implementation*)
+      (error "start-http-server: no HTTP server implementation loaded")))
+  (when (<= port 0) ;; includes NULL
+    (setq port *default-http-server-port*))
+  (let ((address
+         (first-defined
+          (start-http-server-impl *http-server-implementation* port)
+          (concatenate "http://localhost:" (integer-to-string port) "/"))))
+    (add-hook *stella-exit-hooks* (quote http-server-exit-hook))
+    (publish-registered-http-handlers)
+    (return address)))
+
+(defmethod (start-http-server-impl STRING) ((server HTTP-SERVER) (port INTEGER))
+  (ignore port)
+  (error "start-http-server-impl: not implemented on " server))
+
+(defun stop-http-server ()
+  :documentation "Stop any currently running HTTP server.  If there is no
+server instance running, this is a no-op."
+  :public? TRUE :command? TRUE
+  (when (null? *http-server-implementation*)
+    ;; Tricky: we autoload an undefined function for the side-effect of loading the system:
+    (autoload "HTTP-SERVER-IMPL-SYSTEM" (get-default-http-server-impl TRUE) NULL FALSE)
+    (when (null? *http-server-implementation*)
+      (error "stop-http-server: no HTTP server implementation loaded")))
+  (stop-http-server-impl *http-server-implementation*))
+
+(defmethod stop-http-server-impl ((server HTTP-SERVER))
+  (error "stop-http-server-impl: not implemented on " server))
+
+(defun http-server-exit-hook ((argument OBJECT))
+  :documentation "Hook function that will be called upon PowerLoom exit.
+This is a no-op if no server is running or if the server is not supported."
+  :public? TRUE
+  (ignore argument)
+  (when (defined? *http-server-implementation*)
+    (exception-case
+        (stop-http-server)
+      (NATIVE-EXCEPTION (e)
+        (print "ERROR: http-server-exit-hook: " (exception-message e))))))
+
+
+  ;;
+;;;;;; Server exchange API
+  ;;
+
+(defclass HTTP-EXCHANGE (STANDARD-OBJECT)
+  :documentation
+  "Abstract class that represents exchange objects that encapsulate all necessary
+state needed by a http handler function to understand the request and generate the
+appropriate response.  This is mirrored somewhat after Sun's basic HTTP server
+implementation in com.sun.net.httpserver."
+  :abstract? TRUE
+  :public? TRUE)
+
+;;; Header accessors:
+
+;;; NOTE: apparently, it is possible to have multiple values for a single header
+;;; element (com.sun.net.httpserver.Headers supports List<String> as the value
+;;; type); we currently do not deal with this complication to keep the API simple.
+;;; If we want to support that in the future, we would simply add a set of functions
+;;; (e.g., `get-values') that can handle multiple values.
+
+(defun (get-header-value STRING) ((xchg HTTP-EXCHANGE) (key KEYWORD))
+  :documentation "Returns the value associated with `key' in `xchg's request
+headers represented as a string.  If no value is found, NULL will be returned.
+If there are multiple values, an arbitrary one will be returned."
+  :public? TRUE
+  (return (get-header-value-impl *http-server-implementation* xchg key)))
+
+(defmethod (get-header-value-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE) (key KEYWORD))
+  (ignore xchg key)
+  (error "get-header-value-impl: not implemented on " server))
+
+#|
+;;; not supported by Servlet API, since usually not needed:
+
+(defun (get-reply-header-value STRING) ((xchg HTTP-EXCHANGE) (key KEYWORD))
+  :documentation "Returns the value associated with `key' in `xchg's reply
+headers represented as a string.  If no value is found, NULL will be returned.
+If there are multiple values, an arbitrary one will be returned."
+  :public? TRUE
+  (return (get-reply-header-value-impl *http-server-implementation* xchg key)))
+
+(defmethod (get-reply-header-value-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE) (key KEYWORD))
+  (ignore xchg key)
+  (error "get-reply-header-value-impl: not implemented on " server))
+|#
+
+(defun set-reply-header-value ((xchg HTTP-EXCHANGE) (key KEYWORD) (value STRING))
+  :documentation "Set the value associated with `key' in `xchg's reply headers to `value'."
+  :public? TRUE
+  (set-reply-header-value-impl *http-server-implementation* xchg key value))
+
+(defmethod set-reply-header-value-impl ((server HTTP-SERVER) (xchg HTTP-EXCHANGE) (key KEYWORD) (value STRING))
+  (ignore xchg key value)
+  (error "set-reply-header-value-impl: not implemented on " server))
+
+;;; Request accessors:
+
+(defun (get-request-uri STRING) ((xchg HTTP-EXCHANGE))
+  :documentation "Return the raw URI associated with `xchg' as a string.  It is ensured
+that any URI-encoded characters are not yet decoded to facilitate further parsing.
+This does not include any protocol/scheme and host/port information.  For example, if
+the user typed http://a.b.c:42/foo/bar.html#frag?a+b+c into the client, this function
+will return /foo/bar.html#frag?a+b+c ."
+  :public? TRUE
+  (return (get-request-uri-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-uri-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-uri-impl: not implemented on " server))
+
+;;; NOTE: instead of defining our own URI class with all the associated parsing and
+;;;       accessors, we define a couple of access methods for commonly needed ops
+;;;       and leave all the associated messiness up to the server implementations.
+;;;       utilities/http.ste also has some parsing support written in STELLA.
+
+(defun (get-request-uri-query STRING) ((xchg HTTP-EXCHANGE))
+  :documentation "Return the raw query portion of the URI associated with `xchg'.  It is ensured
+that any URI-encoded characters are not yet decoded to facilitate further parsing.  For example,
+if the user typed http://a.b.c:42/foo/bar.html#frag?a+b+c into the client, this function will
+return a+b+c ."
+  ;; TO DO: this returns NULL in Sun Java for an empty query but not so in Lisp - canonicalize!!!
+  :public? TRUE
+  (return (get-request-uri-query-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-uri-query-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-uri-query-impl: not implemented on " server))
+
+(defun (get-request-uri-path STRING) ((xchg HTTP-EXCHANGE))
+  :documentation "Return the raw path portion of the URI associated with `xchg'.  It is ensured
+that any URI-encoded characters are not yet decoded to facilitate further parsing.  For example,
+if the user typed http://a.b.c:42/foo/bar.html#frag?a+b+c into the client, this function will
+return /foo/bar.html."
+  :public? TRUE
+  (return (get-request-uri-path-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-uri-path-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-uri-path-impl: not implemented on " server))
+
+(defun (get-request-method KEYWORD) ((xchg HTTP-EXCHANGE))
+  :documentation "Return the method associated with `xchg' (:get, :put or :post)."
+  :public? TRUE
+  (return (get-request-method-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-method-impl KEYWORD) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-method-impl: not implemented on " server))
+
+#|
+;;; not supported by Servlet API:
+
+(defun (get-request-protocol STRING) ((xchg HTTP-EXCHANGE))
+  :public? TRUE
+  :documentation
+  "Return the protocol associated with `xchg' (either HTTP/0.9, HTTP/1.0 or HTTP/1.1)."
+  (return (get-request-protocol-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-protocol-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-protocol-impl: not implemented on " server))
+|#
+
+(defun (get-request-body STRING) ((xchg HTTP-EXCHANGE))
+  :documentation "Returns the body of `xchg' as a string.  If there was no body (e.g.,
+if this was a GET), the result will be the empty string."
+  :public? TRUE
+  (return (get-request-body-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-body-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-body-impl: not implemented on " server))
+
+(defun (get-request-local-address STRING) ((xchg HTTP-EXCHANGE))
+  :documentation "Returns the local-address that received `xchg' as a string.
+Concatenates the hostname with a port in standard : notation.  If the hostname
+can be resolved it will be, otherwise a numeric representation will be returned.
+Note that different implementations have slightly different behavior."
+  :public? TRUE
+  (return (get-request-local-address-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-local-address-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-local-address-impl: not implemented on " server))
+
+(defun (get-request-remote-address STRING) ((xchg HTTP-EXCHANGE))
+  :documentation "Returns the remote-address that sent `xchg' as a string.
+Concatenates the hostname with a port in standard : notation.  If the hostname
+can be resolved it will be, otherwise a numeric representation will be returned.
+Note that different implementations have slightly different behavior."
+  :public? TRUE
+  (return (get-request-remote-address-impl *http-server-implementation* xchg)))
+
+(defmethod (get-request-remote-address-impl STRING) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-request-remote-address-impl: not implemented on " server))
+
+
+;;; Reply accessors:
+
+(defun (get-reply-stream NATIVE-OUTPUT-STREAM) ((xchg HTTP-EXCHANGE))
+  :documentation "Return the stream to which response methods have to write their output."
+  :public? TRUE
+  (return (get-reply-stream-impl *http-server-implementation* xchg)))
+
+(defmethod (get-reply-stream-impl NATIVE-OUTPUT-STREAM) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-reply-stream-impl: not implemented on " server))
+
+(defun set-response-code ((xchg HTTP-EXCHANGE) (code KEYWORD))
+  :documentation "Set the response code of the generated reply to `code'.  By default
+:OK (code 200) is used."
+  :public? TRUE
+  (set-response-code-impl *http-server-implementation* xchg code))
+
+(defmethod set-response-code-impl ((server HTTP-SERVER) (xchg HTTP-EXCHANGE) (code KEYWORD))
+  (ignore xchg code)
+  (error "set-response-code-impl: not implemented on " server))
+
+;;; NOTE: content-type can be set via `(set-reply-header-value xchg :content-type "...")'
+
+
+  ;;
+;;;;;; Response Codes and Mime Types
+  ;;
+
+(defglobal *http-response-codes* (CONS OF CONS)
+           (bquote ((:OK 200 "OK")
+                    (:REDIRECT 301 "Moved Permanently")
+                    (:FORBIDDEN 403 "Forbidden")
+                    (:NOT-FOUND 404 "Not Found")
+                    (:BAD-REQUEST 400 "Bad Request")
+                    (:INTERNAL-ERROR 500 "Internal Server Error")
+                    (:NOT-IMPLEMENTED 501 "Not Implemented"))))
+
+
+(defglobal *http-mime-types* (CONS OF CONS)
+           (bquote ((:PLAIN-TEXT "text/plain" "txt" "text" "asc")
+                    (:HTML "text/html" "htm" "html")
+                    (:XML "text/xml" "xml" "rdf" "owl")
+                    (:BINARY "application/octet-stream" "zip" "exe" "class")
+                    (:IMAGE-GIF "image/gif" "gif")
+                    (:IMAGE-JPG "image/jpeg" "jpg" "jpeg")
+                    (:IMAGE-PNG "image/png" "png")
+                    (:AUDIO-MPEG "audio/mpeg" "mp3")
+                    (:PDF "application/pdf" "pdf")
+                    (:MSWORD "application/msword" "doc"))))
+
+(defun (get-http-response-code INTEGER) ((codeName KEYWORD) (default KEYWORD))
+  (foreach entry in *http-response-codes*
+      where (eql? (first entry) codeName)
+      do (return (second entry)))
+  (if (null? default)
+      (error "get-http-response-code: undefined response code: " codeName)
+    (return (get-http-response-code default NULL))))
+
+(defun (get-http-response-desc STRING) ((codeName KEYWORD) (default KEYWORD))
+  (foreach entry in *http-response-codes*
+      where (eql? (first entry) codeName)
+      do (return (third entry)))
+  (if (null? default)
+      (error "get-http-response-desc: undefined response code: " codeName)
+    (return (get-http-response-desc default NULL))))
+
+(defun (http-success-response-code? BOOLEAN) ((code INTEGER))
+  ;; This is a bit restrictive but will do for now.
+  (return (and (>= code 200) (<= code 205))))
+
+(defun (get-http-mime-type STRING) ((typeName KEYWORD) (default KEYWORD))
+  (foreach entry in *http-mime-types*
+      where (eql? (first entry) typeName)
+      do (return (second entry)))
+  (if (null? default)
+      (error "get-http-mime-type: undefined mime type: " typeName)
+    (return (get-http-mime-type default NULL))))
+
+(defun (get-http-mime-type-from-extension STRING) ((extension STRING))
+  ;; Lookup a mime type based on the `extension' of a file.
+  (foreach entry in *http-mime-types*
+      where (exists ext in (rest (rest entry))
+              where (eql? ext extension))
+      do (return (second entry)))
+  (return "application/octet-stream"))
+
+(defun (guess-file-content-type STRING) ((file STRING))
+  ;; Guess a mime type for a `file' based on its extension.
+  (return
+    (get-http-mime-type-from-extension
+     (subsequence (string-downcase (file-extension file)) 1 NULL))))
+
+
+  ;;
+;;;;;; URL argument and form parsing support
+  ;;
+
+(defun (parse-and-decode-url-arguments (CONS OF STRING-WRAPPER)) ((arguments STRING) (separator CHARACTER))
+  :documentation "Given the `arguments' following the `?' character in a URL, split them at
+`separator' and return them as a list of properly decoded strings."
+  :public? TRUE
+  (when (blank-string? arguments)
+    (return NIL))
+  (let ((result (split-string arguments separator))
+        (cursor result))
+    (while (non-empty? cursor)
+      (setf (first cursor) (unescape-url-string (first cursor)))
+      (setq cursor (rest cursor)))
+    (return result)))
+
+(defun (parse-and-decode-form-values (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)) ((values STRING))
+  :documentation "Given the `values' returned by a form, parse and decode them and return them as
+a key-value-list.  NOTE: values will not be trimmed and empty values will be represented by the empty
+string rather than NULL."
+  :public? TRUE
+  (let ((result (new KEY-VALUE-LIST))
+        (bareEntry STRING NULL)
+        (split 0))
+    (setq values (substitute values #\space #\+)) ;; decode spaces
+    (foreach entry in (split-string values #\&)
+        do (setq bareEntry (unwrap-string entry))
+           (setq split (position bareEntry #\= 0))
+           (when (defined? split)
+             (insert-at result
+                        (unescape-url-string (subsequence bareEntry 0 split))
+                        (unescape-url-string (subsequence bareEntry (1+ split) NULL)))))
+    (return result)))
+
+
+  ;;
+;;;;;; Publishing URLs and response handlers
+  ;;
+
+(defglobal *http-document-root* STRING
+           (first-defined
+            ;; support external programmatic override:
+            *http-document-root*
+            ;; try to induce a reasonable default:
+            (choose (probe-file? "PL:htdocs;powerloom.html")
+                    ;; standard location in PowerLoom source tree:
+                    (translate-logical-pathname "PL:htdocs;")
+                    ;; location in Tomcat webapp:
+                    (translate-logical-pathname "PL:"))))
+
+(defun (get-http-document-root STRING) ()
+  :public? TRUE
+  (return *http-document-root*))
+
+(defun set-http-document-root ((root STRING))
+  :documentation "Set the document root to `root'.  Important: this needs to be
+called before any handlers are published, otherwise it won't be effective."
+  :public? TRUE
+  (setq *http-document-root* root))
+
+;;; TO DO: maybe support unpublishing
+
+(defglobal *http-handler-registry* (KEY-VALUE-MAP OF STRING-WRAPPER PROPERTY-LIST)
+           (new KEY-VALUE-MAP))
+
+(defmethod (lookup-handler PROPERTY-LIST) ((server HTTP-SERVER) (path STRING))
+  :documentation "Simple default handler lookup implementation.  Return the registered
+handler whose path is identical to `path' or is the longest prefix of `path'."
+  :public? TRUE
+  (when (null? *http-server-implementation*)
+    (error "lookup-handler: no HTTP server implementation loaded"))
+  (let ((handler (lookup *http-handler-registry* path))
+        (handlerPath STRING NULL)
+        (handlerPathLength 0))
+    (when (defined? handler)
+      (return handler))
+    (foreach (p h) in *http-handler-registry*
+        where (starts-with? path p 0)
+        do (when (or (null? handler)
+                     (> (length (unwrap-string p)) handlerPathLength))
+             (setq handler h)
+             (setq handlerPath p)
+             (setq handlerPathLength (length handlerPath))))
+    (return handler)))
+
+(defun publish-registered-http-handlers ()
+  :documentation "Publish all currently registered HTTP handler with the current HTTP server.
+This is run every time a server is started with `start-http-server'."
+  :public? TRUE
+  (when (null? *http-server-implementation*)
+    (error "publish-registered-http-handlers: no HTTP server implementation loaded"))
+  (foreach (path options) in *http-handler-registry*
+      do (case (lookup options :handler-type)
+           (:FILE
+            (publish-file-impl *http-server-implementation* path (lookup options :file) options))
+           (:DIRECTORY
+            (publish-directory-impl *http-server-implementation* path (lookup options :directory) options))
+           (:HANDLER
+            (publish-handler-impl *http-server-implementation* path (lookup options :handler) Options)))))
+
+(defun print-registered-http-handlers ()
+  :public? TRUE :command? TRUE
+  (let ((paths NIL))
+    (foreach (path options) in *http-handler-registry*
+        do (ignore options)
+           (pushq paths path))
+    (setq paths (sort paths NULL))
+    (special ((*printPretty?* FALSE)
+              (*printReadably?* TRUE))
+      (foreach path in paths
+          do (print (unwrap-string path) " ->" EOL)
+             (foreach (key value) in (lookup-handler *http-server-implementation* path)
+                 do (print "      " key " " value EOL))))))
+
+(defun publish-file ((path STRING) (file STRING) &rest (options OBJECT))
+  :documentation "Publish `path' to be served with `file' which must exist and be readable.
+If :content-type is supplied, it will be used when serving `file', otherwise, a content
+type is guessed from `file's extension."
+  :public? TRUE
+  (setq file (translate-logical-pathname file))
+  (ensure-file-exists file "publish-file")
+  (let ((theOptions
+         (vet-options
+          (coerce-&rest-to-cons options)
+          (quote (:content-type :documentation))))) ;; @STRING
+    (when (null? (lookup theOptions :content-type))
+      (insert-at theOptions :content-type (guess-file-content-type file)))
+    (insert-at theOptions :handler-type :file)
+    (insert-at theOptions :path path)
+    (insert-at theOptions :file file)
+    (insert-at *http-handler-registry* path theOptions)))
+
+(defmethod publish-file-impl ((server HTTP-SERVER) (path STRING) (file STRING) (options PROPERTY-LIST))
+  (ignore path file options)
+  (error "publish-file-impl: not implemented on " server))
+
+(defun publish-directory ((path STRING) (directory STRING) &rest (options OBJECT))
+  :documentation "Make all files descending from `directory' available on the server.
+`path' will be coerced to end in a delimiter and `directory' must exist.
+This is very rudimentary right now and does not provide any sophisticated access
+control.  It recurses into subdirectories of `directory', prevents escape via `..'
+and does not (yet) support directory listings."
+  :public? TRUE
+  (setq directory (translate-logical-pathname directory))
+  (setq directory (file-name-as-directory directory))
+  (ensure-file-exists directory "publish-directory")
+  (unless (ends-with? path "/" NULL)
+    (setq path (concatenate path "/")))
+  (let ((theOptions
+         (vet-options
+          (coerce-&rest-to-cons options)
+          (quote (:documentation))))) ;; @STRING
+    (insert-at theOptions :handler-type :directory)
+    (insert-at theOptions :path path)
+    (insert-at theOptions :directory directory)
+    (insert-at *http-handler-registry* path theOptions)))
+
+(defmethod publish-directory-impl
+    ((server HTTP-SERVER) (path STRING) (directory STRING) (options PROPERTY-LIST))
+  (ignore path directory options)
+  (error "publish-directory-impl: not implemented on " server))
+
+(defun publish-handler ((path STRING) (handler FUNCTION-CODE) &rest (options OBJECT))
+  :documentation "Publish `path' to be handled by the handler function `handler' which must
+take a single argument of type HTTP-EXCHANGE and use the API functions to read request
+information and generate a result page.  If :content-type is supplied, it will be used as
+the content type of the resulting page, otherwise, text/html will be used by default."
+  :public? TRUE
+  (let ((theOptions
+         (vet-options
+          (coerce-&rest-to-cons options)
+          (quote (:content-type :documentation))))) ;; @STRING
+    (when (null? (lookup theOptions :content-type))
+      (insert-at theOptions :content-type (get-http-mime-type :HTML NULL)))
+    (insert-at theOptions :handler-type :handler)
+    (insert-at theOptions :path path)
+    (insert-at theOptions :handler handler)
+    (insert-at *http-handler-registry* path theOptions)))
+
+(defmethod publish-handler-impl
+    ((server HTTP-SERVER) (path STRING) (handler FUNCTION-CODE) (options PROPERTY-LIST))
+  (ignore path handler options)
+  (error "publish-handler-impl: not implemented on " server))
+
+(defun (get-handler-options PROPERTY-LIST) ((xchg HTTP-EXCHANGE))
+  :documentation "Return the options supplied when the handler for this exchange was published.
+This includes required as well as optional arguments.  This will never return NULL."
+  :public? TRUE
+  (return (get-handler-options-impl *http-server-implementation* xchg)))
+
+(defmethod (get-handler-options-impl PROPERTY-LIST) ((server HTTP-SERVER) (xchg HTTP-EXCHANGE))
+  (ignore xchg)
+  (error "get-handler-options-impl: not implemented on " server))
+
+
+  ;;
+;;;;;; Simple File and Directory Default Handlers
+  ;;
+
+(defglobal *http-server-copyright-trailer* STRING
+           (concatenate
+             *stella-version-string* " HTTP Server" 
+             "<BR>"
+             "Copyright 1996-"
+             (integer-to-string (get-calendar-date (make-current-date-time) (get-local-time-zone)))
+             " University of Southern California Information Sciences Institute"))
+  
+(defun generate-error-response ((xchg HTTP-EXCHANGE) (code KEYWORD) (message STRING))
+  ;; Generate an error response according to `code'.  If `message' is non-NULL
+  ;; it will be appended at the end.
+  (let ((stream (get-reply-stream xchg)))
+    (set-response-code xchg code)
+    (set-reply-header-value xchg :content-type (get-http-mime-type :HTML NULL))
+    (with-html-tag ("BODY BGCOLOR='FF9999'" stream true)
+      (print-stream stream "ERROR: " (get-http-response-code code NULL)
+                    " " (get-http-response-desc code NULL))
+      (when (defined? message)
+        (print-stream stream "<BR><BR>" message EOL)))))
+
+(defun file-handler ((xchg HTTP-EXCHANGE))
+  :documentation "Serve the specific file specified when the associated handler was published.
+Simple default implementation for minimal servers such as the Sun JRE HttpServer."
+  :public? TRUE
+  (let ((uriPath (get-request-uri-path xchg))
+        (options (get-handler-options xchg))
+        (path STRING (lookup options :path))
+        (file STRING (lookup options :file))
+        ;; NOTE: we should never have to rely on a default here and figure out the proper
+        ;;       content type at handler publishing time (e.g., from the filename).
+        (contentType (lookup-with-default options :content-type (get-http-mime-type :HTML NULL)))
+        (stream (get-reply-stream xchg)))
+    (setq uriPath (string-trim (unescape-url-string uriPath)))
+    (cond ((not (eql? uriPath path))
+           ;; we were not called exactly with the published path:
+           (generate-error-response xchg :NOT-FOUND NULL))
+          (otherwise
+           (set-reply-header-value xchg :content-type contentType)
+           (with-input-file (in file)
+             (copy-stream-to-stream in (new OUTPUT-STREAM :native-stream stream)))))))
+
+(defun directory-handler ((xchg HTTP-EXCHANGE))
+  :documentation "Serve files located anywhere in the directory specified when the associated
+handler was published (including subdirectories).  Simple default implementation for minimal
+servers such as the Sun JRE HttpServer."
+  :public? TRUE
+  (let ((uriPath (get-request-uri-path xchg))
+        (options (get-handler-options xchg))
+        (path STRING (lookup options :path))
+        (directory STRING (lookup options :directory))
+        (resolvedUri STRING NULL)
+        (isDirectory? FALSE)
+        (contentType (get-http-mime-type :BINARY NULL))
+        (stream (get-reply-stream xchg)))
+    (setq uriPath (string-trim (unescape-url-string uriPath)))
+    (setq isDirectory? (ends-with? uriPath "/" NULL))
+    (unless (starts-with? uriPath path NULL)
+      ;; we were not called exactly with the published path:
+      (generate-error-response xchg :NOT-FOUND NULL)
+      (return))
+    ;; eliminate path prefix:
+    (setq uriPath (subsequence uriPath (length path) NULL))
+    (when (or (starts-with? uriPath "../" NULL)
+              (starts-with? uriPath "/.." NULL)
+              (defined? (string-search uriPath "/../" NULL)))
+      ;; guard against directory escape - conceivably, we could be more
+      ;; sophisticated and generate a true filename first and then
+      ;; check whether it is contained in `directory' somewhere:
+      (generate-error-response xchg :FORBIDDEN NULL)
+      (return))
+    ;; map to native filename syntax:
+    (setq resolvedUri (substitute uriPath (directory-separator) #\/))
+    ;; add base directory (which is guaranteed to end in a separator):
+    (setq resolvedUri (concatenate directory resolvedUri))
+    (when isDirectory?
+      (cond ((probe-file? (concatenate resolvedUri "index.html"))
+             (setq resolvedUri (concatenate resolvedUri "index.html")))
+            ((probe-file? (concatenate resolvedUri "index.htm"))
+             (setq resolvedUri (concatenate resolvedUri "index.htm")))
+            (otherwise
+             ;; we don't yet support directory listings:
+             (generate-error-response xchg :FORBIDDEN NULL)
+             (return))))
+    (unless (probe-file? resolvedUri)
+      (generate-error-response xchg :NOT-FOUND NULL)
+      (return))
+    (setq contentType (guess-file-content-type resolvedUri))
+    (set-reply-header-value xchg :content-type contentType)
+    (with-input-file (in resolvedUri)
+      (copy-stream-to-stream in (new OUTPUT-STREAM :native-stream stream)))))
+
+(defun unknown-url-handler ((xchg HTTP-EXCHANGE))
+  :documentation "Simple default handler for unknown/unhandled URLs."
+  :public? TRUE
+  (generate-error-response xchg :NOT-FOUND NULL))
+
+
+(startup-time-progn
+  (publish-directory "/ploom/" (get-http-document-root)
+                     :documentation "Top-level htdocs directory."))
+
+
+  ;;
+;;;;;; Load-System Handler
+  ;;
+
+(defun load-system-handler ((xchg HTTP-EXCHANGE))
+  :documentation "Load the STELLA system with options identified by the URL parameters."
+  :public? TRUE
+  (let  ((arguments (parse-and-decode-url-arguments (get-request-uri-query xchg) #\+))
+         (systemName (first arguments))
+         (loadCommand (bquote (load-system & systemName)))
+         (stream (get-reply-stream xchg)))
+    (foreach arg in (rest arguments)
+       collect (unstringify arg) into loadCommand)
+    (exception-case
+        (progn
+          (evaluate loadCommand)
+          (with-html-tag ("BODY" stream true)
+             (print-stream stream "Successfully evaluated: " (stringify loadCommand))
+             (print-stream stream "<BR><BR>" EOL)
+             (with-html-tag ("HR SIZE=2" stream TRUE))
+             (print-stream stream *http-server-copyright-trailer*)))
+      (NATIVE-EXCEPTION (e)
+        (generate-error-response xchg :BAD-REQUEST (exception-message e))))))
+
+;; Example: http://localhost:9999/ploom/load-system?powerloom-server+:startup%3F+true
+
+(startup-time-progn
+  (publish-handler
+   "/ploom/load-system"
+   (the-code :function load-system-handler)
+   :content-type (get-http-mime-type :html null)
+   :documentation "Triggers a load-system operation at the server for the argument system."))
+
+
+  ;;
+;;;;;; Testing
+  ;;
+
+(defglobal *test-http-api-handler-last-xchg* HTTP-EXCHANGE NULL)
+
+(defun test-http-api-handler-serve-form ((xchg HTTP-EXCHANGE))
+  (let ((stream (get-reply-stream xchg)))
+    (print-stream stream "
+<FORM NAME=\"frank\" METHOD=\"POST\">
+<b>Execute Query</b><BR>
+<b>Theory:</b> <INPUT TYPE=\"text\" NAME=\"CONTEXT\" VALUE=\"INSPECT\" SIZE=40 ><BR>
+<b>Package:</b><INPUT TYPE=\"text\" NAME=\"PACKAGE\" VALUE=\"EXPECT\" SIZE=40 ><P>
+<b>Output Variable(s):</b><INPUT TYPE=\"text\" NAME=\"VARIABLES\" SIZE=60 ><P>
+<b>Query:</b><TEXTAREA NAME=\"QUERY\" ROWS=10 COLS=72 ></TEXTAREA><P>
+<INPUT TYPE=submit  NAME=\"submit\" VALUE=\"submit\">
+</FORM>")))
+
+(defun test-http-api-handler ((xchg HTTP-EXCHANGE))
+  ;; Useful to check whether different HTTP API implementations are conforming to each other.
+  ;; Use a URL like this to test: http://redhouse:9999/ploom/test-http-api?a+>+c
+  ;; Also type something in the Query area using whitespace and special characters.
+  (setq *test-http-api-handler-last-xchg* xchg)
+  (let ((uri (get-request-uri xchg))
+        (path (get-request-uri-path xchg))
+        (query (get-request-uri-query xchg))
+        (args (parse-and-decode-url-arguments query #\+))
+        (method (get-request-method xchg))
+        (localHost (get-request-local-address xchg))
+        (remoteHost (get-request-remote-address xchg))
+        (body (get-request-body xchg))
+        (stream (get-reply-stream xchg)))
+    (case method
+      (:get
+       (when (member? args "plain")
+         (set-reply-header-value xchg :content-type (get-http-mime-type :PLAIN-TEXT NULL)))
+       (print-stream stream "<PRE>" EOL)
+       (print-stream stream "It worked, here are some parameters: " EOL)
+       (print-stream stream "URI=`" uri "'" EOL)
+       (print-stream stream "Path=`" path "'" EOL)
+       (print-stream stream "Query=`" query "'" EOL)
+       (print-stream stream "Args=`" args "'" EOL)
+       (print-stream stream "Method=`" method "'" EOL)
+       ;(print-stream stream "Protocol=`" (get-request-protocol xchg) "'" EOL)
+       (print-stream stream "Local host=`" localHost "'" EOL)
+       (print-stream stream "Remote host=`" remoteHost "'" EOL)
+       (print-stream stream "Body=`" body "'" EOL)
+       (print-stream stream "</PRE>" EOL)
+       (test-http-api-handler-serve-form xchg))
+      (:post
+       (let ((values (parse-and-decode-form-values body)))
+         (print-stream stream "<PRE>" EOL)
+         (print-stream stream "It worked, here are some parameters: " EOL)
+         (print-stream stream "URI=`" uri "'" EOL)
+         (print-stream stream "Path=`" path "'" EOL)
+         (print-stream stream "Query=`" query "'" EOL)
+         (print-stream stream "Args=`" args "'" EOL)
+         (print-stream stream "Method=`" method "'" EOL)
+         ;(print-stream stream "Protocol" (get-request-protocol xchg) "'" EOL)
+         (print-stream stream "Local host=`" localHost "'" EOL)
+         (print-stream stream "Remote host=`" remoteHost "'" EOL)
+         (print-stream stream "Body=`" body "'" EOL)
+         (print-stream stream "Values=`" values "'" EOL EOL)
+         (print-stream stream "</PRE>" EOL))))))
+
+(startup-time-progn
+  (publish-handler "/ploom/test-http-api"
+                   (the-code :function test-http-api-handler)
+                   :content-type (get-http-mime-type :HTML NULL)
+                   :documentation "Useful for comparing different HTTP API implementations."))

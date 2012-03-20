@@ -20,7 +20,7 @@ REM The Initial Developer of the Original Code is                              #
 REM UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          #
 REM 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               #
 REM                                                                            #
-REM Portions created by the Initial Developer are Copyright (C) 1996-2006      #
+REM Portions created by the Initial Developer are Copyright (C) 1996-2010      #
 REM the Initial Developer. All Rights Reserved.                                #
 REM                                                                            #
 REM Contributor(s):                                                            #
@@ -39,21 +39,28 @@ REM the terms of any one of the MPL, the GPL or the LGPL.                      #
 REM                                                                            #
 REM ############################ END LICENSE BLOCK #############################
 
-REM Version: powerloom.bat,v 1.1 2006/05/16 06:34:04 hans Exp
+REM Version: powerloom.bat,v 1.3 2010/10/15 01:55:11 hans Exp
 REM
-REM Run the C++ or Java version of the PowerLoom KR&R system
-REM in a Windows 2000/XP command prompt window.
+REM Run the C++ or Java version of the PowerLoom KR&R system in
+REM a Windows 2000/XP command prompt window.  If you double-click
+REM on this file, it will lauch the Java GUI version of PowerLoom.
 REM
-REM Usage: powerloom [c++ | java] [{-e|--eval} STELLA-EXPRESSION [--batch]
+REM Usage: powerloom [--c++|--java|--gui|--gui-only] [--help] [{-e|--eval} command] [--batch] ...
 REM
-REM If the first argument is `c++' the C++ version of POWERLOOM is run
-REM (if installed), if it is `java' the Java version is run (if
-REM installed); otherwise, if the C++ version is installed it will run
-REM that; if that is not installed, it will run the Java version.
+REM If the first argument is `--c++' the C++ version of PowerLoom is run
+REM (if installed), if it is `--java' the plain Java version is run (if
+REM installed); if it is `--gui' the Java version is run and the PowerLoom
+REM GUI is started from it connecting to an embedded HTTP server; if it
+REM is `--gui-only', the GUI is run in standalone mode and can connect to
+REM any available PowerLoom server.  If nothing is specified, the Java
+REM version of PowerLoom is run.
 REM
 REM Example usage:
 REM
 REM    C:\powerloom> powerloom --batch -e "(demo """equations""" FALSE)"
+REM    C:\powerloom> powerloom --gui
+REM    C:\powerloom> powerloom --gui-only --host myhost --port 9999
+
 
 SET POWERLOOM_ROOT=%~d0%~p0
 
@@ -65,22 +72,35 @@ SET POWERLOOM_CPP=%POWERLOOM_ROOT%native\cpp\powerloom\powerloom.exe
 REM Java environment:
 SET JAVA=java
 SET JAVA_FLAGS=-Xmx256m
-SET POWERLOOM_JAR=%POWERLOOM_ROOT%native\java\lib\powerloom.jar
-SET STELLA_JAR=%STELLA_ROOT%native\java\lib\stella.jar
-SET CLASSPATH=%POWERLOOM_JAR%;%STELLA_JAR%
+SET JAVA_LIBDIR=%POWERLOOM_ROOT%native\java\lib
+SET STELLA_JAR=%JAVA_LIBDIR%\stella.jar
+SET POWERLOOM_JAR=%JAVA_LIBDIR%\powerloom.jar
+SET POWERLOOM_SERVER_JAR=%JAVA_LIBDIR%\powerloom-server.jar
+SET POWERLOOM_GUI_JAR=%JAVA_LIBDIR%\powerloom-gui.jar
+SET CASTOR_CORE_JAR=%JAVA_LIBDIR%\castor-core.jar
+SET CASTOR_JAR=%JAVA_LIBDIR%\castor.jar
+SET LOGGING_JAR=%JAVA_LIBDIR%\commons-logging.jar
 
-IF "%1" == "c++" (
+SET GUI_CLASSPATH=%POWERLOOM_GUI_JAR%;%CASTOR_CORE_JAR%;%CASTOR_JAR%;%LOGGING_JAR%
+SET CLASSPATH=%GUI_CLASSPATH%;%POWERLOOM_SERVER_JAR%;%POWERLOOM_JAR%;%STELLA_JAR%
+
+
+IF "%1" == "--c++" (
    ECHO Running C++ version of PowerLoom...
    "%POWERLOOM_CPP%" %2 %3 %4 %5 %6 %7 %8 %9
 ) ELSE (
-IF "%1" == "java" (
+IF "%1" == "--java" (
    ECHO Running Java version of PowerLoom...
    %JAVA% %JAVA_FLAGS% -classpath "%CLASSPATH%" edu.isi.powerloom.PowerLoom %2 %3 %4 %5 %6 %7 %8 %9
 ) ELSE (
-IF EXIST "%POWERLOOM_CPP%" (
-   ECHO Running C++ version of PowerLoom...
-   "%POWERLOOM_CPP%" %*
+IF "%1" == "--gui" (
+   ECHO Running Java GUI version of PowerLoom...
+   %JAVA% %JAVA_FLAGS% -classpath "%CLASSPATH%" edu.isi.powerloom.PowerLoom --gui %2 %3 %4 %5 %6 %7 %8 %9
+) ELSE (
+IF "%1" == "--gui-only" (
+   ECHO Running standalone PowerLoom GUI...
+   %JAVA% %JAVA_FLAGS% -classpath "%GUI_CLASSPATH%" edu.isi.powerloom.gui.components.PowerloomApp %2 %3 %4 %5 %6 %7 %8 %9
 ) ELSE (
    ECHO Running Java version of PowerLoom...
    %JAVA% %JAVA_FLAGS% -classpath "%CLASSPATH%" edu.isi.powerloom.PowerLoom %*
-)))
+))))

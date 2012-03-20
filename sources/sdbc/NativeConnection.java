@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2010      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,15 +39,15 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: NativeConnection.java,v 1.3 2006/11/20 20:43:18 hans Exp
+// Version: NativeConnection.java,v 1.4 2010/10/11 22:10:28 hans Exp
 
 
 package edu.isi.sdbc;
 
 import edu.isi.stella.*;
 
-class NativeConnection {
-    boolean connected;
-    java.sql.Connection connection;
-    Cons types;
+public class NativeConnection {
+    public boolean connected;
+    public java.sql.Connection connection;
+    public Cons types;
 }

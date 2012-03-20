@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: primal.ste,v 1.153 2010/02/10 21:57:26 hans Exp
+;;; Version: primal.ste,v 1.156 2010/10/16 19:23:49 hans Exp
 
 ;;; Declarations for objects implemented by native constructs.
 
@@ -124,7 +124,7 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
             :cpp "std::numeric_limits<double>::infinity() != 0 ?
                     -std::numeric_limits<double>::infinity() :
                     // work around a problem in g++ 3.2.2 where infinity()==0:
-                    NULL_INTEGER / 0.0"
+                    NULL_INTEGER / (double)ceiling(-0.42)" ; disguise div-by-0
 	    ; :java "Double.NaN; // IEEE Not a Number"
 	    :java "Double.NEGATIVE_INFINITY; /* IEEE Infinity */"
 	    )
@@ -2551,25 +2551,87 @@ will be initialized to NULL."
 ;;;;;; File operations
   ;;
 
+(defun (native-probe-file? BOOLEAN) ((fileName FILE-NAME))
+  :documentation "Return true if file `fileName' exists.  Note that this does
+not necessarily mean that the file can also be read.  This does not handle any
+necessary pathname translations or error conditions."
+  :native? TRUE :public? TRUE)
+
 (defun (probe-file? BOOLEAN) ((fileName FILE-NAME))
   :documentation "Return true if file `fileName' exists.  Note that this does
 not necessarily mean that the file can also be read."
+  (return (native-probe-file? (translate-logical-pathname fileName))))
+
+(defun (native-file-write-date CALENDAR-DATE) ((fileName FILE-NAME))
+  :documentation "Return the time at which file `fileName' was last modified or
+NULL if that cannot be determined.  This does not handle any necessary pathname
+translations or error conditions."
   :native? TRUE :public? TRUE)
 
 (defun (file-write-date CALENDAR-DATE) ((fileName FILE-NAME))
   :documentation "Return the time at which file `fileName' was last modified or
 NULL if that cannot be determined."
+  :public? TRUE
+  (let ((truefile (translate-logical-pathname fileName)))
+    (unless (native-probe-file? truefile)
+      ;; this will test again which is ok and then throw the exception:
+      (ensure-file-exists fileName "file-write-date"))
+    (return (native-file-write-date truefile))))
+
+(defun (native-file-length LONG-INTEGER) ((fileName FILE-NAME))
+  :documentation "Return the length of file `fileName' in bytes or NULL if that
+cannot be determined.  This does not handle any necessary pathname translations
+or error conditions."
   :native? TRUE :public? TRUE)
 
 (defun (file-length LONG-INTEGER) ((fileName FILE-NAME))
   :documentation "Return the length of file `fileName' in bytes or NULL if that
-cannot be determined.  Note that this will currently overrun for files that
-are longer than what can be represented by a STELLA integer."
+cannot be determined."
+  :public? TRUE
+  ;; TO DO: maybe also check that we are dealing with a plain file, not a directory:
+  (let ((truefile (translate-logical-pathname fileName)))
+    (unless (native-probe-file? truefile)
+      ;; this will test again which is ok and then throw the exception:
+      (ensure-file-exists fileName "file-length"))
+    (return (native-file-length truefile))))
+
+;;; TO DO: the native versions of delete-file and rename-file use a mixture of
+;;; methods to signal success or failure, e.g., C++ always returns a success or
+;;; error code, Lisp and Java sometimes return a success code and for certain
+;;; cases return an exception.  We could make this more uniform by always
+;;; signalling a file-operation exception in case something went wrong; however,
+;;; for now this is a bit too much effort for what it's worth.
+
+(defun native-delete-file ((fileName FILE-NAME))
+  :documentation "Delete the file `fileName'.  This does not handle any necessary
+pathname translations or error conditions."
   :native? TRUE :public? TRUE)
 
 (defun delete-file ((fileName FILE-NAME))
   :documentation "Delete the file `fileName'."
+  :public? TRUE
+  (let ((truefile (translate-logical-pathname fileName)))
+    (unless (native-probe-file? truefile)
+      ;; this will test again which is ok and then throw the exception:
+      (ensure-file-exists fileName "delete-file"))
+    (native-delete-file truefile)))
+
+(defun native-rename-file ((fromFile FILE-NAME) (toFile FILE-NAME))
+  :documentation "Rename the file `fromFile' to `toFile'.  This does not handle
+any necessary pathname translations or error conditions."
   :native? TRUE :public? TRUE)
+
+(defun rename-file ((fromFile FILE-NAME) (toFile FILE-NAME))
+  :documentation "Rename the file `fromFile' to `toFile'."
+  :public? TRUE
+  (let ((truefrom (translate-logical-pathname fromFile))
+        (trueto (translate-logical-pathname toFile)))
+    (unless (native-probe-file? truefrom)
+      ;; this will test again which is ok and then throw the exception:
+      (ensure-file-exists fromFile "rename-file"))
+    (when (native-probe-file? trueto)
+      (ensure-file-does-not-exist toFile "rename-file"))
+    (native-rename-file truefrom trueto)))
 
 (defun copy-stream-to-stream ((in INPUT-STREAM) (out OUTPUT-STREAM))
   :documentation "Copy `in' verbatimely to `out'.  Does the right thing for binary data."
@@ -2593,6 +2655,146 @@ any data already in `toFile'."
   (with-input-file (from fromFile)
     (with-output-file (to toFile)
       (copy-stream-to-stream from to))))
+
+(defun (make-temporary-file-name STRING) ((prefix STRING) (suffix STRING))
+  :documentation "Return a file name of the form `<prefix>NNNNNN<suffix>'
+which is guaranteed to not refer to any existing file.  A null `prefix'
+defaults to `tmpfile', a null `suffix' defaults to the empty string.
+The number portion NNNNNN will correpond to a random number between 0
+and 999999.  If no qualifying filename can be found after 100 attempts,
+NULL will be returned.  Note that it is possible due to multi-threading
+or processing that the generated filename becomes used by another thread
+or OS process.  If necessary, this case can be handled by the caller."
+  :public? TRUE
+  (when (null? prefix)
+    (setq prefix "tmpfile"))
+  (when (null? suffix)
+    (setq suffix ""))
+  (foreach i in (interval 0 100)
+      do (ignore i)
+         (let ((uniquifier (format-with-padding
+                            (integer-to-string (random 1000000))
+                            6 #\0 :right FALSE))
+               (tempFileName
+                (concatenate prefix uniquifier suffix)))
+           (when (not (probe-file? tempFileName))
+             (return tempFileName))))
+  (return NULL))
+
+(defun (cl-list-directory-files (CONS OF STRING-WRAPPER)) ((directory STRING))
+  ;; Lisp support for `list-directory-files'.
+  ;; This is complicated by the fact that different Lisps expect different
+  ;; wildcarding to get files with or without extensions and/or directories,
+  ;; and that they generate different output for different kinds of files.
+  (let ((files (CONS OF STRING-WRAPPER) NULL)
+        (dirnameLength (length directory))
+        (dirsep (directory-separator-string))
+        (checkDuplicates? FALSE)
+        (normFile STRING NULL)
+        (normalizedFiles NIL))
+    (verbatim :common-lisp
+      "#+allegro (setq files (cl:directory directory))
+       #+cmucl (setq files (cl:directory directory))
+       #+lispworks (setq files (cl:directory (string-concatenate directory \"*\")))
+       #+mcl (setq files (cl:directory (string-concatenate directory \"*.*\")))
+       #+clisp (setq files (cl:append (cl:directory (string-concatenate directory \"*\"))
+                                      (cl:directory (string-concatenate directory \"*/\"))))"
+      :otherwise NULL)
+    ;; for all Lisps not special-cased above, we use * and *.* wild cards which
+    ;; might lead to duplicate entries:
+    (when (null? files)
+      (setq checkDuplicates? TRUE)
+      (verbatim :common-lisp
+        "(setq files (cl:append (cl:directory (string-concatenate directory \"*\"))
+                                (cl:directory (string-concatenate directory \"*.*\"))))"
+        :otherwise NULL))
+    (verbatim :common-lisp
+      "(setq files (stellify (cl:mapcar #'cl:namestring files)))"
+      :otherwise (setq files NIL))
+    (when checkDuplicates?
+      (setq normalizedFiles (remove-duplicates-equal normalizedFiles)))
+    ;; normalize different Lisps to have bare filenames without trailing directory separators:
+    (foreach file in files
+        do (setq normFile file)
+           (when (starts-with? normFile directory 0)
+             (setq normFile (subsequence normFile dirnameLength NULL)))
+           (when (ends-with? normFile dirsep NULL)
+             ;; this is wrong for files that have a directory separator in their name:
+             (setq normFile (subsequence normFile 0 (- (length normFile) (length dirsep)))))
+           (when (or (eql? normFile ".")
+                     (eql? normFile ".."))
+             (continue))
+        collect normFile into normalizedFiles)
+    (return normalizedFiles)))
+
+(verbatim
+    ;; we will need to conditionalize this:
+    :cpp "# include <dirent.h>
+"
+    :otherwise NULL)
+
+(defun (cpp-list-directory-files (CONS OF STRING-WRAPPER)) ((directory STRING))
+  ;; C++ support for `list-directory-files'.
+  ;; TO DO: maybe (optionally) use the Boost.Filesystem library to implement this
+  ;;    more portably (http://www.boost.org/).
+  (let ((files (CONS OF STRING-WRAPPER) NIL))
+    (verbatim :cpp
+      "DIR *dirptr;
+       struct dirent *entry;
+       dirptr = opendir(directory);
+       if (dirptr != NULL) {
+          while (entry = readdir(dirptr)) {
+            char* filename = entry->d_name;
+            // skip . and ..:
+            if (!strcmp(filename, \".\") || !strcmp(filename, \"..\"))
+               continue;
+            // do this to copy out the string:
+            filename = stringConcatenate(filename, \"\");
+            files = cons(wrapString(filename), files);
+          }
+          closedir(dirptr);
+         }
+         else
+            files = NULL"
+      :otherwise NULL)
+    (when (null? files)
+      (error "list-directory-files: error reading " directory))
+    (return files)))
+
+(defun (java-list-directory-files (CONS OF STRING-WRAPPER)) ((directory STRING))
+  ;; Java support for `list-directory-files'.
+  ;; As usual, Java would have all the necessary accessors to do more sophisticated
+  ;; normalization, but we don't use that for now given the problems with Lisp and C++.
+  (let ((files NIL))
+    (verbatim :java
+      "  java.io.File[] dirfiles = new java.io.File(directory).listFiles();
+         String filename = null;
+         String dirsep = Stella.directorySeparatorString();
+         for (int i = dirfiles.length-1; i >= 0; i--) {
+             filename = dirfiles[i].getName();
+             files = Cons.cons(StringWrapper.wrapString(filename), files);
+         }"
+      :otherwise NULL)
+    (return files)))
+
+(defun (list-directory-files (CONS OF STRING-WRAPPER)) ((directory STRING))
+  :documentation "Return all the files and sub-directories in `directory' sorted by name.
+Each returned file is a bare file name without a `directory' component.  If a file is
+a directory, it will look just like a plain file.  This means consumers might have to
+explicitly test whether a file is a directory depending on what they do. Excludes . and ..
+directories.  Handles logical pathnames but resulting files will always use physical pathname
+syntax.  This is mostly consistent across native languages, but some differences still exist -
+e.g., Lisp will convert . or .. into absolute pathnames."
+  :public? TRUE :command? TRUE
+  (setq directory (translate-logical-pathname (file-name-as-directory directory)))
+  (ensure-file-exists directory "list-directory-files")
+  (let ((files
+         (if-output-language :common-lisp
+             (cl-list-directory-files directory)
+             (if-output-language :java
+                 (java-list-directory-files directory)
+                 (cpp-list-directory-files directory)))))
+    (return (sort files NULL))))
 
 
   ;;

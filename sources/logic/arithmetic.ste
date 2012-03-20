@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: arithmetic.ste,v 1.44 2009/04/01 19:26:30 tar Exp
+;;; Version: arithmetic.ste,v 1.45 2010/09/09 22:53:29 hans Exp
 
 ;;; Evaluators perform computations (e.g., '+', '>') during constraint
 ;;;    propagation, and may side-effect, causing additional propagations.
@@ -863,29 +863,17 @@
 ;;;;;; String Computations
   ;;
 
-
-(define-computed-constraint concatenate-constraint ((x1 STRING-WRAPPER)
-						    (x2 STRING-WRAPPER)
-						    (x3 STRING-WRAPPER))
-  ;; X3 = X1 X2
-  (setq value
-    (string-eql? (concatenate (wrapper-value x1) (wrapper-value x2)) 
-		 (wrapper-value x3)))
-  (let ((s2 (wrapper-value x2))
-	(s3 (wrapper-value x3))
-	(n (/stella/- (/stella/length s3) (/stella/length s2))))
-    (if (and (stella/>= n 0) (string-eql? (subsequence s3 n NULL) s2))
-      (setq value (wrap-string (subsequence s3 0 n)))
-      (setq value NULL)))
-  (let ((s1 (wrapper-value x1))
-	(s3 (wrapper-value x3))
-	(l1 (/stella/length s1)))
-    (if (string-eql? (subsequence s3 0 l1) s1)
-      (setq value (wrap-string (subsequence s3 l1 NULL)))
-      (setq value NULL)))
-  (setq value (concatenate (wrapper-value x1) (wrapper-value x2)))
-  )
-
+(defun (string-concatenate-computation STRING-WRAPPER) ((x OBJECT) (yArgs CONS))
+  ;; This now takes a variable number of arguments and coerces all of them to a string.
+  ;; The variable number of args need to be passed in as a CONS, since there are some
+  ;; issues with `apply' and varargs in C++ (see `compute-relation-value').
+  (special ((*printMode* :original))
+    (let (;; use a stream for now to handle variable args more easily:
+          (out (new STRING-OUTPUT-STREAM)))
+      (print-stream out (pli/object-to-string x))
+      (foreach arg in yArgs
+          do (print-stream out (pli/object-to-string arg)))
+      (return (the-string out)))))
 
 (defun (subsequence-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
@@ -1006,15 +994,22 @@
         (theStart INTEGER start)
         (theEnd INTEGER end)
         (name STRING (choose (string? x) x (object-name-string x)))
+        (nameLength (stella/length name))
         (matchPosition INTEGER NULL))
-    (when (and (stella/>= theEnd 0)
-               (stella/<= theEnd (stella/length name)))
-      ;; need to do this, since `string-search' doesn't yet take an `end' argument.
-      (setq name (subsequence name theStart theEnd)))
+    (when (stella/< theStart 0)
+      (setq theStart (1+ (stella/+ nameLength theStart))))
+    (when (stella/< theStart 0)
+      (return NULL))
+    (when (stella/< theEnd 0)
+      (setq theEnd (1+ (stella/+ nameLength theEnd))))
+    (when (or (stella/< theEnd 0)
+              (stella/> theEnd nameLength))
+      (return NULL))
     (if ignore-case?
 	(setq matchPosition (string-search-ignore-case name thePattern theStart))
 	(setq matchPosition (string-search name thePattern theStart)))
-    (if (defined? matchPosition)
+    (if (and (defined? matchPosition)
+             (stella/< matchPosition theEnd))
         (return matchPosition)
       (return NULL))))
 

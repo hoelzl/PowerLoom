@@ -1,0 +1,490 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2000-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: general-query.ste,v 1.10 2010/09/11 02:26:11 hans Exp
+
+(in-package "STELLA")
+
+(in-module "ONTOSAURUS")
+
+
+;;; This is a new template-based query form generator that also supports
+;;; explanation of results.  This was written many years ago in a frenzy to
+;;; support a demo and was never fully finished, generalized and cleaned up.
+;;; However, it works reasonably well so that we promote it for now into
+;;; the official query support for Ontosaurus.
+
+(defspecial *preset-queries* (CONS OF (CONS OF STRING-WRAPPER)) NIL
+  :documentation "A list of preset queries to make entry easier.  Format is
+(\"Title\" \"ModuleName\" \"QueryBody\") ")
+
+(defglobal *general-query-form-template* STRING
+           (concatenate
+             "<HTML>
+<HEAD>
+<BASE TARGET='answer'>
+<TITLE>Query Form</TITLE>
+</HEAD>
+<" (make-html-body-tag *standard-background-color*) ">
+
+#$(FORM-HEADER)
+
+<H1>Query Form</H1>
+
+Module:&nbsp;#$(MODULE-MENU)
+<BR>
+
+Queries:&nbsp;#$(QUERY-MENU)
+<BR>
+Number of answers:&nbsp;#$(NOF-ANSWERS-MENU)
+<BR>
+#$(QUERY-INPUT-AREA)
+<BR>
+#$(SUBMIT-BUTTON)
+#$(RESET-BUTTON)
+
+#$(FORM-TRAILER)
+
+<BR>
+<HR SIZE=2>
+"
+             *powerloom-copyright-trailer*
+"</BODY>
+</HTML>
+"))
+ 
+
+#|
+;;; Another example template:
+
+(defglobal *kojak-query-form-template* STRING
+           "<HTML>
+<HEAD>
+<BASE TARGET='answer'>
+<TITLE>KOJAK Pattern Instantiator</TITLE>
+</HEAD>
+<BODY BGCOLOR='#FFFFFF'>
+
+#$(FORM-HEADER)
+
+<IMG SRC='images/kojak-logo.gif' ALIGN='BOTTOM'>
+<H1> PATTERN INSTANTIATOR</H1>
+
+Module:&nbsp;#$(MODULE-MENU)
+<BR>
+
+Patterns:&nbsp;#$(QUERY-MENU)
+<BR>
+Number of answers:&nbsp;#$(NOF-ANSWERS-MENU)
+<BR>
+#$(QUERY-INPUT-AREA)
+<BR>
+#$(SUBMIT-BUTTON)
+#$(RESET-BUTTON)
+
+#$(FORM-TRAILER)
+
+</BODY>
+</HTML>
+")
+|#
+
+(defun html-write-query-form-page ((stream NATIVE-OUTPUT-STREAM))
+  (html-write-query-form-page-from-template
+   (new OUTPUT-STREAM :native-stream stream)
+   (new STRING-INPUT-STREAM :the-string *general-query-form-template*)))
+
+(defun (yield-preset-queries-script STRING) ((queries (CONS OF (CONS OF STRING-WRAPPER))))
+  (when (empty? queries)
+    (return ""))
+  (let ((nQueries (length queries))
+        (script (new STRING-OUTPUT-STREAM)))
+    (print-stream script "<SCRIPT LANGUAGE='JavaScript'>
+	      
+function makeArray (size) {
+  this.length = size;
+  return this;
+}
+
+var queryModuleList = new makeArray(")
+    (print-stream script nQueries  ");
+var querySourceList = new makeArray(")
+    (print-stream script nQueries  ");" EOL EOL)
+
+    (foreach entry in queries
+        as j in (interval 1 NULL)
+        do (print-stream script
+                         "queryModuleList[" j "] = '" 
+                         (wrapper-value (second entry))
+                         "';" EOL)
+           ;; The code here replaces newlines by \n, etc.
+           (print-stream script
+                         "querySourceList[" j "] = '" 
+                         (replace-character-with-substring
+                          (replace-character-with-substring
+                           (replace-character-with-substring
+                            (replace-substrings (third entry) "\\\\" "\\")
+                            "\\\"" #\")
+                           "\\n" #\LINEFEED)
+                          "\\n" #\RETURN)
+                         "';" EOL))
+
+    (print-stream script EOL "function setSourceAndModule (index) {
+  if (index > 0) {
+    document.QUERY.QUERYSOURCE.value = querySourceList[index];
+    for (var i = 0; i < document.QUERY.MODULE.length; i++) {
+       if (document.QUERY.MODULE[i].value==queryModuleList[index]) {
+           document.QUERY.MODULE.selectedIndex = i; }
+    }
+  } else {
+  document.QUERY.QUERYSOURCE.value = '';
+  }
+}
+</SCRIPT>" EOL EOL)
+    (return (the-string script))))
+
+(defun (yield-choice-menu-string STRING) ((items CONS) (selectOptions STRING))
+  (let ((menu (new STRING-OUTPUT-STREAM))
+        (optionItem STRING NULL)
+        (menuItem STRING NULL))
+    (print-stream menu "<SELECT " selectOptions ">" EOL)
+    (foreach item in items
+        as i in (interval 1 NULL)
+        do (typecase item
+             (STRING
+              (setq optionItem item)
+              (setq menuItem item))
+             (CONS
+              (setq optionItem (first item))
+              (setq menuItem (second item))))
+           (print-stream menu
+                         "<OPTION VALUE='" optionItem "'"
+                         (choose (= i 1) " SELECTED" "") ">"
+                         menuItem
+                         "</OPTION>" EOL))
+    (print-stream menu "</SELECT>" EOL)
+    (return (the-string menu))))
+
+(defun (yield-module-menu-string STRING) ((modules (CONS OF STRING-WRAPPER)))
+  (when (empty? modules)
+    (return ""))
+  (return
+    (yield-choice-menu-string
+     modules
+    "NAME='MODULE' onChange='document.cookie=\"theory=\" + this[this.selectedIndex].value + \";\";'")))
+
+(defun (yield-query-menu-string STRING)
+    ((queries (CONS OF (CONS OF STRING-WRAPPER))))
+  (when (empty? queries)
+    (return ""))
+  (let ((queryItems NIL))
+    (foreach entry in queries
+        collect (first entry) into queryItems)
+    (pushq queryItems (quote ("None" "----")))
+    (return
+      (yield-choice-menu-string
+       queryItems
+       "NAME='QLIST' onChange='setSourceAndModule(this.selectedIndex)'"))))
+
+(defun (yield-nof-answers-menu-string STRING) ((nofAnswers
+                                                (CONS OF STRING-WRAPPER)))
+  (when (empty? nofAnswers)
+    (return ""))
+  (return (yield-choice-menu-string nofAnswers "NAME='NANSWERS'")))
+
+(defun (yield-timeouts-menu-string STRING) ((timeouts (CONS OF STRING-WRAPPER)))
+  (when (empty? timeouts)
+    (return ""))
+  (return (yield-choice-menu-string timeouts "NAME='TIMEOUT'")))
+
+(defun html-write-query-form-page-from-template ((stream OUTPUT-STREAM)
+                                                 (templateStream INPUT-STREAM))
+  (let ((variables (new (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+        (formHeader
+         "<FORM NAME='QUERY' METHOD='POST' ACTION='do-query' ENCTYPE='application/www-url-form-encoded'>"))
+    (insert-at variables "MODULE-MENU"
+               (yield-module-menu-string (sorted-contexts)))
+    (setq formHeader
+      (concatenate formHeader EOL-STRING
+                   (yield-preset-queries-script *preset-queries*)))
+    (insert-at variables "QUERY-MENU"
+               (yield-query-menu-string *preset-queries*))
+    (insert-at variables "NOF-ANSWERS-MENU"
+               (yield-nof-answers-menu-string
+                (quote ("All" "1" "2" "5" "10" "20" "50" "100"))))
+    (insert-at variables "TIMEOUTS-MENU"
+               (yield-timeouts-menu-string
+                (quote ("None" "1.0" "2.0" "5.0" "10.0" "30.0" "60.0" "120.0"))))
+    (insert-at variables "QUERY-INPUT-AREA"
+               "<TEXTAREA NAME='QUERYSOURCE' ROWS='4' COLS='80'></TEXTAREA>")
+    ;; Try to get it to clear the Answers early.
+    ;;    (commented, since it gives us an unwanted submit button).
+    ;(with-html-tag ("INPUT TYPE='SUBMIT' onClick='parent.answer.document.location.pathname=\"/ploom/blank.html\"'" stream))
+    (insert-at variables "SUBMIT-BUTTON"
+               "<INPUT TYPE='SUBMIT' VALUE='Submit'>")
+    (insert-at variables "RESET-BUTTON"
+               "<INPUT TYPE='RESET' VALUE='Clear'>")
+    (insert-at variables "FORM-TRAILER" "</FORM>")
+    
+    ;; Add script to set the form to the previously stored cookie value:
+    (setq formHeader
+      (concatenate formHeader EOL-STRING
+                   "<SCRIPT LANGUAGE='JavaScript'>
+var cookieValue = document.cookie.substring(document.cookie.indexOf('qmodule=')+8,document.cookie.length);
+if (cookieValue.indexOf(';') != -1) {
+cookieValue = cookieValue.substring(0,cookieValue.indexOf(';'));
+}
+for (var i = 0; i < document.QUERY.MODULE.length; i++) {
+   if (document.QUERY.MODULE[i].value==cookieValue) {
+     document.QUERY.MODULE.selectedIndex = i; }
+}</SCRIPT>"))
+    
+    (insert-at variables "FORM-HEADER" formHeader)
+    (substitute-template-variables-to-stream templateStream stream variables)))
+
+(defun html-execute-query ((queryData KEY-VALUE-LIST)
+			   (stream NATIVE-OUTPUT-STREAM))
+  ;; Execute a query as defined by the entries in `queryData' coming from the query form.
+  (let ((moduleName (wrapper-value
+		     (cast (lookup queryData "MODULE") STRING-WRAPPER)))
+	(module (get-module moduleName))
+        (nValueEntry STRING-WRAPPER (lookup queryData "NANSWERS"))
+	(nValueObject (choose (defined? nValueEntry)
+                              (unstringify nValueEntry)
+                              NULL))
+	(nValues INTEGER (choose (integer? nValueObject)
+                                 nValueObject
+				 NULL))
+        (timeoutEntry STRING-WRAPPER (lookup queryData "TIMEOUT"))
+        (timeoutObject (choose (defined? timeoutEntry)
+                               (unstringify timeoutEntry)
+                               NULL))
+        (timeout FLOAT (choose (float? timeoutObject)
+                               timeoutObject
+                               NULL))
+	(query CONS NIL)
+        ;; this should really come from a form, but we hardcode it for now:
+        (options (bquote (:sort-by :values)))
+	(variables (new (LIST OF SYMBOL))))
+  
+    (if (defined? module)
+      (within-module module
+	(setq query (unstringify (lookup queryData "QUERYSOURCE")))
+	(collect-undeclared-variables query nil variables)
+        (when (defined? timeout)
+          (setq options (bquote (&& options :timeout & timeout))))
+	(if (empty? variables)
+	  (html-execute-ask-query query options module stream)
+	  (html-execute-retrieve-query 
+	   nValues (the-cons-list variables)
+           query options module stream))
+        (html-line-break stream)
+	(with-html-tag ("HR SIZE=2" stream TRUE))
+        (write-powerloom-trailer stream))
+      (html-unknown-module-response :QUERY "" moduleName stream)) ))
+
+(defun html-execute-ask-query ((query CONS)
+                               (options CONS)
+                               (mod MODULE)
+                               (stream NATIVE-OUTPUT-STREAM))
+  ;; TO DO: Print the query
+  (let ((answer (pli/ask (cons query options) mod NULL)))
+    (cond ((true-truth-value? answer)
+	   (with-html-tag ("FONT COLOR='#33FF66'" stream true)
+	     (print-stream stream "TRUE")))
+	  ((false-truth-value? answer)
+	   (with-html-tag ("FONT COLOR='#FF6633'" stream true)
+	     (print-stream stream "FALSE")))
+	  (otherwise
+	   (with-html-tag ("FONT COLOR='#888888'" stream true)
+	     (print-stream stream "UNKNOWN"))))
+    (verbatim
+        :common-lisp (CL:force-output stream)
+        :otherwise NULL)))
+
+(defun html-execute-retrieve-query ((nValues INTEGER)
+                                    (variables CONS)
+                                    (query CONS)
+                                    (options CONS)
+                                    (mod Module)
+                                    (stream NATIVE-OUTPUT-STREAM))
+  ;; TO DO: Print the query
+  ;; NOTE: a simple ordered list format would look better with queries that only
+  ;; bind a single variable, but for multiple columns, the definition list format
+  ;; is better and more uniform.  With an ordered list format, we could attach the
+  ;; explanation button as a `?' superscript at the end of the bindings instead.
+  (special ((*printReadably?* TRUE))
+    (let ((queryIterator QUERY-ITERATOR NULL)
+          (solutions (CONS OF CONS) NIL))
+      (with-logic-environment mod NULL
+        (setq queryIterator
+          (call-retrieve
+           (bquote (& (choose (> nValues 0) nValues (quote all))
+                      & variables
+                      & query
+                      && options)))))
+      (setq solutions (pli/consify-current-solutions queryIterator))
+      (with-html-tag ("HTML" stream TRUE)
+        (with-html-tag ("HEAD" stream TRUE)
+          (with-html-tag ("BASE TARGET='content'" stream TRUE))
+          (with-html-tag ("TITLE" stream TRUE)
+            (print-stream stream "Answer Page")))
+        (with-html-tag ((make-html-body-tag *answer-background-color*) stream TRUE)
+          (when (timeout? queryIterator)
+            (print-stream stream "The query timed out.<BR>" EOL))
+          (if (empty? solutions)
+              (with-html-tag ("FONT COLOR='#CC3366'" stream true)
+                (with-html-tag ("I" stream)
+                  (print-stream stream "No Solutions")))
+            (foreach soln in solutions
+                as answerCounter in (interval 1 NULL)
+                do (with-html-tag ("DL" stream true)
+                     (with-html-tag ("DT" stream true)
+                       (with-html-tag ("FONT COLOR='#999999'" stream)
+                         (print-stream stream "Solution " answerCounter ":" EOL)
+                         (write-explanation-icon queryIterator soln stream)))
+                     (foreach binding in soln
+                         as var in variables
+                         do (with-html-tag ("DD" stream true)
+                              (print-stream stream var " = ")
+                              (typecase binding
+                                (LOGIC-OBJECT 
+                                 (html-write-href
+                                  stream "show" "concept" binding))
+                                (otherwise 
+                                 (print-stream stream binding)))))))))))))
+
+(defun write-explanation-icon ((query QUERY-ITERATOR)
+                               (bindings CONS)
+                               (stream NATIVE-OUTPUT-STREAM))
+  ;; Generate an explanation icon for the current solution `bindings'
+  ;;    of `query' (assumes we always get a list even for a single variable).
+  ;; The most difficult thing about this is instantiation the variable
+  ;;    so we get a fully-ground ASK-able query.  There's gotta be a better
+  (let ((module (base-module (query-context query)))
+        (description (description (pattern-record (base-control-frame query))))
+        (existsVars (internal-variables description))
+        (proposition OBJECT NULL)
+        (mapping (new ENTITY-MAPPING)))
+    (foreach binding in bindings
+        as var in (io-variables description)
+        do (insert-at mapping var binding))
+    (foreach var in existsVars
+        do (insert-at mapping var var))
+    (setq proposition
+      (generate-proposition (copy-proposition (proposition description) mapping)))
+    (when (non-empty? existsVars)
+      (setq proposition
+        (bquote (pl-kernel/exists & (generate-variables existsVars FALSE)
+                   & proposition))))
+    (html-write-href-in-detail
+     stream
+     NULL
+     "explain"
+     "query"
+     (name module)
+     (stringify proposition)
+     "<IMG SRC='/ploom/icons/button-question.gif' ALT='Explain result' BORDER='0' WIDTH='14' HEIGHT='15' /></A>"
+     TRUE)))
+
+(defun html-write-explanation-response-page ((moduleName STRING)
+                                             (query STRING)
+                                             (stream NATIVE-OUTPUT-STREAM))
+  ;; This might need to be robustified, but for now we assume there won't
+  ;; be any problems with the explanation, since it is relative to a query
+  ;; that just succeeded.  Of course, if the state changes inbetween, we'd
+  ;; be hosed.
+  (let ((module (get-stella-module moduleName FALSE)))
+    (when (null? module)
+      (html-unknown-module-response :relation query moduleName stream)
+      (return))
+    (with-logic-environment module NULL
+      (special ((*record-justifications?* TRUE))
+        ;;; there is some strange bug where `concatenat' produces complete
+        ;;; garbage but only when called from withing CL-HTTP, so we work
+        ;;; around that for now:
+        (let ((queryIterator
+               (create-ask-query (cons (unstringify query) NIL)))
+              (explanation (new STRING-OUTPUT-STREAM))
+              (justification JUSTIFICATION NULL))
+          (call-ask queryIterator)
+          (setq justification
+            (justification (base-control-frame queryIterator)))
+          (special ((*explanation-format* :html)
+                    (*explanation-audience* :LAY)
+                    (*logic-dialect* :KIF-ONTOSAURUS))
+            (print-explanation justification
+                               explanation
+                               NULL
+                               4
+                               *explanation-audience*))
+          (with-html-tag ((make-html-body-tag "FFFFFF") ;; white for now
+                          stream TRUE)
+            (print-stream stream (the-string explanation) EOL)))))))
+
+
+(defun ploom-query-handler ((xchg HTTP/HTTP-EXCHANGE))
+  ;; HTTP server handler for the query form.
+  (let ((stream (http/get-reply-stream xchg))
+        (method (http/get-request-method xchg)))
+    (case method
+      (:GET
+       (html-write-query-form-page stream))
+      (:POST
+       (exception-case
+           (let ((body (http/get-request-body xchg))
+                 (values (http/parse-and-decode-form-values body)))
+             (html-execute-query values stream))
+         (LOGIC-EXCEPTION (e)
+           (http/generate-error-response xchg :BAD-REQUEST (exception-message e)))
+         (NATIVE-EXCEPTION (e)
+           (http/generate-error-response xchg :INTERNAL-ERROR (exception-message e)))))
+      (otherwise
+       (http/generate-error-response
+        xchg :BAD-REQUEST (message-to-string "Unhandled request method: " method))))))
+
+(startup-time-progn
+  (http/publish-handler
+   "/ploom/ontosaurus/do-query"
+   (the-code :function ploom-query-handler)
+   :content-type (http/get-http-mime-type :HTML NULL)
+   :documentation "Ontosaurus form to send PowerLoom queries."))

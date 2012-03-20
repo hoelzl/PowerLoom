@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: logic-in.ste,v 1.138 2009/06/02 19:24:20 tar Exp
+;;; Version: logic-in.ste,v 1.144 2010/10/16 19:26:24 hans Exp
 
 ;;; Evaluating and loading logic commands
 
@@ -225,58 +225,8 @@ See `set-feature' for a description of supported features."
 ;;;;;; Defining PowerLoom commands
   ;;
 
-;;; Various support for the (soon to be written) DEFPLCOM macro/operator.
-
-(defun (coerce-option-value OBJECT) ((value OBJECT) (type TYPE))
-  ;; Coerce `value' to `type' and return the result.
-  ;; Return NULL if coercion is not possible.
-  (case type
-    (@INTEGER
-     (typecase value
-       (INTEGER (return value))
-       (FLOAT (return (floor value)))
-       (otherwise NULL)))
-    (@FLOAT
-     (typecase value
-       ((INTEGER FLOAT)
-        (return (* value 1.0)))
-       (otherwise NULL)))
-    (@NUMBER
-     (typecase value
-       ((INTEGER FLOAT)
-        (return value))
-       (otherwise NULL)))
-    (@KEYWORD
-     (typecase value
-       ((GENERALIZED-SYMBOL STRING-WRAPPER)
-        (return (keywordify value)))
-       (otherwise NULL)))
-    (@SYMBOL
-     (typecase value
-       (KEYWORD
-        (return (intern-symbol (symbol-name value))))
-       (SURROGATE
-        (return (intern-derived-symbol value (symbol-name value))))
-       (SYMBOL
-        (return value))
-       (STRING-WRAPPER
-        (return (intern-symbol value)))
-       (otherwise NULL)))
-    (@BOOLEAN
-     (return (coerce-to-boolean value)))
-    (@MODULE
-     (return (coerce-to-module value FALSE)))
-    ((@DESCRIPTION @NAMED-DESCRIPTION)
-     (return (coerce-to-description value NULL)))
-    (otherwise
-     (cond ((null? type)
-            (return value))
-           ((isa? value type)
-            (return value))
-           ((isa? value (type-to-wrapped-type type))
-            (return value)))))
-  ;; error, not coercible:
-  (return NULL))
+;;; Support for the (soon to be written) DEFPLCOM macro/operator
+;;; (most of this was moved into stella/systems.ste):
 
 (defun (parse-logic-command-options PROPERTY-LIST) ((options OBJECT)
                                                     (legalOptions&Types CONS)
@@ -291,35 +241,7 @@ See `set-feature' for a description of supported features."
   ;; If `allowOtherKeys?' is TRUE options other than those specified in
   ;;    `legalOptions&Types' are allowed but won't be coerced since we
   ;;    don't know their type.
-  ;; TO DO:
-  ;; - handle default values
-  ;; - handle parametric types such as (CONS OF KEYWORD)
-  (let ((legalOptions (new PROPERTY-LIST :the-plist legalOptions&Types))
-        (parsedOptions PROPERTY-LIST NULL)
-        (type SURROGATE NULL)
-        (corecedValue OBJECT NULL))
-    (typecase options
-      (CONS
-       (when (odd? (length options))
-         (signal-parsing-error "Odd-length command options list: " options))
-       (setq parsedOptions (new PROPERTY-LIST :the-plist options)))
-      (PROPERTY-LIST (setq parsedOptions options))
-      (otherwise
-       (signal-parsing-error "Illegal command options specification: " options)))
-    (when (defined? legalOptions)
-      (foreach (key value) in parsedOptions
-          do (setq type (lookup legalOptions key))
-             (when (and (null? type)
-                        (not allowOtherKeys?))
-               (signal-parsing-error "Illegal option: " key))
-             (unless (or (eql? type @IDENTITY)
-                         (null? value))
-               (setq corecedValue (coerce-option-value value type))
-               (when (and coercionError?
-                          (null? corecedValue))
-                 (signal-parsing-error "Can't corerce " value " to type " type))
-               (insert-at parsedOptions key corecedValue))))
-    (return parsedOptions)))
+  (return (parse-options options legalOptions&Types coercionError? allowOtherKeys?)))
 
 
   ;;
@@ -510,94 +432,6 @@ for C++ where exiting the listener will also exit the program."
 ;;;        might need two-pass loading for a while and we also need to bind
 ;;;        special variables such as `*logic-dialect*', etc.
 
-;;; The load-path machinery should probably be promoted into STELLA:
-(defglobal *file-load-path* (CONS OF STRING-WRAPPER) NIL)
-
-(defun (parse-directory-path (CONS OF STRING-WRAPPER)) ((path STRING))
-  ;; Parse a |-separated directory `path' into a list of directories.
-  (let ((separator #\|)
-        (length (length path))
-        (start 0)
-        (end 0)
-        (parsedPath NIL))
-    (loop
-      (setq end (position path separator start))
-      (pushq parsedPath (file-name-as-directory (subsequence path start end)))
-      (if (and (defined? end)
-               (< end (1- length)))
-          (setq start (1+ end))
-        (break)))
-    (return (reverse parsedPath))))
-
-(defun (set-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
-  :documentation "Set the PowerLoom load path to the |-separated
-directories listed in `path'.  Return the resulting load path."
-  :public? TRUE :command? TRUE
-  (setq *file-load-path* (parse-directory-path path))
-  (return *file-load-path*))
-
-(defun (get-load-path (CONS OF STRING-WRAPPER)) ()
-  :documentation "Return the current PowerLoom load path."
-  :public? TRUE :command? TRUE
-  (return *file-load-path*))
-
-(defun (push-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
-  :documentation "Add the directories listed in the |-separated
-`path' to the front of the PowerLoom load path.  Return the
-resulting load path."
-  :public? TRUE :command? TRUE
-  (setq *file-load-path*
-    (concatenate (parse-directory-path path) *file-load-path*))
-  (return *file-load-path*))
-
-(defun (pop-load-path STRING) ()
-  :documentation "Remove the first element from the PowerLoom load path
-and return the removed element."
-  :public? TRUE :command? TRUE
-  (return (popq *file-load-path*)))
-
-(defun (add-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
-  :documentation "Append the directories listed in the |-separated
-`path' to the end of the PowerLoom load path.  Return the
-resulting load path."
-  :public? TRUE :command? TRUE
-  (setq *file-load-path*
-    (concatenate *file-load-path* (parse-directory-path path)))
-  (return *file-load-path*))
-
-(defun (drop-load-path (CONS OF STRING-WRAPPER)) ((path STRING))
-  :documentation "Remove the directories listed in the |-separated
-`path' from the PowerLoom load path."
-  :public? TRUE :command? TRUE
-  (foreach dir in (parse-directory-path path)
-      do (setq *file-load-path* (remove *file-load-path* dir)))
-  (return *file-load-path*))
-
-(defun (find-file-in-load-path STRING) ((file STRING)
-                                        (extensions (CONS OF STRING-WRAPPER)))
-  :documentation "Try to find `file' in the current load path and, if found,
-return its full name.  If `file' doesn't have its own extension try to find
-it with any of the listed `extensions'.  If `extensions' is NULL it defaults
-to `*powerloom-kb-file-extensions*', therefore, to not default to any extensions
-the value has to be supplied as NIL."
-  :public? TRUE
-  (let ((type (file-extension file))
-        (expandedFile file))
-    (when (null? extensions)
-      (setq extensions *powerloom-kb-file-extensions*))
-    (foreach dir in (cons "" *file-load-path*)
-        do (setq expandedFile
-             (concatenate (unwrap-string dir) file))
-           (when (probe-file? expandedFile)
-             (return expandedFile))
-           (when (null? type)
-             (foreach ext in extensions
-                 do (setq expandedFile
-                      (concatenate (unwrap-string dir) file ext))
-                    (when (probe-file? expandedFile)
-                      (return expandedFile)))))
-    (return NULL)))
-
 (defglobal *powerloom-kb-file-extensions* CONS (quote (".plm" ".ploom"))
   :documentation "If the extension of a KB file is unspecified in a
 `load' or `demo' command, try to find it with one of these extensions."
@@ -729,6 +563,51 @@ not have an `in-module' form, an error is signaled."
             do (evaluate-logic-command tree TRUE)))
       (unless (ignore-translation-errors?)
         (summarize-translation-errors)) )))
+
+(defun load-directory ((directory STRING))
+  :documentation "Load all PowerLoom files (*.plm) in `directory' in alphabetic sort order."
+  :public? TRUE :command? TRUE
+  (pl-log :low "Loading PowerLoom files from directory " directory "...")
+  (bump-log-indent)
+  (setq directory (file-name-as-directory directory))
+  (foreach file in (list-directory-files directory)
+      where (exists ext in *powerloom-kb-file-extensions*
+              where (ends-with? file ext NULL))
+      do (pl-log :medium "Loading file " file)
+         (load (concatenate directory file)))
+  (unbump-log-indent)
+  (process-definitions))
+
+(defun load-cmd-line-files ()
+  :documentation "Loads all PowerLoom files specified on the command line.
+If directories are listed, all PowerLoom files in those directories are loaded.
+Since when this is called we might still have unprocessed command line args,
+this only looks at files which are to the right of the last argument that
+starts with a `-' character."
+  :public? TRUE :command? TRUE
+  (let ((unprocessedArgs (unprocessed-command-line-arguments))
+        (file STRING NULL))
+    (when (defined? unprocessedArgs)
+      (setq unprocessedArgs (reverse (copy-cons-list (unprocessed-command-line-arguments))))
+      (foreach arg in unprocessedArgs
+          as i in (interval 0 NULL)
+          where (starts-with? arg "-" NULL)
+          do (if (= i 0)
+                 (setq unprocessedArgs NIL)
+               (setf (nth-rest unprocessedArgs i) NIL))
+             (break))
+      (pl-log :low "Loading command line PowerLoom files...")
+      (bump-log-indent)
+      (foreach arg in (reverse unprocessedArgs)
+          do (cond ((exists ext in *powerloom-kb-file-extensions*
+                        where (ends-with? arg ext NULL))
+                    (setq file (first-defined (find-file-in-load-path arg NULL) arg))
+                    (pl-log :medium "Loading file " file)
+                    (load file))
+                   ((probe-file? (file-name-as-directory arg))
+                    (load-directory arg))))
+      (unbump-log-indent))))
+
 
   ;;
 ;;;;;; Demo
@@ -936,7 +815,7 @@ Each entry is a `(<file> <description>)' pair.")
   (let ((demoBaseFile STRING (first demoEntry)))
     (return
       (first-defined
-       (find-file-in-load-path demoBaseFile NULL)
+       (find-file-in-load-path demoBaseFile *powerloom-kb-file-extensions*)
        demoBaseFile))))
 
 (defun (demo-entry-description STRING) ((demoEntry (CONS OF STRING-WRAPPER)))
@@ -998,7 +877,7 @@ Each entry is a `(<file> <description>)' pair.")
       (demo-file file TRUE))))
 
 (defun demo (&rest (fileAndPause OBJECT))
-  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :command? TRUE :public? TRUE :evaluate-arguments? TRUE
   :documentation
   "Read logic commands from a file, echo them verbatimly to standard output,
 and evaluate them just as if they had been typed in interactively.
@@ -1010,7 +889,7 @@ as the optional second argument, or by typing `c' at the pause prompt.
 Typing `?' at the pause prompt prints a list of available commands."
   (let ((theFileAndPause (coerce-&rest-to-cons fileAndPause))
         (fileSpec (first theFileAndPause))
-        (pause? (not (eql? (second theFileAndPause) (quote FALSE))))
+        (pause? (not (eql? (second theFileAndPause) FALSE-WRAPPER)))
         (file STRING NULL))
     (when (integer? fileSpec)
       (setq file (select-example-demo (cast fileSpec INTEGER-WRAPPER)))
@@ -1125,6 +1004,133 @@ needed for its execution, and then return its result."
     ;;   the CPU time, which just seems odd.
     (print (round (/ (millis elapsedTime) 1000.0)) " secs" EOL)
     (return result)))
+
+
+  ;;
+;;;;;; Ontosaurus, PowerLoom server and GUI startup
+  ;;
+
+(defun (get-http-server-system STRING) ()
+  ;; Return the STELLA system which implements the HTTP server support.
+  (return "webtools"))
+
+(defun start-ontosaurus (&rest (options OBJECT))
+  :documentation "Start the PowerLoom HTTP server at :port (defaults to 9090).  Loads
+the required support systems in Lisp and Java if necessary (C++ is not yet supported)."
+  :command? TRUE :public? TRUE
+  (let ((theOptions
+         (parse-logic-command-options
+          (coerce-&rest-to-cons options)
+          (bquote (:port @INTEGER))
+          TRUE FALSE))
+        (port INTEGER (lookup-with-default theOptions :port 0))
+        (address STRING NULL))
+    (autoload "ONTOSAURUS/CONTROL-PANEL-HANDLER" "ontosaurus" NULL TRUE)
+    (setq address
+      (funcall (autoload "HTTP/START-HTTP-SERVER" (get-http-server-system) NULL TRUE) port))
+    (pl-log :low "Started Ontosaurus, point your browser to `" address "ploom/ontosaurus/'")))
+
+(defun stop-ontosaurus ()
+  :documentation "Stop the PowerLoom HTTP server and free up any bound ports.
+This is a no-op if no server is running or the server is not supported."
+  :command? TRUE :public? TRUE
+  (funcall (autoload "HTTP/STOP-HTTP-SERVER" (get-http-server-system) NULL TRUE)))
+
+(defun start-powerloom-server (&rest (options OBJECT))
+  :documentation "Start the PowerLoom HTTP server at :port (defaults to 9090).  Loads
+the required support systems in Lisp and Java if necessary (C++ is not yet supported)."
+  :command? TRUE :public? TRUE
+  (let ((theOptions
+         (parse-logic-command-options
+          (coerce-&rest-to-cons options)
+          (bquote (:port @INTEGER))
+          TRUE FALSE))
+        (port INTEGER (lookup-with-default theOptions :port 0))
+        (address STRING NULL))
+    (autoload "GUI-SERVER/GUI-REQUEST-HANDLER" "powerloom-server" NULL TRUE)
+    (setq address
+      (funcall (autoload "HTTP/START-HTTP-SERVER" (get-http-server-system) NULL TRUE) port))
+    (pl-log :low "Started PowerLoom server at `" address "ploom/soap-rpc/...'")))
+
+(defun stop-powerloom-server ()
+  :documentation "Stop the PowerLoom HTTP server and free up any bound ports.
+This is a no-op if no server is running or the server is not supported."
+  :command? TRUE :public? TRUE
+  (funcall (autoload "HTTP/STOP-HTTP-SERVER" (get-http-server-system) NULL TRUE)))
+
+(defun start-powerloom-gui (&rest (options OBJECT))
+  :documentation "Start the PowerLoom server at :port (defaults to 9090) and launches
+the GUI which will communicate with the server at that port.  If :host is specified,
+the GUI will try to communicate with a server at `host:port' instead of the local
+embedded server (note, you can always point the GUI manually to a different server
+from its `Connect to Server' menu item).  Loads the required support systems if necessary.
+Embedded calls to the GUI are currently only supported in Java; however, when the GUI is
+run in standalone mode, it can communicate with any PowerLoom installation that supports
+an HTTP server (currently Lisp and Java)."
+  :command? TRUE :public? TRUE
+  (let ((theOptions
+         (parse-logic-command-options
+          (coerce-&rest-to-cons options)
+          (bquote (:host @STRING
+                   :port @INTEGER
+                   :debug-level @INTEGER))
+          TRUE FALSE))
+        (host STRING (lookup-with-default theOptions :host "localhost"))
+        (port INTEGER (lookup-with-default theOptions :port 9090))
+        (debugLevel INTEGER (lookup-with-default theOptions :debug-level 1))
+        (guiclass "edu.isi.powerloom.gui.components.PowerloomApp")
+        (guifn FUNCTION-CODE NULL)
+        (guifnargs (new (ARRAY (6) OF STRING))))
+    (if-output-language
+     :java
+     (exception-case
+         (progn
+           (verbatim :java
+             "guifn = Native.find_java_method(guiclass, \"main\", new java.lang.Class[]{java.lang.Class.forName(\"[Ljava.lang.String;\")})")
+           (start-powerloom-server :port port)
+           (add-hook *stella-exit-hooks* (quote powerloom-gui-exit-hook))
+           (setf (aref guifnargs 0) "--debug")
+           (setf (aref guifnargs 1) (integer-to-string debugLevel))
+           (setf (aref guifnargs 2) "--host")
+           (setf (aref guifnargs 3) host)
+           (setf (aref guifnargs 4) "--port")
+           (setf (aref guifnargs 5) (integer-to-string port))
+           (funcall guifn guifnargs))
+       (NATIVE-EXCEPTION (e)
+         (signal-exception
+          (new LOGIC-EXCEPTION
+               :message (concatenate "PowerLoom GUI error: " (exception-message e))))))
+     ;; otherwise
+     (progn
+       (ignore host port debugLevel guiclass guifn guifnargs)
+       (signal-exception
+        (new LOGIC-EXCEPTION :message "PowerLoom GUI only available in Java version of PowerLoom"))))))
+
+(defun stop-powerloom-gui ()
+  :documentation "Closes the PowerLoom GUI application if it is currently visible.
+This is a no-op if the GUI is not running or if it is not supported."
+  :command? TRUE :public? TRUE
+  (let ((guiclass "edu.isi.powerloom.gui.components.PowerloomApp")
+        (exitfn FUNCTION-CODE NULL))
+    (if-output-language :java
+       (exception-case
+           (verbatim :java
+             "exitfn = Native.find_java_method(guiclass, \"exit\", new java.lang.Class[]{})")
+         (NATIVE-EXCEPTION (e)
+           (signal-exception
+            (new LOGIC-EXCEPTION
+                 :message (concatenate "PowerLoom GUI error: " (exception-message e))))))
+       (ignore guiclass))
+    (when (defined? exitfn)
+      (funcall exitfn))))
+
+(defun powerloom-gui-exit-hook ((ignore OBJECT))
+  :documentation "Exit hook to stop the PowerLoom GUI if it is running."
+  :public? TRUE
+  (ignore ignore)
+  (exception-case
+      (stop-powerloom-gui)
+    (NATIVE-EXCEPTION ())))
 
 
   ;;
@@ -1828,8 +1834,11 @@ UNKNOWN
            (setq axioms (cons relationName (cons selfName NIL))))
           ((and (symbol? value)
                 (string-equal? (symbol-name (cast value SYMBOL)) "FALSE"))
-           (setq axioms (bquote (not (& relationName & selfName)))))
-          ((cons? value)
+           (setq axioms (bquote (NOT (& relationName & selfName)))))
+          ((and (cons? value)
+                ;; special-case SETOFALL and KAPPA terms:
+                (not (memb? (quote (SETOFALL KAPPA))
+                            (first (cast value CONS)))))
            (foreach val in (cast value CONS)
                collect (cons relationName (cons selfName (cons val NIL)))
                into axioms))
@@ -2495,11 +2504,19 @@ Expects the same arguments as `defobject' but supplied as a list."
         (term OBJECT NULL))
     (special ((*termSourceBeingParsed* (stringify definition)))
       (setq arguments (normalize-defobject-arguments arguments))
-      (setq name (first arguments))
       (setq options (rest arguments))
-      ;; make sure we are allowed to define an object with this name:
-      (intern-logic-object-surrogate name)
-      (setq term (create-logic-instance NULL NULL))
+      (cond ((cons? (first arguments))
+             ;; we have a function term, for now create a symbol naming
+             ;; it so that the re/definition machinery will work:
+             (setq name (intern-symbol (stringify (first arguments))))
+             (setq term (conceive-term (first arguments)))
+             (when (null? term)
+               (signal-proposition-error "Illegal object name or term: " name)))
+            (otherwise
+             (setq name (first arguments))
+             ;; make sure we are allowed to define an object with this name:
+             (intern-logic-object-surrogate name)
+             (setq term (create-logic-instance NULL NULL))))
       (typecase term
         (LOGIC-OBJECT
          (setf (stringified-source term) *termSourceBeingParsed*)
@@ -2520,9 +2537,9 @@ Expects the same arguments as `defobject' but supplied as a list."
   ;; This primarily performs some error checking.
   (let ((name (first arguments))
         (options (rest arguments)))
-    (unless (symbol? name)
+    (unless (or (symbol? name) (cons? name))
       (signal-proposition-error
-       "Illegal object name where symbol expected: " name))
+       "Illegal object name where symbol or function term expected: " name))
     ;; no more error checking right now:
     (ignore options)
     (return arguments)))
@@ -2698,11 +2715,13 @@ Expects the same arguments as `defproposition' but supplied as a list."
   ;;    option handler does so), instead only axiom definitions are collected.
   ;; WOULD BE BETTER IF `VET-OPTIONS' WOULD SIGNAL A PROPOSITION ERROR;
   ;;    THEN WE WOULD KNOW IN WHICH DEFINITION THE OPTION ERROR OCCURRED):
-  ;; Reset options so we won't inherit old values if we redefined `self'
-  ;;    with different options (guarded, since these slots are dynamic):
-  (when (forward-only? self) (setf (forward-only? self) NULL))
-  (when (backward-only? self) (setf (backward-only? self) NULL))
-  (when (dont-optimize? self) (setf (dont-optimize? self) NULL))
+  ;; Don't reset options anymore, since it wipes out annotations that
+  ;;    directly came from the proposition (such as =>>, etc.).  The drawback
+  ;;    is that if we previously had an annotation that we now want to get
+  ;;    rid of, it has to be explicitly set to false in the redefinition.
+  ;(when (forward-only? self) (setf (forward-only? self) NULL))
+  ;(when (backward-only? self) (setf (backward-only? self) NULL))
+  ;(when (dont-optimize? self) (setf (dont-optimize? self) NULL))
   (setf (axioms self) NULL)
   (foreach (key value) in (vet-options options NULL)
       do (when (not (run-option-handler? self key value))

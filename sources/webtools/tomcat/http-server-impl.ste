@@ -1,0 +1,263 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2009-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: http-server-impl.ste,v 1.2 2010/02/12 23:54:28 hans Exp
+
+;;; HTTP interface utilities for Tomcat or similar servlet-supporting HTTP servers
+
+(in-package "STELLA")
+
+(in-module "HTTP/TOMCAT")
+
+
+;;; NOTES, TO DO:
+;;; - maybe rename to something more generic, since it is not really Tomcat-specific
+;;; - BTW, linking ploom to the powerloom root directory didn't work (try again?)
+;;; - init might be called multiple times when it breaks, guard against that.
+;;; - synchronization, locking, handler error trapping
+;;; - describe file-serving URLs in web.xml, so we don't have to serve them from
+;;;   here which doesn't support caching, etc.
+;;; - implement/test absolute and relative load path extension in the servlet
+;;; - fix/complete KB and system startup (e.g., web services, not-classified, ....)
+;;; - implement getServletInfo() method.
+;;; - maybe test for a null or identical port in `start-http-server-impl' and suppress
+;;;   the error message in this case; we still need to call it to get handlers
+;;;   registered via ``publish-registered-http-handlers' (currently called explicitly
+;;;   in the init method of the servlet).
+;;; - document the issue that the prefixes of handler paths have to match the webapp
+;;;   directory where the servlet is installed.
+
+
+  ;;
+;;;;;; Server operations
+  ;;
+
+;;; Since this is not an embedded server implementation, the start and
+;;; stop methods are simply no-ops, but they should do the proper dispatch
+;;; setup.
+
+(defclass HTTP-SERVER-TOMCAT (HTTP-SERVER)
+  :public? TRUE)
+
+(startup-time-progn
+  (if (and (defined? *http-server-implementation*)
+           (not (isa? *http-server-implementation* @HTTP-SERVER-TOMCAT)))
+      (error "Conflicting HTTP server implementation already loaded")
+    (setq *http-server-implementation* (new HTTP-SERVER-TOMCAT))))
+
+
+(defmethod (start-http-server-impl STRING) ((server HTTP-SERVER-TOMCAT) (port INTEGER))
+  ;; This is a no-op.
+  (print "start-http-server: you cannot start/stop or change the port on which Tomcat listens")
+  (return "http://localhost:8080/")) ;; fix, since this isn't universally true!!!
+
+(defmethod stop-http-server-impl ((server HTTP-SERVER-TOMCAT))
+  ;; This is a no-op.
+  NULL)
+
+
+  ;;
+;;;;;; Server exchange API
+  ;;
+
+(defclass NATIVE-HTTP-SERVLET-REQUEST ()
+  :java-native-type "javax.servlet.http.HttpServletRequest")
+
+(defclass NATIVE-HTTP-SERVLET-RESPONSE ()
+  :java-native-type "javax.servlet.http.HttpServletResponse")
+
+(defclass HTTP-EXCHANGE-TOMCAT (HTTP-EXCHANGE)
+  :slots ((native-request :type NATIVE-HTTP-SERVLET-REQUEST)
+          (native-response :type NATIVE-HTTP-SERVLET-RESPONSE)
+          (response-code :type INTEGER :initially (get-http-response-code :OK NULL))
+          (reply-stream :type NATIVE-OUTPUT-STREAM)
+          (handler-options :type PROPERTY-LIST)))
+
+
+;;; Header accessors:
+
+(defmethod (get-header-value-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE) (key KEYWORD))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT)))
+        (jkey (symbol-name key))) ;; keys are case-insensitive
+    (return (verbatim :java "jreq.getHeader(jkey)"))))
+
+(defmethod (get-reply-header-value-impl STRING) ((server HTTP-SERVER-TOMCAT)
+                                                 (xchg HTTP-EXCHANGE)
+                                                 (key KEYWORD))
+  (error "get-reply-header-value: not available for a Tomcat server"))
+
+(defmethod set-reply-header-value-impl ((server HTTP-SERVER-TOMCAT)
+                                        (xchg HTTP-EXCHANGE)
+                                        (key KEYWORD)
+                                        (value STRING))
+  (let ((jresp (native-response (cast xchg HTTP-EXCHANGE-TOMCAT)))
+        (jkey (symbol-name key))) ;; keys are case-insensitive
+    (verbatim :java "jresp.setHeader(jkey, value)")))
+
+
+;;; Request accessors:
+
+(defmethod (get-request-uri-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT)))
+        (uri STRING (verbatim :java "jreq.getRequestURI()"))
+        (query STRING (verbatim :java "jreq.getQueryString()")))
+    (return (choose (defined? query)
+                    (concatenate uri "?" query)
+                    uri))))
+
+(defmethod (get-request-uri-query-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT))))
+    (return (verbatim :java "jreq.getQueryString()"))))
+
+(defmethod (get-request-uri-path-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT))))
+    (return (verbatim :java "jreq.getRequestURI()"))))
+
+(defmethod (get-request-method-impl KEYWORD) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT))))
+    (return (intern-keyword (verbatim :java "jreq.getMethod()")))))
+
+(defmethod (get-request-protocol-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (error "get-request-protocol: not available for a Tomcat server"))
+
+(defmethod (get-request-body-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT)))
+        (bodyStream (new INPUT-STREAM :buffering-scheme :BLOCK))
+        (body NATIVE-INPUT-STREAM NULL))
+    (verbatim :java
+      "try {
+         body = new java.io.PushbackInputStream(jreq.getInputStream());
+       }
+       catch (java.io.IOException e) {
+         Native.rethrowAsStellaException(e, InputOutputException.class, \"getRequestBodyImpl: \", true);
+       }")
+    (setf (native-stream bodyStream) body)
+    (return (stream-to-string bodyStream))))
+
+(defmethod (get-request-local-address-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT)))
+        (host STRING (verbatim :java "jreq.getLocalName()"))
+        (port INTEGER (verbatim :java "jreq.getLocalPort()")))
+    (return (concatenate host ":" (integer-to-string port)))))
+
+(defmethod (get-request-remote-address-impl STRING) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jreq (native-request (cast xchg HTTP-EXCHANGE-TOMCAT)))
+        (host STRING (verbatim :java "jreq.getRemoteHost()"))
+        (port INTEGER (verbatim :java "jreq.getRemotePort()")))
+    (return (concatenate host ":" (integer-to-string port)))))
+
+
+;;; Reply accessors:
+
+(defmethod (get-reply-stream-impl NATIVE-OUTPUT-STREAM) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  ;; Similar to Lisp, we have to buffer any output, since we have to wait for the handler method to
+  ;; finish and generate all its output before we can send out the reply headers which might have
+  ;; been affected by the handler.
+  (let ((jxchg HTTP-EXCHANGE-TOMCAT xchg)
+        (jstream (reply-stream jxchg)))
+    (when (null? jstream)
+      (setq jstream (verbatim :java "new #$(STELLAROOT).javalib.PrintStringStream()"))
+      (setf (reply-stream jxchg) jstream))
+    (return jstream)))
+
+(defmethod set-response-code-impl ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE) (code KEYWORD))
+  (let ((jxchg HTTP-EXCHANGE-TOMCAT xchg))
+    (setf (response-code jxchg) (get-http-response-code code NULL))))
+
+
+  ;;
+;;;;;; Publishing URLs and response handlers
+  ;;
+
+(defmethod publish-file-impl ((server HTTP-SERVER-TOMCAT)
+                              (path STRING)
+                              (file STRING)
+                              (options PROPERTY-LIST))
+  NULL) ;; nothing to be done, handled by `servlet-handle-request'
+
+(defmethod publish-directory-impl ((server HTTP-SERVER-TOMCAT)
+                                   (path STRING)
+                                   (directory STRING)
+                                   (options PROPERTY-LIST))
+  NULL) ;; nothing to be done, handled by `servlet-handle-request'
+
+(defmethod publish-handler-impl ((server HTTP-SERVER-TOMCAT)
+                                 (path STRING)
+                                 (handler FUNCTION-CODE)
+                                 (options PROPERTY-LIST))
+  NULL) ;; nothing to be done, handled by `servlet-handle-request'
+
+(defmethod (get-handler-options-impl PROPERTY-LIST) ((server HTTP-SERVER-TOMCAT) (xchg HTTP-EXCHANGE))
+  (let ((jxchg HTTP-EXCHANGE-TOMCAT xchg))
+    (return (handler-options jxchg))))
+
+(defmethod (servlet-handle-request HTTP-EXCHANGE-TOMCAT) ((server HTTP-SERVER-TOMCAT)
+                                                          (request NATIVE-HTTP-SERVLET-REQUEST)
+                                                          (response NATIVE-HTTP-SERVLET-RESPONSE))
+  ;; Dispatches handlers dynamically based on the URI of `request'.
+  ;; This does everything up to calling the handler function.  The rest, that is
+  ;; sending out the defined headers and accumulated response has to be done by
+  ;; the servlet.  It could be done here, but it's an exception mess, as usual.
+  ;; TO DO: maybe we can make this a bit more efficient.
+  (let ((xchg (new HTTP-EXCHANGE-TOMCAT
+                   :native-request request
+                   :native-response response))
+        (path (string-trim (unescape-url-string (get-request-uri-path-impl server xchg))))
+        (handler (lookup-handler server path))
+        (code (response-code xchg)))
+    ;;(print "*** servlet-handle-request: path=" path EOL)
+    (when (null? handler)
+      (setq handler (dictionary @PROPERTY-LIST :path path :handler-type :ERROR)))
+    (setf (handler-options xchg) handler)
+    ;;(print "*** servlet-handle-request: handler=" handler EOL)
+    (let ((function (unwrap-function-code (lookup handler :handler))))
+      (when (null? function)
+        (case (lookup handler :handler-type)
+          (:FILE (setq function (the-code :function file-handler)))
+          (:DIRECTORY (setq function (the-code :function directory-handler)))
+          (otherwise (setq function (the-code :function unknown-url-handler)))))
+      ;; setup defaults:
+      (set-reply-header-value
+       xchg :content-type (lookup-with-default handler :content-type (get-http-mime-type :HTML NULL)))
+      ;; call the handler:
+      (funcall function xchg)
+      (return xchg))))

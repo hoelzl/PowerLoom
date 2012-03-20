@@ -1,0 +1,1175 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2000-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: html-describe-object.ste,v 1.30 2010/03/05 00:17:45 hans Exp
+
+(in-package "STELLA")
+
+(in-module "ONTOSAURUS")
+
+
+(defun (lookup-term STRING) ((term KEYWORD) (capitalized? BOOLEAN) (plural? BOOLEAN))
+  ;; Currently a stub, but this will allow customizing the terminology for
+  ;;  different users.  This uses constant strings to avoid the consing that
+  ;;  would be needed to produce capitalized versions on-the-fly.
+  (cond ((and plural? capitalized?)
+	 (case term
+	   (:CONCEPT  (return "Concepts"))
+	   (:RELATION (return "Relations"))
+	   (:CONTEXT  (return "Modules"))
+	   (:INSTANCE (return "Instances"))
+	   (:QUERY    (return "Queries"))
+	   (:OBJECT   (return "Objects"))
+	   (otherwise (return (concatenate (string-capitalize (symbol-name term))
+					   "s")))))
+	(capitalized?
+	 (case term
+	   (:CONCEPT  (return "Concept"))
+	   (:RELATION (return "Relation"))
+	   (:CONTEXT  (return "Module"))
+	   (:INSTANCE (return "Instance"))
+	   (:QUERY    (return "Query"))
+	   (:OBJECT   (return "Object"))
+	   (otherwise (return (string-capitalize (symbol-name term))))))
+	(plural?
+	 (case term
+	   (:CONCEPT  (return "concepts"))
+	   (:RELATION (return "relations"))
+	   (:CONTEXT  (return "modules"))
+	   (:INSTANCE (return "instances"))
+	   (:QUERY    (return "queries"))
+	   (:OBJECT   (return "objects"))
+	   (otherwise (return (concatenate (string-downcase (symbol-name term))
+					   "s")))))
+	(otherwise
+	 (case term
+	   (:CONCEPT  (return "concept"))
+	   (:RELATION (return "relation"))
+	   (:CONTEXT  (return "module"))
+	   (:INSTANCE (return "instance"))
+	   (:QUERY    (return "query"))
+	   (:OBJECT   (return "object"))
+	   (otherwise (return (string-downcase (symbol-name term))))))))
+
+
+(defun (safe-object-name-string STRING) ((instance LOGIC-OBJECT))
+  (let ((surrogate (surrogate-value-inverse instance)))
+    (if (defined? surrogate)
+	(return (symbol-name surrogate))
+      (return NULL))))
+
+(defun html-describe-location ((self LOGIC-OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  (with-html-tag ("PRE" stream true)
+    (print-stream stream (lookup-term :context TRUE FALSE) ": ")
+    (if (and (defined? self)
+	     (isa? (home-module self) @MODULE))
+	(html-write-href stream "show" "context" (home-module self))
+	(print-stream stream (cc)))
+    (print-stream stream EOL)
+    (when (and (defined? self)
+               (defined?  (object-name self))
+               (not (eq? (home-module (object-name self)) (home-module self))))
+      (print-stream stream "Namespace: ")
+      (html-write-href stream "show" "context" (home-module (object-name self)))
+      (print-stream stream EOL))
+    )
+  (return))
+
+
+(defun html-write-context-view-option 
+    ((stream NATIVE-OUTPUT-STREAM) (objectName STRING) (ctx MODULE))
+  (print-stream stream "<option VALUE=\"do-action?show+object+")
+  (write-html-escaping-url-special-characters stream (name ctx))
+  (print-stream stream "+")
+  (write-html-escaping-url-special-characters stream objectName)
+  (print-stream stream "\"")
+  (when (eq? ctx *MODULE*)
+    (print-stream stream " SELECTED"))
+  (print-stream stream ">")
+  (write-html-quoting-special-characters stream (name ctx))
+  (print-stream stream "</OPTION>" EOL)
+  (return))
+
+(defun html-describe-context-view ((self LOGIC-OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  (let ((homec (home-module self))
+	(objectName (pli/get-name self))
+	(contextList (all-subcontexts homec :preorder)))
+    (unless (empty? (child-modules homec))
+      (html-write-javascript stream  "
+function jumpLink (opt) {
+  var URLpath = self.location.href.substring(0 , self.location.href.lastIndexOf('/') + 1);
+  self.location.href=URLpath + opt.options[opt.selectedIndex].value;
+};
+")
+      (with-html-tag ("FORM Name='CFORM'" stream TRUE)
+	(print-stream stream "Seen from: ")
+	(with-html-tag ("SELECT NAME='context' onchange='jumpLink(this);'" stream)
+	  (print-stream stream EOL)
+	  (html-write-context-view-option stream objectName homec)
+	  (foreach c in contextList
+	      where (isa? c @MODULE)
+	      do (html-write-context-view-option stream objectName c))))) )
+  (return))
+
+
+(defglobal *image-url-relation* LOGIC-OBJECT
+	   (pli/s-get-relation "IMAGE-URL" "PL-USER" NULL))
+
+;; was LOGIC-OBJECT, but needs to also include THING.
+(defun html-display-images ((self STANDARD-OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  ;; Display any images associated with object 'self'
+  ; (when (preference-value :display-image)
+  (let ((first? TRUE)
+	; (images (retrieve all ?i (html-image ?object ?i)))
+	(images (pli/get-inferred-binary-proposition-values 
+		 *image-url-relation* self
+		 NULL NULL))
+	)
+    (unless (empty? images)
+      (print-stream stream EOL)
+      (with-html-tag ("P" stream)
+	(foreach i in images
+	    do (if first?
+		   (html-line-break stream)
+		 (print-stream stream " "))
+	       (html-emit-image stream (wrapper-value (cast i STRING-WRAPPER))
+				"" null null "BOTTOM" 0)))) )
+  (return))
+
+(defglobal *documentation-relation* LOGIC-OBJECT 
+	   (pli/s-get-relation "DOCUMENTATION" "PL-USER" NULL))
+
+;; was LOGIC-OBJECT, but needs to also include THING.
+(defun html-display-documentation ((self STANDARD-OBJECT)
+				   (stream NATIVE-OUTPUT-STREAM))
+  (let ((docStrings (pli/get-inferred-binary-proposition-values 
+		     *documentation-relation* self
+		     NULL NULL)))
+    (when (defined? docStrings)
+      (with-html-tag ("FONT COLOR='#007700'" stream true)  ; '#228800'
+	(with-html-tag ("DL" stream)
+	  (foreach doc in docStrings 
+			  ;; POSSIBLE BUG in DEFINED? code for wrappers?
+	      do (when (and (defined? doc) 
+			    (defined? (wrapper-value (cast doc STRING-WRAPPER))))
+		   (with-html-tag ("DT" stream)
+		     (html-display-string-in-paragraphs doc stream)))))))
+    (with-html-tag ("HR SIZE=2" stream true))))
+
+(defun html-display-synonyms ((self OBJECT)
+                              (stream NATIVE-OUTPUT-STREAM))
+  (let ((synonyms (get-synonyms self)))
+    (unless (empty? synonyms)
+      (with-html-tag ("P" stream true)
+        (with-html-tag ("B" stream false)
+          (print-stream stream "Synonyms: "))
+        (write-html-escaping-url-special-characters 
+         stream (object-string-name (first synonyms)))
+        (foreach syn in (rest synonyms)
+          do (print-stream stream ", ")
+             (write-html-escaping-url-special-characters 
+              stream (object-string-name syn)))))))
+
+(defun html-describe-equivalents ((title STRING)
+				  (head STRING)
+				  (relation NAMED-DESCRIPTION)
+				  (stream NATIVE-OUTPUT-STREAM)
+				  (rule? BOOLEAN))
+  (let ((equivalents (copy-cons-list (all-equivalent-relations relation true))))
+    (unless (empty? (rest equivalents))
+      (setq equivalents (sort (remove equivalents relation)
+			      (the-code :function object-name-less-than?)))
+
+      (html-write-header-with-table stream title head)
+      (html-write-href stream "show" "concept" (first equivalents))
+      (foreach c in (rest equivalents)
+	  do (print-stream stream ", ")
+	     (html-write-href stream "show" "concept" c))
+
+      (when rule?
+	(with-html-tag ("HR SIZE=2" stream true)))) 
+    (return)))
+
+(defun html-describe-one-sub-level ((object NAMED-DESCRIPTION)
+				    (depth INTEGER)
+				    (cutoff INTEGER)
+				    (stream NATIVE-OUTPUT-STREAM))
+  (let ((directSubs (consify (pli/get-direct-subrelations object NULL NULL))))
+    (when (empty? directSubs)
+      (return))
+    (setq directSubs (sort directSubs 
+			   (the-code :function object-name-less-than?)))
+    (with-html-tag ("DL STYLE=' margin-top: 0; margin-bottom:0'" stream true)
+      (foreach sub in directSubs
+	  do (with-html-tag ("DT STYLE='margin-top: 0'" stream true)
+	       (html-write-href stream "show" "concept" sub)
+	       (when (and (>= depth cutoff)
+			  (not (empty? (pli/get-direct-subrelations sub NULL NULL))))
+		 (print-stream stream "    +...")))
+	     (unless (>= depth cutoff)
+	       (with-html-tag ("DD" stream true)
+		 (html-describe-one-sub-level sub (+ depth 1) cutoff stream)))))
+    (return)))
+
+(defun html-describe-subs ((title STRING)
+			   (head STRING)
+			   (relation NAMED-DESCRIPTION)
+			   (stream NATIVE-OUTPUT-STREAM)
+			   (rule? BOOLEAN))
+  (let ((heuristicDepth	4		;(preference-value :child-depth)
+	 )
+	;(heuristicLength 30) 
+	(subLength (length (pli/get-direct-subrelations relation NULL NULL))))
+    (when (> subLength 30)
+      (-- heuristicDepth))
+    (html-write-header-with-table stream title head)
+    (if (= subLength 0)
+	(with-html-tag ("I" stream true)
+	  (print-stream stream "None"))
+      (html-describe-one-sub-level relation 0 heuristicDepth stream))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return)))
+
+(defun html-describe-one-super-level ((directSupers (CONS OF NAMED-DESCRIPTION))
+				      (alreadyOutput HASH-TABLE)
+				      (stream NATIVE-OUTPUT-STREAM))
+  (let ((alreadyOutput? FALSE))
+    (when (empty? directSupers)
+      (return))
+    (setq directSupers (sort (copy-cons-list directSupers)
+			     (the-code :function object-name-less-than?)))
+    (with-html-tag ("DL STYLE=' margin-top: 0; margin-bottom:0'" stream true)
+      (foreach super in directSupers
+	  do (setq alreadyOutput? (defined? (lookup alreadyOutput super)))
+	     (with-html-tag ("DT STYLE='margin-top: 0'" stream true)
+	       (html-write-href stream "show" "concept" super)
+	       (when alreadyOutput?
+		 (print-stream stream "...")))
+	     (unless alreadyOutput?
+	       (insert-at alreadyOutput super TRUE-WRAPPER)
+	       (with-html-tag ("DD" stream true)
+		 (html-describe-one-super-level 
+		  (consify (pli/get-direct-superrelations super NULL NULL))
+		  alreadyOutput
+		  stream)))))
+    (return)))
+
+(defun html-describe-supers ((title STRING)
+			     (head STRING)
+			     (relation NAMED-DESCRIPTION)
+			     (stream NATIVE-OUTPUT-STREAM)
+			     (rule? BOOLEAN))
+  (let ((alreadyOutput (new HASH-TABLE))
+	(directSupers (consify (pli/get-direct-superrelations relation NULL NULL))))
+    (html-write-header-with-table stream title head)
+    (if (empty? directSupers)
+	(with-html-tag ("I" stream true)
+	  (print-stream stream "None"))
+      (html-describe-one-super-level directSupers alreadyOutput stream))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return)))
+
+(defun html-describe-types ((title STRING)
+			    (head STRING)
+			    (relation LOGIC-OBJECT)
+			    (stream NATIVE-OUTPUT-STREAM)
+			    (rule? BOOLEAN))
+  (let ((alreadyOutput (new HASH-TABLE))
+	(types (consify (pli/get-direct-types relation NULL NULL))))
+    (html-write-header-with-table stream title head)
+    (if (empty? types)
+	(with-html-tag ("I" stream true)
+	  (print-stream stream "None"))
+      (html-describe-one-super-level types alreadyOutput stream))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return)))
+
+
+(defun html-describe-one-parent-with-siblings ((parent NAMED-DESCRIPTION)
+					       (child NAMED-DESCRIPTION)
+					       (stream NATIVE-OUTPUT-STREAM))
+  (let ((directSubs (consify (pli/get-direct-subrelations parent NULL NULL))))
+    (setq directSubs (sort directSubs 
+			   (the-code :function object-name-less-than?)))
+    (with-html-tag ("DT" stream true)
+      (print-stream stream "Common parent: ")
+      (html-write-href stream "show" "concept" parent))
+    (foreach sub in directSubs
+	where (not (eq? sub child))	; Don't repeat the top concept
+	do (with-html-tag ("DD" stream true)
+	     (html-write-href stream "show" "concept" sub)))
+    (return) ))
+
+(defun (has-child-other-than? BOOLEAN) ((parent NAMED-DESCRIPTION)
+					(child NAMED-DESCRIPTION))
+  ;; Helping function to locate siblings.  Returns true if "parent"
+  ;;  has at least one child other than "child".
+  (foreach c in (pli/get-direct-subrelations parent NULL NULL)
+      where (not (eq? c child))
+      do (return true))
+  (return false))
+
+(defun html-describe-siblings ((title STRING)
+			       (head STRING)
+			       (relation NAMED-DESCRIPTION)
+			       (stream NATIVE-OUTPUT-STREAM)
+			       (rule? BOOLEAN))
+  (let ((parentsOfSibs (CONS OF NAMED-DESCRIPTION) NIL))
+    (foreach p in (pli/get-direct-superrelations relation NULL NULL)
+	where (has-child-other-than? p relation)
+	collect p into parentsOfSibs)
+    (setq parentsOfSibs (sort parentsOfSibs 
+			      (the-code :function object-name-less-than?)))
+    (html-write-header-with-table stream title head)
+    (if (empty? parentsOfSibs)
+	(with-html-tag ("I" stream true)
+	  (print-stream stream "None"))
+      (with-html-tag ("DL" stream true)
+	(foreach p in parentsOfSibs
+	    do (html-describe-one-parent-with-siblings p relation stream))))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return)))
+
+(defun html-describe-rules ((title STRING)
+			    (head STRING)
+			    (relation LOGIC-OBJECT)
+			    (stream NATIVE-OUTPUT-STREAM)
+			    (rule? BOOLEAN))
+  (let ((rules (CONS OF PROPOSITION)
+	       (consify (pli/get-rules relation NULL NULL)))
+	(rule-written? false))
+    (html-write-header-with-table stream title head)
+    (with-html-tag ("PRE" stream true)
+      (setq rules
+	(sort rules (the-code :function proposition-less-than?)))
+      (foreach rule in rules
+	  where (true-proposition? rule)
+	  do (unless (simple-subrelation-proposition? rule)
+	       (pprint-object rule stream)
+	       (print-stream stream EOL EOL)
+	       (setq rule-written? true))))
+    (unless rule-written?
+      (with-html-tag ("I" stream true)
+	(print-stream stream "None")))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return) ))
+
+(defun html-describe-facts ((title STRING)
+			    (head STRING)
+			    (relation LOGIC-OBJECT)
+			    (stream NATIVE-OUTPUT-STREAM)
+			    (filter-rules? BOOLEAN)
+			    (rule? BOOLEAN))
+  (let ((facts (CONS OF PROPOSITION)
+	       (consify (pli/get-propositions-of relation NULL NULL)))
+	(fact-written? false))
+    (html-write-header-with-table stream title head)
+    (with-html-tag ("PRE" stream true)
+      (setq facts
+	(sort facts (the-code :function proposition-less-than?)))
+      (foreach fact in facts
+	  where (true-proposition? fact)
+	  do (unless (class? (operator fact))          ; Filter types
+	       (unless (eql? (kind fact) :EQUIVALENT)  ; Filter equivalents
+		 (unless (and filter-rules?            ; Optionally filter rules
+			      (eql? (kind fact) :IMPLIES))
+		   (setq fact-written? true)
+		   (pprint-object fact stream)
+		   (print-stream stream EOL EOL))))))
+    (unless fact-written?
+      (with-html-tag ("I" stream true)
+	(print-stream stream "None")))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return) ))
+
+
+(defun html-describe-instances ((title STRING)
+				(head STRING)
+				(relation NAMED-DESCRIPTION)
+				(stream NATIVE-OUTPUT-STREAM)
+				(rule? BOOLEAN))
+
+  (let ((instances (consify (pli/get-concept-instances
+			     relation NULL NULL)))
+	(assertedInstances
+	 (levellized-all-class-instances ASSERTION-INFERENCE 
+					 (surrogate-value-inverse relation)))
+	(directInstances (consify (pli/get-direct-concept-instances
+				   relation NULL NULL)))
+	(n-instances (length instances)))
+    (html-write-header-with-table stream title head)
+    (if (empty? instances)
+      (with-html-tag ("I" stream true)
+	(print-stream stream "None"))
+      (progn 
+	;; Number and direct legend.
+	(print-stream stream n-instances (choose (= n-instances 1)
+						 " instance; "
+						 " instances; ")
+		      (length directInstances) " direct (")
+	(html-emit-image stream "icons/small-circ-filled.gif" "x"
+			 11 11 "BOTTOM" 0)
+	(print-stream stream ")" EOL)
+
+	(with-html-tag ("DL" stream true)
+	  (setq instances 
+	    (sort instances (the-code :function logic-form-less?)))
+	  (foreach instance in instances
+	      do (with-html-tag ("DT" stream true)
+		   (html-emit-image stream 
+				    (choose (member? directInstances instance)
+					    "icons/small-circ-filled.gif"
+					    "icons/small-circ-open.gif")
+				    (choose (member? directInstances instance)
+					    "x"
+					    "o")
+				    11 11
+				    "BOTTOM"
+				    0)
+		   (print-stream stream "&nbsp;")
+		   (if (member? assertedInstances instance)
+		     (pprint-object instance stream)
+		     (with-html-tag ("I" stream)
+		       (pprint-object instance stream))))))))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return) ))
+
+(defun html-describe-tuples ((title STRING)
+			     (head STRING)
+			     (relation NAMED-DESCRIPTION)
+			     (stream NATIVE-OUTPUT-STREAM)
+			     (rule? BOOLEAN))
+  ;; Use this instead to reduce unnecessary consing?
+  ;; (collect p in (all-extension-members relation)
+  ;;                         where (true-proposition? p))
+  (let ((tuples (CONS OF PROPOSITION) 
+		(consify (pli/get-relation-extension relation NULL NULL))))
+    (html-write-header-with-table stream title head)
+    (if (empty? tuples)
+	(with-html-tag ("I" stream true)
+	  (print-stream stream "None"))
+      (with-html-tag ("PRE" stream true)
+	(setq tuples 
+	  (sort tuples (the-code :function proposition-less-than?)))
+	(foreach tuple in tuples
+	    do (pprint-object tuple stream)
+	       (print-stream stream EOL EOL))))  ;; Drop Extra EOL?
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return) ))
+
+
+(defun html-describe-named-description
+    ((concept NAMED-DESCRIPTION) (stream NATIVE-OUTPUT-STREAM))
+  (unless (defined? concept)
+    (return))
+  (let ((nameString (object-name-string concept))
+	(descriptionTerm (lookup-term (choose (class? concept) :concept :relation)
+				      false true)))
+    (with-process-lock *powerloom-lock*
+      (within-context (get-query-context)
+        (elaborate-instance concept)))
+    (html-describe-location concept stream)
+    (html-describe-context-view concept stream)
+  ; (html-concept-action-block concept stream)
+    (html-display-synonyms concept stream)
+    (html-display-images concept stream)
+    (html-display-documentation concept stream)
+    (html-describe-equivalents (string-concatenate "Equivalent " descriptionTerm)
+			       nameString concept stream true)
+    (when (viz-server-available?)
+      (html-write-href-in-detail stream 
+				 "Graph"
+				 "graph"
+				 "relation"
+				 (name *module*)
+				 (visible-name (object-name concept) TRUE)
+				 (concatenate "Graph " nameString)
+				 FALSE)
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (html-describe-types "Types" nameString concept stream true)
+    (html-describe-subs (string-concatenate "Sub" descriptionTerm)
+			nameString concept stream true)
+    (html-describe-supers (string-concatenate "Super" descriptionTerm)
+			  nameString concept stream true)
+    (html-describe-siblings "Siblings" nameString concept stream true)
+    (html-describe-facts "Facts" nameString concept stream true true)
+    (html-describe-rules "Rules" nameString concept stream true)
+    (within-context (get-query-context)
+      (if (= (pli/get-arity concept) 1)
+        (html-describe-instances "Instances" nameString concept stream true)
+	(html-describe-tuples "Tuples" nameString concept stream true)))
+    (return) ))
+
+(defun html-describe-instance
+    ((instance LOGIC-OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  (unless (defined? instance)
+    (return))
+  (let ((nameString (object-name-string instance)))
+    (with-process-lock *powerloom-lock*
+      (within-context (get-query-context)
+        (elaborate-instance instance)))
+    (html-describe-location instance stream)
+    (html-describe-context-view instance stream)
+  ; (html-instance-action-block instance stream)
+    (html-display-synonyms instance stream)
+    (html-display-images instance stream)
+    (html-display-documentation instance stream)
+    (html-describe-types "Types" nameString instance stream true)
+    (within-context (get-query-context)
+      (html-describe-facts "Facts" nameString instance stream false true))
+    (return) )
+  )
+
+;;;;; DESCRIBE MODULE
+
+(defun (child-modules (CONS OF MODULE)) ((module MODULE))
+  (let ((directSubModules NIL))
+    ;; Filter out non-modules:
+    (foreach child in (child-contexts module)
+	where (isa? child @MODULE)
+	collect child into directSubModules)
+    (return directSubModules) ))
+
+(defun html-describe-one-module-sub-level ((module MODULE)
+					   (depth INTEGER)
+					   (cutoff INTEGER)
+					   (stream NATIVE-OUTPUT-STREAM))
+  (let ((directSubModules (child-modules module)))
+    (when (empty? directSubModules)
+      (return))
+    (setq directSubModules
+      (sort directSubModules
+	    (the-code :function module-name-less-than?)))
+    (with-html-tag ("DL STYLE=' margin-top: 0; margin-bottom:0'" stream true)
+      (foreach sub in directSubModules
+	  do (with-html-tag ("DT STYLE='margin-top: 0'" stream true)
+	       (html-write-href stream "show" "context" sub)
+	       (when (and (>= depth cutoff)
+			  (not (empty? (child-modules sub))))
+		 (print-stream stream "    +...")))
+	     (unless (>= depth cutoff)
+	       (with-html-tag ("DD" stream true)
+		 (html-describe-one-module-sub-level sub (+ depth 1) cutoff stream)))))
+    (return)))
+
+(defun html-describe-module-subs ((title STRING)
+				  (head STRING)
+				  (module MODULE)
+				  (stream NATIVE-OUTPUT-STREAM)
+				  (rule? BOOLEAN))
+  (let ((heuristicDepth	4		;(preference-value :child-depth)
+			)
+	; (heuristicLength 30) 
+	(subLength (length (child-modules module))))
+    (when (> subLength 30)
+      (-- heuristicDepth))
+    (html-write-header-with-table stream title head)
+    (if (= subLength 0)
+	(with-html-tag ("I" stream true)
+	  (print-stream stream "None"))
+      (html-describe-one-module-sub-level module 0 heuristicDepth stream))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return)))
+
+(defun html-describe-one-module-super-level ((module MODULE)
+					     (alreadyOutput HASH-TABLE)
+					     (stream NATIVE-OUTPUT-STREAM))
+  
+  (let ((parents (sort (copy-cons-list (the-cons-list (parent-modules module)))
+		       (the-code :function module-name-less-than?)))
+	(alreadyOutput? FALSE))
+    (when (empty? parents)
+      (return))
+    (with-html-tag ("DL STYLE=' margin-top: 0; margin-bottom:0'" stream true)
+      (foreach parent in parents 
+	  do (setq alreadyOutput? (defined? (lookup alreadyOutput parent)))
+	     (with-html-tag ("DT STYLE='margin-top: 0'" stream true)
+	       (html-write-href stream "show" "context" parent)
+	       (when alreadyOutput?
+		 (print-stream stream "...")))
+	     (unless alreadyOutput?
+	       (insert-at alreadyOutput parent TRUE-WRAPPER)
+	       (with-html-tag ("DD" stream true)
+		 (html-describe-one-module-super-level
+		  parent alreadyOutput stream))))) )
+  (return))
+
+(defun html-describe-module-supers ((title STRING)
+				    (head STRING)
+				    (module MODULE)
+				    (stream NATIVE-OUTPUT-STREAM)
+				    (rule? BOOLEAN))
+  ;; TO DO: Possibly eliminate this hash table?
+  (let ((alreadyOutput (new HASH-TABLE)))
+    (html-write-header-with-table stream title head)
+    (if (null? (parent-module module))
+	(with-html-tag ("I" stream true)
+	  (print-stream stream "None"))
+      (html-describe-one-module-super-level module alreadyOutput stream))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return)))
+
+(defun html-display-module-stats ((title STRING)
+				  (head STRING)
+				  (module MODULE)
+				  (stream NATIVE-OUTPUT-STREAM)
+				  (rule? BOOLEAN))
+  ;; Print statistics and then a list of top-level concepts
+  ;;
+  (let ((nConcepts 0)
+	(nRelations 0)
+	(nInstances 0)
+	(allClasses (new (LIST OF LOGIC-OBJECT)))    ;; THING as well => STANDARD-OBJECT
+	(topLevelClasses (new (LIST OF LOGIC-OBJECT)))
+	(add? FALSE))
+    (foreach object in (all-named-terms module true)
+	;; isa? test incase
+	do (cond ((isa? object @NAMED-DESCRIPTION)
+		  (cond ((class? object) 
+			 (++ nConcepts)
+			 (push allClasses object))
+			((relation? object)
+			 (++ nRelations))
+			(otherwise 
+			 (++ nInstances))))
+		 ((stella-class? object)
+		  (++ nConcepts))
+		 (otherwise
+		  (++ nInstances))))
+    (foreach class in allClasses
+	do (setq add? true)
+	   (foreach parent in (all-direct-superrelations class true)
+	       where (member? allClasses parent)
+	       do (setq add? false)
+		  (break))
+	   (when add?
+	     (push topLevelClasses class)))
+    (html-write-header-with-table stream title head)
+    (print-stream stream nConcepts " " (lookup-term :concept FALSE (not (= nConcepts 1)))
+		  "; " nRelations  " " (lookup-term :relation FALSE (not (= nRelations 1)))
+		  "; " nInstances  " " (lookup-term :instance FALSE (not (= nInstances 1)))
+		  ";  TOTAL of objects = " (+ nConcepts nRelations nInstances))
+    (with-html-tag ("P" stream true)
+      (with-html-tag ("B" stream false)
+	(print-stream stream "Top Level Classes:"))
+      (with-html-tag ("BR" stream true))
+      (if (empty? topLevelClasses)
+	  (with-html-tag ("I" stream true)
+	    (print-stream stream "None"))
+	(with-html-tag ("DL" stream false)
+	  (setq topLevelClasses (sort topLevelClasses 
+				      (the-code :function object-name-less-than?)))
+	  (foreach class in topLevelClasses
+	      do (with-html-tag ("DT STYLE='margin-top: 0'" stream true)
+		   (html-write-href stream "show" "concept" class))))))
+    (when rule?
+      (with-html-tag ("HR SIZE=2" stream true)))
+    (return)))
+
+(defun html-describe-module
+    ((module MODULE) (stream NATIVE-OUTPUT-STREAM))
+  (unless (defined? module)
+    (return))
+  (let ((nameString (name module)))
+    ;; Does this make any sense for modules?
+    ;(html-describe-location module stream)
+    ;; Can't graph code-only? modules because we can't run
+    ;;   the necessary queries inside it.  Plus, they wouldn't
+    ;;   have a concept hierarchy anyway.  Normally we can't
+    ;;   even get to them, but there is a route via computed-procedure
+    ;;   where the namespace does appear.
+    (when (and (viz-server-available?)
+               (not (code-only? module))
+               (not (namespace? module)))
+      (html-write-href-in-detail stream 
+				 "Graph"
+				 "graph"
+				 "context"
+				 (name module)
+				 (name module)
+				 (concatenate "Graph " (name module))
+				 FALSE))
+    (html-display-images module stream)
+    (html-display-documentation module stream)
+    (html-describe-module-subs "Child Modules" nameString module stream true)
+    (html-describe-module-supers "Parent Modules" nameString module stream true)
+    (html-display-module-stats "Contents" nameString module stream true)
+    (return) )
+  )
+
+;;;;; RESPONSE FUNCTIONS
+
+(defun html-unknown-module-response ((itemType KEYWORD)
+				     (itemName STRING)
+				     (moduleName STRING)
+				     (stream NATIVE-OUTPUT-STREAM))
+  (with-html-tag ("HTML" stream TRUE)
+    (with-html-tag ("HEAD" stream TRUE)
+      (with-html-tag ("TITLE" stream TRUE)
+	(print-stream stream (lookup-term itemType TRUE FALSE) " ")
+	(write-html-quoting-special-characters stream itemName)))
+    (with-html-tag ((concatenate "BODY BGCOLOR='#" *error-background-color* "'")
+		    stream TRUE)
+      (with-html-tag ("H1" stream TRUE)
+	(print-stream stream (lookup-term itemType TRUE FALSE) " ")
+	(write-html-quoting-special-characters stream itemName))
+      (with-html-tag ("HR SIZE=4" stream TRUE))
+      (with-html-tag ("STRONG" stream TRUE)
+	(print-stream stream
+		      "SORRY: Unknown "
+		      (lookup-term :context FALSE FALSE)
+		      " `")
+	(write-html-quoting-special-characters
+	 stream moduleName)
+	(print-stream stream "'.")
+	(html-line-break stream)
+	(with-html-tag ("HR SIZE=2" stream TRUE))
+	(write-powerloom-trailer stream)))))
+
+
+(defun html-unknown-object-response ((itemType KEYWORD)
+				     (itemName STRING)
+				     (stream NATIVE-OUTPUT-STREAM))
+  (with-html-tag ("HTML" stream)
+    (with-html-tag ("HEAD" stream)
+      (with-html-tag ("TITLE" stream)
+	(print-stream stream (lookup-term itemType true false) " ")
+	(write-html-quoting-special-characters stream itemName))
+      (print-stream stream EOL))
+    (print-stream stream EOL)
+    (with-html-tag ((concatenate "BODY BGCOLOR='#" *error-background-color* "'")
+		    stream TRUE)
+      (with-html-tag ("H1" stream TRUE)
+	(print-stream stream (lookup-term itemType true false) " ")
+	(write-html-quoting-special-characters stream itemName))
+      (with-html-tag ("HR SIZE=4" stream TRUE))
+      (with-html-tag ("STRONG" stream)
+	(print-stream stream
+		      "SORRY: Unknown "
+		      (lookup-term itemType FALSE FALSE) 
+		      " `" itemName
+		      "' in " (lookup-term :context FALSE FALSE) " ")
+	(write-html-quoting-special-characters
+	 stream (name *MODULE*))
+	(print-stream stream "."))
+      (html-line-break stream)
+      (with-html-tag ("HR SIZE=2" stream TRUE))
+      (write-powerloom-trailer stream))) )
+
+
+(defun html-write-relation-response-page ((relation NAMED-DESCRIPTION)
+					  (stream NATIVE-OUTPUT-STREAM))
+  (let ((objectName (object-name-string relation)))
+    (with-html-tag ("HTML" stream TRUE)
+      (with-html-tag ("HEAD" stream TRUE)
+	(with-html-tag ("BASE TARGET='content'" stream TRUE))
+	(with-html-tag ("TITLE" stream TRUE)
+	  (print-stream stream 
+			(lookup-term (choose (class? relation) :concept :relation)
+				     true false)
+			" ")
+	  (write-html-quoting-special-characters stream objectname)))
+      (with-html-tag ((concatenate "BODY BGCOLOR='#" *standard-background-color* "'")
+		      stream TRUE)
+	(with-html-tag ("H1" stream TRUE)
+	  (print-stream stream 
+			(lookup-term (choose (class? relation) :concept :relation) true false)
+			" ")
+	  (write-html-quoting-special-characters stream objectname))
+	(with-html-tag ("HR SIZE=4" stream TRUE))
+	(html-describe-named-description relation stream)
+	(write-powerloom-trailer stream))) ))
+
+(defun html-write-instance-response-page ((instance LOGIC-OBJECT)
+					  (stream NATIVE-OUTPUT-STREAM))
+  (let ((objectname (object-name-string instance)))
+    (with-html-tag ("HTML" stream TRUE)
+      (with-html-tag ("HEAD" stream TRUE)
+	(with-html-tag ("BASE TARGET='content'" stream TRUE))
+	(with-html-tag ("TITLE" stream TRUE)
+	  (print-stream stream (lookup-term :instance true false) " ")
+	  (write-html-quoting-special-characters stream objectname)))
+      (with-html-tag ((concatenate "BODY BGCOLOR='#" *standard-background-color* "'")
+		      stream TRUE)
+	(with-html-tag ("H1" stream TRUE)
+	  (print-stream stream (lookup-term :instance true false) " ")
+	  (write-html-quoting-special-characters stream objectname))
+	(with-html-tag ("HR SIZE=4" stream TRUE))
+	(html-describe-instance instance stream)
+	(write-powerloom-trailer stream))) ))
+
+(defun html-write-object-response-page-internal ((object OBJECT)
+                                                 (stream NATIVE-OUTPUT-STREAM))
+  (let ((objectname (object-name-string object)))
+    (when (null? objectname) (setq objectname (stringify object)))
+    (with-html-tag ("HTML" stream TRUE)
+      (with-html-tag ("HEAD" stream TRUE)
+	(with-html-tag ("BASE TARGET='content'" stream TRUE))
+	(with-html-tag ("TITLE" stream TRUE)
+	  (print-stream stream (lookup-term :object true false) " ")
+	  (write-html-quoting-special-characters stream objectname)))
+      (with-html-tag ((concatenate "BODY BGCOLOR='#" *standard-background-color* "'")
+		      stream TRUE)
+	(with-html-tag ("H1" stream TRUE)
+	  (print-stream stream (lookup-term :object true false) " ")
+	  (write-html-quoting-special-characters stream objectname))
+	(with-html-tag ("HR SIZE=4" stream TRUE))
+        (write-html-quoting-special-characters stream objectname)
+        (with-html-tag ("BR" stream TRUE))
+	(with-html-tag ("HR SIZE=2" stream TRUE))
+	(write-powerloom-trailer stream))) ))
+
+(defun html-write-module-response-page-internal ((module MODULE)
+						 (stream NATIVE-OUTPUT-STREAM))
+  (let ((modulename (name module)))
+    (with-html-tag ("HTML" stream TRUE)
+      (with-html-tag ("HEAD" stream TRUE)
+	(with-html-tag ("BASE TARGET='content'" stream TRUE))
+	(with-html-tag ("TITLE" stream TRUE)
+	  (print-stream stream (lookup-term :module true false) " ")
+	  (write-html-quoting-special-characters stream modulename)))
+      (with-html-tag ((concatenate "BODY BGCOLOR='#" *module-background-color* "'")
+		      stream TRUE)
+	(with-html-tag ("H1" stream TRUE)
+	  (print-stream stream (lookup-term :context true false) " ")
+	  (write-html-quoting-special-characters stream modulename))
+	(with-html-tag ("HR SIZE=4" stream TRUE))
+	(html-describe-module module stream)
+	(write-powerloom-trailer stream))) ))
+
+(defun html-write-module-response-page ((moduleName STRING)
+					(stream NATIVE-OUTPUT-STREAM))
+  
+  (let ((module (get-stella-module moduleName FALSE)))
+    (cond ((null? module)
+	   (html-unknown-object-response :context moduleName stream))
+	  (otherwise
+	   (within-module module
+             (html-write-module-response-page-internal module stream)))) ))
+
+(defun html-write-object-response-page ((moduleName STRING)
+					(objectname STRING)
+					(stream NATIVE-OUTPUT-STREAM))
+  (let ((module (get-stella-module moduleName FALSE)))
+    (when (null? module)
+      (html-unknown-module-response :relation objectname moduleName stream)
+      (return))
+    (within-module module
+      (let ((instance (pli/get-object objectname NULL NULL)))
+        (if (defined? instance)
+          (typecase instance
+            (NAMED-DESCRIPTION
+             (html-write-relation-response-page instance stream))
+            (LOGIC-OBJECT
+             (html-write-instance-response-page instance stream))
+            (otherwise
+             (html-write-object-response-page-internal instance stream)))
+          (html-unknown-object-response :object objectname stream)) ))) )
+
+(defun (find-candidate-objects (LIST OF LOGIC-OBJECT)) ((objectName STRING)
+							(objectType STRING)
+							(matchType KEYWORD))
+  ;; matchType is one of :EXACT, :CASE-INSENSITIVE, :SUBSTRING, :WILDCARD, :REGEX
+  ;;   for now, only :EXACT, :CASE-INSENSITIVE and :SUBSTRING are implemented.
+  (let ((bareName STRING NULL)
+        (moduleName STRING NULL)
+        (kind KEYWORD NULL)
+        (results (new (LIST OF LOGIC-OBJECT)))
+        (candidateObjectName SYMBOL NULL)
+        (objectModule MODULE NULL)
+        (upcasedObjectName STRING NULL)
+        (candidateTerms (ITERATOR OF OBJECT) NULL))
+    (ignore kind)
+    (exception-case 
+      (mv-setq (bareName moduleName kind)
+               (parse-stella-name objectName FALSE))
+      (READ-EXCEPTION ()  ;; Can't be parsed as Stella name.  Just use as substring.
+                          ;; n.B. this can happen if just an integer is entered.
+          (setq bareName objectName)))
+    
+    (setq upcasedObjectName (string-upcase bareName))
+    (setq candidateTerms (all-named-terms *CONTEXT* FALSE))
+
+    (when (defined? moduleName)
+      (setq objectModule (get-stella-module moduleName TRUE)))
+    ;; Branch on case-sensitive module
+    ;; Iterate over appropriate object types
+    (case matchType
+      (:EXACT
+       (foreach obj in candidateTerms
+         ;; Filter by objectname
+         where (isa? obj @LOGIC-OBJECT)       ;; TO DO: RELAX THIS?
+         do (setq candidateObjectName (object-name obj))
+         (when (defined? candidateObjectName)
+           (when (and (string-eql? (symbol-name candidateObjectName) bareName)
+                      (or (null? objectModule)
+                          (eq? (home-module candidateObjectName) objectModule)))
+             (push results obj)
+             (continue)))
+         (foreach syn in (get-synonyms obj)
+           do (setq candidateObjectName (object-name syn))
+           (when (defined? candidateObjectName)
+             (when (and (string-eql? (symbol-name candidateObjectName) bareName)
+                        (or (null? objectModule)
+                            (eq? (home-module candidateObjectName) objectModule)))
+               (push results syn)
+               (break))))))
+      (:CASE-INSENSITIVE
+       (foreach obj in candidateTerms
+         ;; Filter by objectname
+         where (isa? obj @LOGIC-OBJECT)       ;; TO DO: RELAX THIS?
+         do (setq candidateObjectName (object-name obj))
+         (when (defined? candidateObjectName)
+           (when (and (string-equal? (symbol-name candidateObjectName) bareName)
+                      (or (null? objectModule)
+                          (eq? (home-module candidateObjectName) objectModule)))
+             (push results obj)
+             (continue)))
+         (foreach syn in (get-synonyms obj)
+           do (setq candidateObjectName (object-name syn))
+           (when (defined? candidateObjectName)
+             (when (and (string-equal? (symbol-name candidateObjectName) bareName)
+                        (or (null? objectModule)
+                            (eq? (home-module candidateObjectName) objectModule)))
+               (push results syn)
+               (break))))))
+      (:SUBSTRING
+       (foreach obj in candidateTerms
+         ;; Filter by objectname
+         where (isa? obj @LOGIC-OBJECT)       ;; TO DO: RELAX THIS?
+         do (setq candidateObjectName (object-name obj))
+         (when (defined? candidateObjectName)
+           (when (and (defined? (string-search (string-upcase (symbol-name candidateObjectName))
+                                               upcasedObjectName 0))
+                      (or (null? objectModule)
+                          (eq? (home-module candidateObjectName) objectModule)))
+             (push results obj)
+             (continue)))
+         (foreach syn in (get-synonyms obj)
+           do (setq candidateObjectName (object-name syn))
+           (when (defined? candidateObjectName)
+             (when (and (defined? (string-search (string-upcase (symbol-name candidateObjectName))
+                                                 upcasedObjectName 0))
+                        (or (null? objectModule)
+                            (eq? (home-module candidateObjectName) objectModule)))
+               (push results syn)
+               (break))))))
+      (:WILDCARD
+       (error ":WILDCARD matching not implemented yet"))
+      (:REGEX
+       (error ":REGEX matching not implemented yet")))
+    ;; Prepare for final processing:
+    ;; Finally sort the results and return them. ?? Should this be CONS?
+    (remove-duplicates results)
+    (sort results (the-code :function logic-form-less?))
+    (return results) ))
+
+(defun (resolve-synonyms LOGIC-OBJECT) ((obj LOGIC-OBJECT))
+  ;; Returns the object that corresponds to `obj' after doing any
+  ;; necessary resolution if `obj' happens to be a synonym.
+  (let ((surrogate (surrogate-value-inverse obj)))
+    (if (and (defined? surrogate)
+             (synonym-surrogate? surrogate))
+      (return (surrogate-value surrogate))
+      (return obj))))
+
+(defun html-write-find-object-response-page ((moduleName STRING)
+					     (objectname STRING)
+					     (objecttype STRING)
+					     (matchtype KEYWORD)
+					     (stream NATIVE-OUTPUT-STREAM))
+  (let ((module (get-stella-module moduleName FALSE)))
+    (when (null? module)
+      (html-unknown-module-response :relation objectname moduleName stream)
+      (return))
+    (within-module module
+      (let ((candidateObjects 
+	     (find-candidate-objects objectName objectType matchType)))
+	(case (length candidateObjects)
+	  (0 
+	   (html-unknown-object-response (choose (eql? objecttype "instance")
+						 :object :relation) 
+					 objectname
+					 stream))
+	  (1 
+           (typecase (first candidateObjects)
+             (NAMED-DESCRIPTION
+              (html-write-relation-response-page (resolve-synonyms (first candidateObjects))
+                                                 stream))
+             (LOGIC-OBJECT
+              (html-write-instance-response-page (resolve-synonyms (first candidateObjects))
+                                                 stream))
+             (otherwise
+              (error "Can't handle object in html-write-find-object-response-page"))))
+	  (otherwise
+	   (html-write-multiple-choice-page 
+	    objectname candidateObjects stream))) )) ))
+
+(defun html-write-multiple-choice-page ((searchString STRING)
+					(candidateObjects (LIST OF LOGIC-OBJECT))
+					(stream NATIVE-OUTPUT-STREAM))
+  (with-html-tag ("HTML" stream TRUE)
+    (with-html-tag ("HEAD" stream TRUE)
+      (with-html-tag ("BASE TARGET='content'" stream TRUE))
+      (with-html-tag ("TITLE" stream TRUE)
+	(write-html-quoting-special-characters stream searchString)))
+    (with-html-tag ((concatenate "BODY BGCOLOR='#" *standard-background-color* "'")
+		    stream TRUE)
+      (with-html-tag ("H1" stream true)
+	(print-stream stream "Matches for &quot;")
+	(with-html-tag ("FONT COLOR='#990033'" stream true)
+	  (write-html-quoting-special-characters stream searchString))
+	(print-stream stream "&quot;" EOL))
+      (with-html-tag ("HR SIZE=4" stream TRUE))
+      (foreach obj in candidateObjects
+	  do (typecase obj
+	       (DESCRIPTION
+		(if (class? obj)
+		  (print-stream stream "Concept ")
+		  (print-stream stream "Relation "))
+		(pprint-object obj stream))
+	       (otherwise
+		(print-stream stream "Object ")
+		(pprint-object obj stream)))
+	     (html-line-break stream)
+	     )
+      (with-html-tag ("HR SIZE=2" stream true))
+      (write-powerloom-trailer stream))) )
+
+
+;;
+;; Consider passing all the search URL parameters as a list of strings
+;;  instead of as single parameters.  Alternately, encode the match type
+;;  into the action string findexact, findsubstring, findwildcard, findregex.
+;;
+(defun html-powerloom-response ((action STRING)
+				(objectType STRING)
+				(moduleName STRING)
+				(objectName STRING)
+				(stream NATIVE-OUTPUT-STREAM))
+  ;; action is one of "show" "find" "findsubstring" "findexact"
+  ;; objectType is one of "concept"
+  (special ((*pprint-atomic-object-renderer*
+	     (function-code (lookup-function-or-stella-function
+			     (quote PPRINT-ATOMIC-OBJECT-FOR-HTML))))
+	    (*pprint-indent* 0)
+	    (*printReadably?* true))
+    (cond ((or (string-eql? objectType "object")
+	       (string-eql? objectType "concept")
+	       (string-eql? objectType "relation")
+	       (string-eql? objectType "instance"))
+	   (cond ((string-eql? action "show")
+		  (special ((*ontosaurus-url-action* "show"))
+		    (html-write-object-response-page 
+		     moduleName objectName stream))
+		  (return))
+		 ((or (string-eql? action "find")
+		      (string-eql? action "findsubstring"))
+		  (special ((*ontosaurus-url-action* "show"))
+		    (html-write-find-object-response-page
+		     moduleName objectName objectType :SUBSTRING stream))
+		  (return))
+		 ((string-eql? action "findexact")
+		  (special ((*ontosaurus-url-action* "show"))
+		    (html-write-find-object-response-page
+		     moduleName objectName objectType :EXACT stream))
+		  (return))
+		 ((string-eql? action "findinsensitive")
+		  (special ((*ontosaurus-url-action* "show"))
+		    (html-write-find-object-response-page
+		     moduleName objectName objectType :CASE-INSENSITIVE stream))
+		  (return))))
+	  ((and (string-eql? objectType "context")
+		(string-eql? action "show"))
+	   (html-write-module-response-page moduleName stream)
+	   (return))
+          ((string-eql? objectType "query")
+           (cond ((string-eql? action "explain")
+                  (html-write-explanation-response-page
+                   moduleName objectName stream)
+                  (return))))
+	  ))
+  (with-html-tag ("FONT COLOR='#BB0000'" stream true)
+    (with-html-tag ("B" stream)
+      (print-stream stream "ERROR: Unrecognized action-type pair: '"
+		    action "' '" objectType "'.")))
+  (return) )
+
+
+(defun do-action-handler ((xchg HTTP/HTTP-EXCHANGE))
+  ;; HTTP server handler for `html-powerloom-response'.
+  (let  ((keys (http/parse-and-decode-url-arguments (http/get-request-uri-query xchg) #\+))
+	 (action (first keys))
+	 (objectType (second keys))
+	 (moduleName (third keys))
+	 (objectName (fourth keys))
+         (stream (http/get-reply-stream xchg)))
+    (cond ((>= (length keys) 4)
+           (cond ((starts-with? action "graph" 0)
+                  (viz-server-handler xchg))
+                 (otherwise
+                  (html-powerloom-response action objectType moduleName objectName stream))))
+          (otherwise
+           (http/set-response-code xchg :BAD-REQUEST)
+           (with-html-tag ((make-html-body-tag *error-background-color*) stream true)
+             (print-stream stream "ERROR: expected four parameters, only received " (length keys) EOL)
+             (print-stream stream "<BR><OL>" EOL)
+             (foreach key in keys
+                 do (print-stream stream "<LI>" key "</LI>" EOL))
+             (print-stream stream "</OL>" EOL))))))
+
+(startup-time-progn
+  (http/publish-handler
+   "/ploom/ontosaurus/do-action"
+   (the-code :function do-action-handler)
+   :content-type (http/get-http-mime-type :HTML NULL)
+   :documentation "Various parameterized Ontosaurus actions to describe objects."))

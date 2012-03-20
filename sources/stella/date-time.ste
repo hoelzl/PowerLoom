@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: date-time.ste,v 1.30 2008/09/04 02:13:08 hans Exp
+;;; Version: date-time.ste,v 1.33 2010/09/10 23:25:59 hans Exp
 
 (in-package "STELLA")
 
@@ -368,9 +368,9 @@ returns 0.0"
   }")
     (return offset) ))
 
-(defun (time-zone-format60 STRING) ((timezone FLOAT))
+(defun (time-zone-format60 STRING) ((timezone FLOAT) (include-colon? BOOLEAN))
   :public? FALSE
-  :documentation "Format `zone' as an hh:mm string"
+  :documentation "Format `zone' as an hh:mm or hhmm string depending on `include-colon?'"
   (let ((sign "+")
 	(hours 0))
     (when (< timezone 0)
@@ -381,7 +381,7 @@ returns 0.0"
 	     sign
 	     (format-with-padding (integer-to-string hours)
 				  2 #\0 :right false)
-	     ":"
+	     (choose include-colon? ":" "")
 	     (format-with-padding (integer-to-string (round (* (- timezone hours) 60.0)))
 				  2 #\0 :right false)))))
 
@@ -395,10 +395,20 @@ returns 0.0"
 (defconstant MILLIS-PER-HOUR INTEGER (* 1000 60 60)
   :public? FALSE)
 
+(defglobal *month-name-vector* (VECTOR OF STRING-WRAPPER) NULL
+  :documentation "A vector of month names for printing dates")
 (defglobal *month-abbreviation-vector* (VECTOR OF STRING-WRAPPER) NULL
   :documentation "A vector of month abbreviations for printing dates")
 
 (startup-time-progn :globals
+  (setq *month-name-vector*
+    (new (VECTOR OF STRING-WRAPPER)
+         :array-size 13))
+  (foreach i in (interval 0 12)
+      as abbreviation in (quote ("NUL" "January" "February" "March" "April"
+				       "May" "June" "July" "August" "September"
+				       "October" "November" "December"))
+      do (setf (nth *month-name-vector* i) abbreviation))
   (setq *month-abbreviation-vector*
     (new (VECTOR OF STRING-WRAPPER)
          :array-size 13))
@@ -530,7 +540,7 @@ be included (if present) if a time value is given."
 	    (when (defined? (date-time-zone date))
 	      (if (= (date-time-zone date) 0.0)
 		  (setq index (insert-string "Z" 0 null buffer index :PRESERVE))
-		  (setq index (insert-string (time-zone-format60 (date-time-zone date))
+		  (setq index (insert-string (time-zone-format60 (date-time-zone date) TRUE)
 					     0 null buffer index :PRESERVE))))))))
     (return (subsequence buffer 0 index)) ))
 
@@ -766,7 +776,7 @@ Recommended values for the flag is `true'."
     (when include-timezone?
       (if (= timezone 0.0)
         (setq tz-string "Z")
-	(setq tz-string (time-zone-format60 timezone))))
+	(setq tz-string (time-zone-format60 timezone TRUE))))
     (return (concatenate (calendar-date-to-date-string date timezone TRUE)
                          "T"
                          (calendar-date-to-time-string date timezone FALSE FALSE TRUE)
@@ -902,8 +912,8 @@ integer values for days and milliseconds.  If no valid parse is found, `null' is
       (setq ms-end-position (string-search duration "ms" ms-start-position))
       (when (defined? ms-end-position)
         (setq n-millis (string-to-integer (subsequence duration 
-					     ms-start-position
-					     (- ms-end-position 1))))))
+					     (1+ ms-start-position)
+					     (1- ms-end-position))))))
     (if negative?
       (return (make-time-duration (- n-days) (- n-millis)))
       (return (make-time-duration n-days n-millis)))))
@@ -1270,7 +1280,8 @@ then the reutrn value will be a relative date."
 (defun fill-in-date-substitution ((substitution-list (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
   :documentation "Fill in `substitution-list' with template variable substitions
 for the names YEAR and DATE which correspond to the current year and date.
-These substitutions can then be used with `substitute-template-variables-in-string'"
+These substitutions can then be used with `substitute-template-variables-in-string'
+DEPRECATED.  Use `add-date-subsitution' or `add-current-date-substitution' instead."
   :public? TRUE
   (mv-bind (year month day dow)
       (get-calendar-date (make-current-date-time) (get-local-time-zone))
@@ -1283,3 +1294,61 @@ These substitutions can then be used with `substitute-template-variables-in-stri
 			    (nth *month-abbreviation-vector* month)
 			    "-"
 			    (integer-to-string year))) ))
+
+(defun add-date-substitution ((date CALENDAR-DATE) 
+			      (substitution-list (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+  :documentation "Fill in `substitution-list' with template variable substitions
+for the names YEAR, MONTH, MON, DAY, HOUR, MINUTE, SECOND, TIMEZONE,
+DAY-OF-WEEK, DOW with their values for `date'.  Also, pre-formatted
+DATE, TIME and ISO8601 variables are set.
+
+TIMEZONE is in the format \"{+|-}hhmm\".  MONTH is the full English
+month name and MON is the numeric month.  DAY-OF-WEEK is an English
+string and DOW is the first three letters.  Minutes and seconds are
+zero-padded.
+
+These substitutions can be used with `substitute-template-variables-in-string'"
+  :public? TRUE
+  (let ((tz  (get-local-time-zone)))
+  (mv-bind (year month day dow)
+      (get-calendar-date date tz)
+    (insert-at substitution-list "YEAR" (integer-to-string year))
+    (insert-at substitution-list "MONTH" (nth *month-name-vector* month))
+    (insert-at substitution-list "MON" (integer-to-string month))
+    (insert-at substitution-list "DAY" (integer-to-string day))
+    (insert-at substitution-list "DAY-OF-WEEK" (string-capitalize (symbol-name dow)))
+    (insert-at substitution-list "DOW" (string-capitalize (subsequence (symbol-name dow) 0 3)))
+    (insert-at substitution-list "DATE" 
+	       (concatenate (format-with-padding (integer-to-string day)
+						 2 #\0 :right false)
+			    "-"
+			    (nth *month-abbreviation-vector* month)
+			    "-"
+			    (integer-to-string year))) )
+  (mv-bind (hour min sec millis)
+       (get-time date tz)
+    (ignore millis)
+    (insert-at substitution-list "HOUR" (integer-to-string hour))
+    (insert-at substitution-list "MINUTE" (format-with-padding (integer-to-string min)
+							       2 #\0 :right false))
+    (insert-at substitution-list "SECOND" (format-with-padding (integer-to-string sec)
+							       2 #\0 :right false))
+    (insert-at substitution-list "TIME" 
+	       (concatenate (integer-to-string hour)
+			    ":"
+			    (format-with-padding (integer-to-string min)
+						 2 #\0 :right false)
+			    ":"
+			    (format-with-padding (integer-to-string sec)
+						 2 #\0 :right false))) )
+  (insert-at substitution-list "TIMEZONE" (time-zone-format60 tz FALSE))
+  (insert-at substitution-list "IOS8601" (calendar-date-to-iso8601-string date tz TRUE)) ))
+
+
+
+(defun add-current-date-substitution ((substitution-list (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+  :documentation "Fill in `substitution-list' with date information for the current
+date and time.  See `add-date-substitution' for details."
+  :public? TRUE
+  (add-date-substitution (make-current-date-time) substitution-list))
+  

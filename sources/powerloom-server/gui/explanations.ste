@@ -1,0 +1,235 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2002-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: explanations.ste,v 1.7 2010/02/12 22:41:33 hans Exp
+
+;;; Support for html printing of explanations in Java GUI
+
+(in-package "STELLA")
+
+(in-module "GUI-SERVER")
+
+
+  ;;
+;;;;;; Atom and URL print functions adapted from Ontosaurus
+  ;;
+
+(defun plgui-html-pprint-object ((self OBJECT) (stream OUTPUT-STREAM))
+  (special ((*logic-dialect* :KIF)
+            (ontosaurus/*pprint-atomic-object-renderer*
+             (the-code :function plgui-html-pprint-atomic-object)))
+  ;;; KLUDGE: force proper pretty-printing of certain propositions via <PRE> formatting.
+    (typecase self
+      (PROPOSITION
+       (case (kind self)
+         ((:ISA :FUNCTION :PREDICATE :NOT :EQUIVALENT #|:FAIL|#) NULL)
+         (otherwise
+          (with-html-tag ("PRE" stream true)
+            (ontosaurus/pprint-object self stream))
+          (return))))
+      (otherwise NULL))
+    (ontosaurus/pprint-object self stream)))
+
+(defun plgui-html-pprint-atomic-object ((self OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  :PUBLIC? TRUE
+  (unless (null? self)
+    (typecase self
+      (LITERAL-WRAPPER
+       (ontosaurus/pprint-literal-wrapper-for-html self stream))
+      (PATTERN-VARIABLE 
+       (ontosaurus/pprint-atomic-object self stream))
+      (SKOLEM   ;; Revisit
+       (cond ((defined? (native-value-of self))
+	      (ontosaurus/pprint-atomic-object (native-value-of self) stream))
+	     ((defined? (innermost-of self))
+	      (if (eq? (innermost-of self) self)
+                  (with-html-tag ("FONT COLOR='#666666'" stream)
+                    (print-stream stream (string-downcase (get-skolem-print-name self))))
+		(progn 
+		  (with-html-tag ("FONT COLOR='#996633'" stream)
+		    (print-stream stream (string-downcase (get-skolem-print-name self)))
+		    (print-stream stream VALUE-OF-SEPARATOR))
+		  (ontosaurus/pprint-object (innermost-of self) stream))))
+	     (otherwise 
+	      (print-stream stream (generate-skolem self)))))
+      (LOGIC-OBJECT
+       (if (defined? (surrogate-value-inverse self))
+           (print-plgui-url self stream)
+	 (print-stream stream "Unamed_Object")))
+      (SURROGATE 
+       (if (defined? (surrogate-value self))
+           (ontosaurus/pprint-object (surrogate-value self) stream)
+	 (print-stream stream (surrogate-to-symbol self))))
+      (GENERALIZED-SYMBOL
+       (write-html-quoting-special-characters stream (symbol-name self)))
+      (MODULE
+       (plgui-write-url stream *plgui-url-action* "context" self))
+      (THING
+       (if (defined? (surrogate-value-inverse self))
+           (print-stream stream (symbol-name (surrogate-value-inverse self)))
+	 (print-stream stream self)))
+      (otherwise
+       (print-stream stream self)))) )
+
+(defspecial *plgui-url-action* STRING "show"
+  :documentation "The action parameter for URL printing"
+  :PUBLIC? TRUE)
+
+(defun print-plgui-url ((the-object LOGIC-OBJECT)
+                        (nativeStream NATIVE-OUTPUT-STREAM))
+  :PUBLIC? TRUE
+  :documentation "Prints a URL following PowerLoom Plgui conventions."
+  (plgui-write-url nativeStream
+                   *plgui-url-action* 
+                   (ontosaurus/logic-object-display-type the-object)
+                   the-object))
+
+(defun plgui-write-url-in-detail ((stream NATIVE-OUTPUT-STREAM) 
+                                  (target STRING)
+                                  (action STRING)
+                                  (objectType STRING)
+                                  (contextName STRING)
+                                  (objectName STRING)
+                                  (objectTitle STRING)
+                                  (rawTitle? BOOLEAN))
+  (ignore action)
+  (print-stream stream "<A ")
+  (when (defined? target)
+    (print-stream stream "TARGET='" target "' "))
+  (print-stream stream "HREF='plgui:navigateTo?type=" (string-upcase objectType) "&id=")
+  (write-html-escaping-url-special-characters stream objectName)
+  (print-stream stream "&module=")
+  (write-html-escaping-url-special-characters stream contextName)
+  (print-stream stream "'>")
+  (if rawTitle?
+      (print-stream stream objectTitle)
+    (write-html-quoting-special-characters stream objectTitle))
+  (print-stream stream "</A>")
+  (return))
+
+(defun plgui-write-url ((stream NATIVE-OUTPUT-STREAM) 
+                        (action STRING)
+                        (objectType STRING)
+                        (object STANDARD-OBJECT))
+  (typecase object
+    (LOGIC-OBJECT
+     (let ((writeModule (home-module object)))
+       ;(when (and (isa? *module* @MODULE)
+       ;           (member? (all-super-contexts *module*) writeModule))
+       ;  (setq writeModule *module*))
+       (plgui-write-url-in-detail stream 
+                                  NULL
+                                  action
+                                  objectType
+                                  (name writeModule)
+                                  (object-string-name object)
+                                  (object-string-name object)
+                                  FALSE) ))
+    (MODULE
+     (plgui-write-url-in-detail stream 
+                                NULL
+                                action
+                                objectType
+                                (name object)
+                                (name object)
+                                (name object)
+                                FALSE) )
+    (otherwise
+     (print STANDARD-ERROR "Don't know how to write URL for object" object)
+     (print-stream stream object)))
+  (return))
+
+(startup-time-progn
+  (register-logic-dialect-print-function
+   :JAVA-GUI-HTML (the-code :function plgui-html-pprint-object)))
+
+
+  ;;
+;;;;;; Printing justifications
+  ;;
+	
+(defun print-justification-to-html-file ((justification JUSTIFICATION)
+                                         (file STRING))
+  (special ((*explanation-format* :HTML)
+            (*explanation-audience* :LAY)
+            (*logic-dialect* :KIF-ONTOSAURUS)
+            (*most-recent-explanation-mapping* (new EXPLANATION-MAPPING)))
+    (when (null? (lookup *logic-dialect-print-functions* *logic-dialect*))
+      (setq *logic-dialect* :KIF))
+    (let ((info (register-justification
+                 (visible-justification justification)
+                 *most-recent-explanation-mapping*)))
+      (setf (label info) "1")
+      (setf (depth info) 1))
+    (with-output-file (stream file)
+      (print-stream stream EOL "Explanation #" 1 " score="
+                    (positive-score justification) ":" EOL EOL)
+      (print-whynot-justification
+       (visible-justification justification) stream NULL :BRIEF FALSE))))
+
+;; Set this to a real file in order to trace PLGUI-generated explanations
+;;    to an HTML-formatted file.  This is useful for capturing explanations
+;;    for demoing or to be included into presentations.
+(defglobal *plgui-explanation-trace-file* STRING NULL)
+
+(defun (get-justification-string STRING) ((justification JUSTIFICATION))
+  (special ((*explanation-format* :HTML)
+            (*explanation-audience* :LAY)
+            (*logic-dialect* :JAVA-GUI-HTML)
+            (*most-recent-explanation-mapping* (new EXPLANATION-MAPPING)))
+    (let ((stringStream (NEW OUTPUT-STRING-STREAM))
+	  (info (register-justification
+                 (visible-justification justification)
+                 *most-recent-explanation-mapping*)))
+      (setf (label info) "1")
+      (setf (depth info) 1)
+      (print-stream stringStream EOL "Explanation #" 1)
+      (when (defined? (positive-score justification))
+        (print-stream stringStream " score=" (positive-score justification)))
+      (print-stream stringStream ":" EOL EOL)
+      (print-whynot-justification
+       (visible-justification justification) stringStream NULL :BRIEF FALSE)
+      (let ((result (the-string stringStream)))
+        (when (defined? *plgui-explanation-trace-file*)
+          (with-output-file (out *plgui-explanation-trace-file*)
+            (print-stream out result EOL)))
+        (return result)))))

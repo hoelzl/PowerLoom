@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: fetch-interface.ste,v 1.10 2005/02/15 18:11:09 powerloom Exp
+;;; Version: fetch-interface.ste,v 1.11 2010/02/13 03:16:53 hans Exp
 
 ;;; Interface to Fetch query handler via HTTP protocol.
 
@@ -53,48 +53,44 @@
 ;;;;  Fetch EDB Queries
 ;;;;
 
-(defun (run-fetch-query OBJECT) 
-    ((host STRING) (port INTEGER)
-     (query-id STRING) (task-id STRING) (subtask-id STRING) (database STRING)
-     (parameters STRING))
-  :public? TRUE
+(defun (run-fetch-query OBJECT) ((host STRING) (port INTEGER)
+                                 (query-id STRING) (task-id STRING)
+                                 (subtask-id STRING) (database STRING)
+                                 (parameters STRING))
   :documentation "Runs a Fetch query specifying the parameters given.
 Returns an object representing the returned XML-encoded answer from
 the server."
+  :public? TRUE
+  ;;; NOTE: WE REWROTE THIS TO DYNAMICALLY LOAD AND USE THE NEW
+  ;;;       "webtools" SUPPORT, BUT THE RESULT IS UNTESTED!!!
   (special ((*printreadably?* FALSE))
-     (with-network-stream (in out host port)
-       ;; Send request
-       (print-stream out "GET /agent/runner?plan=")
-       (write-html-escaping-url-special-characters out query-id)
-       (print-stream out "&TaskID=")
-       (write-html-escaping-url-special-characters out task-id)
-       (print-stream out "-")
-       (write-html-escaping-url-special-characters out subtask-id)
-       (print-stream out "&Database=")
-       (write-html-escaping-url-special-characters out database)
-       (print-stream out "&")
-       (print-stream out parameters)
-       (print-stream out " HTTP/1.0" #\Return #\Linefeed #\Return #\Linefeed)
-       (flush-output out)
-
-       ;; Read and parse reply
-       (mv-bind (returnCode returnMessage version)
-		(utilities/read-http-header in (new KEY-VALUE-LIST))
-		(ignore version)
-	  (if (= returnCode 200)	; HTTP SUCCESS
-	      (progn 
-		(foreach exp in (xml-expressions in NULL)
-		   where (and (isa? exp @CONS)
-			      (xml-element? (first (cast exp CONS))))
-		   do (xml-tag-case (get-xml-tag exp)
-		       (("PlanExecution")
-			(return exp))
-		       (("Error")
-			(error (wrapper-value (cast (first (get-xml-content exp))
-						    STRING-WRAPPER))))
-		       (otherwise NULL)))
-		(error "Fetch Query Error: No answer element found."))
-	    (error "HTTP Error " returnCode " " returnMessage)))) ))
+    (let ((url (new STRING-OUTPUT-STREAM))
+          (reply INPUT-STREAM NULL))
+       ;; Create request URL:
+       (print-stream url "/agent/runner?plan=")
+       (write-html-escaping-url-special-characters url query-id)
+       (print-stream url "&TaskID=")
+       (write-html-escaping-url-special-characters url task-id)
+       (print-stream url "-")
+       (write-html-escaping-url-special-characters url subtask-id)
+       (print-stream url "&Database=")
+       (write-html-escaping-url-special-characters url database)
+       (print-stream url "&")
+       (print-stream url parameters)
+       (setq reply
+         (funcall (autoload "HTTP/HTTP-GET-DATA" "webtools" @RUN-FETCH-QUERY TRUE)
+                  host port (the-string url) NULL))
+       (foreach exp in (xml-expressions reply NULL)
+           where (and (isa? exp @CONS)
+                      (xml-element? (first (cast exp CONS))))
+           do (xml-tag-case (get-xml-tag exp)
+                (("PlanExecution")
+                 (return exp))
+                (("Error")
+                 (error (wrapper-value (cast (first (get-xml-content exp))
+                                             STRING-WRAPPER))))
+                (otherwise NULL)))
+       (error "Fetch Query Error: No answer element found."))))
 
 #|
 (eval (run-fetch-query "pegasus2.isi.edu" 8080 

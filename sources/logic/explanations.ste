@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: explanations.ste,v 1.11 2008/08/22 18:41:38 tar Exp
+;;; Version: explanations.ste,v 1.13 2010/09/09 23:04:39 hans Exp
 
 ;;; Support for generating explanations
 
@@ -71,16 +71,15 @@
 ;;;   in recursion demo, `has-ancestor' subsumes `has-parent', hence, the
 ;;;   explicit `has-parent' assertions are always recorded as `has-ancestor'
 ;;;   assertions.
-;;; - Handle propositions derived via forward inference.  A first-cut solution
-;;;   would be to record the inference context and say
-;;;   "holds via forward inference" if the proposition holds in a strict
-;;;   inference cache of the query context.
 
 ;;; Tom's suggestions:
 
 ;;; - Mention rule in modus ponens as last antecedent.
 ;;; - Use forward-implication by default.
 
+;;; Done.
+;;; - Handle propositions derived via forward inference.
+;;;
 
 (defclass EXPLAIN-EXCEPTION (LOGIC-EXCEPTION))
 (defclass EXPLAIN-NO-QUERY-EXCEPTION (EXPLAIN-EXCEPTION))
@@ -238,6 +237,9 @@ proposition will be printed on the same line.")
         (bestScore -1))
     (when (null? vocabulary)
       (setq vocabulary (lookup *explanation-vocabularies* :TECHNICAL)))
+    (when (null? phraseKey)
+      ;; avoid breakage if we have underspecified justifications:
+      (setq phraseKey :unknown-rule))
     (setq entry (lookup vocabulary phraseKey))
     (when (null? entry)
       (setq vocabulary (lookup *explanation-vocabularies* :TECHNICAL))
@@ -580,6 +582,8 @@ proposition will be printed on the same line.")
        (when (and (> (length amplification) 0)
                   (not (eql? amplification inference)))
          (print-stream stream " " amplification))
+       (when (eql? (inference-direction self) :forward)
+         (print-stream stream " [Forward]"))
        (print-stream stream EOL))
       (:HTML
        (print-stream stream "<BR>" EOL)
@@ -587,9 +591,14 @@ proposition will be printed on the same line.")
        (when (and (> (length amplification) 0)
                   (not (eql? amplification inference)))
          (print-stream stream " " amplification))
+       (when (eql? (inference-direction self) :forward)
+         (print-stream stream " [Forward]"))
        (print-stream stream EOL))
       (:XML
-       (print-stream stream "<method>" inference "</method>" EOL))) ))
+       (print-stream stream "<method")
+       (when (eql? (inference-direction self) :forward)
+	 (print-stream stream " direction='forward'"))
+       (print-stream stream ">" inference "</method>" EOL))) ))
 
 (defun (mark-as-explicit-assertion? BOOLEAN) ((self JUSTIFICATION))
   ;; Return TRUE if `self' should be marked inline in an antecedent list
@@ -655,14 +664,19 @@ proposition will be printed on the same line.")
 (defun (get-explanation-substitution ENTITY-MAPPING) ((self JUSTIFICATION))
   ;; `self' represents the result of a rule application.
   ;; Collect the set of rule variable substitutions and return the result.
-  (let ((ruleJustification (first (antecedents self)))
-        (rule (proposition ruleJustification))
+  (let ((rule-justification (first (antecedents self)))
+        (rule (proposition rule-justification))
         ;; the rule antecedent is a :PATTERN frame containing the relevant
         ;;    variable substitutions:
-        (antecedentJustification (second (antecedents self)))
-        (antecedentSubstitution (substitution antecedentJustification)))
+        (antecedent-justification (second (antecedents self)))
+        (antecedent-substitution (substitution antecedent-justification)))
+    ;; HACK:  The FORWARD-JUSTIFICATION should follow the
+    ;;        same rule conventions as the backward justifications.
+    ;;        Or maybe this should become a method?
+    (when (isa? self @FORWARD-JUSTIFICATION)
+      (setq antecedent-substitution (substitution self)))
     #|
-    ;; All we do below is sort the variables in `antecedentSubstitution'
+    ;; All we do below is sort the variables in `antecedent-substitution'
     ;;    so they occur in the same order as in the rule.  This is complicated
     ;;    by the fact that the variables in the pattern frame are copied from
     ;;    the optimal pattern and have to be compared by name:
@@ -671,13 +685,13 @@ proposition will be printed on the same line.")
     (let ((substitution (new ENTITY-MAPPING))
           (antecedent DESCRIPTION (first (arguments rule))))
       (foreach var in (io-variables antecedent)
-          do (foreach (pVar value) in antecedentSubstitution
+          do (foreach (pVar value) in antecedent-substitution
                  where (eql? (skolem-name var)
                              (skolem-name (cast pVar PATTERN-VARIABLE)))
                  do (insert-at substitution var value)
                     (break)))
       (foreach var in (internal-variables antecedent)
-          do (foreach (pVar value) in antecedentSubstitution
+          do (foreach (pVar value) in antecedent-substitution
                  where (eql? (skolem-name var)
                              (skolem-name (cast pVar PATTERN-VARIABLE)))
                  do (insert-at substitution var value)
@@ -686,7 +700,7 @@ proposition will be printed on the same line.")
       |#
     ;; since we collect the bindings in the same order they are in the
     ;;    pattern frame, the order should be ok even without sorting:
-    (return antecedentSubstitution)))
+    (return antecedent-substitution)))
 
 (defun print-one-variable-substitution ((stream OUTPUT-STREAM) (var OBJECT) (value OBJECT))
   ;; Prints one variable substitution in the appropriate format

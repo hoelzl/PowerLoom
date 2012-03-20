@@ -1,0 +1,335 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 2009-2010      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: http-server-impl.ste,v 1.2 2010/02/12 23:54:26 hans Exp
+
+;;; HTTP interface implementation for Allegro Serve
+
+(in-package "STELLA")
+
+(in-module "HTTP/ASERVE")
+
+
+  ;;
+;;;;;; Server operations
+  ;;
+
+(defclass HTTP-SERVER-ASERVE (HTTP-SERVER)
+  :public? TRUE)
+
+(startup-time-progn
+  (if (and (defined? *http-server-implementation*)
+           (not (isa? *http-server-implementation* @HTTP-SERVER-ASERVE)))
+      (error "Conflicting HTTP server implementation already loaded")
+    (setq *http-server-implementation* (new HTTP-SERVER-ASERVE))))
+
+
+(defmethod (start-http-server-impl STRING) ((server HTTP-SERVER-ASERVE) (port INTEGER))
+  (verbatim :common-lisp
+    "(net.aserve:start :port port :chunking #-:MCL CL:t #+:MCL CL:nil)")
+  (return NULL))
+
+(defmethod stop-http-server-impl ((server HTTP-SERVER-ASERVE))
+  (verbatim :common-lisp
+    "(net.aserve:shutdown)"))
+
+
+  ;;
+;;;;;; Server exchange API
+  ;;
+
+(defclass HTTP-EXCHANGE-ASERVE (HTTP-EXCHANGE)
+  :slots ((request :type LISP-CODE :required? TRUE)
+          (entity :type LISP-CODE :required? TRUE)
+          (stream :type NATIVE-OUTPUT-STREAM)))
+
+
+;;; Header accessors:
+
+(defun (coerce-lisp-value-to-string STRING) ((lvalue LISP-CODE))
+  (cond ((cl:eq lvalue NIL)
+         (return NULL))
+        ((cl:stringp lvalue)
+         (return (safe-cast lvalue STRING)))
+        (otherwise
+         (return (cl:princ-to-string lvalue)))))
+
+(defmethod (get-header-value-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE) (key KEYWORD))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg))
+        (lkey (lispify key)))
+    (return
+      (coerce-lisp-value-to-string
+       (verbatim :common-lisp "(net.aserve:header-slot-value lreq lkey)")))))
+
+(defmethod (get-reply-header-value-impl STRING) ((server HTTP-SERVER-ASERVE)
+                                                 (xchg HTTP-EXCHANGE)
+                                                 (key KEYWORD))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg))
+        (lkey (lispify key)))
+    (return
+      (coerce-lisp-value-to-string
+       (verbatim :common-lisp "(net.aserve:reply-header-slot-value lreq lkey)")))))
+
+(defmethod set-reply-header-value-impl ((server HTTP-SERVER-ASERVE)
+                                        (xchg HTTP-EXCHANGE)
+                                        (key KEYWORD)
+                                        (value STRING))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg))
+        (lkey (lispify key)))
+    (verbatim :common-lisp "(CL:setf (net.aserve:reply-header-slot-value lreq lkey) value)")))
+
+
+;;; Request accessors:
+
+(defmethod (get-request-uri-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg)))
+    (return (verbatim :common-lisp "(net.uri:render-uri (net.aserve:request-raw-uri lreq) CL:nil)"))))
+
+(defmethod (get-request-uri-query-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg)))
+    (return
+      (coerce-lisp-value-to-string
+       (verbatim :common-lisp "(net.uri:uri-query (net.aserve:request-uri lreq))")))))
+
+(defmethod (get-request-uri-path-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg)))
+    (return
+      (coerce-lisp-value-to-string
+       (verbatim :common-lisp "(net.uri:uri-path (net.aserve:request-uri lreq))")))))
+
+(defmethod (get-request-method-impl KEYWORD) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg)))
+    (return (intern-keyword (verbatim :common-lisp "(CL:symbol-name (net.aserve:request-method lreq))")))))
+
+(defmethod (get-request-protocol-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg)))
+    (return (verbatim :common-lisp "(net.aserve:request-protocol-string lreq)"))))
+
+(defmethod (get-request-body-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg)))
+    (return (verbatim :common-lisp "(net.aserve:get-request-body lreq)"))))
+
+(defmethod (get-request-local-address-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg))
+        (lsocket LISP-CODE (verbatim :common-lisp "(net.aserve:request-socket lreq)"))
+        (host STRING (verbatim :common-lisp "(CL:or (socket:ipaddr-to-hostname (socket:local-host lsocket))
+                                                    (socket:ipaddr-to-dotted (socket:local-host lsocket)))"))
+        (port INTEGER (verbatim :common-lisp "(socket:local-port lsocket)")))
+    (return (concatenate host ":" (integer-to-string port)))))
+
+(defmethod (get-request-remote-address-impl STRING) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg))
+        (lsocket LISP-CODE (verbatim :common-lisp "(net.aserve:request-socket lreq)"))
+        (host STRING (verbatim :common-lisp "(CL:or (socket:ipaddr-to-hostname (socket:remote-host lsocket))
+                                                    (socket:ipaddr-to-dotted (socket:remote-host lsocket)))"))
+        (port INTEGER (verbatim :common-lisp "(socket:remote-port lsocket)")))
+    (return (concatenate host ":" (integer-to-string port)))))
+
+
+;;; Reply accessors:
+
+#|
+;;; Problem: see `generic-response-handler' below for why we can't do
+;;; this and need to use an intermediate string stream instead:
+
+(defmethod (get-reply-stream-impl NATIVE-OUTPUT-STREAM) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg)))
+    (return (verbatim :common-lisp "(net.aserve:request-reply-stream lreq)"))))
+|#
+
+(defmethod (get-reply-stream-impl NATIVE-OUTPUT-STREAM) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lstream (stream lxchg)))
+    (when (null? lstream)
+      (setq lstream (verbatim :common-lisp "(CL:make-string-output-stream)"))
+      (setf (stream lxchg) lstream))
+    (return lstream)))
+
+(defun (get-aserve-response-code LISP-CODE) ((code KEYWORD))
+  ;; Create an AServe response code object corresponding to `code'
+  ;; (this uses pre-existing structures for the most common codes).
+  ;; CAUTION: We use some non-exported internal functions here.
+  (let ((ncode (get-http-response-code code NULL))
+        (lcode (verbatim :common-lisp "(net.aserve::code-to-response ncode)"))
+        (lcodedesc STRING (verbatim :common-lisp "(net.aserve::response-desc lcode)")))
+    (when (eql? lcodedesc "unknown code")
+      ;; we created a new code which was also cached on *responses*:
+      (setq lcodedesc (get-http-response-desc code NULL))
+      (verbatim :common-lisp "(CL:setf (net.aserve::response-desc lcode) lcodedesc)"))
+    (return lcode)))
+        
+(defmethod set-response-code-impl ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE) (code KEYWORD))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lreq (request lxchg))
+        (lcode (get-aserve-response-code code)))
+    (verbatim :common-lisp "(CL:setf (net.aserve:request-reply-code lreq) lcode)")))
+
+
+  ;;
+;;;;;; Publishing URLs and response handlers
+  ;;
+
+(defmethod publish-file-impl ((server HTTP-SERVER-ASERVE)
+                              (path STRING)
+                              (file STRING)
+                              (options PROPERTY-LIST))
+  (let ((ctype (lispify (lookup options :content-type))))
+    (verbatim :common-lisp
+      "(net.aserve:publish-file
+         :path path
+         :file file
+         :content-type ctype
+         :plist `(handler-options ,options))")))
+
+(defmethod publish-directory-impl ((server HTTP-SERVER-ASERVE)
+                                   (path STRING)
+                                   (directory STRING)
+                                   (options PROPERTY-LIST))
+  (ignore options)
+  (verbatim :common-lisp
+     "(net.aserve:publish-directory
+        :prefix path
+        :destination directory
+        :plist `(handler-options ,options))"))
+
+#|
+;; just for testing the handler function:
+(defmethod publish-directory-impl ((server HTTP-SERVER-ASERVE)
+                                   (path STRING)
+                                   (directory STRING)
+                                   (options PROPERTY-LIST))
+  (publish-handler-impl server path (the-code :function directory-handler) options))
+|#
+
+(defmethod publish-handler-impl ((server HTTP-SERVER-ASERVE)
+                                 (path STRING)
+                                 (handler FUNCTION-CODE)
+                                 (options PROPERTY-LIST))
+  (let ((ctype (lispify (lookup options :content-type))))
+    (verbatim :common-lisp
+      "(net.aserve:publish
+         :path path
+         :content-type ctype
+         :function #'generic-response-handler
+         :plist `(response-handler ,handler handler-options ,options))")))
+
+(defmethod (get-handler-options-impl PROPERTY-LIST) ((server HTTP-SERVER-ASERVE) (xchg HTTP-EXCHANGE))
+  (let ((lxchg HTTP-EXCHANGE-ASERVE xchg)
+        (lent (entity lxchg)))
+    (return (verbatim :common-lisp "(CL:getf (net.aserve:entity-plist lent) 'handler-options)"))))
+
+
+  ;;
+;;;;;; Defining computed response handlers
+  ;;
+
+;;; The basic issue we need to solve here is that we want to define handler functions in
+;;; STELLA that all use a single argument of type `HTTP-EXCHANGE' (since all API functions
+;;; are defined on that); however, each native HTTP server implementation has its own
+;;; unique calling signature that handler functions must match.  So, we must map from a
+;;; native handler function to the STELLA handler when we publish a URL.
+
+;;; In Lisp we could do that by defining native handler functions on the fly that call
+;;; out to the STELLA handler, which is a bit tricky to do, since we want STELLA functions
+;;; to define handlers dynamically (which would require us to call CL:compile).  Instead,
+;;; we link the STELLA handler to the URL handler object and then have a generic handler
+;;; function call it from there.  In Allegro, we can use the `plist' slot of the computed
+;;; entity to pass in the handler, in CL-HTTP we might have to use a special keyword and
+;;; then use that as a key to an external table where functions are stored.  In Java, we
+;;; simply store it as a field of the servlet object.
+
+#|
+;;; Problem: the following does not work quite right in Allegro, since any modifications
+;;; we make to reply headers in the handler function won't make it into the generated
+;;; response.  The reason is that at the beginning of `with-http-body' those headers are
+;;; sent out and later modifications are therefore not seen.  The slightly inefficient
+;;; workaround is that we construct the reply output on a string stream outside of the
+;;; macros and then send it in one shot - see alternative version below.  Should this
+;;; become a performance issue with large replies, we can rethink the protocol here.
+
+;;; To resurrect this, compile the commented `get-reply-stream-impl' above.
+
+(defun generic-response-handler ((lreq LISP-CODE) (lent LISP-CODE))
+  ;; Generic response handler for Allegro Serve which determins the STELLA handler
+  ;; function from the computed entity `lent's plist and then calls it.
+  (let (;; `handler' always exists, we make sure of that during definition:
+        (handler FUNCTION-CODE
+                 (verbatim :common-lisp
+                   ;; use STELLA symbol as p-list key to avoid conflicts:
+                   "(CL:getf (net.aserve:entity-plist lent) 'response-handler)"))
+        (xchg (new HTTP-EXCHANGE-ASERVE :request lreq :entity lent)))
+    (verbatim :common-lisp
+      "(net.aserve:with-http-response (lreq lent)
+         (net.aserve:with-http-body (lreq lent)
+           (CL:funcall handler xchg)))")))
+|#
+
+(defun generic-response-handler ((lreq LISP-CODE) (lent LISP-CODE))
+  ;; Generic response handler for Allegro Serve which determins the STELLA handler
+  ;; function from the computed entity `lent's plist and then calls it.
+  (let (;; `handler' always exists, we make sure of that during definition:
+        (handler FUNCTION-CODE
+                 (verbatim :common-lisp
+                   ;; use STELLA symbol as p-list key to avoid conflicts:
+                   "(CL:getf (net.aserve:entity-plist lent) 'response-handler)"))
+        (xchg (new HTTP-EXCHANGE-ASERVE :request lreq :entity lent)))
+    (CL:funcall handler xchg)
+    (let ((stream (stream xchg))
+          (output ""))
+      (when (defined? stream)
+        (setq output (verbatim :common-lisp "(cl:get-output-stream-string stream)")))
+      (verbatim :common-lisp
+       "(net.aserve:with-http-response (lreq lent)
+          (net.aserve:with-http-body (lreq lent)
+            (CL:write-string output (net.aserve:request-reply-stream lreq))))"))))

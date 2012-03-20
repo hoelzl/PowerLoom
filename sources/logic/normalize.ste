@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: normalize.ste,v 1.45 2009/06/12 00:53:54 tar Exp
+;;; Version: normalize.ste,v 1.46 2010/09/09 23:59:27 hans Exp
 
 ;;; Normalization of propositions
 
@@ -510,6 +510,10 @@
   ;; If the relation argument of the HOLDS-proposition `self' is not a
   ;;    a variable (e.g., a relation name, ground function term or KAPPA),
   ;;    then convert 'self' into an ordinary proposition.
+  ;; PROBLEM: if we have an expression such as `(holds (f a) ?x ?y)' where
+  ;;    `(f a)' can dynamically infer descriptions, the approach of evaluating
+  ;;    the term to a surrogate at proposition building time is insufficient.
+  ;;    Figure out how to address this more generally.
   (let ((holdsArguments (arguments self))
         (relationTerm (nth holdsArguments 0))
         (nofArguments (1- (length holdsArguments)))
@@ -517,7 +521,9 @@
         (predicateArguments (new VECTOR :array-size nofArguments))
         (description DESCRIPTION NULL))
     (when (and (null? surrogate)
-               (not (isa? relationTerm @DESCRIPTION)))
+               (or (not (isa? relationTerm @DESCRIPTION))
+                   ;; check the KAPPA for any unbound external variables:
+                   (not (argument-bound? relationTerm))))
       (return))
     (foreach i in (interval 1 nofArguments)
         do (setf (nth predicateArguments (1- i)) (nth holdsArguments i)))
@@ -562,6 +568,14 @@
   (when (eql? (operator self) @THING)
     (overlay-proposition self TRUE-PROPOSITION)
     (return))
+  (foreach clause in (arguments self)
+      where (isa? clause @PROPOSITION)
+      do (normalize-proposition clause)) )
+
+(defun normalize-function-proposition ((self PROPOSITION))
+  ;; Normalize any proposition arguments of `self'.
+  ;; This primarily benefits `finish-creating-function-proposition', so it
+  ;; can properly deal with arguments that are propositions.
   (foreach clause in (arguments self)
       where (isa? clause @PROPOSITION)
       do (normalize-proposition clause)) )
@@ -747,10 +761,7 @@
     (:OR (normalize-OR-proposition self))
     (:NOT (normalize-NOT-proposition self))
     ((:ISA :PREDICATE) (normalize-predicate-proposition self))
-    (:FUNCTION
-     (foreach clause in (arguments self)
-              where (isa? clause @PROPOSITION)
-              do (normalize-proposition clause)))
+    (:FUNCTION (normalize-function-proposition self))
     (:EXISTS (normalize-EXISTS-proposition self))
     (:FORALL (normalize-FORALL-proposition self))
     (:EQUIVALENT (normalize-EQUIVALENT-proposition self))

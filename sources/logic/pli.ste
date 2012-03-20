@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: pli.ste,v 1.54 2010/01/27 18:19:38 tar Exp
+;;; Version: pli.ste,v 1.56 2010/09/10 01:10:05 hans Exp
 
 ;;; Application Program Interface (API) for PowerLoom
 
@@ -634,7 +634,10 @@ v.
   (when (null? relation)
     (return NIL))
   (with-logic-environment module environment
-    (let ((specialize? (not (test-environment-level? environment "ASSERTION")))
+    ;; Note: by default, all PLI routines should use the same environment as
+    ;;       `test-isa?' unless we only want to look at explicit assertions.
+    (let ((assertionsOnly? (test-environment-level? environment "ASSERTION"))
+          (specialize? (not assertionsOnly?))
           (argumentWithBacklinks (some arg in arguments
                                        where (and (defined? arg)
                                                   (isa? arg @LOGIC-OBJECT))))
@@ -644,6 +647,8 @@ v.
                             (allocate-iterator
                              (help-get-true-extension-members relation specialize?))))
           (results NIL))
+      (unless assertionsOnly?
+        (setq *context* (get-property-test-context)))
       (foreach p in iterator
                where (and (forall inputArg in arguments
                                   as arg2 in (arguments p)
@@ -1877,21 +1882,24 @@ then a Stella `no-such-context-exception' is thrown."
 (defun (get-nth-domain LOGIC-OBJECT) ((relation LOGIC-OBJECT) (n INTEGER))
   :public? TRUE
   :documentation "Return the type (a concept) for the the nth argument of the
-relation `relation'.  Counting starts at zero."
-  (if (class? relation)
-    (return (choose (eql? n 0) relation NULL))
-    (typecase relation
-      (NAMED-DESCRIPTION
-       (if (and (>= n 0)
+relation `relation'.  Counting starts at zero.  NOTE: if there are multiple
+`nth-domain' propositions for `relation', this arbitrarily returns one of them;
+it does not look for the most specific one (which might have to be created)."
+  (when (class? relation)
+    (return (choose (eql? n 0) relation NULL)))
+  (typecase relation
+    (NAMED-DESCRIPTION
+     (when (and (>= n 0)
                 (< n (length (io-variable-types relation))))
-         (let ((type (surrogate-value (nth (io-variable-types relation) n))))
-           (when (null? type)
-             (return NULL))
-           (typecase type
-             (CLASS (return (description type)))
-             (LOGIC-OBJECT (return type))))
-         (return NULL)))
-      (otherwise (return NULL)))))
+       (let ((domainProp
+              (first
+               (help-get-propositions (surrogate-value PL-KERNEL/@nth-domain)
+                                      (cons relation (cons n (cons null nil)))
+                                      1 null null))))
+         (when (defined? domainProp)
+           (return (last-argument domainProp))))))
+    (otherwise NULL))
+  (return NULL))
 
 (defun (s-get-nth-domain LOGIC-OBJECT)
        ((relation-name STRING) (n INTEGER) (module-name STRING) (environment ENVIRONMENT))
@@ -2287,6 +2295,11 @@ either absolutely or by default."
   :documentation "Tests whether `tv' is an unknown truth value."
   (return (unknown-truth-value? tv)))
 
+(defun (is-known BOOLEAN) ((tv TRUTH-VALUE))
+  :public? TRUE
+  :documentation "Tests whether `tv' is a known truth value (i.e., true or false)."
+  (return (known-truth-value? tv)))
+
 (defun (is-inconsistent BOOLEAN) ((tv TRUTH-VALUE))
   :public? TRUE
   :documentation "Tests whether `tv' is an inconsistent truth value."
@@ -2318,7 +2331,7 @@ interpreted as a sentence that is queried without any options.  For example:
 	 
     (happy Fred)
 	
-is a legal `query' argument.  Note that for a setence whose relation is a list
+is a legal `query' argument.  Note that for a sentence whose relation is a list
 itself, e.g., `((FruitFn BananaTree) MyBanana)' this shortcut is not available,
 that is, in that case an extra level of list nesting is always necessary.
 The returned truth value represents the logical truth of the queried sentence

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: propositions.ste,v 1.203 2009/02/07 05:53:34 hans Exp
+;;; Version: propositions.ste,v 1.206 2010/09/11 02:23:21 hans Exp
 
 ;;; Parsing and constructing propositions.
 
@@ -317,6 +317,16 @@ this proposition.")
                   (if (defined? value)
                       (print-native-stream stream "|W|" #\" value #\")
                       (print-native-stream stream "|W|" "NULL-STRING")))))
+
+
+(deftype ENTITY-MAPPING (KEY-VALUE-MAP #|KEY-VALUE-LIST|# OF OBJECT OBJECT)
+  :documentation "Used to keep track of copied or substituted variables
+and propositions within 'copy-description', etc.  This needs to be a
+subtype of DICTIONARY.  KEY-VALUE-LIST is a good choice for most cases,
+however, for very high-arity relations and descriptions we do get bad performance
+during copying and equivalence checking and KEY-VALUE-MAP (though more
+heavy-weight) would be the better option.")
+
 
 (defun (stringified-source STRING) ((self OBJECT))
   ;; Generic slot reader for the source of `self'.  Handles that LOGIC-OBJECT
@@ -991,8 +1001,10 @@ the overhead of the context mechanism." )
       (cond
        ((or (eql? self TRUE-PROPOSITION)
             (eql? self FALSE-PROPOSITION))
-        ;; avoid modifying global proposition constants:
-        NULL)
+        ;; avoid modifying global proposition constants - but signal a clash anyway
+        ;; (maybe the better solution would be to avoid the derivation of a FALSE constant
+        ;;  proposition, but instead derive the original prop with a false truth value):
+        (signal-truth-value-clash self))
        ((eql? oldTruthValue INCONSISTENT-TRUTH-VALUE)
         ;; if `self' is inconsistent, we require a deassign operation first:
         NULL)
@@ -1834,6 +1846,12 @@ its value!) and return the result.  Otherwise, return `tv1' unmodified."
   (return (or (eql? self UNKNOWN-TRUTH-VALUE)
               (null? self))))
 
+(defun (known-truth-value? BOOLEAN) ((self TRUTH-VALUE))
+  :documentation "Return TRUE if `self' is a known truth value, that is
+either TRUE or FALSE, but not UNKNOWN, INCONSISTENT, etc."
+  (return (or (true-truth-value? self)
+             (false-truth-value? self))))
+
 (defun (inconsistent-truth-value? BOOLEAN) ((self TRUTH-VALUE))
   :documentation "Return TRUE if `self' represents INCONSISTENT."
   :public? TRUE :globally-inline? TRUE
@@ -1887,7 +1905,10 @@ its value!) and return the result.  Otherwise, return `tv1' unmodified."
 
 (defun signal-truth-value-clash ((proposition PROPOSITION))
   ;; Mark `proposition' as inconsistent and signal a clash.
-  (assign-truth-value proposition INCONSISTENT-TRUTH-VALUE)
+  (unless (or (eql? proposition TRUE-PROPOSITION)
+              (eql? proposition FALSE-PROPOSITION))
+    ;; avoid modifying global proposition constants:
+    (assign-truth-value proposition INCONSISTENT-TRUTH-VALUE))
   (cond
    ((eql? *context* (meta-inference-cache *module*))
     (signal CLASH
@@ -2520,18 +2541,23 @@ without signalling an error if none exists.")
        ;;    have a corresponding symbol.  So, use STELLA/@TRUE for now:
        :operator STELLA/@TRUE
        :arguments (new ARGUMENTS-VECTOR :array-size 0)
-       :truth-value TRUE-TRUTH-VALUE))
+       :truth-value TRUE-TRUTH-VALUE
+       :home-context *pl-kernel-module*))
 
 (defconstant FALSE-PROPOSITION PROPOSITION
   (new PROPOSITION
        :kind :CONSTANT
        :operator STELLA/@FALSE
        :arguments (new ARGUMENTS-VECTOR :array-size 0)
-       :truth-value FALSE-TRUTH-VALUE))
+       :truth-value FALSE-TRUTH-VALUE
+       :home-context *pl-kernel-module*))
 
 (startup-time-progn
  (setf (surrogate-value STELLA/@TRUE) TRUE-PROPOSITION)
- (setf (surrogate-value STELLA/@FALSE) FALSE-PROPOSITION))
+ (setf (surrogate-value STELLA/@FALSE) FALSE-PROPOSITION)
+ ;; ensure they are in the duplicate index:
+ (find-duplicate-proposition TRUE-PROPOSITION)
+ (find-duplicate-proposition FALSE-PROPOSITION))
 
 
   ;;
@@ -2967,7 +2993,10 @@ with size less than `sizeCutoff' (default is 10)."
       (setq isaProposition (create-proposition (quote ISA) 1))
       (setf (operator isaProposition) type)
       (setf (nth (arguments isaProposition) 0) self)
-      (fasten-down-one-proposition isaProposition TRUE))
+      ;; even though we know that there isn't a duplicate at this point, check
+      ;; for one anyway during fastening, so the proposition will get added to
+      ;; the structured objects index (otherwise, we won't find duplicates later):
+      (fasten-down-one-proposition isaProposition FALSE))
     (update-proposition-truth-value isaProposition updateMode)
     (return isaProposition) ))
 
@@ -3005,7 +3034,8 @@ with size less than `sizeCutoff' (default is 10)."
       (setq propertyProposition (create-proposition (quote PREDICATE) 1))
       (setf (nth (arguments propertyProposition) 0) self)
       (setf (relationRef propertyProposition) surrogate)
-      (fasten-down-one-proposition propertyProposition TRUE))
+      ;; ensure insertion into structured object index - see above:
+      (fasten-down-one-proposition propertyProposition FALSE))
     (update-proposition-truth-value propertyProposition updateMode)
     (return propertyProposition) ))
 
@@ -3020,13 +3050,19 @@ with size less than `sizeCutoff' (default is 10)."
   (return (update-property instance property :RETRACT-TRUE)) )
 
 ;; TO DO: UPGRADE TO CLIP VALUES OF SINGLE-VALUED RELATIONS:
-(defun (update-tuple PROPOSITION)
-       ((relation SURROGATE) (arguments (CONS OF OBJECT)) (updateMode KEYWORD))
+(defun (update-tuple PROPOSITION) ((relation SURROGATE)
+                                   (arguments (CONS OF OBJECT))
+                                   (updateMode KEYWORD))
+  :documentation "Assert or retract a proposition that applies 'relation' to 'arguments'."
   :public? TRUE
-  ;; Assert or retract a proposition that applies 'relation' to
-  ;;    'arguments'.
-  (let ((description (get-description relation))
+  (let ((holds? (eql? relation PL-KERNEL/@HOLDS))
+        (description (choose holds?
+                             (get-description (first arguments))
+                             (get-description relation)))
         (proposition PROPOSITION NULL))
+    (when holds?
+      (setq relation (surrogate-value-inverse description))
+      (setq arguments (rest arguments)))
     (cond
      ((function-description? description)
       (let ((definingProposition
@@ -3293,7 +3329,7 @@ structure hash code which might be shared by different objects.")
 ;;;   hashing without preventing detection of different looking
 ;;;   duplicates (e.g., if order of quantified variables differs).
 
-(defun (proposition-hash-index INTEGER) ((self PROPOSITION))
+(defun (proposition-hash-index INTEGER) ((self PROPOSITION) (mapping ENTITY-MAPPING))
   ;; Compute a hash code that can be used to index `self' for
   ;;    the purpose of duplicate detection.
   ;; This purposely ignores variable names and positions and skolems
@@ -3301,7 +3337,14 @@ structure hash code which might be shared by different objects.")
   ;;    is assumed that true equivalence is checked via
   ;;    `equivalent-propositions?'.
   ;; TO DO: THINK ABOUT USING A SIMILAR SCHEME FOR PERSISTENT STORES.
-  (let ((code (object-hash-code (operator self)))
+  (let ((mapped? (defined? mapping))
+        (code (object-hash-code (operator self)))
+        (arguments (arguments self))
+        (functionOutput
+         (choose (and mapped?
+                      (eql? (kind self) :FUNCTION))
+                 (last arguments)
+                 NULL))
         (argCode 0)
         (commutative? FALSE))
     (case (kind self)
@@ -3309,8 +3352,12 @@ structure hash code which might be shared by different objects.")
        (setq commutative? TRUE))
       (otherwise NULL))
     (setq code (rotate-hash-code code))
-    (foreach arg in (arguments self)
-        do (when (and (defined? *queryIterator*)
+    (foreach arg in arguments
+        do (when mapped?
+             (if (eql? arg functionOutput)
+                 (setq arg NULL) ;; emulate partially-built function
+               (setq arg (mapped-value-of arg mapping FALSE))))
+           (when (and (defined? *queryIterator*)
                       (variable? arg))
              ;; we have a variable that might be bound in a query;
              ;; use its value instead if it has one (for descriptions):
@@ -3325,13 +3372,13 @@ structure hash code which might be shared by different objects.")
                (setq argCode (object-hash-code @SKOLEM))
              (typecase arg
                (PROPOSITION
-                (setq argCode (proposition-hash-index arg)))
+                (setq argCode (proposition-hash-index arg mapping)))
                (NAMED-DESCRIPTION
                 (setq argCode (object-hash-code arg)))
                (DESCRIPTION
                 ;; we ignore the fact that this is a description, but it's
                 ;; unlikely that we would often clash because of that:
-                (setq argCode (proposition-hash-index (proposition arg))))
+                (setq argCode (proposition-hash-index (proposition arg) mapping)))
                (PATTERN-VARIABLE
                 (setq argCode (object-hash-code @PATTERN-VARIABLE)))
                (SKOLEM
@@ -3339,7 +3386,7 @@ structure hash code which might be shared by different objects.")
                   (if (and (defined? definingProp)
                            (not (eql? definingProp self)))
                       ;; we have a function term as an argument, hash it:
-                      (setq argCode (proposition-hash-index definingProp))
+                      (setq argCode (proposition-hash-index definingProp mapping))
                     (setq argCode (object-hash-code @SKOLEM)))))
                (WRAPPER
                 (setq argCode (hash-code arg)))
@@ -3356,7 +3403,7 @@ structure hash code which might be shared by different objects.")
   ;; If not, add 'self' to `*structured-objects-index*'.
   ;; Also finds duplicate function propositions that are identical to
   ;;    `self' except for the last argument.
-  (let ((index (wrap-integer (proposition-hash-index self)))
+  (let ((index (wrap-integer (proposition-hash-index self NULL)))
         (bucket (lookup *structured-objects-index* index))
         (homeModule (base-module (home-context self)))
         (function? (eql? (kind self) :FUNCTION)))
@@ -4484,6 +4531,26 @@ doesn't indicate that."
 ;;;;;; Type checking
   ;;
 
+;;; NOTES, TO-DOs:
+;;; - proposition argument type checking needs to be cleaned up along various lines:
+;;;   - we need to make up our mind on what we want here: for now, we sort of treat
+;;;     automatic argument type fixing as an inference, but:
+;;;     - we don't handle retraction right since it is not done in an inference cache
+;;;     - we don't handle truth values right: both (r a b) and (not (r a b)) assert
+;;;       missing types about a and b
+;;;     - if (r a b) only holds by default, types should also only hold by default
+;;;       which is what it would be if it were implemented by a rule
+;;;     - if we actually infer (r a b), we don't get the additional type inferences
+;;;       for a and b
+;;;   - if we want both, i.e., allow it to be an inference or a constraint, we should
+;;;     invent a separate syntax for the constraint case which then could also be
+;;;     used more reliably during inference and rule application (right now that is
+;;;     also somewhat of a mess).  For example:
+;;;       (defrelation r ((?x => c) (?y => d)))       ...vs.
+;;;       (defrelation r ((?x <= c) (?y <= d)))       ...where by default
+;;;       (defrelation r ((?x c) (?y d)))             ...means infer the types
+;;;       (defrelation r ((?x => c) (?y d) (?z <= e)) ...mixed use is ok
+
 (defun (check-strict-type? BOOLEAN)
        ((self OBJECT) (type SURROGATE) (shallow? BOOLEAN))
   ;; Check that the type of 'self' satisfies 'type'.
@@ -4827,7 +4894,8 @@ but might pass once finalization is complete.")
                          :REPORT-TYPE-VIOLATIONS
                          *type-check-policy*))
                        (*termUnderConstruction* (parent-proposition record))
-                       (*descriptionUnderConstruction* (parent-description record)))
+                       (*descriptionUnderConstruction* (parent-description record))
+                       (*evaluationMode* :EXTENSIONAL-ASSERTION))
                (when (or (and (defined? *termUnderConstruction*)
                               (deleted? *termUnderConstruction*))
                          (and (defined? *descriptionUnderConstruction*)
@@ -5085,8 +5153,11 @@ the processing and validation."
     (setf (defining-proposition skolem) proposition)
     (when (defined? type)
       (update-skolem-type skolem type))
-    (when (eql? (operator proposition) PL-KERNEL/@VALUE)
-      (setq proposition (normalize-VALUE-function proposition)))
+    (if (eql? (operator proposition) PL-KERNEL/@VALUE)
+        (setq proposition (normalize-VALUE-function proposition))
+      ;; ensure proper normalizaton of functions with HOLDS arguments
+      ;; (we call this directly to avoid flattening at this stage):
+      (normalize-function-proposition proposition))
     (verify-argument-types-and-count proposition)
     (when (isa? (operator proposition) @SURROGATE)
       (fasten-down-one-proposition proposition TRUE)
@@ -5237,8 +5308,19 @@ the processing and validation."
   ;; We don't run this through the complete function-proposition machinery
   ;;    to avoid generating backlinks from all the set elements.
   (let ((setProp (begin-creating-function-proposition
-                  PL-KERNEL/@SETOF (the-cons-list set)))
-        (skolem (create-skolem PL-KERNEL/@SET NULL)))
+                  PL-KERNEL/@SETOF
+                  ;; sort arguments to normalize set terms:
+                  (sort (copy-cons-list (the-cons-list set))
+                        (the-code :function logic-form-less?))))
+        (duplicate
+         (only-if (not (description-mode?))
+           ;; this will either find a duplicate or insert
+           ;; `setProp' into the structured object index:
+           (find-duplicate-function-proposition setProp)))
+        (skolem SKOLEM NULL))
+    (when (defined? duplicate)
+      (return (last-argument duplicate)))
+    (setq skolem (create-skolem PL-KERNEL/@SET NULL))
     (setf (nth (arguments setProp) (length set)) skolem)
     (setf (defining-proposition skolem) setProp)
     (add-dependent-proposition-link skolem setProp)
@@ -5252,7 +5334,15 @@ the processing and validation."
   ;;    to avoid generating backlinks from all the list elements.
   (let ((listProp (begin-creating-function-proposition
                    PL-KERNEL/@LISTOF (the-cons-list list)))
-        (skolem (create-skolem PL-KERNEL/@LIST NULL)))
+        (duplicate
+         (only-if (not (description-mode?))
+           ;; this will either find a duplicate or insert
+           ;; `listProp' into the structured object index:
+           (find-duplicate-function-proposition listProp)))
+        (skolem SKOLEM NULL))
+    (when (defined? duplicate)
+      (return (last-argument duplicate)))
+    (setq skolem (create-skolem PL-KERNEL/@LIST NULL))
     (setf (nth (arguments listProp) (length list)) skolem)
     (setf (defining-proposition skolem) listProp)
     (add-dependent-proposition-link skolem listProp)
@@ -5964,7 +6054,7 @@ NULL if no matching object was found."
   ;;    and any of its children.
   (within-module module
     (destroy-inference-caches module)
-    (flush-inline-query-caches)
+    (clear-inline-query-caches)
     (foreach term in (listify (all-terms module TRUE))
              do (destroy-instance term))
     (foreach proposition in (all-propositions module TRUE)
@@ -6023,7 +6113,9 @@ confirming with the user."
     (clear-logic-module-hook self)
     (setf (surrogate-value (surrogate-value-inverse self)) NULL))
   (when (isa? self @WORLD)
-    (unlink-inference-cache self)) )
+    (unlink-inference-cache self)
+    (unlink-propagation-environment self))
+  (clear (dynamic-slots self)))
 
 (startup-time-progn
   (add-hook *destroy-context-hooks* (quote destroy-logic-context-hook)))
@@ -6032,6 +6124,7 @@ confirming with the user."
   :documentation "Clear all query and memoization caches."
   :public? TRUE :command? TRUE
   (clear-query-results-cache)
+  (clear-inline-query-caches)
   (clear-all-memoization-tables))
 
 (defun reset-powerloom ()
@@ -6125,18 +6218,41 @@ loaded STELLA systems if they do reference PowerLoom symbols in their code."
 (defun (proposition-less-than? BOOLEAN)  ((p1 PROPOSITION) (p2 PROPOSITION))
   ;; Compares two propositions, place by place.  Shorter propositions will
   ;; sort ahead of longer ones that share the same prefix.
-  (when (string-less? (symbol-name (operator p1)) (symbol-name (operator p2)))
-    (return true))
-  (when (string-less? (symbol-name (operator p2)) (symbol-name (operator p1)))
-    (return false))
-  (foreach a1 in (arguments p1)
-      as a2 in (arguments p2)
-      do (if (logic-form-less? a1 a2)
-	     (return true)
-	   (when (logic-form-less? a2 a1)
-	     (return false))))
-  (return (< (length (arguments p1))
-	     (length (arguments p2)))))
+  (let ((operator1 (symbol-name (operator p1)))
+        (operator2 (symbol-name (operator p2)))
+        (arguments1 (arguments p1))
+        (arguments2 (arguments p2))
+        (end1 (1- (length arguments1)))
+        (end2 (1- (length arguments2)))
+        (a1 OBJECT NULL)
+        (a2 OBJECT NULL))
+    (when (string-less? operator1 operator2)
+      (return true))
+    (when (string-less? operator2 operator1)
+      (return false))
+    (foreach i1 in (interval 0 end1)
+        as i2 in (interval 0 end2)
+        do (setq a1 (nth arguments1 i1))
+           (setq a2 (nth arguments2 i2))
+           ;; check special case where we are looking at two identical function
+           ;; propositions that aren't EQ (even though they probably should be);
+           ;; this avoids infinite recursion which isn't handled in all cases in
+           ;; `logic-form-less?' (see also comments there); since we fixed duplicate
+           ;; SETOF/LISTOF term generation, this check isn't strictly needed anymore:
+           (when (and (= i1 end1)
+                      (= i2 end2)
+                      (function-output-skolem? a1)
+                      (function-output-skolem? a2)
+                      (eql? (defining-proposition (cast a1 SKOLEM)) p1)
+                      (eql? (defining-proposition (cast a2 SKOLEM)) p2)
+                      (eql? (value-of a1) a1)
+                      (eql? (value-of a2) a2))
+             (return false))
+          (if (logic-form-less? a1 a2)
+               (return true)
+             (when (logic-form-less? a2 a1)
+               (return false))))
+    (return (< end1 end2))))
 
 (defun (proposition-head-sort-string STRING) ((p PROPOSITION))
   (case (kind p)
@@ -6255,7 +6371,7 @@ for lists, collections and propositions.  Numbers precede all other values,
        (QUANTITY-LOGIC-WRAPPER
         (return (safe-quantity-less? (wrapper-value o1) (wrapper-value o2))))
        (NUMBER-WRAPPER
-        (return (less? (wrapper-value o1) o2)))
+        (return (safe-quantity-less? (wrapper-value o1) o2)))
        (otherwise
         (return true))))
     (PROPOSITION
