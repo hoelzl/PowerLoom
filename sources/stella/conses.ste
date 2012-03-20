@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: conses.ste,v 1.91 2006/05/11 07:05:50 hans Exp
+;;; Version: conses.ste,v 1.96 2009/06/12 01:19:47 hans Exp
 
 ;;; Procedures that manipulate cons lists.
 
@@ -160,6 +160,7 @@ will always be relative to the entire list."
 (defun (cons CONS) ((value OBJECT) (rest CONS))
   :documentation "Return a cons record that points to `value' and `rest'."
   :public? TRUE
+  :constructor? TRUE
   (let ((cons (make CONS)))
     (setf (value cons) value)
     (setf (rest cons) rest)
@@ -237,7 +238,7 @@ an unoptimized Common Lisp, 20 is a good crossover point.")
 result.  Removes all but the first occurrence of items in the list.
 Preserves the original order of the remaining members.  Runs in linear time."
    (if (> (length self) *remove-duplicates-crossover-point*)
-       (return (remove-duplicates-from-long-list self))
+       (return (remove-duplicates-from-long-list self FALSE))
      (let ((cursor self)
            (rest CONS NULL))
        (while (non-empty? cursor)
@@ -248,10 +249,15 @@ Preserves the original order of the remaining members.  Runs in linear time."
          (setq cursor rest))
        (return self) )))
 
-(defun (remove-duplicates-from-long-list (LIKE self)) ((self CONS))
+(defmethod (remove-duplicates-equal (LIKE self)) ((self CONS))
+  :documentation "`remove-duplicates' (which see) using an `equal?' test."
+  :public? TRUE
+  (return (remove-duplicates-from-long-list self TRUE)))
+
+(defun (remove-duplicates-from-long-list (LIKE self)) ((self CONS)
+                                                       (equalTest? BOOLEAN))
   ;; Removes duplicates in (close to) linear time using a hash strategy.
- ;;;; IMPROVED: WORKS WITHOUT STRINGIFICATION AND MINIMAL HASHING AND WORKS
- ;;;;    AROUND A PERFORMANCE BUG WITH ACL HASH TABLES.
+  ;; Uses `equal?' to compare items if `equalTest?' is true.
   (let ((tableSize
          ;; we shoot for buckets with (at worst) around 5 items:
          (ceiling (* (length self) 0.3)))
@@ -270,7 +276,9 @@ Preserves the original order of the remaining members.  Runs in linear time."
       (setq bucketIndex (rem (hash-code item) tableSize))
       (setq bucket (aref table bucketIndex))
       (if (exists it in bucket
-            where (eql? it item))
+            where (choose equalTest?
+                          (equal? it item)
+                          (eql? it item)))
           (setf (value cursor) NULL)
         (setf (aref table bucketIndex) (cons item bucket)))
       (setq cursor (rest cursor)))
@@ -671,6 +679,7 @@ a singleton cons list containing it."
 (defun (cons-list CONS) (&rest (values OBJECT))
   :documentation "Return a cons list containing `values', in order."
   :public? TRUE
+  :constructor? TRUE
   (let ((list NIL))
     (foreach v in values collect v into list)
     (return list) ))
@@ -680,6 +689,7 @@ a singleton cons list containing it."
 terminated by the last value rather than by `nil'.  Assumes that
 at least one value is passed in."
   :public? TRUE
+  :constructor? TRUE
   ;; Note: This is ridiculously slow, but it assumes that a C++
   ;;    implementation can only extract values from a variable
   ;;    argument list by iterating from start to finish, with no
@@ -802,7 +812,7 @@ suitable '<' predicate is chosen depending on the first element of `self',
 and it is assumed that all elements of `self' have the same type (supported
 element types are GENERALIZED-SYMBOL, STRING, INTEGER, and FLOAT)."
   (when (null? predicate)
-    (setq predicate (choose-sort-predicate self)))
+    (setq predicate (choose-sort-predicate (value self))))
   (return (help-sort-cons-list self (length self) predicate)))
 
 (defun (help-sort-cons-list CONS)
@@ -868,6 +878,11 @@ element types are GENERALIZED-SYMBOL, STRING, INTEGER, and FLOAT)."
   :public? TRUE
   (return (< (wrapper-value x) (wrapper-value y))))
 
+(defun (wrapped-long-integer-less-than? BOOLEAN)
+    ((x LONG-INTEGER-WRAPPER) (y LONG-INTEGER-WRAPPER))
+  :public? TRUE
+  (return (< (wrapper-value x) (wrapper-value y))))
+
 (defun (wrapped-float-less-than? BOOLEAN)
     ((x FLOAT-WRAPPER) (y FLOAT-WRAPPER))
   :public? TRUE
@@ -883,26 +898,37 @@ element types are GENERALIZED-SYMBOL, STRING, INTEGER, and FLOAT)."
   :public? TRUE
   (return (string< (wrapper-value x) (wrapper-value y))))
 
-(defun (choose-sort-predicate FUNCTION-CODE) ((self CONS))
+(defun (number-less-than? BOOLEAN) ((x NUMBER-WRAPPER) (y NUMBER-WRAPPER))
+  :documentation
+  "Generic number comparison that works with integers, longs and floats."
+  :public? TRUE
+  (typecase x
+    ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER FLOAT-WRAPPER)
+     (typecase y
+       ((FLOAT-WRAPPER LONG-INTEGER-WRAPPER INTEGER-WRAPPER)
+        (return (< (wrapper-value x) (wrapper-value y))))))))
+
+(defun (choose-sort-predicate FUNCTION-CODE) ((firstElement OBJECT))
   ;; Choose a '<' sorting function for `self' based on the type of the
-  ;;    first element and return the result.
-  (let ((firstElement (value self)))
-    (when (null? firstElement)
-      (return NULL))
-    (typecase firstElement
-      (GENERALIZED-SYMBOL
-       (return (the-code :function generalized-symbol-less-than?)))
-      (INTEGER-WRAPPER
-       (return (the-code :function wrapped-integer-less-than?)))
-      (FLOAT-WRAPPER
-       (return (the-code :function wrapped-float-less-than?)))
-      (STRING-WRAPPER 
-       (return (the-code :function wrapped-string-less-than?)))
-      (MUTABLE-STRING-WRAPPER
-       (return (the-code :function wrapped-mutable-string-less-than?)))
-      (otherwise
-       (error "choose-sort-predicate: Don't know how to sort "
-              (primary-type firstElement) "s")))))
+  ;;    `firstElement' of a list and return the result.
+  (when (null? firstElement)
+    (return NULL))
+  (typecase firstElement
+    (GENERALIZED-SYMBOL
+     (return (the-code :function generalized-symbol-less-than?)))
+    (INTEGER-WRAPPER
+     (return (the-code :function wrapped-integer-less-than?)))
+    (LONG-INTEGER-WRAPPER
+     (return (the-code :function wrapped-long-integer-less-than?)))
+    (FLOAT-WRAPPER
+     (return (the-code :function wrapped-float-less-than?)))
+    (STRING-WRAPPER 
+     (return (the-code :function wrapped-string-less-than?)))
+    (MUTABLE-STRING-WRAPPER
+     (return (the-code :function wrapped-mutable-string-less-than?)))
+    (otherwise
+     (error "choose-sort-predicate: Don't know how to sort "
+            (primary-type firstElement) "s"))))
 
 #|
 (defun (generate-test-list CONS) ((n INTEGER))
@@ -934,7 +960,7 @@ element types are GENERALIZED-SYMBOL, STRING, INTEGER, and FLOAT)."
 whose `n'-th element (0-based) will be used for comparison."
   (when (and (null? predicate)
              (non-empty? self))
-    (setq predicate (choose-sort-predicate (nth-rest (cast (first self) CONS) n))))
+    (setq predicate (choose-sort-predicate (nth (cast (first self) CONS) n))))
   (special ((*sort-tuple-compare-predicate* predicate)
             (*sort-tuple-compare-index* n))
     (return (help-sort-cons-list
@@ -1182,13 +1208,17 @@ pretty-printed parse tree."
   (unless (empty? tree)
     (print-native-stream stream (value tree))
     (setq tree (rest tree))
-    (foreach element in tree
-        as i in (interval 2 *printLength*)
-        do (print-native-stream stream " ")
-           (print-native-stream stream element)
-           (setq tree (rest tree)))
-    (when (non-empty? tree)
-      (print-native-stream stream " ...")))
+    (if (defined? *printLength*)
+	(let ((i 1))
+	  (foreach element in tree
+	      do (print-native-stream stream " " element)
+		 (setq tree (rest tree))
+		 (++ i)
+		 (when (>= i *printLength*) (break)))
+	  (when (non-empty? tree)
+	    (print-native-stream stream " ...")))
+	(foreach element in tree
+	    do (print-native-stream stream " " element))))
   (print-native-stream stream rparen))
 
 (defun pprint-cons ((tree CONS) (stream NATIVE-OUTPUT-STREAM)

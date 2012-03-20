@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-stella.lisp,v 1.36 2006/05/16 18:28:19 tar Exp
+;;; Version: load-stella.lisp,v 1.37 2008/07/24 21:39:15 tar Exp
 
 ;;; Load STELLA.
 
@@ -169,6 +169,7 @@ hash tables grow large).")
          (binaryFileName (stella-make-file-name file :binary))
          (*compile-verbose* *stella-verbose?*)
          (*load-verbose* *stella-verbose?*))
+    (ensure-directories-exist binaryFileName)
     (compile-file stellaFileName :output-file binaryFileName)
     (load binaryFileName)))
 
@@ -181,6 +182,7 @@ hash tables grow large).")
         (*load-verbose* *stella-verbose?*))
     (when (stella-need-to-compile? stellaFileName binaryFileName)
       (proclaim *stella-compiler-optimization*)
+      (ensure-directories-exist binaryFileName)
       (compile-file stellaFileName :output-file binaryFileName))
     (load binaryFileName)))
 
@@ -195,6 +197,7 @@ hash tables grow large).")
         (*load-verbose* *stella-verbose?*))
     (when (stella-need-to-compile? stellaFileName binaryFileName)
       (proclaim *stella-compiler-optimization*)
+      (ensure-directories-exist binaryFileName) 
       (compile-file stellaFileName :output-file binaryFileName))
     (load binaryFileName)))
 

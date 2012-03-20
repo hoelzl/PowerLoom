@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: logic-in.ste,v 1.131 2006/05/11 07:05:17 hans Exp
+;;; Version: logic-in.ste,v 1.138 2009/06/02 19:24:20 tar Exp
 
 ;;; Evaluating and loading logic commands
 
@@ -88,10 +88,13 @@ features, and a list of all available PowerLoom features."
   (unless (member? *current-powerloom-features* feature)
     (case feature
       (:trace-subgoals
+       (clear-caches)
        (add-trace :GOAL-TREE))
       (:trace-solutions
+       (clear-caches)
        (add-trace :TRACE-SOLUTIONS))
       (:trace-classifier
+       (clear-caches)
        (add-trace :CLASSIFIER-INFERENCES))
       (:closed-world
        ;;(setq *globally-closed-collections?* TRUE) ;; BROKEN!!! -hc (why? -rmm)
@@ -396,6 +399,7 @@ for C++ where exiting the listener will also exit the program."
   ;; The initial module for command execution is set to `module'.
   (let ((command OBJECT NULL)
         (result OBJECT NULL)
+        (eof? FALSE)
         (exit? FALSE)
         (exitCommand? FALSE))
     (within-module (first-defined module *module*)
@@ -404,7 +408,14 @@ for C++ where exiting the listener will also exit the program."
 	    (progn
 	      (print EOL)
 	      (print-logic-prompt)
-	      (setq command (read-s-expression STANDARD-INPUT))
+              ;; EOF shouldn't be reached for an interactive stream,
+              ;;   but we check for it anyway to support batch operations
+              ;;   with re-directed input streams.
+	      (mv-setq (command eof?)
+                (read-s-expression STANDARD-INPUT))
+              (when eof?
+                (print "End of File encountered.  Exiting." EOL)
+                (break))
 	      (print EOL)
 	      (mv-setq (exit? exitCommand?)
 		(logic-command-loop-exit? command))
@@ -414,9 +425,16 @@ for C++ where exiting the listener will also exit the program."
 		(continue))
 	      (setq result (evaluate-logic-command command FALSE))
 	      (print-logic-command-result result))
+          ;; Logic errors should be reasonably descriptive.
+	  (LOGIC-EXCEPTION (le)
+	     (print-stream STANDARD-ERROR ">> Error: "
+			   (exception-message le)))
+	  ;; Print more information for Stella errors for debugging
+	  ;; purposes.
 	  (STELLA-EXCEPTION (e)
-            (print-stream STANDARD-ERROR ">> Error: "
-                          (exception-message e))))))))
+            (print-stream STANDARD-ERROR ">> Internal Error: "
+                          (exception-message e))
+	    (print-exception-context e STANDARD-ERROR)))))))
 
   ;;
 ;;;;;; Evaluating logic commands
@@ -446,7 +464,7 @@ for C++ where exiting the listener will also exit the program."
               (setq operator (quote DEFMODULE))
               (setf (value command) operator))
             (cond ((string-equal? operatorName "IN-MODULE")
-                   (handle-in-module-tree command FALSE))
+                   (handle-in-module-tree command FALSE FALSE))
                   ;; Ignore 'in-package':
                   ((string-equal? operatorName "IN-PACKAGE")
                    NULL)
@@ -596,7 +614,13 @@ equivalent proposition already exists and, if so, not assert the
 duplicate.  These duplicate checks are somewhat expensive though and
 can be skipped by setting the option :check-duplicates? to false.
 This can save time when loading large KBs where it is known that no
-duplicate assertions exist in a file."
+duplicate assertions exist in a file.
+
+Also, by setting the option :module, the module in which the file
+contents will be loaded will be set.  This will only affect files
+that do NOT have an `in-module' declaration as part of the file.
+If this is not set, and no `in-module' declaration is in the file,
+then an error will be signaled."
   :command? TRUE :public? TRUE
   (setq file
     (first-defined
@@ -606,7 +630,8 @@ duplicate assertions exist in a file."
   (let ((theOptions
              (parse-logic-command-options
               (coerce-&rest-to-cons options)
-              (bquote (:check-duplicates? @BOOLEAN))
+              (bquote (:check-duplicates? @BOOLEAN
+		       :module @MODULE))
               TRUE FALSE))
         (topLevelInvocation? (null? *currentFile*))
 	(inputStream INPUT-FILE-STREAM NULL))
@@ -615,7 +640,7 @@ duplicate assertions exist in a file."
                   (*dont-check-for-duplicate-propositions?*
                    (not (lookup-with-default theOptions :check-duplicates? TRUE))))
 	  (setq inputStream (new INPUT-FILE-STREAM :filename file))
-	  (load-stream inputStream))
+	  (load-stream-in-module inputStream (lookup theOptions :module)))
       (when topLevelInvocation?
 	(sweep-transients))
       (when (defined? inputStream)
@@ -635,21 +660,39 @@ duplicate assertions exist in a file."
 (defun load-stream ((stream INPUT-STREAM))
   :documentation "Read logic commands from `stream' and evaluate them."
   :public? TRUE
+  (load-stream-in-module stream NULL))
+
+(defun load-stream-in-module ((stream INPUT-STREAM) (default-module MODULE))
+  :documentation "Read logic commands from `stream' and evaluate them.  If `default-module'
+is not `null', then any commands will be read into that module unless
+an `in-module' declaration is encountered which will over-ride the default
+value.  If noe `default-module' is specified, and the input stream does
+not have an `in-module' form, an error is signaled."
+  :public? TRUE
   ;;; TO DO: CHANGE TWO-PASS LOADING SCHEME TO ONLY EVALUATE DEFINITION COMMANDS
   ;;;        WITHOUT OPTION PROCESSING IN THE FIRST PASS AND IN THE SECOND PASS
   ;;;        SIMPLY EVALUATE EVERYTHING IN SEQUENCE (THIS WILL ALLOW MULTIPLE
   ;;;        `IN-MODULE' DECLARATIONS ALSO).
+
+  ;; To allow loading KB files that don't start with IN-MODULE,
+  ;; we set seenInModule? as TRUE if a default module is specified.
   (let ((currentDialect *logic-dialect*)
         (skipCommand? FALSE)
-        (seenInModule? FALSE)
-        (commands NIL))
-    (special ((*logic-dialect* currentDialect))
-      (within-module *module*
+        (seenInModule? (defined? default-module))
+        (commands NIL)
+	(load-module (choose seenInModule? default-module *module*)))
+    (special ((*logic-dialect* currentDialect)
+              (*translationErrors* 0)
+              (*translationWarnings* 0)
+              (*translationNotes* 0))
+      (within-module load-module
         (foreach tree in (s-expressions stream)
             do (typecase tree
                  (CONS
+                  ;; Allow multiple IN-MODULE forms: pass FALSE as the 3nd argument.
+                  ;; If command is fully handled, then skip rest of clause.
                   (mv-setq (skipCommand? seenInModule?)
-                    (handle-in-module-tree tree seenInModule?))
+                    (handle-in-module-tree tree seenInModule? FALSE))
                   (when skipCommand?
                     (continue))
                   (let ((operator (first tree)))
@@ -683,7 +726,9 @@ duplicate assertions exist in a file."
         (special ((*translationPhase* :FINALIZE))
           (finalize-objects))
         (foreach tree in (reverse commands)
-            do (evaluate-logic-command tree TRUE))))))
+            do (evaluate-logic-command tree TRUE)))
+      (unless (ignore-translation-errors?)
+        (summarize-translation-errors)) )))
 
   ;;
 ;;;;;; Demo
@@ -1073,7 +1118,12 @@ needed for its execution, and then return its result."
     (print "Elapsed Time: ")
     (when (> (days elapsedTime) 0)
       (print (days elapsedTime) " days, "))
-    (print (/ (millis elapsedTime) 1000.0) " secs" EOL)
+    ;; Round the resulting elapsed time because millisecond time
+    ;;   resolution is not supported by Stella.  (It could only 
+    ;;   be supported by Java), so fractional values in the format
+    ;;   mean that the elapsed time is often shown as less than
+    ;;   the CPU time, which just seems odd.
+    (print (round (/ (millis elapsedTime) 1000.0)) " secs" EOL)
     (return result)))
 
 
@@ -1722,7 +1772,7 @@ UNKNOWN
            (when (and typed?
                       (not (eql? pType @THING)))
              (setq parameter
-               (bquote (& parameter & (surrogate-to-symbol pType)))))
+               (bquote (& parameter & (type-to-symbol pType)))))
            (pushq parameterList parameter))
     (when (and dropFunctionParameter?
                (function-description? self))
@@ -2712,8 +2762,8 @@ Expects the same arguments as `defproposition' but supplied as a list."
 (defun (command< BOOLEAN) ((command1 METHOD-SLOT) (command2 METHOD-SLOT))
   ;; Return TRUE if 'command1' should come before 'command2' in a
   ;;    sorted list of commands.
-  (return (string< (visible-name (slot-name command1))
-                   (visible-name (slot-name command2)))))
+  (return (string-less? (visible-name (slot-name command1) FALSE)
+                        (visible-name (slot-name command2) FALSE))))
 
 (defun (list-logic-commands (LIST OF METHOD-SLOT)) ()
   ;; Return a sorted list of available logic commands.

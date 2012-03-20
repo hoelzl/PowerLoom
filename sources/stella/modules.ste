@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: modules.ste,v 1.82 2006/05/09 20:30:47 hans Exp
+;;; Version: modules.ste,v 1.86 2009/06/12 01:17:44 hans Exp
 
 ;;; Contexts, Modules, and Worlds.
 
@@ -270,7 +270,7 @@ if no such module exists.  The search looks at ancestors and top-most
                ;;    we can't compute the full name, since then the symbol
                ;;    'BAR' will expand into '/STELLA/BAR' which is wrong too:
                (otherwise
-                (return (visible-name nameSpec))))))
+                (return (visible-name nameSpec FALSE))))))
       (otherwise
        (when warn?
          (warn "Illegal module name: " nameSpec))
@@ -372,11 +372,10 @@ if no such module exists.  The search looks at ancestors and top-most
   ;; Replace '(parent-modules self)' with the most-specific direct
   ;;    ancestors of 'module' (don't include modules that are ancestors
   ;;    of other direct super modules).
-  ;; Generate a warning if the original parents are not all most
-  ;;    specific.
   (when (not (multiple-parents? self))
     (return))
-  (let ((parents (parent-modules self)))
+  (let ((parents (parent-modules self))
+        (recomputeFullName? FALSE))
     ;; remove direct supers that are not most specific:
     (foreach superModule in parents
         do (foreach othersuperModule in parents
@@ -388,7 +387,11 @@ if no such module exists.  The search looks at ancestors and top-most
                     ;;    a module that inherits various parents that define
                     ;;    relevant things without having to know the whole
                     ;;    module super structure of each parent.
-                    (remove parents otherSuperModule))))))
+                    (remove parents otherSuperModule)
+                    (remove (child-contexts otherSuperModule) self)
+                    (setq recomputeFullName? TRUE))))
+    (when recomputeFullName?
+      (setf (module-full-name self) (compute-full-name "" self)))))
 
 
 (defmethod inherit-supercontexts ((context CONTEXT))
@@ -1044,13 +1047,19 @@ The list of modules specified in the
 `name' become the new module's parents. If no `:uses' option was
 supplied, the new module will use the `STELLA' module by default,
 otherwise, it will use the set of specified modules.
-If `:case-sensitive?' is supplied as TRUE, symbols in the module will be
-interned case-sensitively, otherwise (the default), they will be
-converted to uppercase before they get interned. Modules can shadow
-definitions of functions and classes inherited from parents or used
-modules. Shadowing is done automatically, but generates a warning unless
-the shadowed type or function name is listed in the `:shadow' option of
-the module definition .
+
+If `:case-sensitive?' is supplied as TRUE, symbols in the module
+will be interned case-sensitively, otherwise (the default), they
+will be converted to uppercase before they get interned.  That
+means that any reference from inside a case-sensitive module to a
+non-case-sensitive module will have to use uppercase names for
+symbols in the non-case-sensitive module.  The standard system
+modules are all NOT case sensitive.
+
+Modules can shadow definitions of functions and classes inherited
+from parents or used modules. Shadowing is done automatically,
+but generates a warning unless the shadowed type or function name
+is listed in the `:shadow' option of the module definition .
 
 Examples:
 	 
@@ -1135,14 +1144,14 @@ Optionally, specify a name."
 (defun (push-world WORLD) ()
   :documentation "Spawn a new world that is a child of the current context,
 and change the current context to the new world."
-  :public? TRUE
+  :public? TRUE :command? TRUE
   (return (setq *context* (create-world *context* NULL))) )
 
 (defun (pop-world CONTEXT) ()
   :documentation "Destroy the current world and change the current
 context to be its parent.  Return the current context. Nothing happens
 if there is no current world."
-  :public? TRUE
+  :public? TRUE :command? TRUE
   ;; tricky test to see if *context* is a module:
   (when (not (eql? *context* *module*))
     (let ((world WORLD *context*))

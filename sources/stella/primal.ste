@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: primal.ste,v 1.140 2006/05/14 06:47:35 hans Exp
+;;; Version: primal.ste,v 1.153 2010/02/10 21:57:26 hans Exp
 
 ;;; Declarations for objects implemented by native constructs.
 
@@ -78,32 +78,37 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
 
 (defconstant NULL-INTEGER INTEGER
   (verbatim :common-lisp CL:MOST-NEGATIVE-FIXNUM
-            :cpp "1 << (sizeof (int) / sizeof (char) * 8 - 1)"
+            :cpp "std::numeric_limits<int>::min()"
 	    :java "Integer.MIN_VALUE")
     :public? TRUE)
 
 (defconstant NULL-SHORT-INTEGER SHORT-INTEGER
   (verbatim :common-lisp CL:MOST-NEGATIVE-FIXNUM
-            :cpp "1 << (sizeof (short int) / sizeof (char) * 8 - 1)"
+            :cpp "std::numeric_limits<short int>::min()"
 	    :java "Short.MIN_VALUE")
   :public? TRUE)
 
 (defconstant NULL-LONG-INTEGER LONG-INTEGER
-  (verbatim :common-lisp CL:MOST-NEGATIVE-FIXNUM
-            :cpp "1 << (sizeof (long int) / sizeof (char) * 8 - 1)"
+  (verbatim :common-lisp
+            ;; we restrict Lisp long integers to 63+1 bits to mirror C++ & Java,
+            ;; even though Lisp bignums are (virtually) infinite precision;
+            ;; this also allows us to have a NULL value of the appropriate
+            ;; type instead of the symbol that Bob used in his version:
+            "(CL:- (CL:expt 2 63))"
+            :cpp "std::numeric_limits<long long int>::min()"
 	    :java "Long.MIN_VALUE")
-  :public? TRUE)   ;; Use 64-bit ints rather than 32 bit longs.
+  :public? TRUE)
 
 (defconstant NULL-UNSIGNED-SHORT-INTEGER UNSIGNED-SHORT-INTEGER
   (verbatim :common-lisp CL:MOST-NEGATIVE-FIXNUM
-            :cpp "(unsigned short int) -1"
+            :cpp "std::numeric_limits<unsigned short int>::min()"
 	    :java "Short.MIN_VALUE"
 	    )
   :public? TRUE)
 
 (defconstant NULL-UNSIGNED-LONG-INTEGER UNSIGNED-LONG-INTEGER
-  (verbatim :common-lisp CL:MOST-NEGATIVE-FIXNUM
-            :cpp "(unsigned long int) -1"
+  (verbatim :common-lisp "(CL:1- (CL:expt 2 64))"
+            :cpp "std::numeric_limits<unsigned long long int>::min()"
 	    :java "Long.MIN_VALUE")
   :public? TRUE)
 
@@ -116,7 +121,10 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
 
 (defconstant NULL-FLOAT FLOAT
   (verbatim :common-lisp CL:MOST-NEGATIVE-DOUBLE-FLOAT
-            :cpp "-HUGE_VAL /* IEEE infinity, defined in <math.h> */"
+            :cpp "std::numeric_limits<double>::infinity() != 0 ?
+                    -std::numeric_limits<double>::infinity() :
+                    // work around a problem in g++ 3.2.2 where infinity()==0:
+                    NULL_INTEGER / 0.0"
 	    ; :java "Double.NaN; // IEEE Not a Number"
 	    :java "Double.NEGATIVE_INFINITY; /* IEEE Infinity */"
 	    )
@@ -124,7 +132,7 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
 
 (defconstant NULL-SINGLE-FLOAT SINGLE-FLOAT
   (verbatim :common-lisp CL:MOST-NEGATIVE-SINGLE-FLOAT
-            :cpp "-HUGE_VAL /* IEEE infinity, defined in <math.h> */"
+            :cpp "-std::numeric_limits<float>::infinity()"
 	    ; :java "Float.NaN; /* IEEE Not a Number */"
 	    :java "Float.NEGATIVE_INFINITY; /* IEEE Infinity */"
 	    )
@@ -132,7 +140,7 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
 
 (defconstant NULL-DOUBLE-FLOAT DOUBLE-FLOAT
   (verbatim :common-lisp CL:MOST-NEGATIVE-DOUBLE-FLOAT
-	    :cpp "-HUGE_VAL /* IEEE infinity, defined in <math.h> */"
+	    :cpp "-std::numeric_limits<double>::infinity()"
             ; :java "Double.NaN; /* IEEE Not a Number */"
 	    :java "Double.NEGATIVE_INFINITY; /* IEEE Infinity */"
 	    )
@@ -155,8 +163,9 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
     :public? TRUE)
 
 (defun (lisp-null-array-symbol-string STRING) ((rank INTEGER))
-  ;; Used in the lisp translation code, insdie a verbatim
+  ;; Used in the lisp translation code, inside a verbatim
   ;; to return Lisp-specific-code.
+  ;; Needs to match with NULL values defined in cl-lib/cl-setup.lisp
   (CASE rank
     (1 (return "STELLA::NULL-1D-ARRAY"))
     (2 (return "STELLA::NULL-2D-ARRAY"))
@@ -165,10 +174,82 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
     (5 (return "STELLA::NULL-5D-ARRAY"))
     (otherwise (return "STELLA::NULL"))))
 
+;;; Boundary values for the (usable) numeric types:
+
+(defconstant MOST-POSITIVE-INTEGER INTEGER
+  (verbatim :common-lisp CL:MOST-POSITIVE-FIXNUM 
+            :cpp "std::numeric_limits<int>::max()"
+	    :java "Integer.MAX_VALUE")
+  :public? TRUE)
+
+(defconstant MOST-NEGATIVE-INTEGER INTEGER (1+ NULL-INTEGER)
+  :public? TRUE)
+
+(defconstant MOST-POSITIVE-LONG-INTEGER LONG-INTEGER
+  (verbatim :common-lisp
+            "(CL:1- (CL:expt 2 63))"
+            :cpp "std::numeric_limits<long long int>::max()"
+	    :java "Long.MAX_VALUE")
+  :public? TRUE)
+
+(defconstant MOST-NEGATIVE-LONG-INTEGER LONG-INTEGER (1+ NULL-LONG-INTEGER)
+  :public? TRUE)
+
+(defconstant MOST-POSITIVE-FLOAT FLOAT
+  (verbatim :common-lisp CL:MOST-POSITIVE-DOUBLE-FLOAT
+            :cpp "std::numeric_limits<double>::max()"
+	    :java "Double.MAX_VALUE")
+  :public? TRUE)
+
+(defconstant MOST-NEGATIVE-FLOAT FLOAT
+  (verbatim :common-lisp
+            ;; since we don't have a CL-portable infinite value for NULL-FLOAT
+            ;; we have to generate the smallest/most negative number greater than
+            ;; and different from NULL-FLOAT to use for this constant:
+            "(cl:multiple-value-bind (signif expon)
+                (cl:integer-decode-float cl:most-positive-double-float)
+              (cl:- (cl:scale-float (CL:- signif 1.0) expon)))"
+            :otherwise (- MOST-POSITIVE-FLOAT))
+  :public? TRUE)
+
+(defconstant LEAST-POSITIVE-FLOAT FLOAT
+  (verbatim :common-lisp CL:LEAST-POSITIVE-DOUBLE-FLOAT
+            :cpp "std::numeric_limits<double>::min()"
+	    :java "Double.MIN_VALUE")
+  :public? TRUE)
+
+(defconstant LEAST-NEGATIVE-FLOAT FLOAT (- LEAST-POSITIVE-FLOAT)
+  :public? TRUE)
+
+(defun print-numeric-constants ()
+  :command? TRUE
+  ;; for testing only:
+  (print "MOST-POSITIVE-INTEGER:             " MOST-POSITIVE-INTEGER EOL
+         "MOST-NEGATIVE-INTEGER:            "  MOST-NEGATIVE-INTEGER EOL
+         "NULL-INTEGER:                     "  NULL-INTEGER EOL
+         "MOST-POSITIVE-LONG-INTEGER:        " MOST-POSITIVE-LONG-INTEGER EOL
+         "MOST-NEGATIVE-LONG-INTEGER:       "  MOST-NEGATIVE-LONG-INTEGER EOL
+         "NULL-LONG-INTEGER:                "  NULL-LONG-INTEGER EOL
+         "MOST-POSITIVE-FLOAT:               " MOST-POSITIVE-FLOAT EOL
+         "MOST-NEGATIVE-FLOAT:              "  MOST-NEGATIVE-FLOAT EOL
+         "LEAST-POSITIVE-FLOAT:              " LEAST-POSITIVE-FLOAT EOL
+         "LEAST-NEGATIVE-FLOAT:             "  LEAST-NEGATIVE-FLOAT EOL
+         "NULL-FLOAT:                       "  NULL-FLOAT EOL
+         "*INTEGER-MSB-MASK*:                " *integer-msb-mask* EOL
+         "*INTEGER-UNSIGNED-BITS-MASK*:      " *integer-unsigned-bits-mask* EOL
+         "*LONG-INTEGER-MSB-MASK*:           " *long-integer-msb-mask* EOL
+         "*LONG-INTEGER-UNSIGNED-BITS-MASK*: " *long-integer-unsigned-bits-mask* EOL
+         "LONG-INTEGER-BIT-WIDTH:            " LONG-INTEGER-BIT-WIDTH EOL
+         "il(MOST-POSITIVE-INTEGER):         " (integer-length MOST-POSITIVE-INTEGER) EOL
+         "il(MOST-POSITIVE-LONG-INTEGER):    " (integer-length MOST-POSITIVE-LONG-INTEGER) EOL
+         "il(MOST-NEGATIVE-INTEGER):         " (integer-length MOST-NEGATIVE-INTEGER) EOL
+         "il(MOST-NEGATIVE-LONG-INTEGER):    " (integer-length MOST-NEGATIVE-LONG-INTEGER) EOL
+         ))
+
+
   ;;
 ;;;;;; `null?' and `defined?':
   ;;
-
 
 (defmethod (null? BOOLEAN) ((x UNKNOWN))
   :documentation
@@ -207,6 +288,10 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
   "Return true if `x' is undefined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
 (defmethod (null? BOOLEAN) ((x INTEGER))
+  :documentation
+  "Return true if `x' is undefined (handled specially by all translators)."
+  :public? TRUE :native? TRUE)
+(defmethod (null? BOOLEAN) ((x LONG-INTEGER))
   :documentation
   "Return true if `x' is undefined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
@@ -252,6 +337,10 @@ type.  For example, NULL-INTEGER represents the undefined INTEGER value.\")"))
   "Return true if `x' is defined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
 (defmethod (defined? BOOLEAN) ((x INTEGER))
+  :documentation
+  "Return true if `x' is defined (handled specially by all translators)."
+  :public? TRUE :native? TRUE)
+(defmethod (defined? BOOLEAN) ((x LONG-INTEGER))
   :documentation
   "Return true if `x' is defined (handled specially by all translators)."
   :public? TRUE :native? TRUE)
@@ -344,7 +433,7 @@ Otherwise, return the result of (...((`x' - arg1) - arg2) - ... - argN)."
 Otherwise, return the result of (...((`x' / arg1) / arg2 ) / ... / argN)."
   :public? TRUE :native? TRUE)
 
-(defun (zero? BOOLEAN) ((x INTEGER))
+(defmethod (zero? BOOLEAN) ((x INTEGER))
   :documentation "Return true if `x' is 0."
   :public? TRUE :globally-inline? TRUE
   (return
@@ -352,7 +441,23 @@ Otherwise, return the result of (...((`x' / arg1) / arg2 ) / ... / argN)."
               :cpp "(!x)"
               :java "(x == 0)")))
 
-(defun (plus? BOOLEAN) ((x INTEGER))
+(defmethod (zero? BOOLEAN) ((x LONG-INTEGER))
+  :documentation "Return true if `x' is 0."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp (CL:= x 0)
+              :cpp "(!x)"
+              :java "(x == 0)")))
+
+(defmethod (plus? BOOLEAN) ((x INTEGER))
+  :documentation "Return true if `x' is greater than 0."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp (CL:> x 0)
+              :cpp "(x > 0)"
+              :java "(x > 0)")))
+
+(defmethod (plus? BOOLEAN) ((x LONG-INTEGER))
   :documentation "Return true if `x' is greater than 0."
   :public? TRUE :globally-inline? TRUE
   (return
@@ -360,7 +465,7 @@ Otherwise, return the result of (...((`x' / arg1) / arg2 ) / ... / argN)."
               :cpp "(x > 0)"
               :java "(x > 0)")))
   
-(defun (even? BOOLEAN) ((x INTEGER))
+(defmethod (even? BOOLEAN) ((x INTEGER))
   :documentation "Return true if `x' is an even number."
   :public? TRUE :globally-inline? TRUE
   (return
@@ -368,7 +473,15 @@ Otherwise, return the result of (...((`x' / arg1) / arg2 ) / ... / argN)."
               :cpp "!(x % 2)"
               :java "((x % 2) == 0)")))
 
-(defun (odd? BOOLEAN) ((x INTEGER))
+(defmethod (even? BOOLEAN) ((x LONG-INTEGER))
+  :documentation "Return true if `x' is an even number."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp (CL:not (CL:logbitp 0 x))
+              :cpp "!(x % 2)"
+              :java "((x % 2) == 0)")))
+
+(defmethod (odd? BOOLEAN) ((x INTEGER))
   :documentation "Return true if `x' is an odd number."
   :public? TRUE :globally-inline? TRUE
   (return
@@ -376,7 +489,15 @@ Otherwise, return the result of (...((`x' / arg1) / arg2 ) / ... / argN)."
               :cpp "(x % 2)"
               :java "((x % 2) == 1)")))
 
-(defun (div INTEGER) ((x INTEGER) (y INTEGER))
+(defmethod (odd? BOOLEAN) ((x LONG-INTEGER))
+  :documentation "Return true if `x' is an odd number."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp (CL:logbitp 0 x)
+              :cpp "(x % 2)"
+              :java "((x % 2) == 1)")))
+
+(defmethod (div INTEGER) ((x INTEGER) (y INTEGER))
   :documentation "Return the integer quotient from dividing `x' by `y'."
   :public? TRUE :globally-inline? TRUE
   (return
@@ -384,7 +505,26 @@ Otherwise, return the result of (...((`x' / arg1) / arg2 ) / ... / argN)."
               :cpp "(x / y)"
               :java "(x / y)")))
 
-(defun (rem INTEGER) ((x INTEGER) (y INTEGER))
+(defmethod (div LONG-INTEGER) ((x LONG-INTEGER) (y LONG-INTEGER))
+  :documentation "Return the integer quotient from dividing `x' by `y'."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp (CL:VALUES (CL:truncate x y))
+              :cpp "(x / y)"
+              :java "(x / y)")))
+
+(defmethod (rem INTEGER) ((x INTEGER) (y INTEGER))
+  :documentation "Return the remainder from dividing `x' by `y'.  The
+sign of the result is always the same as the sign of `x'.  This has slightly
+different behavior than the `mod' function, and has less overhead in C++ and
+Java, which don't have direct support for a true modulus function."
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp (CL:rem x y)
+              :cpp "(x % y)"
+              :java "(x % y)")))
+
+(defmethod (rem LONG-INTEGER) ((x LONG-INTEGER) (y LONG-INTEGER))
   :documentation "Return the remainder from dividing `x' by `y'.  The
 sign of the result is always the same as the sign of `x'.  This has slightly
 different behavior than the `mod' function, and has less overhead in C++ and
@@ -406,7 +546,29 @@ Java, which don't have direct support for a true modulus function."
               :cpp "fmod(x, y)"
               :java "(x % y)")))
 
-(defun (mod INTEGER) ((x INTEGER) (modulus INTEGER))
+(defmethod (mod INTEGER) ((x INTEGER) (modulus INTEGER))
+  :documentation "True modulus.  Return the result of `x' mod `modulo'.
+Note: In C++ and Java, `mod' has more overhead than the similar
+function `rem'.  The  answers returned by `mod' and `rem' are only
+different when the signs of `x' and `modulo' are different."
+  :public? TRUE
+  (let ((remainder (verbatim :common-lisp (cl:mod x modulus)
+                             :otherwise (rem x modulus))))
+    ;; At this point, remainder is the correct answer in Common Lisp,
+    ;; but needs to be modified if the signs of x and modulus are
+    ;; different for the other languages that do not have a native
+    ;; modulus function.
+    (verbatim :common-lisp NULL
+              :otherwise
+              (cond ((> remainder 0)
+                     (when (< modulus 0)
+                       (setq remainder (+ modulus remainder))))
+                    ((< remainder 0)
+                     (when (> modulus 0)
+                       (setq remainder (+ modulus remainder))))))
+    (return remainder)))
+
+(defmethod (mod LONG-INTEGER) ((x LONG-INTEGER) (modulus LONG-INTEGER))
   :documentation "True modulus.  Return the result of `x' mod `modulo'.
 Note: In C++ and Java, `mod' has more overhead than the similar
 function `rem'.  The  answers returned by `mod' and `rem' are only
@@ -450,20 +612,22 @@ different when the signs of `x' and `modulo' are different."
                        (setq remainder (+ modulus remainder))))))
     (return remainder)))
 
-(defun (gcd INTEGER) ((x INTEGER) (y INTEGER))
+(defun (gcd LONG-INTEGER) ((x LONG-INTEGER) (y LONG-INTEGER))
   :documentation "Return the greatest common divisor of `x' and `y'."
   :public? TRUE
   (when (< x 0)
     (setq x (- x)))
   (when (< y 0)
     (setq y (- y)))
-  (let ((temp 0))
+  (let ((temp LONG-INTEGER 0))
     (while (not (= y 0))
       (setq temp (rem x y))
       (setq x y)
       (setq y temp))
     (return x)))
 
+;;; TO DO: FIGURE OUT WHETHER TO HANDLE LONG INTEGERS HERE
+;;; AND WHETHER THEY ALL SHOULD RETURN LONG INTEGERS...
 (defun (ceiling INTEGER) ((n NUMBER))
   :documentation "Return the smallest integer >= `n'."
   :native? TRUE :public? TRUE)
@@ -478,6 +642,12 @@ different when the signs of `x' and `modulo' are different."
   :native? TRUE :public? TRUE)
 
 
+(defun (regular-integer-valued? BOOLEAN) ((x LONG-INTEGER))
+  :documentation "Return `true' if `x' can be represented by a regular integer."
+  :public? TRUE :globally-inline? TRUE
+  (return (and (>= x NULL-INTEGER)
+               (<= x MOST-POSITIVE-INTEGER))))
+    
 (defun (integer-valued? boolean) ((x float)) 
   :documentation "Returns `true' if `x' is the floating point representation of an integer."
   :public? TRUE
@@ -656,29 +826,92 @@ Used for log 10 conversions.")
 	:cpp "::pow(x,y)"
         :java "Math.pow(x,y)")))
 
-;; QUESTION (1): SHOULDN'T THESE BE DEFINED ON NUMBER RATHER THAN INTEGER?
-;; QUESTION (2): SHOULD WE IMPLEMENT NATIVE VERSIONS OF INSTEAD?
-(defun (min INTEGER) ((x INTEGER) (y INTEGER))
+(defmethod (min INTEGER) ((x INTEGER) (y INTEGER))
   :documentation
   "Return the minimum of `x' and `y'.  If either is NULL, return the other."
-  :public? TRUE 
-  (when (null? x)
-    (return y))
-  (when (null? y)
-    (return x))
-  (return (choose (< x y) x y)))
+  :public? TRUE
+  ;; slightly tricky, if > condition is true, x can't be NULL:
+  (return (choose (> x y) 
+                  (choose (null? y) x y)
+                  (choose (null? x) y x))))
 
-(defun (max INTEGER) ((x INTEGER) (y INTEGER))
+(defmethod (min LONG-INTEGER) ((x LONG-INTEGER) (y LONG-INTEGER))
+  :documentation
+  "Return the minimum of `x' and `y'.  If either is NULL, return the other."
+  :public? TRUE
+  ;; slightly tricky, if > condition is true, x can't be NULL:
+  (return (choose (> x y) 
+                  (choose (null? y) x y)
+                  (choose (null? x) y x))))
+
+(defmethod (min FLOAT) ((x FLOAT) (y FLOAT))
+  :documentation
+  "Return the minimum of `x' and `y'.  If either is NULL, return the other."
+  :public? TRUE
+  ;; slightly tricky, if > condition is true, x can't be NULL:
+  (return (choose (> x y) 
+                  (choose (null? y) x y)
+                  (choose (null? x) y x))))
+
+(defmethod (min NUMBER-WRAPPER) ((x NUMBER-WRAPPER) (y NUMBER-WRAPPER))
+  :documentation
+  "Return the minimum of `x' and `y'.  If `y' is NULL, return `x'."
+  :public? TRUE
+  (typecase x
+    ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER FLOAT-WRAPPER)
+     ;; we could have separate methods for the various wrapper types:
+     (typecase y
+       ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER FLOAT-WRAPPER)
+        (if (or (null? y)
+                (<= (wrapper-value x) (wrapper-value y)))
+            (return x)
+          (return y)))
+       (otherwise ;; y is NULL
+        (return x))))))
+
+(defmethod (max INTEGER) ((x INTEGER) (y INTEGER))
   :documentation
   "Return the maximum of `x' and `y'.  If either is NULL, return the other."
   :public? TRUE
-  (when (null? x)
-    (return y))
-  (when (null? y)
-    (return x))
+  ;; slightly tricky, if > condition is true, x can't be NULL:
   (return (choose (> x y) x y)))
 
+(defmethod (max LONG-INTEGER) ((x LONG-INTEGER) (y LONG-INTEGER))
+  :documentation
+  "Return the maximum of `x' and `y'.  If either is NULL, return the other."
+  :public? TRUE
+  ;; slightly tricky, if > condition is true, x can't be NULL:
+  (return (choose (> x y) x y)))
+
+(defmethod (max FLOAT) ((x FLOAT) (y FLOAT))
+  :documentation
+  "Return the maximum of `x' and `y'.  If either is NULL, return the other."
+  :public? TRUE
+  ;; slightly tricky, if > condition is true, x can't be NULL:
+  (return (choose (> x y) x y)))
+
+(defmethod (max NUMBER-WRAPPER) ((x NUMBER-WRAPPER) (y NUMBER-WRAPPER))
+  :documentation
+  "Return the maximum of `x' and `y'.  If `y' is NULL, return `x'."
+  :public? TRUE
+  (typecase x
+    ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER FLOAT-WRAPPER)
+     ;; we could have separate methods for the various wrapper types:
+     (typecase y
+       ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER FLOAT-WRAPPER)
+        (if (or (null? y)
+                (>= (wrapper-value x) (wrapper-value y)))
+            (return x)
+          (return y)))
+       (otherwise ;; y is NULL
+        (return x))))))
+
 (defmethod (abs INTEGER) ((x INTEGER))
+  :documentation "Return the absolute value of `x'."
+  :globally-inline? TRUE :public? TRUE
+  (return (choose (< x 0) (- 0 x) x)))
+
+(defmethod (abs LONG-INTEGER) ((x LONG-INTEGER))
   :documentation "Return the absolute value of `x'."
   :globally-inline? TRUE :public? TRUE
   (return (choose (< x 0) (- 0 x) x)))
@@ -836,6 +1069,15 @@ If `case-sensitive?' is true, then case does matter for the comparison"
   :public? TRUE :globally-inline? TRUE
   (return (not (empty? x))))
 
+(defun (blank-string? BOOLEAN) ((string STRING))
+  :documentation "Return true if `string' is either NULL, empty, or only
+contains white space characters."
+  :public? TRUE
+  (return (or (null? string)
+              (eql? string "")
+              (forall char in string
+                always (white-space-character? char)))))
+
 ;;
 ;; The Common Lisp verbatim does null tests on all of these in order
 ;;   to handle true values other than T, which some Lisps (i.e., ACL 5.0.1)
@@ -962,7 +1204,7 @@ If `case-sensitive?' is true, then case does matter for the comparison"
   :public? TRUE :globally-inline? TRUE
   (let ((s MUTABLE-STRING NULL))
     (verbatim :common-lisp (setq s (CL:make-string size))
-              :cpp "s = new (GC) char[size+1]; s[size]='\\0'"
+              :cpp "s = new (PointerFreeGC) char[size+1]; s[size]='\\0'"
               ;; annoying that we have to explicitly set the length:
               :java "s = new StringBuffer(size); s.setLength(size)")
     (return s)))
@@ -1156,16 +1398,38 @@ The final value of target-index is returned."
 	    (++ target-index))))
   (return target-index))
 
-(defun (integer-to-string STRING) ((i INTEGER))
+(defun (string-trim STRING) ((string STRING))
+  :documentation "Remove any leading and trailing white space from `string'
+and return a copy of the trimmed substring (which might be empty if we had
+all white space).  If no white space was removed, `string' is returned
+unmodified and uncopied."
+  :public? TRUE
+  ;; There are native CL and Java implementations available, but the Java
+  ;; semantics are somewhat involved, so we punted and wrote this ourselves:
+  (let ((start 0)
+        (last (1- (length string)))
+        (end last))
+    (while (and (<= start end)
+                (white-space-character? (nth string start)))
+      (++ start))
+    (while (and (> end start)
+                (white-space-character? (nth string end)))
+      (-- end))
+    (if (or (> start 0)
+            (< end last))
+        (return (subsequence string start (1+ end)))
+      (return string))))
+
+(defun (integer-to-string STRING) ((i LONG-INTEGER))
   :documentation "Convert `i' to its string representation and return the result.
  This is more efficient than using a string stream."
   :native? TRUE :public? TRUE)
 
-(defun (integer-to-hex-string STRING) ((i INTEGER))
+(defun (integer-to-hex-string STRING) ((i LONG-INTEGER))
   :documentation "Convert `i' to a string representation in hexadecimal notation and return the result."
   :native? TRUE :public? TRUE)
 
-(defun (integer-to-string-in-base STRING) ((i INTEGER) (base INTEGER))
+(defun (integer-to-string-in-base STRING) ((i LONG-INTEGER) (base INTEGER))
   :documentation "Convert `i' to a string representation in `base' and return the
 result.  `base' must be positive and not more than 36.
 
@@ -1184,7 +1448,7 @@ efficient than using a string stream."
   :public? TRUE :globally-inline? TRUE
   (return (make-string 1 c)))
 
-(defun (string-to-integer INTEGER) ((string STRING))
+(defun (string-to-integer LONG-INTEGER) ((string STRING))
   :documentation
   "Convert a `string' representation of an integer into an integer."
   :native? TRUE :public? TRUE)
@@ -1415,8 +1679,24 @@ always be relative to the entire string."
     ((string STRING) (substring STRING) (start INTEGER))
   :documentation "Return start position of the left-most occurrence of
 `substring' in `string', beginning from `start'.  Return NULL if it is not
-a substring."
+a substring.  The comparison is exact."
   :native? TRUE :public? TRUE)
+
+(defun (string-search-ignore-case INTEGER)
+    ((string STRING) (substring STRING) (start INTEGER))
+  :documentation "Return start position of the left-most occurrence of
+`substring' in `string', beginning from `start'.  Return NULL if it is not
+a substring.  The comparison ignores differences in letter case."
+  :public? TRUE
+  (when (null? start)
+    (setq start 0))
+  (return
+    (verbatim :common-lisp
+	      "(CL:or (CL:search substring string :start2 start :test #'CL:string-equal)
+		      NULL-INTEGER)"
+	      :otherwise
+	      (string-search (string-downcase string) (string-downcase substring) start))))
+
 
 (defun (starts-with? BOOLEAN) ((string STRING) (prefix STRING) (start INTEGER))
   :documentation "Return TRUE if `string' starts with `prefix' starting from
@@ -1432,6 +1712,22 @@ a substring."
         (forall i in (interval 0 (1- prefixLength))
           as j in (interval start NULL)
           always (eql? (nth prefix i) (nth string j)))))))
+
+(defun (ends-with? BOOLEAN) ((string STRING) (suffix STRING) (end INTEGER))
+  :documentation "Return TRUE if the substring of `string' ending at `end'
+ends with `suffix'.  If `end' is NULL it defaults to the length of `string'."
+  :public? TRUE
+  ;; For C++ it would pay to implement this natively, since we could
+  ;; avoid iterating over the whole `string' to determine its length.
+  (when (null? end) (setq end (length string)))
+  (let ((suffixLength (length suffix))
+        (start (- end suffixLength)))
+    (if (< start 0)
+        (return false)
+      (return
+        (forall i in (interval 0 (1- suffixLength))
+          as j in (interval start NULL)
+          always (eql? (nth suffix i) (nth string j)))))))
 
 (defun (help-find-matching-prefix-length INTEGER) ((string1 STRING) (start1 INTEGER) (end1 INTEGER)
                                                    (string2 STRING) (start2 INTEGER) (end2 INTEGER))
@@ -1569,6 +1865,22 @@ and ending up to but not including position `end', counting from zero.  An
 and ending up to but not including position `end', counting from zero.  An
 `end' value of NULL stands for the rest of the string."
   :native? TRUE :public? TRUE)
+
+(defun (split-string (CONS OF STRING-WRAPPER)) ((input STRING) (separator CHARACTER))
+  :documentation "Split `input' into separate strings based on the `separator' character."
+  :public? TRUE
+  (let ((length (length input))
+        (start 0)
+        (end 0)
+        (strings NIL))
+    (loop
+      (setq end (position input separator start))
+      (pushq strings (subsequence input start end))
+      (if (and (defined? end)
+               (< end (1- length)))
+          (setq start (1+ end))
+        (break)))
+    (return (reverse strings))))
 
 (defun (stringify STRING) ((expression OBJECT))
   :documentation "Print `expression' onto a string and return the result.
@@ -1885,20 +2197,31 @@ even number of 0's and 1's.")
      :common-lisp
      ;; this restricts us to positive fixnums, since shifting
      ;;    the mask by one more position gets us into bignums:
-     "#.(CL:ash 1 (CL:1- (CL:integer-length CL:most-positive-fixnum)))"
-     ;; identical to C++ version of NULL-INTEGER - let's
-     ;;    hope the compiler does constant evaluation here:
+     "#.(cl:abs (cl:ash cl:most-negative-fixnum -1))"
+     ;; identical to `(lognot MOST-POSITIVE-INTEGER)', but we
+     ;;    are hoping for some constant evaluation here:
      :cpp "1 << (sizeof (int) / sizeof (char) * 8 - 1)"
      ;; Java guarantees 32-bit integers:
      :java "0x80000000")
    :documentation "The most significant bit of a regular integer (FIXNUM
 in Common-Lisp).  In C++ and Java this corresponds to the sign bit, in
-Lisp this corresponds to the left-most bit of `CL:most-positive-fixnum'.")
+Lisp this corresponds to the left-most bit of `CL:most-positive-fixnum'."
+   :public? TRUE)
 
 (defconstant *integer-unsigned-bits-mask* INTEGER
-  (verbatim :common-lisp (CL:logior (CL:1- *integer-msb-mask*) *integer-msb-mask*)
-            :otherwise (lognot *integer-msb-mask*))
-  :documentation "Mask that covers all the unsigned bits of an integer.")
+  (verbatim :otherwise MOST-POSITIVE-INTEGER)
+  :documentation "Mask that covers all the unsigned bits of an integer."
+  :public? TRUE)
+
+(defconstant *long-integer-msb-mask* LONG-INTEGER
+  (verbatim :otherwise NULL-LONG-INTEGER)
+  :documentation "The sign bit of a long integer."
+  :public? TRUE)
+
+(defconstant *long-integer-unsigned-bits-mask* LONG-INTEGER
+  (verbatim :otherwise MOST-POSITIVE-LONG-INTEGER)
+  :documentation "Mask that covers all the unsigned bits of a long integer."
+  :public? TRUE)
 
 (defun (hashmod INTEGER) ((code INTEGER) (size INTEGER))
   :documentation "Map the hash code `code' onto a bucket index for a hash table
@@ -1977,6 +2300,12 @@ do not necessarily generate different hash codes."
   :public? TRUE :globally-inline? TRUE
   (return (hash-code (wrapper-value self))))
 
+(defmethod (hash-code INTEGER) ((self LONG-INTEGER-WRAPPER))
+  :public? TRUE :globally-inline? TRUE
+  ;; what we should really do here is XOR the high 4 bytes with low ones;
+  ;; for now we are only looking at the least significant bits.
+  (return (hash-code (cast (wrapper-value self) INTEGER))))
+
 (defmethod (hash-code INTEGER) ((self FLOAT-WRAPPER))
   :public? TRUE :globally-inline? TRUE
   (return (hash-code (wrapper-value self))))
@@ -2003,6 +2332,11 @@ do not necessarily generate different hash codes."
   :public? TRUE :globally-inline? TRUE
   ;; should we use byte-sequence hashing similar to `hash-string' instead?
   (return self))
+
+(defmethod (hash-code INTEGER) ((self LONG-INTEGER))
+  :public? TRUE :globally-inline? TRUE
+  ;; see comment for LONG-INTEGER-WRAPPER.hash-code.
+  (return (cast self INTEGER)))
 
 (defmethod (hash-code INTEGER) ((self FLOAT))
   :public? TRUE :globally-inline? TRUE
@@ -2117,7 +2451,8 @@ that are suitable to be used as hash table sizes."
   (verbatim :common-lisp NULL
             :otherwise (foreach s in *hash-table-size-prime-strings*
                          as i in (interval 0 NULL)
-                         do (setf (nth *hash-table-size-primes* i) (string-to-integer s))))
+                         do (setf (nth *hash-table-size-primes* i)
+                              (cast (string-to-integer s) INTEGER))))
   )
 
 (defun (pick-hash-table-size-prime INTEGER) ((minSize INTEGER))
@@ -2226,7 +2561,7 @@ not necessarily mean that the file can also be read."
 NULL if that cannot be determined."
   :native? TRUE :public? TRUE)
 
-(defun (file-length INTEGER) ((fileName FILE-NAME))
+(defun (file-length LONG-INTEGER) ((fileName FILE-NAME))
   :documentation "Return the length of file `fileName' in bytes or NULL if that
 cannot be determined.  Note that this will currently overrun for files that
 are longer than what can be represented by a STELLA integer."
@@ -2236,6 +2571,20 @@ are longer than what can be represented by a STELLA integer."
   :documentation "Delete the file `fileName'."
   :native? TRUE :public? TRUE)
 
+(defun copy-stream-to-stream ((in INPUT-STREAM) (out OUTPUT-STREAM))
+  :documentation "Copy `in' verbatimely to `out'.  Does the right thing for binary data."
+  :public? TRUE
+  (let ((buffer (make-tokenizer-byte-array *tokenizer-initial-buffer-size*))
+        (bytesRead 0))
+    (loop
+      (setq bytesRead
+        (native-byte-array-read-sequence buffer in 0 *tokenizer-initial-buffer-size*))
+      (cond ((> bytesRead 0)
+             (native-byte-array-write-sequence buffer out 0 bytesRead))
+            (otherwise
+             (flush-output out)
+             (break))))))
+
 (defun copy-file ((fromFile FILE-NAME) (toFile FILE-NAME))
   :documentation "Copy file `fromFile' to file `toFile', clobbering
 any data already in `toFile'."
@@ -2243,21 +2592,14 @@ any data already in `toFile'."
   (ensure-file-exists fromFile "copy-file")
   (with-input-file (from fromFile)
     (with-output-file (to toFile)
-       (let ((buffer (make-tokenizer-byte-array *tokenizer-initial-buffer-size*))
-             (bytes-read 0))
-         (loop 
-           (setq bytes-read (native-byte-array-read-sequence 
-                             buffer from 0 *tokenizer-initial-buffer-size*))
-           (if (> bytes-read 0)
-             (native-byte-array-write-sequence buffer to 0 bytes-read)
-             (break)))))))
+      (copy-stream-to-stream from to))))
 
 
   ;;
 ;;;;;; Bit operations
   ;;
 
-(defun (lognot INTEGER) ((arg INTEGER))
+(defmethod (lognot INTEGER) ((arg INTEGER))
   :globally-inline? TRUE
   :public? TRUE
   (return
@@ -2266,7 +2608,16 @@ any data already in `toFile'."
         :cpp "(~ arg)"
 	:java "(~ arg)")))
 
-(defun (logand INTEGER) ((arg1 INTEGER) (arg2 INTEGER))
+(defmethod (lognot LONG-INTEGER) ((arg LONG-INTEGER))
+  :globally-inline? TRUE
+  :public? TRUE
+  (return
+    (verbatim
+        :common-lisp (CL:lognot arg)
+        :cpp "(~ arg)"
+	:java "(~ arg)")))
+
+(defmethod (logand INTEGER) ((arg1 INTEGER) (arg2 INTEGER))
   :globally-inline? TRUE
   :public? TRUE
   (return
@@ -2275,7 +2626,16 @@ any data already in `toFile'."
         :cpp "(arg1 & arg2)"
 	:java "(arg1 & arg2)")))
 
-(defun (logor INTEGER) ((arg1 INTEGER) (arg2 INTEGER))
+(defmethod (logand LONG-INTEGER) ((arg1 LONG-INTEGER) (arg2 LONG-INTEGER))
+  :globally-inline? TRUE
+  :public? TRUE
+  (return
+    (verbatim
+        :common-lisp (CL:logand arg1 arg2)
+        :cpp "(arg1 & arg2)"
+	:java "(arg1 & arg2)")))
+
+(defmethod (logor INTEGER) ((arg1 INTEGER) (arg2 INTEGER))
   :globally-inline? TRUE
   :public? TRUE
   (return
@@ -2284,7 +2644,16 @@ any data already in `toFile'."
         :cpp "(arg1 | arg2)"
 	:java "(arg1 | arg2)")))
 
-(defun (logxor INTEGER) ((arg1 INTEGER) (arg2 INTEGER))
+(defmethod (logor LONG-INTEGER) ((arg1 LONG-INTEGER) (arg2 LONG-INTEGER))
+  :globally-inline? TRUE
+  :public? TRUE
+  (return
+    (verbatim
+        :common-lisp (CL:logior arg1 arg2)
+        :cpp "(arg1 | arg2)"
+	:java "(arg1 | arg2)")))
+
+(defmethod (logxor INTEGER) ((arg1 INTEGER) (arg2 INTEGER))
   :globally-inline? TRUE
   :public? TRUE
   (return
@@ -2293,11 +2662,42 @@ any data already in `toFile'."
         :cpp "(arg1 ^ arg2)"
 	:java "(arg1 ^ arg2)")))
 
-(defun (integer-length INTEGER) ((arg INTEGER))
-  :native? TRUE
-  :public? TRUE)
+(defmethod (logxor LONG-INTEGER) ((arg1 LONG-INTEGER) (arg2 LONG-INTEGER))
+  :globally-inline? TRUE
+  :public? TRUE
+  (return
+    (verbatim
+        :common-lisp (CL:logxor arg1 arg2)
+        :cpp "(arg1 ^ arg2)"
+	:java "(arg1 ^ arg2)")))
 
-(defun (shift-left INTEGER) ((arg INTEGER) (count INTEGER))
+(defconstant LONG-INTEGER-BIT-WIDTH INTEGER
+             (round (/ (log (* MOST-POSITIVE-LONG-INTEGER 2.0)) (log 2)))
+  :documentation "The number of bits in a long integer.")
+
+(defun (integer-length INTEGER) ((x LONG-INTEGER))
+  :documentation "Return the 1-based position of the left-most bit in `x'.
+If `x' is negative, we only count the value bits, not the sign."
+  :public? TRUE
+  (when (< x 0)
+    (setq x (- -1 x)))
+  (when (= x 0)
+    (return 0))
+  (let ((bot 0)
+        (top (1- LONG-INTEGER-BIT-WIDTH))
+        (split 0)
+        (rem LONG-INTEGER 0))
+    ;; run a binary search:
+    (loop
+      (setq split (shift-right (+ bot top) 1))
+      (setq rem (shift-right x split))
+      (when (= rem 1)
+        (return (1+ split)))
+      (if (= rem 0)
+          (setq top (1- split))
+        (setq bot (1+ split))))))
+
+(defmethod (shift-left INTEGER) ((arg INTEGER) (count INTEGER))
   :globally-inline? TRUE
   :public? TRUE
   (return
@@ -2306,7 +2706,16 @@ any data already in `toFile'."
         :cpp "(arg << count)"
 	:java "(arg << count)")))
 
-(defun (shift-right INTEGER) ((arg INTEGER) (count INTEGER))
+(defmethod (shift-left LONG-INTEGER) ((arg LONG-INTEGER) (count INTEGER))
+  :globally-inline? TRUE
+  :public? TRUE
+  (return
+    (verbatim
+        :common-lisp (CL:ash arg count)
+        :cpp "(arg << count)"
+	:java "(arg << count)")))
+
+(defmethod (shift-right INTEGER) ((arg INTEGER) (count INTEGER))
   :documentation "Shift `arg' to the right by `count' positions and
 0-extend from the left if `arg' is positive or 1-extend if it is
 negative.  This is an arithmetic shift that preserve the sign of `arg'
@@ -2318,7 +2727,19 @@ and is equivalent to dividing `arg' by 2** `count'."
         :cpp "(arg >> count)"
 	:java "(arg >> count)")))
 
-(defun (unsigned-shift-right-by-1 INTEGER) ((arg INTEGER))
+(defmethod (shift-right LONG-INTEGER) ((arg LONG-INTEGER) (count INTEGER))
+  :documentation "Shift `arg' to the right by `count' positions and
+0-extend from the left if `arg' is positive or 1-extend if it is
+negative.  This is an arithmetic shift that preserve the sign of `arg'
+and is equivalent to dividing `arg' by 2** `count'."
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (verbatim
+        :common-lisp (CL:ash arg (CL:the CL:FIXNUM (CL:- count)))
+        :cpp "(arg >> count)"
+	:java "(arg >> count)")))
+
+(defmethod (unsigned-shift-right-by-1 INTEGER) ((arg INTEGER))
   :documentation "Shift `arg' to the right by 1 position and 0-extend
 from the left.  This does not preserve the sign of `arg' and shifts
 the sign-bit just like a regular bit.  In Common-Lisp we can't do that
@@ -2332,6 +2753,22 @@ directly and need to do some extra masking."
       :common-lisp (CL:logand (CL:the CL:FIXNUM (CL:ash arg -1))
                               *integer-unsigned-bits-mask*)
       :cpp "((unsigned int)arg >> 1)"
+      :java "(arg >>> 1)")))
+
+(defmethod (unsigned-shift-right-by-1 LONG-INTEGER) ((arg LONG-INTEGER))
+  :documentation "Shift `arg' to the right by 1 position and 0-extend
+from the left.  This does not preserve the sign of `arg' and shifts
+the sign-bit just like a regular bit.  In Common-Lisp we can't do that
+directly and need to do some extra masking."
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (verbatim
+      ;; If `arg' is positive, this works just like a regular `shift-right';
+      ;; if it is negative, this shifts in the sign bit and then masks it
+      ;; emulating a 0 shifted in from the left:
+      :common-lisp (CL:logand (CL:ash arg -1)
+                              *long-integer-unsigned-bits-mask*)
+      :cpp "((unsigned long long int)arg >> 1)"
       :java "(arg >>> 1)")))
 
 #|
@@ -2424,7 +2861,7 @@ bytes 7 and 8, - bytes 9 and 10, - then followed by bytes 11-16."
            (cl:setq result (intern-symbol (CL:symbol-name self)))))
         ((CL:or CL:NUMBER CL:STRING) (cl:setq result (wrap-literal self)))
         (STELLA::OBJECT (cl:setq result self))
-        (CL:t (CL:error \"Can't stellify: \" self)))"
+        (CL:t (CL:error \"Can't stellify: ~s\" self)))"
       :otherwise NULL)
     (return result) ))
 
@@ -2440,13 +2877,16 @@ bytes 7 and 8, - bytes 9 and 10, - then followed by bytes 11-16."
 
 (defun (running-as-lisp? BOOLEAN) ()
   :documentation "Return true if the executable code is a Common Lisp application."
+  :public? TRUE
   (let ((result? FALSE))
     (verbatim :common-lisp "(cl:setq result? TRUE)"
               :otherwise NULL)
     (return result?)) )
 
 (defun (running-in-language KEYWORD) ()
-  :documentation "Returns the keyword for the language the current implementation is running in."
+  :documentation
+  "Returns the keyword for the language the current implementation is running in."
+  :public? TRUE
   (return (verbatim :common-lisp (intern-keyword "COMMON-LISP")
                     :cpp "internKeyword(\"CPP\")"
                     :java "Stella.internKeyword(\"JAVA\")"

@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: translate-file.ste,v 1.101 2006/05/14 06:52:41 hans Exp
+;;; Version: translate-file.ste,v 1.108 2009/09/11 21:31:48 tar Exp
 
 ;;; Generic translator for Stella files.
 
@@ -98,14 +98,23 @@ to a local directory containing sources, natives, or binaries.")
   ;;
 
 (defun (handle-in-module-tree BOOLEAN BOOLEAN)
-    ((tree CONS) (seenInModule? BOOLEAN))
+    ((tree CONS) (seenInModule? BOOLEAN) (errorOnInModule? BOOLEAN))
   :public? TRUE
-  ;; Handle 'tree' in case it is an 'IN-MODULE' declaration.
-  ;; 'seenInModule?' indicates that an 'IN-MODULE' declaration has already
-  ;;    been seen, in which case another one triggers an error message.
-  ;; The first return value is TRUE if 'tree' has actually been handled
-  ;;    by this function; the second return value is TRUE if 'tree' was an
-  ;;    'IN-MODULE' declaration.
+  ;; Handle `tree' in case it is an `IN-MODULE' declaration.
+  ;; `seenInModule?' is used to keep track of whether an IN-MODULE form
+  ;;    has already been seen.
+  ;; `errorOnInModule?' indicates that if an `IN-MODULE' declaration has already
+  ;;    been seen, another one triggers an error message.  If false, then multiple
+  ;;    IN-MODULE forms are allowed.
+  ;;
+  ;; The first return value is TRUE if `tree' has actually been completely
+  ;;    handled by this function.  `IN-MODULE' is not considered completely
+  ;;    handled, since certain two-pass operations require handling it again
+  ;;    in the proper order during the second pass;
+  ;; The second return value is TRUE if `tree' was an 'IN-MODULE' declaration,
+  ;;     else it is the value passed in as `seenInModule?'   This should be
+  ;;     passed back in when processing forms in a loop, as the state
+  ;;     information is needed by this function.
   (let ((operator (first tree))
         (firstArg OBJECT NULL))
     (typecase operator
@@ -116,16 +125,16 @@ to a local directory containing sources, natives, or binaries.")
          ("IN-PACKAGE"
           (return TRUE seenInModule?))
          ("IN-MODULE"
-          (when seenInModule?
-            (walk-warn "Ignoring duplicate IN-MODULE declaration: " tree)
-            (return TRUE seenInModule?))
+          (when (and seenInModule? errorOnInModule?)
+            (walk-error "Additional IN-MODULE declaration: " tree)
+            (return FALSE seenInModule?))
           (setq firstArg (second tree))
           (typecase firstArg
             (STRING (change-module (wrapper-value firstArg))
                     (setq seenInModule? TRUE))
             (otherwise
              (walk-warn "Ignoring illegal IN-MODULE declaration: " tree)))
-          (return TRUE seenInModule?))
+          (return FALSE seenInModule?))
          ;; Allowed before IN-MODULE:
          (("DEFMODULE" "VERBATIM") NULL)
          (otherwise
@@ -171,6 +180,7 @@ to a local directory containing sources, natives, or binaries.")
     (special ((*translationPhase* NULL)
               (*translationErrors* 0)
               (*translationWarnings* 0)
+              (*translationNotes* 0)
 	      (*currentFile* (file-base-name file))
               (*module* currentModule)
               (*context* currentContext))
@@ -192,7 +202,7 @@ to a local directory containing sources, natives, or binaries.")
                  (typecase tree
                    (CONS
                     (mv-setq (skip? seenInModule?)
-                      (handle-in-module-tree tree seenInModule?))
+                      (handle-in-module-tree tree seenInModule? TRUE))
                     (unless skip?
                       (special ((*translationPhase* :DEFINE))
                         (walk-top-level-tree tree TRUE))))
@@ -986,11 +996,17 @@ running in Lisp, which allows us to depend on the native
   ;; Return TRUE if the `language' version of `systemName' has one or more
   ;;    files that need to be translated.
   ;; Assumes the preprocessed files are a subset of the source files.
+  ;; Note: This handles the system startup file separately, since the logic
+  ;;       for determining if translation is needed is different, since it
+  ;;       may not exist, which doesn't apply to normal system files.
   (with-system-definition systemName
-    (return (exists file in (files-plus-system-startup
-                             (system-definition-source-files
-                              *currentSystemDefinition*))
-                where (stella-need-to-translate? file language))))
+    (when (exists file in (system-definition-source-files *currentSystemDefinition*)
+		  where (stella-need-to-translate? file language))
+      (return TRUE))
+    (let ((startup-file (system-startup-file-name NULL)))
+      (unless (probe-file? (make-file-name startup-file :stella TRUE))
+	(return TRUE))
+      (return (stella-need-to-translate? startup-file language))))
   ;; make Java happy:
   (return FALSE))
 
@@ -1022,11 +1038,14 @@ running in Lisp, which allows us to depend on the native
     (return (new LIST :the-cons-list (rest head)))))
 
 (defun (translate-system BOOLEAN) ((systemName STRING)
-                                   (outputLanguage KEYWORD)
-                                   &rest (options OBJECT))
+                                   &rest (language&options OBJECT))
   :documentation
   "Translate all of the STELLA source files in system `systemName' into
-`outputLanguage'.  The following keyword/value `options' are recognized:
+`language' (the optional first argument).  The following keyword/value
+`options' are recognized:
+
+`:language': can be used as an alternative to the optional language argument.
+If not specified, the language of the running implementation is assumed.
 
 `:two-pass?' (default false): if true, all files will be scanned twice, once
 to load the signatures of objects defined in them, and once to actually
@@ -1042,17 +1061,29 @@ will be favored instead (according to the value of `:production-settings'
 on the system definition).
 
 `:production-settings?' (default true): inverse to `:development-settings?'."
-  :public? TRUE
-  (let ((plist (new PROPERTY-LIST :the-plist (coerce-&rest-to-cons options)))
+  :public? TRUE :command? TRUE
+  (let ((options (coerce-&rest-to-cons language&options))
+        (language KEYWORD
+         (choose (member? (quote (:common-lisp :cpp :java)) (first options))
+                 (first options)
+                 (running-in-language)))
+        (plist (vet-options
+                (choose (eql? (first options) language)
+                        (rest options)
+                        options)
+                (quote (:two-pass?
+                         :force-translation?
+                         :production-settings?
+                         :development-settings?
+                         :language
+                         :action))))
         (twoPass? FALSE)
         (forceTranslation? FALSE)
         (productionMode? TRUE))
-    (setq outputLanguage (stellify outputLanguage))
-    (vet-options plist
-                 (quote (:two-pass?
-                         :force-translation?
-                         :production-settings?
-                         :development-settings?)))
+    (setq language (lookup-with-default plist :language language))
+    (insert-at plist :language language) ;; for required system actions
+    ;; initialize :action unless it already has a value:
+    (insert-at plist :action (lookup-with-default plist :action :translate-system))
     (foreach (key value) in plist
         do (case key
              (:two-pass?
@@ -1062,25 +1093,24 @@ on the system definition).
              (:production-settings?
               (setq productionMode? (eql? value TRUE-WRAPPER)))
              (:development-settings?
-              (setq productionMode? (not (eql? value TRUE-WRAPPER))))))
-    (when (null? (lookup-function-or-stella-function
-                  (system-startup-function-symbol
-                   (get-system-definition systemName))))
-      ;; This relies on the fact that "system-startup.ste" gets translated last:
-      (setq twoPass? TRUE))
+              (setq productionMode? (not (eql? value TRUE-WRAPPER))))
+             (otherwise NULL)))
     (special ((*translatorOutputLanguage* *translatorOutputLanguage*)
               (*translationPhase* NULL)
               (*safety* *safety*)       ; preserve old value
               ;; Java breaks with recycling.
-              (*recycling-enabled?* (not (eql? outputLanguage :java)))
-              (*current-stella-features* (copy *current-stella-features*)))
+              (*recycling-enabled?* (not (eql? language :java)))
+              (*current-stella-features* (copy *current-stella-features*))
+              (*current-system-action* (copy plist)))
+      (when (not (system-loaded-or-started-up? systemName))
+        (setq twoPass? TRUE))
       (setq *gensym-counter* -1)
       (set-stella-feature
        :TRANSLATE-WITH-COPYRIGHT-HEADER
        :WARN-ABOUT-MISSING-METHODS
        :WARN-ABOUT-UNDEFINED-METHODS)
       (unset-stella-feature :USE-HARDCODED-SYMBOLS)
-      (set-translator-output-language outputLanguage)
+      (set-translator-output-language language)
       (with-system-definition systemName
         (compute-optimization-levels *currentSystemDefinition* productionMode?)
         (let ((files (files-plus-system-startup
@@ -1088,12 +1118,13 @@ on the system definition).
                        *currentSystemDefinition*)))
               (translatedSomething? FALSE))
           (when (or forceTranslation?
-                    (system-needs-translation? systemName outputLanguage))
+                    (system-needs-translation? systemName language))
             ;; create startup-system file; it is translated with source files:
             (create-system-startup-file *currentSystemDefinition*)
             (setq translatedSomething?
               (help-translate-system files twoPass? forceTranslation?)))
-          (transfer-native-system-files outputLanguage)
+          (transfer-native-system-files language)
+          (transfer-data-files language)
           (return translatedSomething?)))
       ;; Return required in case the WITH-SYSTEM-DEFINITION code doesn't execute
       ;; its body!
@@ -1149,7 +1180,7 @@ on the system definition).
       (clear-symbol-registry)
       (return translatedFile?))))
 
-(defun transfer-native-system-files ((outputLanguage KEYWORD))
+(defun transfer-native-system-files ((output-language KEYWORD))
   ;; Helping function for 'translate-system'.
   ;; Copy any native files in  *currentSystemDefinition* from their position
   ;;    within the root source directory into an equivalent position in the
@@ -1158,35 +1189,48 @@ on the system definition).
   ;;    native file extensions as indicators of file types, but can't
   ;;    assume that they represent legal extensions (e.g., ".lisp" may
   ;;    translate to ".lsp" for some Lisps).
-  (let ((nativeFiles (CONS OF STRING-WRAPPER) NULL)
-        (systemSubDirectory
+  (let ((native-files (CONS OF STRING-WRAPPER) NULL))
+    (case output-language
+      (:common-lisp 
+       (setq native-files (lisp-only-files *currentSystemDefinition*)))
+      (:java 
+       (setq native-files (java-only-files *currentSystemDefinition*)))
+      (:cpp
+       (setq native-files (cpp-only-files *currentSystemDefinition*))))
+    (when (defined? native-files)
+      ;; subtract any language-specific STELLA files (such as `cl-primal.ste')
+      ;;    whose translation has already been copied during the translation step
+      ;;    (we now need to do this since we copy extensionless files):
+      (setq native-files
+	    (difference native-files
+			(system-definition-source-files *currentSystemDefinition*)))
+      (transfer-files native-files output-language))))
+
+(defun transfer-data-files ((output-language KEYWORD))
+  ;; Helping function for 'translate-system'.
+  ;; Copy any data files in  *currentSystemDefinition* from their position
+  ;;    within the root source directory into an equivalent position in the
+  ;;    native source directory.
+  (let ((data-files (data-files *currentSystemDefinition*)))
+    (when (defined? data-files)
+      (transfer-files data-files output-language))))
+
+(defun transfer-files ((files (CONS OF STRING-WRAPPER)) (output-language KEYWORD))
+  ;; Transfer the files in the files list directly to 
+  ;; the appropriate place in the target source.
+  (when (eql? (root-source-directory) (root-native-directory)) ; No need to copy
+    (return))
+  (let ((flotsamFileName STRING "")
+        (system-sub-directory
          (choose (eql? *currentSystemDefinitionSubdirectory* "")
                  ""
                  (concatenate *currentSystemDefinitionSubdirectory*
-                              (directory-separator-string))))
-	(flotsamFileName STRING ""))
-    (case outputLanguage
-      (:common-lisp 
-       (setq nativeFiles (lisp-only-files *currentSystemDefinition*)))
-      (:java 
-       (setq nativeFiles (java-only-files *currentSystemDefinition*))
-       (setq flotsamFileName
-	 (java-yield-flotsam-class-name 
-	  (get-cardinal-module *currentSystemDefinition*))))
-      (:cpp
-       (setq nativeFiles (cpp-only-files *currentSystemDefinition*))))
-    (when (null? nativeFiles)
-      (return))
-    (when (eql? (root-source-directory) (root-native-directory))
-      (return))
-    ;; subtract any language-specific STELLA files (such as `cl-primal.ste')
-    ;;    whose translation has already been copied during the translation step
-    ;;    (we now need to do this since we copy extensionless files):
-    (setq nativeFiles
-      (difference nativeFiles
-                  (system-definition-source-files *currentSystemDefinition*)))
+                              (directory-separator-string)))))
+    (when (eq? output-language :java)
+      (setq flotsamFileName (java-yield-flotsam-class-name 
+			     (get-cardinal-module *currentSystemDefinition*))))
     (within-module (get-cardinal-module *currentSystemDefinition*)
-      (foreach f in nativeFiles
+      (foreach f in files
 	  do (let ((fileName STRING f)
                    (type (classify-file-extension fileName))
                    (relativeFileName
@@ -1201,7 +1245,7 @@ on the system definition).
                  (otherwise NULL))
                (setq fromFileName
                  (concatenate
-                   (root-source-directory) systemSubDirectory fileName))
+                   (root-source-directory) system-sub-directory fileName))
                (setq toFileName (make-file-name relativeFileName type TRUE))
                (when (not (eql? (file-younger-than? toFileName fromFileName)
                                 TRUE-WRAPPER))

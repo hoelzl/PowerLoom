@@ -1,0 +1,569 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2005      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: fetch-interface.ste,v 1.10 2005/02/15 18:11:09 powerloom Exp
+
+;;; Interface to Fetch query handler via HTTP protocol.
+
+(in-package "STELLA")
+
+(in-module "RDBMS")
+
+
+;;;;
+;;;;  Fetch EDB Queries
+;;;;
+
+(defun (run-fetch-query OBJECT) 
+    ((host STRING) (port INTEGER)
+     (query-id STRING) (task-id STRING) (subtask-id STRING) (database STRING)
+     (parameters STRING))
+  :public? TRUE
+  :documentation "Runs a Fetch query specifying the parameters given.
+Returns an object representing the returned XML-encoded answer from
+the server."
+  (special ((*printreadably?* FALSE))
+     (with-network-stream (in out host port)
+       ;; Send request
+       (print-stream out "GET /agent/runner?plan=")
+       (write-html-escaping-url-special-characters out query-id)
+       (print-stream out "&TaskID=")
+       (write-html-escaping-url-special-characters out task-id)
+       (print-stream out "-")
+       (write-html-escaping-url-special-characters out subtask-id)
+       (print-stream out "&Database=")
+       (write-html-escaping-url-special-characters out database)
+       (print-stream out "&")
+       (print-stream out parameters)
+       (print-stream out " HTTP/1.0" #\Return #\Linefeed #\Return #\Linefeed)
+       (flush-output out)
+
+       ;; Read and parse reply
+       (mv-bind (returnCode returnMessage version)
+		(utilities/read-http-header in (new KEY-VALUE-LIST))
+		(ignore version)
+	  (if (= returnCode 200)	; HTTP SUCCESS
+	      (progn 
+		(foreach exp in (xml-expressions in NULL)
+		   where (and (isa? exp @CONS)
+			      (xml-element? (first (cast exp CONS))))
+		   do (xml-tag-case (get-xml-tag exp)
+		       (("PlanExecution")
+			(return exp))
+		       (("Error")
+			(error (wrapper-value (cast (first (get-xml-content exp))
+						    STRING-WRAPPER))))
+		       (otherwise NULL)))
+		(error "Fetch Query Error: No answer element found."))
+	    (error "HTTP Error " returnCode " " returnMessage)))) ))
+
+#|
+(eval (run-fetch-query "pegasus2.isi.edu" 8080 
+                       "q2-et1" "TASK" "SUBTASK" 
+                       "EELD_EDB17JUN03_COMPLIANT_PRIVATE_PL"
+                       "EntityTypeID=ET1003"))
+
+(eval (run-fetch-query "pegasus2.isi.edu" 8080 
+                       "q1-LINK1" "TASK" "SUBTASK" 
+                       "EELD_EDB28JUN03_CORRUPTED_HARDER_PRIVATE_PL"
+                       "entityid_arg1=UID-EVENT-11437"))
+
+;; Breaks
+(eval (run-fetch-query "pegasus2.isi.edu" 8080 
+                       "q1-LINK1" "TASK" "SUBTASK" 
+                       "EELD_EDB28JUN03_CORRUPTED_HARDER_PRIVATE_PL"
+                       "EntityID=UID-EVENT-11437"))
+
+;; Error case:
+(eval (run-fetch-query "pegasus2.isi.edu" 8080 
+                       "q1-LINK" "TASK" "SUBTASK" 
+                       "EELD_EDB28JUN03_CORRUPTED_HARDER_PRIVATE_PL"
+                       "EntityID=UID-EVENT-11437"))
+
+;; Dryrun dataset query that works (on aug-6-03):
+(eval (run-fetch-query "pegasus2.isi.edu" 8080 
+                       "q1-entity1" "TASK" "SUBTASK" 
+                       "REVISED_DRY_RUN_COMPLIANT_SIZE_SECONDARY_UNCURTAILED"
+                       "EntityID=UID-SOURCE-5072"))
+|#
+
+(defun (normalize-Fetch-query-arguments STRING
+                                        (CONS OF STRING-WRAPPER)
+                                        PROPERTY-LIST)
+    ((proposition PROPOSITION)
+     (arguments OBJECT))
+  ;; Parse and normalize the `arguments' to a Fetch query and return three values:
+  ;;    (1) a string specifying the query ID
+  ;;    (2) a list of strings specifying the required output columns.  If no
+  ;;        output arguments are specified, try to derive them from the relation.
+  ;;    (3) a property list containing paramter/value pairs.  Variable symbols
+  ;;        will be substituted with the appropriate argument of `proposition'.
+  ;; Signal an error in case any illegal syntax is encountered.
+  (unless (string? arguments)
+    (signal-parsing-error "Fetch-EDB-query: illegal pattern arguments: "
+                          arguments))
+  (let ((args (unstringify arguments))
+        (cursor CONS NULL)
+        (queryId STRING NULL)
+        (outputArgs NIL)
+        (parameters NIL)
+        (parameterValue OBJECT NULL))
+    (typecase args
+      (CONS
+       (unless (and (or (and (cons? (first args)) ;; output columns specified
+                             (even? (length args)))
+                        (and (not (cons? (first args)))
+                             (odd? (length args))))
+                    (forall arg in (rest args)
+                        always (not (cons? arg))))
+         (signal-parsing-error "Fetch-EDB-query: illegal pattern arguments: "
+                               arguments))
+       (setq cursor args)
+       (cond ((cons? (first cursor))
+              ;; we have output columns specified:
+              (foreach outArg in (cast (first cursor) CONS)
+                  collect (coerce-to-string outArg) into outputArgs)
+              (setq cursor (rest cursor)))
+             (otherwise
+              ;; no output arguments specified, get them from the relation:
+              (setq outputArgs
+                (get-table-column-names
+                 (get-description (relationRef proposition))))
+              (when (null? outputArgs)
+                (signal-parsing-error
+                 "Fetch-EDB-query: missing output arg/column specifications for: "
+                 (get-description (relationRef proposition))))))
+       (setq queryId (coerce-to-string (first cursor)))
+       (setq cursor (rest cursor))
+       (setq parameters cursor)
+       (while (non-empty? cursor)
+         (setf (first cursor) (coerce-to-string (first cursor)))
+         (setq parameterValue (first (rest cursor)))
+         (cond ((question-mark-symbol? parameterValue)
+                ;; we have an input argument, replace it with the matching
+                ;;    argument from `proposition':
+                (setq parameterValue
+                  (some arg in (arguments proposition)
+                      as var in (io-variable-names
+                                 (get-description (relationRef proposition)))
+                      where (eql? var parameterValue)))
+                (when (null? parameterValue)
+                  (signal-parsing-error
+                   "Fetch-EDB-query: non-existent input variable: "
+                   (first (rest cursor))))
+                (setf (first (rest cursor)) parameterValue))
+               (otherwise
+                (setf (first (rest cursor))
+                  (coerce-to-string parameterValue))))
+         (setq cursor (rest (rest cursor)))))
+      (otherwise
+       (signal-parsing-error "Fetch-EDB-query: illegal pattern arguments: "
+                             arguments)))
+    (return queryId outputArgs (new PROPERTY-LIST :the-plist parameters))))
+
+#|
+;; Example Fetch-EDB-query definition:
+
+(DEFQUERY Fetch-EDB-Q1-Entity1 (?arg1 ?arg2)
+  :QUERY-PATTERN (RDBMS/FETCH-EDB-QUERY fetch-edb
+                  "((ENTITY STARTDATE)            ;; output columns specified
+                    q1-entity1                    ;; query ID
+                    EntityID ?arg1 Date ?arg2)")) ;; input parameters
+
+(DEFQUERY Fetch-EDB-Q1-Entity1 (?ENTITY ?STARTDATE)
+  ;; here we derive the optional output columns from the relation args/columns:
+  :QUERY-PATTERN (RDBMS/FETCH-EDB-QUERY fetch-edb
+                  "(q1-entity1                           ;; query ID
+                    EntityID ?ENTITY Date ?STARTDATE)")) ;; input parameters
+
+;; An actually working example:
+
+(DEFQUERY Fetch-EDB-Q1-Entity1-test2 (?ENTITYTYPEID ?ENTITYID)
+  :QUERY-PATTERN (RDBMS/FETCH-EDB-QUERY fetch-edb
+                  "(q1-entity1                    ;; query ID
+                    EntityID ?ENTITYID)"))        ;; input parameters
+|#
+
+(defun (help-memoize-Fetch-EDB-query (ITERATOR OF CONS))
+    ((proposition PROPOSITION) (database LOGIC-OBJECT) (arguments OBJECT))
+  ;; Helper function for `Fetch-EDB-query' (which see).
+  (let ((queryId STRING NULL)
+        (outputArgs NIL)
+        (parameters PROPERTY-LIST NULL)
+        (relation (get-description (relationRef proposition)))
+	(params (new STRING-OUTPUT-STREAM)))
+    (mv-setq (queryId outputArgs parameters)
+      (normalize-Fetch-query-arguments proposition arguments))
+    (foreach (key value) in parameters
+        as i in (interval 1 NULL)
+        do (when (or (null? key)
+                     (null? value))
+             ;; some error during normalization:
+             (return NULL))
+           (when (> i 1)
+             (print-stream params "&"))
+           (print-stream params (unwrap-string key))
+           (setq value (argument-bound-to value))
+           (when (null? value)
+             ;; we must have had an unbound input variable:
+             (return NULL))
+           (print-stream params "="
+                         ;; ignore the relation argument type for now:
+                         (coerce-powerloom-object-to-string value NULL)))
+    (return
+      (allocate-iterator
+       (parse-fetch-xml-answer
+        (run-fetch-query
+         (first-defined
+          (unwrap-string (access-binary-value database RDBMS/@host))
+          "pegasus2.isi.edu")
+         (first-defined
+          (unwrap-integer (access-binary-value database RDBMS/@port))
+          8080)
+         queryId
+         (first-defined
+          (unwrap-string (access-binary-value database RDBMS/@task-id))
+          "TASK")
+         (first-defined
+          (unwrap-string (access-binary-value database RDBMS/@subtask-id))
+          "SUBTASK")
+         (first-defined
+          (unwrap-string (access-binary-value database RDBMS/@db-name))
+          "EELD-DATABASE")
+         (the-string params))
+       relation
+       outputArgs)))))
+
+(defun (Fetch-EDB-query (ITERATOR OF CONS)) ((proposition PROPOSITION)
+                                             (database LOGIC-OBJECT)
+                                             (arguments OBJECT))
+  ;; Generic query evaluator that can execute EELD EDB queries via the
+  ;;    Fetch HTTP/XML interface.  It expects an `arguments' string of
+  ;;    the following format:
+  ;;       "([(<output-column>+)]
+  ;;         <query-id>
+  ;;         {<parameter> <value>}*)"
+  ;; The list of <output-column>'s is optional and will be derived from
+  ;;    `proposition's relation if it was not supplied.
+  ;; The second mandatory argument is the query/plan ID.
+  ;; The remaining arguments are a list of query paramter/value pairs.
+  ;;    Any variable symbols in the parameter list are considered input
+  ;;    paramters that are substituted with the appropriate argument of
+  ;;    `proposition'.  If such an input argument is unbound, the query
+  ;;    fails immediately.
+  (check-for-external-db-updates proposition database)
+  (return
+    (clone-memoized-iterator
+     (memoize ((get-query-pattern-memoization-key proposition)
+               *context* *reversePolarity?*)
+              :timestamps (:META-KB-UPDATE :EXTERNAL-DB-UPDATE)
+              :max-values 10000
+              (new MEMOIZABLE-ITERATOR
+                   :base-iterator
+                   (help-memoize-Fetch-EDB-query
+                    proposition database arguments))))))
+
+(defun (parse-fetch-xml-answer (CONS OF CONS))
+    ((xmlAnswer CONS)
+     (relation NAMED-DESCRIPTION)
+     (outputColumns (CONS OF STRING-WRAPPER)))
+  ;; Derive a list of CONS tuples from `xmlAnswer' that can be bound to the
+  ;;    arguments of `relation'.  The list of `outputColumns' is used to only
+  ;;    select those result columns that are needed.
+  ;; Derived from Tom's `generate-table-assertions'.
+  (let ((tuples NIL))
+    (unless (and (xml-element? (first xmlAnswer))
+		 (xml-element-match? (cast (first xmlAnswer) XML-ELEMENT)
+				     "PlanExecution" NULL))
+      (warn "Fetch-EDB-query Error: Didn't find a Fetch Answer in " xmlAnswer)
+      (return NIL))
+    (foreach answer in (get-xml-content xmlAnswer)
+        where (and (isa? answer @CONS)
+                   (xml-element? (first (cast answer CONS))))
+        do (xml-tag-case (get-xml-tag answer)
+             (("OBJECT")
+              (pushq tuples
+                     (parse-one-fetch-xml-object
+                      (get-xml-content answer)
+                      relation
+                      outputColumns)))
+             (("Error")
+              (error (unwrap-string (first (get-xml-content answer)))))
+             (("ERROR")
+              (error (unwrap-string (first (get-xml-content answer)))))))
+    (return (reverse tuples))))
+
+(defun (parse-one-fetch-xml-object CONS)
+    ((object CONS)
+     (relation NAMED-DESCRIPTION)
+     (outputColumns (CONS OF STRING-WRAPPER)))
+  ;; Extract a list of column values for `outputColumns' from the XML result
+  ;;    `object' and coerce them as required by the argument types of `relation'.
+  ;; Derived from Tom's `build-one-table-assertion'.
+  (let ((tuple NIL))
+    ;; there is probably a more efficient way to extract the required
+    ;;    columns but this will do for now:
+    (foreach column in outputColumns
+        do (foreach item in object
+               where (eql? column (name (get-xml-tag item)))
+               do (pushq tuple (first (get-xml-content item)))
+                  (unless (empty? (rest (get-xml-content item)))
+                    (warn "Extra elements found in " item))))
+    (setq tuple (reverse tuple))
+    (return (coerce-values tuple (get-relation-table-info relation)))))
+
+
+;;;;
+;;;;  Fetch EDB servlet for Jafar
+;;;;
+
+(defun start-fetch-EDB-gateway ((port INTEGER))
+  ;; Start the Fetch EDB gateway servlet on `port'.
+  ;; This only works in Allegro-CL, of course.
+  ;; Slighly messy to be tolerant about packages and functionality
+  ;;    that might not yet be around at compile or load time.
+  (let ((lispForms
+    "#+:aserve
+    (CL:progn
+      (CL:defun handle-fetch-query (request entity)
+        (net.aserve:with-http-response (request entity)
+          (net.aserve:with-http-body (request entity)
+            (CL:case (net.aserve:request-method request)
+              (:get
+               (CL:let ((query (net.aserve:request-query request
+                                                         :uri CL:t
+                                                         :post CL:nil))
+                        (keys (stella::new-key-value-list)))
+                 (CL:loop for (key . value) in query
+                     do (stella::insert-at
+                         keys
+                         (stella::wrap-string (CL:string key))
+                         (stella::wrap-string value)))
+                 (evaluate-fetch-query
+                  keys (net.aserve:request-reply-stream request))))
+              (CL:t
+               (CL:format (net.aserve:request-reply-stream request) 
+                          \"Error occurred:<BR>~%Unhandled request method ~S\"
+                          (net.aserve:request-method request)))))))
+      (CL:defun start-fetch-EDB-servlet (port)
+        (CL:compile 'handle-fetch-query)
+        (net.aserve:publish :path \"/ploom/fetch-EDB-query\"
+                            :content-type \"text/html\"
+                            :function 'handle-fetch-query)
+        (net.aserve:start :port port)))
+    #-:aserve ()"))
+    (verbatim :common-lisp
+      "#+:allegro
+       (CL:progn
+         (CL:require :aserve)
+         (CL:pushnew :aserve CL:*features*)
+         (CL:eval (CL:read-from-string lispForms))
+         (start-fetch-EDB-servlet port))"
+      :otherwise NULL)))
+
+(defun evaluate-fetch-query ((keys KEY-VALUE-LIST) (out NATIVE-OUTPUT-STREAM))
+  ;; Preliminary Fetch query evaluator to serve as a gateway for Jafar so
+  ;;    he doesn't has to parse XML in MathLab.
+  ;; This still needs to take care of setting the database as well as
+  ;;    cache maintenance.
+  (exception-case
+      (with-logic-environment ;; use this since it locks
+          (first-defined (get-stella-module "EELD-EDB" false) *module*) NULL
+        (let (;(primaryDBname (lookup keys "sdatabase"))
+              (secondaryDBname (lookup keys "sdatabase"))
+              ;(edb (get "edb"))
+              (fetchDB (get "fetch-edb"))
+              (taskID (lookup keys "task"))
+              (subTaskID (lookup keys "subtask"))
+              (command (lookup keys "command"))
+              (result OBJECT NULL)
+              (wrappedOut (NEW OUTPUT-STREAM :native-stream out)))
+          (when (defined? fetchDB)
+            ;; always make these assertions which in case of a change will
+            ;;    clear DB caches and otherwise be a no-op:
+            (when (defined? secondaryDBname)
+              (pli/assert-nary-proposition
+               (bquote (& (get-relation RDBMS/@db-name)
+                          & fetchDB
+                          & secondaryDBname))
+               NULL NULL))
+            (when (defined? taskID)
+              (pli/assert-nary-proposition
+               (bquote (& (get-relation RDBMS/@task-id)
+                          & fetchDB
+                          & taskID))
+               NULL NULL))
+            (when (defined? subTaskID)
+              (pli/assert-nary-proposition
+               (bquote (& (get-relation RDBMS/@subtask-id)
+                          & fetchDB
+                          & subTaskID))
+               NULL NULL)))
+          (setq result (evaluate-logic-command (unstringify command) TRUE))
+          (typecase result
+            (QUERY-ITERATOR
+             (foreach solution in (solutions result)
+                 do (foreach elt in (bindings solution)
+                        as i in (interval 0 NULL)
+                        do (when (> i 0)
+                             (print-stream out " "))
+                           (print-logical-form elt wrappedOut))
+                    (print-stream out "<br>")))
+            (otherwise
+             (write-html-quoting-special-characters out (stringify result))))))
+    (NATIVE-EXCEPTION (e)
+      (print-stream out "ERROR: " (exception-message e)))))
+
+#|
+
+http://localhost:8900/ploom/fetch-EDB-query?task=TASK&subtask=SUBTASK&pdatabase=REVISED_DRY_RUN_LOW_PRIMARY_UNCURTAILED&sdatabase=REVISED_DRY_RUN_LOW_SECONDARY_UNCURTAILED&command=(RETRIEVE ALL (communicatedWithInEventInInterval UID-INDIVIDUAL-1000158 %3Fx %3Fev "2002-04-30 00:00:00.000" "2004-05-01 15:00:00.000"))
+
+http://localhost:8900/ploom/fetch-EDB-query?task=TASK&subtask=SUBTASK&pdatabase=REVISED_DRY_RUN_LOW_PRIMARY_UNCURTAILED&sdatabase=REVISED_DRY_RUN_LOW_SECONDARY_UNCURTAILED&command=(RETRIEVE ALL (communicatedWithInEvent UID-INDIVIDUAL-1000158 %3Fx %3Fev %3Fs %3Fe))
+
+|#
+
+
+;;;;
+;;;;  DB-ASSERTION LINKAGE
+;;;;
+
+;;; Most of this is probably obsoleted by the above:
+
+(defun (build-one-table-assertion CONS) ((table-relation NAMED-DESCRIPTION)
+					 (tuple CONS)
+					 (db-module MODULE))
+  ;; KLUDGE:  ASSUMES ITEMS ARE IN PROPER TABLE ORDER!!!
+  ;; FUTURE EXPANSION:  CHECK NAMES AGAINST TABLE COLUMNS AND DO
+  ;; POSITIONING.
+  ;; ?? DO WE NEED TO HANDLE STRING DOMAINS SPECIALLY ??
+  (let ((assertion NIL)
+	(colno -1))
+    (foreach i in (interval 0 (/logic/arity table-relation))
+	collect NULL-STRING-WRAPPER into assertion)
+    (foreach item in tuple
+	do (setq colno
+             (get-table-column-index table-relation
+                                     (name (get-xml-tag item))
+                                     db-module))
+	   (if (/stella/< colno 0)
+	     (warn "Couldn't find column number for " item " on relation " table-relation)
+	     (setf (nth assertion colno)
+	       (first (get-xml-content item))))
+	   (unless (empty? (rest (get-xml-content item)))
+	     (warn "Extra elements found in " item)))
+    (foreach item in (rest assertion)
+	where (null? (unwrap-string item))
+	do (warn "Some table relation values not set: " assertion)
+	   (break))
+    (setf (rest assertion) 
+	  (coerce-values (rest assertion)
+			 (get-relation-table-info table-relation)))
+    (setf (nth assertion 0) table-relation)
+    (return assertion)))
+
+(defun (generate-table-assertions (CONS OF CONS)) ((table-name STRING)
+						   (xml-answer CONS)
+						   (module MODULE)
+						   (db-module MODULE))
+  :documentation "Takes a Stella-parsed, XML-encoded `xml-answer' from Fetch based on
+the database table `table-name' and uses it to generate an assertion
+for an appropriate relation for inclusion in `module'.  The database
+meta information is found in `db-module'."
+  (let ((table-relation (get-table-relation table-name db-module))
+	(assertions NIL))
+    (unless (and (xml-element? (first xml-answer))
+		 (xml-element-match? (cast (first xml-answer) XML-ELEMENT)
+				     "PlanExecution" NULL))
+      (warn "Didn't find a Fetch Answer in " xml-answer)
+      (return NIL))
+    (within-module module
+      (foreach answer in (get-xml-content xml-answer)
+	  where (and (isa? answer @CONS)
+		     (xml-element? (first (cast answer CONS))))
+	  do (xml-tag-case (get-xml-tag answer)
+	       (("OBJECT")
+		(pushq assertions
+		       (build-one-table-assertion table-relation
+						  (get-xml-content answer)
+						  db-module)))
+	       (("Error")
+		(error (wrapper-value (cast (first (get-xml-content answer))
+					    STRING-WRAPPER))))
+	       (("ERROR")
+		(error (wrapper-value (cast (first (get-xml-content answer))
+					    STRING-WRAPPER)))))))
+    (return assertions)
+    ))
+
+
+(defun (lookup-string-value STRING) 
+    ((relation NAMED-DESCRIPTION) (instance LOGIC-OBJECT) (mod module))
+  ;; Convenience function that will return 1 string value for binary `relation'
+  ;; on `instance', or `null' if no values are returned.
+  (let ((iter (pli/retrieve (bquote (1 (& (object-name relation)
+					  & instance ?x))) mod null)))
+    (if (next? iter)
+      (return (cast (/stella/value iter) STRING-WRAPPER))
+      (return null))))
+  
+
+(defun (fetch-query-assertions (CONS OF CONS)) 
+    ((host STRING) (port INTEGER)
+     (fetch-query LOGIC-OBJECT) (task-id STRING) (subtask-id STRING) (database STRING)
+     (parameter-value STRING) (target-module MODULE) (db-module MODULE))
+  :public? TRUE
+  :documentation "Runs a `fetch-query' using `task-id'; `subtask-id',`database'
+and specifying a single additional `parameter-value'.  The connection
+is made to a remote http query server running on `host' port number `port'.
+Returns a set of assertions for `target-module' using the information in `db-module'
+to find the appropriate relations."
+  (let ((db-table (lookup-string-value 
+		   (pli/get-relation "QUERY-TABLE-NAME" db-module null)
+		   fetch-query db-module))
+	(parameter-name (lookup-string-value
+			 (pli/get-relation "QUERY-PARAMETER-NAME" db-module null)
+			 fetch-query db-module))
+	(fetch-answer (run-fetch-query host port (symbol-name (object-name fetch-query))
+				       task-id subtask-id database
+				       (concatenate parameter-name "=" parameter-value))))
+    
+    (return (generate-table-assertions db-table fetch-answer target-module db-module))))

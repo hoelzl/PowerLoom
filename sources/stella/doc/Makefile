@@ -39,7 +39,7 @@
 #                                                                            #
 ############################# END LICENSE BLOCK ##############################
 
-# Version: Makefile,v 1.12 2006/05/11 07:06:41 hans Exp
+# Version: Makefile,v 1.14 2006/06/19 19:23:01 hans Exp
 #
 # Format a TeXINFO manual file and translate it into DVI, PS, INFO, and HTML
 #
@@ -54,7 +54,7 @@ MANUAL = manual
 
 # Formatters:
 TEX = tex
-PDFTEX = pdftex
+PDFTEX = pdftex --interaction nonstopmode
 TEXINDEX = texindex
 DVIPS = dvips
 EMACS = xemacs
@@ -62,7 +62,7 @@ MAKEINFO = makeinfo
 TEXI2HTML = texi2html
 
 
-all: ${MANUAL}.dvi ${MANUAL}.ps ${MANUAL}.info ${MANUAL}.html ${MANUAL}.pdf
+all: ${MANUAL}.dvi ${MANUAL}.ps ${MANUAL}.pdf ${MANUAL}.info ${MANUAL}.html
 
 SOURCES = ${MANUAL}.texi *.texi
 
@@ -72,7 +72,7 @@ ${MANUAL}.dvi : ${SOURCES}
 	${TEXINDEX} ${MANUAL}.fn ${MANUAL}.vr
 	${TEX} ${MANUAL}.texi
 
-${MANUAL}.pdf : ${MANUAL}.dvi
+${MANUAL}.pdf : ${SOURCES}
 	${PDFTEX} ${MANUAL}.texi
 	${PDFTEX} ${MANUAL}.texi
 	${TEXINDEX} ${MANUAL}.fn ${MANUAL}.vr

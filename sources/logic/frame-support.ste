@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: frame-support.ste,v 1.29 2006/05/11 07:05:10 hans Exp
+;;; Version: frame-support.ste,v 1.32 2008/09/08 23:35:04 hans Exp
 
 ;;; Routines that compute various levels of canned queries.
 
@@ -342,6 +342,18 @@ asserted to be satisfied by 'self'."
                (pushq types description))))
     (return types) ))
 
+(defun (all-taxonomic-types (CONS OF NAMED-DESCRIPTION)) ((self OBJECT))
+  :documentation "Return a set of all of the types that are
+satisfied by 'self', using only assertions and upward
+taxonomic reasoning."
+  :public? TRUE
+  (return
+    (memoize (self *context*)
+             :timestamps :KB-UPDATE :max-values 500
+             (help-all-types self false))))
+  
+
+;; DOES THIS NEED TO BE LEVELIZED??
 (defun (all-types (CONS OF NAMED-DESCRIPTION)) ((self OBJECT))
   :documentation "Return a set of all of the types that are
 satisfied by 'self'."
@@ -349,28 +361,48 @@ satisfied by 'self'."
   (return
     (memoize (self *context*)
              :timestamps :KB-UPDATE :max-values 500
-             (help-all-types self))))
+             (help-all-types self true))))
 
-(defun (help-all-types (CONS OF NAMED-DESCRIPTION)) ((self OBJECT))
+(defun (help-all-types (CONS OF NAMED-DESCRIPTION)) ((self OBJECT) (do-subtypes? BOOLEAN))
   ;; Helper function for `all-types'.
+  ;; 'do-subtypes' controls whether we look down in the type hierarchy
+  ;;   only only upward.
   (let ((assertedTypes (all-asserted-types self))
-        (types (copy-cons-list assertedTypes)))
+        (types (new LIST :the-cons-list (copy-cons-list assertedTypes))))
     (foreach d in assertedTypes
         do (foreach c in (all-supercollections d)
                where (isa? c @NAMED-DESCRIPTION)
                do (when (not (member? types c))
-                    (pushq types c))))
-    ;; TO DO:  Needs better inference:
-    ;; This needs to also go down the hierarchy to look for
-    ;; inferred types whose definitions are satisfied and
-    ;; add them as well!
-    (return types)))
+                    (push types c)))
+           ;; This needs to also go down the hierarchy to look for
+           ;; inferred types whose definitions are satisfied and
+           ;; add them as well!
+	   ;; NOTE: `all-asserted-types' doesn't return THING, so
+	   ;;       we don't have to worry about that performance hit.
+	   (when do-subtypes?
+	     (help-all-subtypes d self types)))
+    (return (the-cons-list types))))
 
+(defun help-all-subtypes ((super DESCRIPTION) (self OBJECT) (types LIST))
+  ;; Helper function for `help-all-types'.
+  ;; Returns a list of all of the subtypes of `super' to which `self' belongs.
+  (foreach c in (all-direct-subcollections super TRUE)
+    do (if (isa? c @NAMED-DESCRIPTION)
+         (when (and (not (member? types c))
+                    (test-type-on-instance? self 
+                                            (surrogate-value-inverse
+                                             (cast c NAMED-DESCRIPTION))))
+           (insert-new types c)
+           (help-all-subtypes c self types))
+         (help-all-subtypes c self types))))
+
+
+;; DOES THIS NEED TO BE LEVELIZED??
 (defun (all-direct-types (CONS OF LOGIC-OBJECT)) ((self OBJECT))
   :documentation "Return a set of most specific types that are
 satisfied by 'self'."
   :public? TRUE
-  (return (most-specific-named-descriptions (all-asserted-types self))) )
+  (return (most-specific-named-descriptions (all-types self))))
 
 (defun (test-type-on-instance? BOOLEAN) ((self OBJECT) (type SURROGATE))
   :documentation "Return TRUE if 'self' satisfies 'type'."
@@ -607,7 +639,7 @@ is true."
         (fillerCount (length (all-slot-values self relation))))
     (when (null? minCardinality)
       (setq minCardinality 0))
-    (return (max minCardinality fillerCount)) ))
+    (return (max fillerCount minCardinality)) ))
 
 (defmethod (levellized-get-slot-minimum-cardinality INTEGER)
            ((level SUBSUMPTION-INFERENCE-LEVEL) (self LOGIC-OBJECT) (relation SURROGATE))
@@ -671,7 +703,7 @@ be closed or if the current module closes all relations."
      ((null? fillerCount)
       (return maxCardinality))
      (otherwise
-      (return (min maxCardinality fillerCount)))) ))
+      (return (min fillerCount maxCardinality)))) ))
 
 (defmethod (levellized-get-slot-maximum-cardinality INTEGER)
            ((level SUBSUMPTION-INFERENCE-LEVEL)

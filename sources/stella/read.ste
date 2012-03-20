@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: read.ste,v 1.67 2006/05/11 07:06:22 hans Exp
+;;; Version: read.ste,v 1.73 2009/06/12 01:23:24 hans Exp
 
 ;;; Stream tokenizers and the Stella reader.  
 
@@ -540,7 +540,7 @@
   (return
     (verbatim
       :common-lisp (CL:make-string size)
-      :cpp "new (GC) char[size]"
+      :cpp "new (PointerFreeGC) char[size]"
       :java "new byte[size]")))
 
 (defun (string-to-tokenizer-byte-array TOKENIZER-BYTE-ARRAY) ((string STRING))
@@ -940,6 +940,24 @@ indicated by the return value being equal to start."
           ;; Used as a manual recycle list for TOKENIZER-TOKENs
           (token-list :type TOKENIZER-TOKEN)))
 
+(defmethod (buffered-input-length INTEGER) ((state TOKENIZER-STREAM-STATE))
+  ;; Return the amount of input buffered in `state'.
+  (let ((cursor (cursor state))
+        (end (end state)))
+    (if (>= end cursor)
+        (return (- end cursor))
+      (return (+ (- (buffer-size state) cursor) end)))))
+
+(defmethod clear ((state TOKENIZER-STREAM-STATE))
+  ;; Discard any buffered input of `state'.
+  (setf (cursor state) 0)
+  (setf (end state) 0))
+
+(defmethod reset ((state TOKENIZER-STREAM-STATE))
+  ;; Reset `state' to the :START state.
+  (setf (state state) 1)
+  (setf (state-dictionary state) NULL))
+
 (defmethod (get-saved-state INTEGER) ((state-object TOKENIZER-STREAM-STATE)
                                       (table TOKENIZER-TABLE))
   ;; Manages the retrieval of table-specific saved state for a particular
@@ -1247,6 +1265,9 @@ indicated by the return value being equal to start."
 
                    ;; EOF is handled in 2 phases: (see above).
                    (when tok_endOfTokens?_
+                     ;; this handles a fence post when a token ends exactly at
+                     ;; the end of the tokenizer buffer:
+                     (setq tok_checkPoint_ tok_cursor_)
                      (cond ((= tok_nextState_ -1))
                            ((nth (legal-EOF-states tok_table_) tok_state_)
                             (setq tok_nextState_ -1)
@@ -1877,6 +1898,173 @@ according to a particular tokenization `table'."
           (-- cursor))))
       (setq cursor (1- size)))))
 
+
+;;; Specialized number token parsers:
+
+(defmacro get-token-integer ()
+  :documentation
+  "User-level macro to access the most recently parsed token as an integer.
+This assumes correct signed integer syntax and only checks for overflows."
+  :public? TRUE
+  (when (not (inside-with-tokenizer?))
+    (walk-error
+     "Encountered `get-token-integer' outside of `with-tokenizer' macro.")
+    (return (bquote (get-token-integer))))
+  (return
+    (bquote
+     (get-token-integer-internal tok_buffer_ tok_tokenStart_ tok_cursor_ tok_size_))))
+
+(defglobal *get-token-integer-checkpoint* INTEGER (div (- MOST-POSITIVE-INTEGER 9) 10))
+
+(defun (get-token-integer-internal INTEGER)
+    ((buffer TOKENIZER-BYTE-ARRAY) (start INTEGER) (end INTEGER) (size INTEGER))
+  ;; Helper function for `get-token-integer' that does the actual conversion.
+  ;; MINOR FLAW: if `get-token-long-integer-internal' raises an error, we get a
+  ;; slightly misleading error message, however, we don't want to slow this down
+  ;; by setting up an exception handling context here.
+  (let ((result (get-token-long-integer-internal buffer start end size)))
+    (when (or (> result MOST-POSITIVE-INTEGER)
+              (< result MOST-NEGATIVE-INTEGER))
+      (error "get-token-integer: integer overflow: " result))
+    (return result)))
+
+(defmacro get-token-long-integer ()
+  :documentation
+  "User-level macro to access the most recently parsed token as a long integer.
+This assumes correct signed long-integer syntax and only checks for overflows."
+  :public? TRUE
+  (when (not (inside-with-tokenizer?))
+    (walk-error
+     "Encountered `get-token-long-integer' outside of `with-tokenizer' macro.")
+    (return (bquote (get-token-long-integer))))
+  (return
+    (bquote
+     (get-token-long-integer-internal tok_buffer_ tok_tokenStart_ tok_cursor_ tok_size_))))
+
+(defglobal *get-token-long-integer-checkpoint* LONG-INTEGER
+           (div (- MOST-POSITIVE-LONG-INTEGER 9) 10))
+
+(defun (get-token-long-integer-internal LONG-INTEGER)
+    ((buffer TOKENIZER-BYTE-ARRAY) (start INTEGER) (end INTEGER) (size INTEGER))
+  ;; Helper function for `get-token-long-integer' that does the actual conversion.
+  (let ((length (- end start))
+        (auxEnd end)
+        (result LONG-INTEGER 0)
+        (negative? FALSE)
+        (digit 0))
+    (when (< length 0)
+      ;; token wraps around buffer end:
+      (setq length (+ length size))
+      (setq auxEnd size))
+    ;; we know we have a legal integer token with at least one character:
+    (case (byte-array-nth buffer start)
+      (#\+ (++ start))
+      (#\- (++ start)
+           (setq negative? TRUE))
+      (otherwise NULL))
+    (loop
+      (while (< start auxEnd)
+        (setq digit (- (character-code (byte-array-nth buffer start))
+                       ;; ensure inlining in CL, we know the others will:
+                       (verbatim :common-lisp "#.(CL:char-code #\\0)"
+                                 :otherwise (character-code #\0))))
+        (when (and (>= result *get-token-long-integer-checkpoint*)
+                   (< (div (- MOST-POSITIVE-LONG-INTEGER digit) 10) result))
+          (error "get-token-long-integer: long-integer overflow"))
+        (setq result (+ (* result 10) digit))
+        (++ start))
+      (when (= auxEnd end)
+        (break))
+      (setq start 0)
+      (setq auxEnd end))
+    (if negative?
+        (return (- result))
+      (return result))))
+
+(defmacro get-token-float ()
+  :documentation
+  "User-level macro to access the most recently parsed token as a float.
+This assumes correct signed float syntax and only checks for overflows.
+The main benefit for this is that it doesn't generate strings and wrappers.
+Float parsing and conversion is generally hairy and we are probably not
+covering all special cases here; but we are fast :-)"
+  :public? TRUE
+  (when (not (inside-with-tokenizer?))
+    (walk-error
+     "Encountered `get-token-float' outside of `with-tokenizer' macro.")
+    (return (bquote (get-token-float))))
+  (return
+    (bquote
+     (get-token-float-internal tok_buffer_ tok_tokenStart_ tok_cursor_ tok_size_))))
+
+(defun (get-token-float-internal FLOAT)
+    ((buffer TOKENIZER-BYTE-ARRAY) (start INTEGER) (end INTEGER) (size INTEGER))
+  ;; Helper function for `get-token-float' that does the actual conversion.
+  ;; TO DO: - overflow handling
+  ;;        - handling initial and trailing white space
+  ;;        - possibly unrolling the parsing loop for the different sections
+  ;;        - faster decimal to binary conversion, there's got to be a way...
+  (let ((length (- end start))
+        (auxEnd end)
+        (mantissa LONG-INTEGER 0)
+        (exponent INTEGER 0)
+        (mantissaSign FLOAT 1.0)
+        (exponentSign FLOAT 1.0)
+        (exponent? FALSE)
+        (decimals? FALSE)
+        (decimals 0)
+        (ch CHARACTER NULL)
+        (digit 0)
+        (result FLOAT 0.0))
+    (when (< length 0)
+      ;; token wraps around buffer end:
+      (setq length (+ length size))
+      (setq auxEnd size))
+    (loop
+      (while (< start auxEnd)
+        (setq ch (byte-array-nth buffer start))
+        ;; we could unroll this loop into separate sections
+        ;; so we don't test for all special characters in
+        ;; each iteration; one idea is to always generate a
+        ;; digit and test whether it is out-of-range to
+        ;; recognize special characters:
+        (case ch
+          (#\-
+           (if exponent?
+               (setq exponentSign -1.0)
+             (setq mantissaSign -1.0)))
+          (#\+ NULL)
+          (#\. (setq decimals? TRUE))
+          ((#\e #\E)
+           (setq exponent? TRUE))
+          (otherwise
+           (setq digit (- (character-code ch)
+                          ;; ensure inlining in CL, we know the others will:
+                          (verbatim :common-lisp "#.(CL:char-code #\\0)"
+                                    :otherwise (character-code #\0))))
+           (cond (exponent?
+                  (setq exponent (+ (* exponent 10) digit)))
+                 (otherwise
+                  (when decimals?
+                    (++ decimals))
+                  (setq mantissa (+ (* mantissa 10) digit))))))
+        (++ start))
+      (when (= auxEnd end)
+        (break))
+      (setq start 0)
+      (setq auxEnd end))
+    (setq result mantissa)
+    (setq exponent (- (* exponent exponentSign) decimals))
+    (unless (= exponent 0)
+      ;; this portion could probably be improved with a specialized int exponentiator;
+      ;; unfortunately, since exponents in the binary format are represented via
+      ;; integral base-2 numbers, there doesn't seem to be a shortcut to convert
+      ;; from an integral base-10 to an integral base-2 exponent for which we have
+      ;; to scale the mantissa to properly represent the value:
+      (setq result (* result (expt 10 exponent))))
+    (return (* result mantissaSign))))
+
+
 (defclass STELLA-TOKEN (TOKENIZER-TOKEN)
   :slots ((logical-token-type :type KEYWORD) ;; `logical-type' used in LOGIC
           (module :type STRING)
@@ -2123,8 +2311,7 @@ This function is available primarily for efficiency, since it is about
         (symbolType KEYWORD NULL)
         (separatorPos 0)
         (upcase? (and enableCaseConversion?
-                      (not (case-sensitive? *module*))))
-        (result GENERALIZED-SYMBOL NULL))
+                      (not (case-sensitive? *module*)))))
     (with-stella-tokenizer name
       (get-next-stella-token FALSE)
       (when (end-of-tokens?)
@@ -2217,6 +2404,24 @@ This function is available primarily for efficiency, since it is about
            (:ESCAPED-KEYWORD
             (setq symbolName
               (unescape-token-string (get-token-text FALSE 1) #\\ TRUE)))))
+        (:QUALIFIED-NAME
+         (let ((token (get-token-text TRUE))
+               (length (length token)))
+           (cond
+            ;; Handle the division symbol:
+            ((and (>= length 1)
+                  ;; ensure, division symbol equals module separator char:
+                  (eql? (nth token (1- length)) #\/)
+                  (or (= length 1)
+                      (eql? (nth token (- length 2)) #\/)))
+             (setq symbolName "/")
+             (setq tok_stellaLogicalStateName_ :SYMBOL)
+             (when (> length 1)
+               (setq moduleName
+                     (subsequence token 0 (- length 2)))))
+            (otherwise
+             (signal-read-error "Illegal symbol syntax: " (get-token-text)
+                                " in state " (get-token-type))))))
         (:ERROR
          (signal-read-error "Illegal read syntax: " (get-token-text)))
         (otherwise
@@ -2227,7 +2432,7 @@ This function is available primarily for efficiency, since it is about
       (if (or (end-of-tokens?)
               (eql? (get-token-type) :CLOSE-FULLY-ESCAPED-NAME))
           (return symbolName moduleName symbolType)
-        (signal-read-error "Garbage found after " (symbol-name result))))))
+        (signal-read-error "Garbage found after " name)))))
 
 (defun (qualified-stella-name? BOOLEAN) ((name STRING))
   :documentation
@@ -2286,7 +2491,7 @@ escape characters)."
                 (break))
                (otherwise
                 (let ((parentTree parsedTreeStack))
-                  (popq parsedTreeStack)
+                  (setq parsedTreeStack (rest parsedTreeStack))
                   (setf (rest parentTree) (first parentTree))
                   (setf (first parentTree) (reverse parsedTree))
                   (setq parsedTree parentTree)
@@ -2319,9 +2524,7 @@ escape characters)."
          (setf (wrapper-value (cast parsedToken STRING-WRAPPER))
            (content tokenList)))
         (:INTEGER
-         (setq parsedToken (make INTEGER-WRAPPER))
-         (setf (wrapper-value (cast parsedToken INTEGER-WRAPPER))
-           (string-to-integer (content tokenList))))
+         (setq parsedToken (wrap-integer-value (string-to-integer (content tokenList)))))
         (:FLOAT
          (setq parsedToken (make FLOAT-WRAPPER))
          (setf (wrapper-value (cast parsedToken FLOAT-WRAPPER))
@@ -2416,6 +2619,157 @@ escape characters)."
          (signal-read-error
           "Illegal character constant: " (concatenate "#\\" name)))))
     (return char)))
+
+
+  ;;
+;;;;;; Simple String Tokenizer
+  ;;
+
+(defun (create-tokenize-string-table (VECTOR OF KEYWORD))
+    ((punctuationChars STRING)
+     (quoteChars STRING)
+     (escapeChars STRING))
+  ;; Creates a simple tokenizer table that records the type of each character
+  ;; in a vector table according to `punctuationChars', `quoteChars' and
+  ;; `escapeChars'.  These simple tables are used by `tokenize-string' instead
+  ;; of the more general and heavy-weight state-machine-based tables.
+  ;; We have 5 types: :TEXT, :PUNCTUATION, :WHITE-SPACE, :QUOTE and :ESCAPE
+  ;; We use a VECTOR instead of an ARRAY so we can memoize these tables.
+  (let ((charTypeTable (new (VECTOR OF KEYWORD) :array-size 256)))
+    (foreach i in (interval 0 (1- (length charTypeTable)))
+        do (if (white-space-character? (code-character i))
+               (setf (nth charTypeTable i) :WHITE-SPACE)
+             (setf (nth charTypeTable i) :TEXT)))
+    (foreach ch in punctuationChars
+        do (setf (nth charTypeTable (character-code ch)) :PUNCTUATION))
+    (foreach ch in quoteChars
+        do (setf (nth charTypeTable (character-code ch)) :QUOTE))
+    (foreach ch in escapeChars
+        do (setf (nth charTypeTable (character-code ch)) :ESCAPE))
+    (return charTypeTable)))
+  
+(defun (tokenize-string (CONS OF CONS))
+    ((string STRING)
+     (punctuationChars STRING)
+     (quoteChars STRING)
+     (escapeChars STRING))
+  :documentation
+  "Simple tokenizer that is somewhere between Java's StringTokenizer
+and StreamTokenizer in functionality.  It doens't specially support number
+tokens nor comment strings/sequences even though this could be added at
+the expense of some extra complexity.
+Returns a list of (<token-string> <token-type>) pairs, where the token
+type is one of :TEXT, :PUNCTUATION or :QUOTE, i.e., all white space
+is ignored and escape characters are handled and removed.  For example:
+	 
+  (tokenize-string \"for(i='fo^'o'; i>0; i++)\" \"()=<>+-;\" \"'\" \"^\")
+  =>
+  ((\"for\" :TEXT) (\"(\" :PUNCTUATION) (\"i\" :TEXT)
+   (\"=\" :PUNCTUATION) (\"'\" :QUOTE) (\"fo'o\" :TEXT)
+   (\"'\" :QUOTE) (\";\" :PUNCTUATION) (\"i\" :TEXT)
+   (\">\" :PUNCTUATION) (\"0\" :TEXT) (\";\" :PUNCTUATION)
+   (\"i\" :TEXT) (\"++)\" :PUNCTUATION))
+	
+NOTE: this aggregates multiple punctuation characters that immediately
+follow each other into a single token which is (generally) useful to pickup
+multi-character operators such as ++, >=, etc.  It's still easy to pick them
+apart in a post-processing step if necessary (e.g., for the `++)' case above),
+so we leave this for now as a feature."
+  :public? TRUE
+  ;; TO DO: - needs some more thourough testing.
+  ;;        - consider the automatic creation and use of full-fledged
+  ;;          state-machine tables if speed becomes an issue.
+  (let ((charTypeTable
+         (memoize (punctuationChars quoteChars escapeChars)
+                  :max-values 10
+                  (create-tokenize-string-table
+                   punctuationChars quoteChars escapeChars)))
+        (i 0)
+        (ch CHARACTER NULL)
+        (start 0)
+        (end (length string))
+        (state KEYWORD :TEXT)
+        (newState KEYWORD :TEXT)
+        (quotedToken? FALSE)
+        (quoteChar CHARACTER NULL)
+        (endOfToken? FALSE)
+        (escapePositions (CONS OF INTEGER-WRAPPER) NIL)
+        (token STRING NULL)
+        (result NIL))
+    ;; We have 5 states: :TEXT, :PUNCTUATION, :WHITE-SPACE, :QUOTE and :ESCAPE
+    (loop
+      (setq endOfToken? FALSE)
+      (when (< i end)
+        (setq ch (nth string i))
+        (setq newState (nth charTypeTable (character-code ch)))
+        (case newState
+          (:TEXT
+           (case state
+             ((:PUNCTUATION :WHITE-SPACE :QUOTE)
+              (setq endOfToken? TRUE))
+             (otherwise NULL)))
+          (:ESCAPE
+           (case state
+             ((:PUNCTUATION :WHITE-SPACE :QUOTE)
+              (setq endOfToken? TRUE))
+             (otherwise NULL))
+           ;; this will work even if the escape was the last character:
+           (pushq escapePositions i)
+           (++ i 2)
+           (continue))
+          (:QUOTE
+           (cond ((and quotedToken?
+                       (eql? ch quoteChar))
+                  (setq endOfToken? TRUE)
+                  (setq quotedToken? FALSE))
+                 (quotedToken?
+                  (setq newState :TEXT))
+                 (otherwise
+                  (setq endOfToken? TRUE)
+                  (setq quotedToken? TRUE)
+                  (setq quoteChar ch))))
+          (:PUNCTUATION
+           (case state
+             (:TEXT
+              (if quotedToken?
+                  (setq newState :TEXT)
+                (setq endOfToken? TRUE)))
+             ((:WHITE-SPACE :QUOTE)
+              (setq endOfToken? TRUE))
+             (otherwise NULL)))
+          (:WHITE-SPACE
+           (case state
+             (:TEXT
+              (if quotedToken?
+                  (setq newState :TEXT)
+                (setq endOfToken? TRUE)))
+             ((:PUNCTUATION :QUOTE)
+              (setq endOfToken? TRUE))
+             (otherwise NULL)))))
+      (when (or (and endOfToken? (> i 0))
+                (>= i end))
+        (unless (eql? state :WHITE-SPACE)
+          (cond ((non-empty? escapePositions)
+                 (let ((parts (CONS OF STRING-WRAPPER) NIL)
+                       (s start))
+                   (foreach e in (reverse escapePositions)
+                       do (pushq parts (subsequence string s e))
+                          (setq s (1+ e)))
+                   (pushq parts (subsequence string (min s end) (min i end)))
+                   (setq parts (reverse parts))
+                   (setq token
+                     (string-concatenate (first parts) (second parts)))
+                   (foreach part in (rest (rest parts))
+                       do (setq token (string-concatenate token part))))
+                 (setq escapePositions NIL))
+                (otherwise
+                 (setq token (subsequence string start i))))
+          (pushq result (cons token (cons state NIL))))
+        (when (>= i end) (break))
+        (setq start i))
+      (setq state newState)
+      (++ i))
+    (return (reverse result))))
 
 
   ;;
@@ -2620,7 +2974,11 @@ in any combination.  It is not as fast as `native-read-line', however."
   (when (eql? stream STANDARD-INPUT)
     ;; `read-line' doesn't seem to do quite the right thing on interactive
     ;; streams for PowerLoom's `demo' command, this works around that but
-    ;; might fail in cases somebody redirects the stream to a file:
+    ;; might fail in cases somebody redirects the stream to a file (note,
+    ;; the problem might be due to the fact that `read-line' doesn't consume
+    ;; the terminating white space, but instead relies on the next invocation
+    ;; to gobble that up - which should probably be fixed, since it also causes
+    ;; us problems when we try to use `file-position'):
     (return (native-read-line stream)))
   (with-tokenizer *read-line-tokenizer-table* stream
     (loop

@@ -1,6 +1,6 @@
 ;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
 
-;;; Version: test-suite.plm,v 1.24 2006/05/10 22:43:32 hans Exp
+;;; Version: test-suite.plm,v 1.40 2009/06/25 23:31:48 hans Exp
 
 ;;; Various PowerLoom tests
 ;;; =======================
@@ -1779,3 +1779,519 @@
 (ask (not (r c d)))
 (ask (r c e))
 (ask (not (r c e)))
+
+;;; AVOID FORWARD INFERENCE OF REDUNDANT EXISTENTIALS AND SKOLEMS:
+
+(clear-module "TEST")
+
+(deffunction father (?f ?c))
+(deffunction mother (?m ?c))
+(assert (=>> (mother ?m ?c)
+             (exists ?f
+               (father ?f ?c))))
+(assert (father dad fred))
+(assert (mother mom fred))
+
+;;; WE SHOULD ONLY GET ONE SOLUTION HERE AND NO SKOLEM:
+(retrieve all (father ?x fred))
+
+
+;;; FORWARD EXISTENTIALS AND SINGLE-VALUEDNESS
+
+(clear-module "TEST")
+
+(deffunction father (?c ?f))
+(deffunction mother (?c ?m))
+(deffunction husband (?w ?h))
+
+(assert (=>> (and (mother ?c ?m)
+                  (husband ?m ?f))
+             (father ?c ?f)))
+
+(assert (exists ?f (father fred ?f)))
+(assert (mother fred mom))
+(assert (husband mom dad))
+
+;; WE SHOULD NOT GET ANY CLASHES HERE AND RETRIEVE DAD,
+;; NOT THE SKOLEM WHICH SHOULD BE POINTING AT DAD INSTEAD:
+(retrieve all (father fred ?x))
+
+;;; NOW TRY THE SAME WITH SINGLE-VALUED RELATIONS:
+
+(clear-module "TEST")
+
+(defrelation father (?c ?f) :single-valued TRUE)
+(defrelation mother (?c ?m) :single-valued TRUE)
+(defrelation husband (?w ?h) :single-valued TRUE)
+
+(assert (=>> (and (mother ?c ?m)
+                  (husband ?m ?f))
+             (father ?c ?f)))
+
+(assert (exists ?f (father fred ?f)))
+(assert (mother fred mom))
+(assert (husband mom dad))
+
+;; WE SHOULD NOT GET ANY CLASHES HERE AND RETRIEVE DAD,
+;; NOT THE SKOLEM WHICH SHOULD BE POINTING AT DAD INSTEAD:
+(retrieve all (father fred ?x))
+
+
+;;; GOAL CACHING BUG WITH DESCRIPTION ARGUMENTS THAT HAVE EXTERNAL VARIABLES:
+
+(clear-module "TEST")
+
+(defconcept person)
+
+(defrelation friend-of ((?p person) (?f person))
+  :closed TRUE)
+
+(defconcept person-with-at-most-one-friend ((?p person))
+  :<=> (exists (?f ?c)
+         (and (friend-of ?p ?f)
+              (bound-variables ?p)
+              ;; if we cache this without taking the particular binding of
+              ;; ?p into account, we get additional incorrect solutions:
+              (cardinality (setofall (?p2) (friend-of ?p ?p2)) ?c)
+              (=< ?c 1))))
+
+(assert
+  (and (friend-of fred f1)
+       (friend-of fred f2)
+       (friend-of susi f1)
+       (friend-of otto f1)
+       (friend-of otto f2)))
+
+;;; THIS SHOULD ONLY RETRIEVE ONE SOLUTION:
+(retrieve all (person-with-at-most-one-friend ?p))
+
+
+;;; COLLECT-INTO-SET THAT RUNS INTO CUTOFFS SHOULD FAIL JUST LIKE FAIL:
+
+(clear-module "TEST")
+
+;;; THIS SHOULD FAIL AND NOT DERIVE THE EMPTY SET:
+(retrieve (cardinality (collect-into-set relation) ?c) :maximum-depth 5)
+
+;;; THIS SHOULD SUCCEED:
+(retrieve (cardinality (collect-into-set relation) ?c))
+
+
+;;; FORK CONTINUATION ISSUES
+
+(clear-module "TEST")
+
+(defconcept y)
+(defconcept n)
+
+(assert (y y1))
+(assert (y y2))
+(assert (n n1))
+(assert (n n2))
+
+;;; SHOULD GENERATE FOUR SOLUTIONS:
+(retrieve all (and (member-of ?r (setof relation minimum-value))
+                   (bound-variables ?r)
+                   (fork (concept ?r)
+                         (y ?value)
+                         (n ?value))))
+
+;;; SHOULD GENERATE TWO SOLUTIONS (USED TO LOOP INDEFINITELY):
+(retrieve all (and (member-of ?r (setof relation minimum-value))
+                   (bound-variables ?r)
+                   (fork (concept ?r)
+                         (= ?value "yes")
+                         (= ?value "no"))))
+
+
+;;; DUPLICATE DESCRIPTION LOOKUP WITH EQUIVALENCED VARIABLES:
+
+(clear-module "TEST")
+
+;;; SHOULD GENERATE TWO SOLUTIONS:
+(retrieve all (member-of ?d (setof (kappa (?x ?y ?z) true)
+                                   (kappa (?a ?b ?a) true)
+                                   (kappa (?c ?d ?c) true))))
+
+;;; COLLAPSING OF EQUIVALENCES IN RULES:
+
+(clear-module "TEST")
+
+(deffunction f1 (?x ?y))
+(deffunction f2 (?x ?y))
+(deffunction tf1 (?x ?y) :total true)
+(deffunction tf2 (?x ?y) :total true)
+
+(defrelation r (?x))
+
+(assert (= (tf1 a) (tf1 a)))
+(assert (= (tf2 a) (tf2 a)))
+
+(retrieve all (tf1 ?x ?y))
+(retrieve all (tf2 ?x ?y))
+(ask (= (tf1 a) (tf2 a)))
+
+(assert
+  (=>> (and (r ?x)
+            (tf1 ?x ?y))
+       (= ?y (tf2 ?x))))
+
+(assert (r b))
+(all-facts-of b)
+
+(retrieve all (tf1 ?x ?y))
+(retrieve all (tf2 ?x ?y))
+(ask (= (tf1 b) (tf2 b)))
+
+;;; THIS RULE USED TO BREAK DURING PARSING:
+(assert
+  (=>> (and (tf1 ?x ?v1)
+            (tf2 ?x ?v2))
+       (= ?v1 ?v2)))
+
+(assert (tf1 c c))
+(all-facts-of c)
+(retrieve (tf2 c ?x))
+;;; SHOULD RETURN TRUE:
+(ask (= (tf1 c) (tf2 c)))
+
+;;; A VARIANT OF THE BALANCED-SIBLINGS RULE THAT SHOULD
+;;; COLLAPSE THE INTERNAL VARIABLES IN THE CONSEQUENT:
+
+(assert
+  (=>> (r ?x)
+       (= (f1 ?x) (f2 ?x))))
+
+(retrieve all (= (f1 b) ?x))
+
+;;; THESE SHOULD ALL NORMALIZE TO THE SAME RULE:
+(assert
+  (=> (f2 ?x ?y)
+      (exists (?z)
+        (and (f2 ?y ?z)
+             (= ?x ?z)))))
+(assert
+  (=> (f2 ?x ?y)
+      (exists (?z)
+        (and (f2 ?y ?z)
+             (= ?z ?x)))))
+(assert
+  (=> (exists (?z)
+        (and (f2 ?y ?z)
+             (= ?x ?z)))
+      (f2 ?x ?y)))
+(assert
+  (=> (exists (?z)
+        (and (f2 ?y ?z)
+             (= ?z ?x)))
+      (f2 ?x ?y)))
+;;; SHOULD RETURN ONE FORWARD AND ONE BACKWARD RULE:
+(get-rules f2)
+
+;;; HANDLING FUNCTIONS AND RELATIONS WITH PROPOSITION ARGUMENTS
+
+(clear-module "TEST")
+
+(deffunction age (?x ?y))
+
+(deffunction f1 (?x (?p proposition)))
+(deffunction f2 ((?p proposition) ?x))
+(deffunction f3 (?x (?p proposition) ?y))
+
+(assert (f1 a (age a 10)))
+(assert (f2 (age b 12) b))
+(assert (f3 c (age c 15) d))
+
+;;; THESE SHOULDN'T BREAK, NOT CAUSE ANY ARGUMENT VIOLATIONS AND NOT
+;;; RETURN ANY UNFASTENED PROPOSITIONS:
+(retrieve all (f1 ?x ?y))
+(retrieve all (f2 ?x ?y))
+(retrieve all (f3 ?x ?y ?z))
+
+;;; THIS SHOULD NOT BREAK:
+(conceive (exists (?r)
+            (fork (bound-variables ?r)
+                  (relation ?r)
+                  (relation (setofall ?s (listof ?r ?s))))))
+
+;;; TOTAL FUNCTIONS ARE NOT NECESSARILY CLOSED
+
+(clear-module "TEST")
+
+(deffunction f (?x ?y) :total true)
+
+;;; BOTH OF THESE NEED TO RETURN UNKNOWN:
+(ask (f hans tom))
+(ask (not (f hans tom)))
+
+;;; CLOSED COLLECTIONS AND ITERATIVE FORALL
+
+(clear-module "TEST")
+
+;;; SHOULD BE TRUE:
+(ask (forall ?n (=> (member-of ?n (setof 1 2 3)) (number ?n))))
+;;; SHOULD BE TRUE:
+(ask (forall ?r
+       (=> (member-of ?r (setofall ?r (or (function ?r) (concept ?r))))
+           (relation ?r))))
+;;; SHOULD BE TRUE:
+(ask (closed (setofall ?n (member-of ?n (setof 1 2 3)))))
+;;; SHOULD BE FALSE:
+(ask (closed (setofall ?n
+               (exists (?e1 ?e2)
+                 (and (member-of ?e1 ?n)
+                      (member-of ?e2 ?n))))))
+
+(defconcept person)
+(deffunction siblings ((?p person) (?sibs SET))
+  :closed true)
+
+(assert (person fred))
+(assert (person joe))
+(assert (person susi))
+(assert (siblings fred (setof joe susi)))
+
+;;; CONCEIVABLY, THIS SHOULD RETURN TRUE, BUT IT WOULD REQUIRE US TO
+;;; POTENTIALLY RUN FULL INFERENCE TO FIRST DETERMINE FRED'S SIBLINGS:
+(ask (closed (setofall ?p (member-of ?p (siblings fred)))))
+
+;;; WE CAN WORK AROUND THIS BY EXPLICITLY ASSERTING CLOSURE:
+(assert (closed (setofall ?p (member-of ?p (siblings fred)))))
+(ask (closed (setofall ?p (member-of ?p (siblings fred)))))
+
+;;; FOR THE SAME REASONS AS ABOVE, THIS SHOULD RETURN TRUE, BUT IT
+;;; CURRENTLY DOESN'T, SINCE WE DON'T FIND THE ANTECEDENT TO BE CLOSED:
+(ask (forall ?p
+       (=> (member-of ?p (siblings fred))
+           (person ?p))))
+
+;;; THIS FORMULATION, HOWEVER, DOES THE TRICK SINCE IT EXTRACTS THE
+;;; GOAL NECESSARY TO INFER FRED'S SIBLINGS:
+(ask (exists ?sibs
+       (and (siblings fred ?sibs)
+            (forall ?p
+              (=> (member-of ?p ?sibs)
+                  (person ?p))))))
+
+;;; VARIABLE ARITY BUG IN `COPY-PATTERN-ARGUMENTS':
+
+(clear-module "TEST")
+
+(defconcept c)
+(defconcept d (?x)
+  :<=> (and (c ?x)
+            (bound-variables ?x)))
+
+;;; THIS SHOULD NOT BREAK, THE WARNING SHOULD ALSO EVENTUALLY GO AWAY:
+(retrieve all (not (d ?x)))
+
+;;; IMPROVED JIT CONTEXT AND NESTED FUNCTION TERM EVALUATION:
+
+(clear-module "TEST")
+
+(deffunction age (?p ?a))
+
+(assert (age fred 10))
+(assert (age joe 15))
+(assert (age susi (+ (age fred) (age joe))))
+
+(ask (< (age fred) (age susi)))
+
+(assert (age joe 0))
+(ask (< (age fred) (age susi)))
+
+;;; THIS SHOULD TRIGGER A CLASH, NOT SURE WHY IT STILL DOESN'T:
+(assert (+ 1 2 4))
+
+;;; LIMITED DEPTH FORWARD SKOLEMIZATION:
+
+(clear-module "TEST")
+
+(defconcept c1)
+(defconcept c2)
+(defrelation r1 (?x ?y))
+(defrelation r2 (?x ?y))
+
+(assert (=>> (c1 ?x) (exists (?y) (and (r1 ?x ?y) (c2 ?y)))))
+(assert (=>> (c2 ?x) (exists (?y) (and (r2 ?x ?y) (c1 ?y)))))
+
+(assert (c1 fred))
+
+(run-forward-rules pl-user)
+
+;;; EACH SHOULD RETRIEVE 2 RESULTS; WE GET 3 SKOLEMS TOTAL AFTER
+;;; WHICH FORWARD SKOLEMIZATION IS CUT OFF (BY DEFAULT):
+(retrieve all (c1 ?x))
+(retrieve all (c2 ?x))
+(retrieve all (c1 ?x))
+(retrieve all (c2 ?x))
+
+;;; AN ARGOS KB AND QUERIES THAT WOULD CAUSE PROBLEMS IN THE PAST:
+
+(clear-module "TEST")
+
+(defconcept BASEOBJ)
+
+(defconcept UNIT)
+(ASSERT (UNIT MILES))
+(ASSERT (UNIT KM))
+
+(defconcept DISTANCE_MILES (?X NUMBER))
+(defconcept DISTANCE_KM (?X NUMBER))
+
+(defconcept PLACE)
+
+(deffunction hasStartAddr ((?X BASEOBJ) (?Y PLACE)))
+(deffunction hasEndAddr ((?X BASEOBJ) (?Y PLACE)))
+(deffunction hasValue ((?X BASEOBJ) (?Y NUMBER)))
+(deffunction hasUnit ((?X BASEOBJ) (?Y UNIT)))
+
+(defconcept OBJ_MILES (?O) :<=>
+  (EXISTS ((?S PLACE) (?E PLACE) (?V DISTANCE_MILES))
+	  (AND (BASEOBJ ?O)
+	       (hasStartAddr ?O ?S)
+	       (hasEndAddr ?O ?E)
+	       (hasUnit ?O MILES)
+	       (hasValue ?O ?V))))
+
+(defrelation REL_OBJ_MILES ((?S PLACE) (?E PLACE) (?V DISTANCE_MILES)) :<=>
+  (EXISTS (?O)
+	  (AND (OBJ_MILES ?O)
+	       (hasStartAddr ?O ?S) (PLACE ?S)
+	       (hasEndAddr ?O ?E) (PLACE ?E)
+	       (hasValue ?O ?V) (DISTANCE_MILES ?V))))
+
+(defconcept OBJ_KM (?O) :<=>
+  (EXISTS ((?S PLACE) (?E PLACE) (?V DISTANCE_KM))
+	  (AND (BASEOBJ ?O)
+	       (hasStartAddr ?O ?S)
+	       (hasEndAddr ?O ?E)
+	       (hasUnit ?O KM)
+	       (hasValue ?O ?V))))
+
+(defrelation REL_OBJ_KM ((?S PLACE) (?E PLACE) (?V DISTANCE_KM)) :<=>
+  (EXISTS (?O)
+	  (AND (OBJ_KM ?O)
+	       (hasStartAddr ?O ?S) (PLACE ?S)
+	       (hasEndAddr ?O ?E) (PLACE ?E)
+	       (hasValue ?O ?V) (DISTANCE_KM ?V))))
+
+(defrelation DISTANCES ((?S PLACE) (?E PLACE)
+			(?V1 DISTANCE_MILES) (?V2 DISTANCE_KM)) :<=>
+  (EXISTS (?O1 ?O2)
+	  (AND (OBJ_MILES ?O1)
+	       (hasStartAddr ?O1 ?S) (PLACE ?S)
+	       (hasEndAddr ?O1 ?E) (PLACE ?E)
+	       (hasValue ?O1 ?V1) (DISTANCE_MILES ?V1)
+	       (OBJ_KM ?O2)
+	       (hasStartAddr ?O2 ?S)
+	       (hasEndAddr ?O2 ?E)
+	       (hasValue ?O2 ?V2) (DISTANCE_KM ?V2))))
+
+(ASSERT (forall (?o ?s ?e ?v_miles)
+           (<= (exists (?v_km)
+                  (DISTANCES ?s ?e ?v_miles ?v_km))
+               (and (OBJ_MILES ?o)
+                    (= (hasStartAddr ?o) ?s)
+                    (= (hasEndAddr ?o) ?e)
+                    (= (hasValue ?o) ?v_miles)))))
+
+(ASSERT (forall (?o ?s ?e ?v_km)
+           (<= (exists (?v_miles)
+                  (DISTANCES ?s ?e ?v_miles ?v_km))
+               (and (OBJ_KM ?o)
+                    (= (hasStartAddr ?o) ?s)
+                    (= (hasEndAddr ?o) ?e)
+                    (= (hasValue ?o) ?v_km)))))
+
+(defrelation PROJ_MILES ((?S PLACE) (?E PLACE) (?V DISTANCE_MILES)) :<=>
+  (EXISTS (?V2 DISTANCE_KM)
+	  (DISTANCES ?S ?E ?V ?V2)))
+
+;;; THIS SHOULD NOT CAUSE INFINITE FORWARD SKOLEMIZATION:
+(retrieve all (and (subset-of ?x BASEOBJ) (subset-of OBJ_MILES ?x)))
+
+;; THESE SHOULD BOTH RETURN TRUE:
+(ask (subset-of proj_miles REL_OBJ_MILES))
+(ask (subset-of REL_OBJ_MILES proj_miles))
+
+;;; BUGS DUE TO INCONSISTENT LITERAL ARGUMENT BACKLINKING/REWRAPPING
+
+(clear-module "TEST")
+
+(defconcept individual)
+
+(deffunction individual-fn ((?namespace STRING) (?localname STRING)) :-> (?i individual))
+
+(defrelation name ((?i INDIVIDUAL) (?n STRING)))
+
+(assert (name (individual-fn "saso" "doctor") "Dr. Perez"))
+(assert (= (individual-fn "saso" "doctor") (individual-fn "saso" "perez")))
+
+(retrieve all (name (individual-fn "saso" "perez") ?n))
+;; => There is 1 solution:
+;;      #1: ?N="Dr. Perez"
+
+(retrieve all (name (individual-fn "saso" "doctor") ?n))
+;; => There is 1 solution:
+;;      #1: ?N="Dr. Perez"
+
+;;; BUG WITH CONTEXT SWITCHING OF IST OPERATOR WHERE SUBGOAL HAS
+;;; MULTIPLE SOLUTIONS - EXTRACT OF THE BUSINESS DEMO
+
+(clear-module "TEST")
+
+(defconcept company)
+
+(defrelation company-name ((?c company) (?name STRING)))
+
+(assert (company-name ACME-cleaners "ACME Cleaners, LTD"))
+(assert (company-name megasoft "MegaSoft, Inc."))
+
+(defrelation fictitious-business-name ((?c company) (?name STRING))
+  :=> (company-name ?c ?name))
+
+(assert (fictitious-business-name megasoft "MegaSoft"))
+
+(defmodule "ALTERNATE-TEST"
+  :includes "TEST")
+
+(cc ALTERNATE-TEST)
+
+(assert (and (company web-phantoms)
+             (company-name web-phantoms "Web Phantoms, Inc.")))
+
+(retract (company-name megasoft "MegaSoft, Inc."))
+(assert (company-name megasoft "MegaZorch, Inc."))
+
+(cc TEST)
+(retrieve all (company-name ?x ?y))
+
+(cc ALTERNATE-TEST)
+(retrieve all (company-name ?x ?y))
+
+(cc TEST)
+
+(retrieve all (ist ALTERNATE-TEST (company-name ?x ?y)))
+(retrieve all (and (ist TEST (company-name ?x ?y))
+                   (fail (ist ALTERNATE-TEST (company-name ?x ?y)))))
+
+(cc ALTERNATE-TEST)
+
+(retrieve all (ist TEST (company-name ?x ?y)))
+(retrieve all (and (ist TEST (company-name ?x ?y))
+                   (fail (ist ALTERNATE-TEST (company-name ?x ?y)))))
+
+;;; BUG WITH CONCEPT-PROTOTYPE SPECIALIST
+
+(clear-module "TEST")
+(cc TEST)
+
+;;; NEED TO GET THE SAME `proto-concept-XYZ' OBJECT EVERY TIME (NOT A FUNCTION TERM):
+(retrieve all (and (= (concept-prototype concept) ?p1)
+                   (= (concept-prototype concept) ?p2)))
+
+(assert (relation foo))
+
+(retrieve all (and (= (concept-prototype concept) ?p1)
+                   (= (concept-prototype concept) ?p2)))

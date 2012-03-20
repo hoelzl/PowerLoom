@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006     ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: strategies.ste,v 1.73 2006/05/10 22:41:54 hans Exp
+;;; Version: strategies.ste,v 1.78 2008/10/24 01:05:25 hans Exp
 
 ;;; Routines that implement alternate proof strategies for query processing
 
@@ -498,6 +498,21 @@ control stack before executing.")
 ;;;;;; :ATOMIC-GOAL proof strategies
   ;;
 
+(defun (specialist-applicable? BOOLEAN) ((description NAMED-DESCRIPTION)
+                                         (proposition PROPOSITION))
+  ;; Does tests to see if the specialist for `description' is applicable
+  ;;   to `proposition'.
+  ;; Currently tests arity.
+  ;; The case where arity might legitimately not match is when evaluating
+  ;;   a specialist coming from a relation bound to a variable in the
+  ;;   proposition such as in (holds ?f ?a ?b)
+  ;; TO DO: Maybe add type checks on bound arguments?
+  (let ((d-arity (arity description))
+        (p-arity (length (arguments proposition))))
+    (if (< d-arity 0)                   ; variable arity
+      (return TRUE)
+      (return (= d-arity p-arity)))))
+
 (defun (continue-specialist-proof KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; Proof Strategy: If a specialist exists for the operator in
@@ -507,16 +522,19 @@ control stack before executing.")
   (let ((proposition (proposition frame))
         (description (get-description (relationRef proposition)))
         (specialistCode (lookup-specialist description))
-        (result KEYWORD
-                (choose (defined? specialistCode)
-                        (funcall specialistCode frame lastMove)
-                        :FAILURE)))
-    ;; if the specialist didn't assign a truth value, do it here:
-    (when (null? (truth-value frame))
-      (case result
-        ((:FINAL-SUCCESS :CONTINUING-SUCCESS)
-         (set-frame-truth-value frame TRUE-TRUTH-VALUE))
-        (otherwise NULL)))
+        (result :FAILURE))
+    (when (and (defined? specialistCode)
+               (specialist-applicable? description proposition))
+      (exception-case 
+       (setq result (funcall specialistCode frame lastMove))
+       (NATIVE-EXCEPTION (ne)
+          (warn "Exception executing specialist for " description ": " EOL ne)))
+      ;; if the specialist didn't assign a truth value, do it here:
+      (when (null? (truth-value frame))
+        (case result
+          ((:FINAL-SUCCESS :CONTINUING-SUCCESS)
+           (set-frame-truth-value frame TRUE-TRUTH-VALUE))
+          (otherwise NULL))))
     (return result)))
 
 (defglobal *failed-goal-cutoffs* INTEGER 0)
@@ -852,7 +870,7 @@ control stack before executing.")
       (return :FAILURE))
     (let ((inputValues (reverse (rest argumentValues)))
           (definingProposition 
-            (create-function-proposition (relationRef proposition) inputValues)))
+            (find-or-create-function-proposition (relationRef proposition) inputValues)))
       (bind-variable-to-value?
        (last-argument proposition) (last-argument definingProposition) TRUE)
       (return :FINAL-SUCCESS)) ))
@@ -1018,6 +1036,11 @@ control stack before executing.")
         ;;    for duplicate rule applied to the same goal bindings:
         (when (check-for-duplicate-rule? frame impliesProposition)
           (continue))                   ; skip to next antecedent rule
+        ;; record rule used to trigger subgoal (used by 'check-for-duplicate-rule?'
+        ;;    and by 'trace-goal-tree'); we do this here so that it is also set for the
+        ;;    case where we still need to prove its truth via a conditional antecedent
+        ;;    proof which triggers a recursive call where this `frame' becomes a dummy:
+        (setf (antecedents-rule frame) impliesProposition)
         (when (not (true? impliesProposition))
           (if (empty? (get-forward-goals impliesProposition))
             (continue)                  ; skip to next rule
@@ -1026,9 +1049,6 @@ control stack before executing.")
                frame (proposition frame) impliesProposition)
               (return :MOVE-DOWN))))
         ;; ready to subgoal on the antecedent 'impliesProposition':
-        ;; record rule used to trigger subgoal (used by 'check-for-duplicate-rule?'
-        ;;    and by 'trace-goal-tree'):
-        (setf (antecedents-rule frame) impliesProposition)
         (let ((downFrame (create-subgoal-frame frame NULL :FULL-SUBQUERY)))
           (setf (description downFrame) antecedentDescription)
           (return :MOVE-DOWN))))
@@ -1966,19 +1986,23 @@ control stack before executing.")
 ;;; A "reflex" is a proof having less baggage (needing less state) than a
 ;;;    strategy proof.
 
-(defun (continue-FORALL-proof KEYWORD)
-       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+(defun (continue-FORALL-proof KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; Strategies:
   ;;    (1) If the variables in the FORALL antecedent all belong to closed
   ;;        collections, iterate over their extensions checking to see that
-  ;;        each satisfies the consequent.
+  ;;        each satisfies the consequent.  More generally, if the antecedent
+  ;;        is a closed proposition, enumerate its extension and test the
+  ;;        consequent for each set of generated bindings.
   ;;    (2) Try universal entailment.
-  ;; TO DO: TURN THE ITERATIVE STRATEGY INTO AN EXPLICIT (KEYWORD) STRATEGY.
   (ignore lastMove)
   (cond
    ((or (reverse-polarity? frame)
+        ;; TO DO: think about eliminating this test, since it is problematic.
+        ;; E.g., it could prove (forall (?p person) (=> (rich ?p) (happy ?p)))
+        ;; as true given person is closed even if rich isn't, which is wrong.
         (forall var in (io-variables (proposition frame))
-                always (closed-term? (get-description (logical-type var)))))
+            always (closed-term? (get-description (logical-type var))))
+        (closed-proposition? (first (arguments (proposition frame)))))
     (setf (state frame) :ITERATIVE-FORALL)
     (return :MOVE-IN-PLACE))
    (otherwise
@@ -2043,11 +2067,11 @@ control stack before executing.")
 
 (defun register-inference-cutoff ((frame CONTROL-FRAME) (reason KEYWORD))
   ;; Register an inference cutoff `reason' on `frame' and all interested
-  ;;    parents of `frame' (currently, only :FAIL frames are interested).
+  ;;    parents of `frame'.
   (while (defined? frame)
-    (case (state frame)
-      (:FAIL (setf (inference-cutoff-reason frame) reason))
-      (otherwise NULL))
+    (when (or (eql? (state frame) :FAIL)
+              (collect-description-extension-frame? frame))
+      (setf (inference-cutoff-reason frame) reason))
     (setq frame (up frame))))
 
 (defun (continue-FAIL-proof KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))

@@ -1,0 +1,2160 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the PowerLoom KR&R System.                            ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2008      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: rdbms.ste,v 1.38 2008/10/24 01:11:35 hans Exp
+
+;;; Interface to legacy RDBMS's.
+
+;;; Still to do:
+
+;;; * Implement proper quoting of table/column names and values
+;;; * Implement query compilation ala Draxler's prolog compiler - actually,
+;;;   that doesn't seem to gain us all that much beyond the full SQL-query
+;;;   specialist.  All the (still impressive) Draxler compiler does is
+;;;   translate Prolog syntax into SQL, but everything in that Prolog clause
+;;;   has to refer to the database.  Therefore, this doesn't handle automatic
+;;;   joins of "distant" relations in lifting axioms.
+;;; * Proper release of open cursors - not sure whether that's just a restriction
+;;;   in Oracle or ODBC in general.
+
+;;; Where we are better than XSB:
+;;; * We do size-limited cache of query results.
+;;; * We allow multiple databases or external sources
+;;; * We support JDBC
+
+(in-package "STELLA")
+
+(in-module "RDBMS")
+
+
+;;; Sample syntax:
+;;;
+;;; To map relations to database tables, the syntax is:
+;;;    (deftable <relname> <dbname> <tablename> <(varspec)+>) 
+;;; For example:
+;;;    (deftable flight db1 "FLIGHT" ((?id STRING) ?dest (?seats INTEGER))
+;;; The relation arguments are mapped onto the database table columns at
+;;; the corresponding position.
+;;;						 
+;;; To specify a database: 
+;;;   (defdb db1 
+;;;     :host "blackcat.isi.edu" 
+;;;     :db-name "menagerie"
+;;;     :user "SCOTT" 
+;;;     :password "TIGER")
+
+
+  ;;
+;;;;;; Commands
+  ;;
+
+;;; TODO: Collapse defuntable into deftable and have a :function-p keyword option
+(defun (defuntable LOGIC-OBJECT) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a database table and map it to a function
+The accepted syntax is:
+	 
+ (defuntable <relconst> <dbconst> <tablename> (<columndecl>+)
+    [<keyword-option>*]).
+
+<columndecl>'s specify the names (and optionally types) of the columns
+of the database table.  They have the same form as a PowerLoom <vardecl>, but
+column names can be specified with or without question marks.  If there
+is a question mark it will be stripped to determine the column name, otherwise
+a question mark will be added to generate the relation variable.  The optional
+type specifies the domain of that argument and controls any necessary coercion.
+The name of each column HAS TO MATCH one of the columns of <tablename>, however,
+the order is irrelevant and arbitrary projections can be defined by only
+specifying some subset of <tablename>'s columns.
+
+See `deffunction' for legal keyword options.
+"
+  (exception-case
+      (return (call-defuntable (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+;;; Eventually, a DEFPLCOM macro should do this import for us:
+(startup-time-progn
+  (safe-import-symbol (quote DEFUNTABLE) (get-stella-module "PL-KERNEL" TRUE)))
+
+(defun (call-defuntable NAMED-DESCRIPTION) ((arguments CONS))
+  :documentation "Callable version of the `deftable' command (which see).
+Expects the same arguments as `deftable' but supplied as a list."
+  :public? TRUE
+  ;; TO DO: Once we've settled on the final syntax, we should use the
+  ;;    same normalization/definition structure as `call-defrelation'.
+  (let ((relConst (first arguments))
+        (dbConst (second arguments))
+        (tableName (third arguments))
+        (columnSpecs (fourth arguments))
+        (dbAxioms
+         (bquote
+          ;; we don't really have to qualify the RDBMS names, but just
+          ;;    in case we use a different code module down the road:
+          ((RDBMS/relation-table & relConst & tableName)
+           (RDBMS/relation-database & relConst & dbConst)
+           (PL-KERNEL/relation-specialist
+            & relConst
+            RDBMS/DBTABLE-specialist)))))
+    (mv-bind (relationArgs columnAxioms)
+        (parse-column-specs relConst columnSpecs)
+      (setf (fourth arguments) relationArgs)
+      (concatenate dbAxioms columnAxioms))
+    (return
+      (call-deffunction
+       (bquote
+        (& relConst && (rest (rest (rest arguments)))
+           :axioms & dbAxioms))))))
+
+
+(defun (deftable LOGIC-OBJECT) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a database table and map it to a relation.
+The accepted syntax is:
+	 
+ (deftable <relconst> <dbconst> <tablename> (<columndecl>+)
+    [<keyword-option>*]).
+	
+<columndecl>'s specify the names (and optionally types) of the columns
+of the database table.  They have the same form as a PowerLoom <vardecl>, but
+column names can be specified with or without question marks.  If there
+is a question mark it will be stripped to determine the column name, otherwise
+a question mark will be added to generate the relation variable.  The optional
+type specifies the domain of that argument and controls any necessary coercion.
+The name of each column HAS TO MATCH one of the columns of <tablename>, however,
+the order is irrelevant and arbitrary projections can be defined by only
+specifying some subset of <tablename>'s columns.
+
+See `defrelation' for legal keyword options.
+"
+  (exception-case
+      (return (call-deftable (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+;;; Eventually, a DEFPLCOM macro should do this import for us:
+(startup-time-progn
+  (safe-import-symbol (quote DEFTABLE) (get-stella-module "PL-KERNEL" TRUE)))
+
+(defun (call-deftable NAMED-DESCRIPTION) ((arguments CONS))
+  :documentation "Callable version of the `deftable' command (which see).
+Expects the same arguments as `deftable' but supplied as a list."
+  :public? TRUE
+  ;; TO DO: Once we've settled on the final syntax, we should use the
+  ;;    same normalization/definition structure as `call-defrelation'.
+  (let ((relConst (first arguments))
+        (dbConst (second arguments))
+        (tableName (third arguments))
+        (columnSpecs (fourth arguments))
+        (dbAxioms
+         (bquote
+          ;; we don't really have to qualify the RDBMS names, but just
+          ;;    in case we use a different code module down the road:
+          ((RDBMS/relation-table & relConst & tableName)
+           (RDBMS/relation-database & relConst & dbConst)
+           (PL-KERNEL/relation-specialist
+            & relConst
+            RDBMS/DBTABLE-specialist)))))
+    (mv-bind (relationArgs columnAxioms)
+        (parse-column-specs relConst columnSpecs)
+      (setf (fourth arguments) relationArgs)
+      (concatenate dbAxioms columnAxioms))
+    (return
+      (call-defrelation
+       (bquote
+        (& relConst && (rest (rest (rest arguments)))
+           :axioms & dbAxioms))))))
+
+(defun (parse-one-column-spec PROPERTY-LIST) ((columnSpec OBJECT))
+  ;; Parse `columnSpec' and return it as a normalized property list specifying
+  ;;    the column's :name, :type, relation :variable, etc. 
+  (let ((parsedColumn (new PROPERTY-LIST))
+        (var SYMBOL NULL)
+        (name OBJECT NULL)
+	(options NIL)
+	(optionsPlist PROPERTY-LIST NULL)
+        (type OBJECT NULL))
+    (typecase columnSpec
+      (CONS
+       (setq name (first columnSpec))
+       (if (and (defined? (second columnSpec))
+		(not (keyword? (second columnSpec))))
+	   (progn
+	     (setq type (second columnSpec))
+	     (setq options (rest (rest columnSpec))))
+	 (setq options (rest columnSpec))))
+      (SYMBOL
+       (setq name columnSpec))
+      (otherwise
+       (signal-parsing-error
+        "Illegal table column specification: " columnSpec)))
+    (unless (and (defined? name)
+                 (symbol? name))
+      (signal-parsing-error
+        "Illegal table column name: " name))
+    (unless (or (null? type)
+                (symbol? type))
+      (signal-parsing-error
+        "Illegal table column type: " type))
+    (setq optionsPlist (vet-options (coerce-&rest-to-cons options)
+				    (quote (:MODULE-NAME :MODULE-REFERENCE))))
+    (setq var name) ;; hold `name' as a symbol
+    (cond ((question-mark-symbol? name)
+           ;; for now, use the variable name as the column name; alternatively,
+           ;;    the column names could be derived from the DB schema directly:
+           (setq name (subsequence (symbol-name var) 1 NULL)))
+          (otherwise
+           (setq name (symbol-name var))
+           (setq var (intern-derived-symbol var (concatenate "?" name)))))
+    (insert-at parsedColumn :name name)
+    (insert-at parsedColumn :variable var)
+    (when (defined? type)
+      (insert-at parsedColumn :type type))
+    (foreach (key val) in optionsPlist
+	 do (insert-at parsedColumn key val))
+    (return parsedColumn)))
+
+(defun (parse-column-specs CONS CONS) ((relConst OBJECT) (columnSpecs OBJECT))
+  ;; Parse the arguments `columnSpecs' of relation `relConst' and return
+  ;;    two values: (1) the relation arguments to be used for the definition
+  ;;    of `relConst', and (2) a list of axioms derived from the column
+  ;;    specifications.
+  (unless (cons? columnSpecs)
+    (signal-parsing-error
+     "Illegal variable/column specifications: " columnSpecs))
+  (let ((relationArgs NIL)
+        (axioms NIL))
+    (foreach columnSpec in (cast columnSpecs CONS)
+        as i in (interval 1 NULL)
+        do (let ((columnInfo (parse-one-column-spec columnSpec))
+                 (type (lookup columnInfo :type))
+                 (name (lookup columnInfo :name))
+                 (var (lookup columnInfo :variable))
+		 (moduleName (lookup columnInfo :module-name))
+		 (moduleReference (lookup columnInfo :module-reference)))
+             (if (defined? type)
+                 (pushq relationArgs (cons-list var type))
+               (pushq relationArgs var))
+             (when (defined? name)
+	       (pushq axioms
+		      (bquote
+		       (RDBMS/relation-column-name & relConst & i & name))))
+	     (when (defined? moduleName)
+	       (pushq axioms
+		      (bquote
+		       (RDBMS/relation-column-module-name & relConst & i & moduleName))))
+	     (when (defined? moduleReference)
+	       (pushq axioms
+		      (bquote
+		       (RDBMS/relation-column-module-reference & relConst & i & moduleReference))))))
+    (return (reverse relationArgs) (reverse axioms))))
+
+
+(defun (defdb LOGIC-OBJECT) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) a database instance.  The accepted syntax is:
+	 
+ (defdb <dbconst>
+    [:protocol <protocol string>]
+    [:server-type <server type string>]
+    [:dsn <ODBC data-source name string>]
+    [:odbc-connection-string <ODBC connection string>]
+    [:jdbc-connection-string <JDBC connection string>]
+    [:connection-string <connection string>] ;; deprecated
+    [:host <server host string>]
+    [:port <server host port>]
+    [:user <user name string>]
+    [:password <password string>]
+    [:db-name <database name string>]
+    [<keyword-option>*])
+	
+Connection information can be asserted explicitly later or be done
+programmatically, as long as it is done before the first time a
+connection attempt is made (e.g., during a query).  This information
+is passed to `SDBC/connect' (which see for more documentation on
+ways to specify a connection).  For example, for ODBC a :DSN, an
+:ODBC-CONNECTION-STRING or an appropriate combination of :HOST,
+:PORT, :USER, :PASSWORD AND :DB-NAME can be used.  For JDBC a
+:JDBC-CONNECTION-STRING or combination of :HOST, :PORT, etc. can
+be used.  See `defobject' for additional legal keyword options.
+"
+  (exception-case
+      (return (call-defdb (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+(startup-time-progn
+  (safe-import-symbol (quote DEFDB) (get-stella-module "PL-KERNEL" TRUE)))
+
+(defun (call-defdb LOGIC-OBJECT) ((arguments CONS))
+  :documentation "Callable version of of the `defdb' command (which see).
+Expects the same arguments as `defdb' but supplied as a list."
+  :public? TRUE
+  (let ((definition (bquote (defdb && arguments)))
+        (dbName SYMBOL NULL)
+        (dbAxioms NIL)
+        (relationOptions NIL))
+    (special ((*termSourceBeingParsed* (stringify definition)))
+      (setq arguments (normalize-defobject-arguments arguments))
+      (setq dbName (first arguments))
+      ;; since db utility relations now reside in the RDBMS module, we can't
+      ;;    rely on the built-in option mechanism and handle them manually:
+      (mv-setq (dbAxioms relationOptions)
+        (extract-rdbms-options dbName (rest arguments)))
+      (pushq dbAxioms (bquote (RDBMS/database & dbName)))
+      ;; hookup the remaining keyword options:
+      (setf (rest arguments)
+        (bquote (&& relationOptions
+                    ;; we could try to combine them with other supplied
+                    ;;    :axioms, but this is easier:
+                    :axioms & dbAxioms)))
+      ;; now define the object:
+      (return (call-defobject arguments)))))
+
+(defun (extract-rdbms-options CONS CONS) ((selfName SYMBOL) (options CONS))
+  ;; Specialized keyword axioms handler that finds RDBMS relations from
+  ;;    keywords even if the RDBMS module is not visible.
+  ;; Returns a list of RDBMS axioms with `selfName' as their first arguments
+  ;;    and the list of remaining non-RDBMS options.
+  ;; One difference to the generic keyword axioms handling is that for RDBMS
+  ;;    relations CONS values are interpreted as a list of arguments for a
+  ;;    higher arity relation instead of multiple values for a binary relation.
+  (let ((sourceOptions (new PROPERTY-LIST :the-plist options))
+        (rdbmsModule (get-stella-module "RDBMS" TRUE))
+        (relationRef SURROGATE NULL)
+        (relation NAMED-DESCRIPTION NULL)
+        (axioms NIL)
+        (otherOptions NIL))
+    (foreach (key value) in sourceOptions
+        do (when (keyword? key)
+             (setq relationRef
+               (lookup-surrogate-in-module
+                (symbol-name (cast key KEYWORD)) rdbmsModule TRUE))
+             (when (defined? relationRef)
+               (setq relation (get-description relationRef))
+               (when (defined? relation)
+                 (cond ((cons? value)
+                        (pushq axioms
+                               (cons (description-name relation)
+                                     (cons selfName value))))
+                       (otherwise
+                        (within-module rdbmsModule
+                          (pushq axioms
+                                 (help-define-keyword-axioms
+                                  selfName key value)))))
+                  (continue))))
+           ;; otherwise:
+           (pushq otherOptions key)
+           (pushq otherOptions value))
+    (return (reverse axioms) (reverse otherOptions))))
+
+(defun assert-rdbms-connection-info ((db-instance-name STRING) &rest (options OBJECT))
+  :documentation
+  "Assert DB connectivity information about the DB instance `db-instance-name' (for
+example, \"edb\") according to `options'.  Looks up `db-instance-name' in the module
+specified by the :module option (defaults to current module) and retracts any
+preexisting connection information.  New assertions are also made in that module.
+Default values are taken from the configuration table specified by :configuration.
+
+Understands the following options, with default values specified by the configuration
+key in parentheses:
+   :connection-string (\"DBConnection\"),
+   :jdbc-connection-string (\"JDBCString\"),
+   :odbc-connection-string (\"ODBCString\"),
+   :dsn (\"DSN\"),
+   :db (\"DBName\"),
+   :host (\"DBHost\"),
+   :port (\"DBPort\"),
+   :user (\"DBUser\"),
+   :password (\"DBPassword\"),
+   :module,
+   :configuration."
+  :command? TRUE :public? TRUE
+  ;; MAYBE THIS SHOULD GO INTO RDBMS.STE AS A UTILITY.  IF IT DOES, WE HAVE TO BE
+  ;;    ABLE TO PASS EXTRA PARAMETERS AND CAN'T RELY ON THE CONFIGURATION.
+  (let ((theOptions
+         (parse-logic-command-options
+          (coerce-&rest-to-cons options)
+          (bquote (:connection-string @STRING
+                   :jdbc-connection-string @STRING
+		   :odbc-connection-string @STRING
+		   :dsn @STRING
+		   :db @STRING
+		   :host @STRING
+		   :port @INTEGER
+		   :user @STRING
+		   :password @STRING
+		   :module @MODULE
+		   :configuration @CONFIGURATION-TABLE))
+          TRUE FALSE))
+	(config (lookup theOptions :configuration))
+	(con-string STRING-WRAPPER
+	  (lookup-with-default theOptions :connection-string
+			       (lookup-configuration-property "DBConnection" NULL config)))
+	(jdbc-con-string STRING-WRAPPER
+	  (lookup-with-default theOptions :connection-string
+			       (lookup-configuration-property "JDBCString" NULL config)))
+	(odbc-con-string STRING-WRAPPER
+	  (lookup-with-default theOptions :connection-string
+			       (lookup-configuration-property "ODBCString" NULL config)))
+	(dsn STRING-WRAPPER
+	  (lookup-with-default theOptions :dsn
+			       (lookup-configuration-property "DSN" NULL config)))
+	(db-name STRING-WRAPPER
+	  (lookup-with-default theOptions :db-name
+			       (lookup-configuration-property "DBName" NULL config)))
+	(host STRING-WRAPPER
+	  (lookup-with-default theOptions :host
+			       (lookup-configuration-property "DBHost" NULL config)))
+	(port INTEGER-WRAPPER 
+	      (lookup-with-default theOptions :port
+				   (lookup-configuration-property "DBPort" NULL config)))
+	(user STRING-WRAPPER
+	  (lookup-with-default theOptions :user 
+			       (lookup-configuration-property "DBUser" NULL config)))
+	(password STRING-WRAPPER
+	  (lookup-with-default theOptions :password
+			       (lookup-configuration-property  "DBPassword" NULL config)))
+	(module MODULE (lookup-with-default theOptions :module *module*))
+	(module-name (module-full-name module))
+	(db-object (pli/s-get-object db-instance-name module-name null))
+	(assertion-template
+	 (instantiate-string-template
+	  (concatenate
+	   "(AND"
+	   (choose (and (defined? jdbc-con-string) (non-empty?  jdbc-con-string))
+		   "(RDBMS/JDBC-CONNECTION-STRING #$DB \"#$JDBCCON\")" "")
+	   (choose (and (defined? odbc-con-string) (non-empty?  odbc-con-string))
+		   "(RDBMS/ODBC-CONNECTION-STRING #$DB \"#$ODBCCON\")" "")
+	   (choose (and (defined? dsn) (non-empty?  dsn))
+		   "(RDBMS/DSN #$DB \"#$DSN\")" "")
+	   (choose (and (defined? db-name) (non-empty?  db-name))
+		   "(RDBMS/DB-NAME #$DB \"#$NAME\")" "")
+	   (choose (and (defined? host) (non-empty?  host))
+		   "(RDBMS/HOST #$DB \"#$HOST\")" "")
+	   (choose  (defined? port)
+		   "(RDBMS/PORT #$DB #$PORT)" "")
+	   (choose (and (defined? user) (non-empty?  user))
+		   "(RDBMS/USER #$DB \"#$USER\")" "")
+	   (choose (and (defined? password) (non-empty?  password))
+		   "(RDBMS/PASSWORD #$DB \"#$PWD\")" "")
+	   ")")
+	  "#$DB" db-instance-name
+	  "#$DSN" dsn
+	  "#$NAME" (first-defined db-name "")
+	  "#$HOST" (first-defined host "")
+	  "#$PORT" (choose (defined? port) (integer-to-string port) "")
+	  "#$USER" (first-defined user "")
+	  "#$PWD" (first-defined password "")
+	  "#$JDBCCON" (first-defined jdbc-con-string "")
+	  "#$ODBCCON" (first-defined odbc-con-string "")
+	  )))
+    (when (defined? db-object)
+      ;; retract any pre-existing connection assertions:
+      (pli/s-evaluate
+       (instantiate-string-template
+	"(PROGN (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/DSN #$DB ?dsn)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/DB-NAME #$DB ?db)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/HOST #$DB ?host)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/PORT #$DB ?port)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/USER #$DB ?user)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/PASSWORD #$DB ?pwd)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/CONNECTION-STRING #$DB ?con)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/ODBC-CONNECTION-STRING #$DB ?con)))
+                  (RETRACT-FROM-QUERY (RETRIEVE ALL (RDBMS/JDBC-CONNECTION-STRING #$DB ?con))))"
+	"#$DB" db-instance-name)
+       module-name null))
+    (when (defined? con-string)
+      (pli/s-assert-proposition
+       (instantiate-string-template
+	"(RDBMS/#$PROTOCOL-CONNECTION-STRING #$DB \"#$CON\")"
+	"#$PROTOCOL" (choose (sdbc/odbc-connection-string? con-string) "ODBC" "JDBC")
+	"#$DB" db-instance-name
+	"#$CON" con-string)
+       module-name
+       NULL))
+    (unless (eql? assertion-template "(AND)")
+      (pli/s-assert-proposition assertion-template module-name NULL)) ))
+
+;; Generic `defquery' syntax:
+
+;; Note, the reason why we don't associate column names with relation
+;; arguments (as done in `deftable') but instead have each query
+;; pattern specify its own output arguments, is that there could be
+;; multiple patterns going to different DBs that use different names
+;; for their output arguments.
+
+(defun (defquery LOGIC-OBJECT) (&rest (args PARSE-TREE))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Define (or redefine) an (external) query and map it to a relation.
+The accepted syntax is:
+	 
+ (defquery <relconst> (<vardecl>+)
+    {:query-pattern (<query-evaluator> <dbconst> <arguments-string>)}*
+    [<keyword-option>*]).
+	
+<query-evaluator> has to be a `Computed-Procedure' that takes the following
+three arguments: the <relconst> query proposition, the database object <dbconst>
+and the arguments string.  It needs to return an iterator that generates CONS
+tuples whose elements will be bound in sequence to <relconst>'s arguments.
+
+See `defrelation' for other legal keyword options.
+"
+  (exception-case
+      (return (call-defquery (coerce-&rest-to-cons args)))
+    (LOGIC-EXCEPTION (e)
+      (print-stream STANDARD-ERROR (exception-message e))
+      (return NULL))))
+
+;;; Eventually, a DEFPLCOM macro should do this import for us:
+(startup-time-progn
+  (safe-import-symbol (quote DEFQUERY) (get-stella-module "PL-KERNEL" TRUE)))
+
+(defun (call-defquery NAMED-DESCRIPTION) ((arguments CONS))
+  :documentation "Callable version of the `defquery' command (which see).
+Expects the same arguments as `deftable' but supplied as a list."
+  :public? TRUE
+  (let ((definition (bquote (defquery && arguments)))
+        (relationName SYMBOL NULL)
+        (queryAxioms NIL)
+        (relationOptions NIL))
+    (special ((*termSourceBeingParsed* (stringify definition)))
+      (setq arguments (normalize-defrelation-arguments arguments))
+      (setq relationName (first arguments))
+      (mv-setq (queryAxioms relationOptions)
+        (extract-rdbms-options relationName (rest (rest arguments))))
+      (pushq queryAxioms
+             (bquote
+              (PL-KERNEL/relation-specialist
+               & relationName RDBMS/QUERY-specialist)))
+      (mv-bind (relationArgs columnAxioms)
+          (parse-column-specs relationName (second arguments))
+        (setf (second arguments) relationArgs)
+        (concatenate queryAxioms columnAxioms))
+      ;; hookup the remaining keyword options:
+      (setf (rest (rest arguments))
+        (bquote (&& relationOptions
+                    ;; we could try to combine them with other supplied
+                    ;;    :axioms, but this is easier:
+                    :axioms & queryAxioms)))
+      ;; now define the relation:
+      (return (call-defrelation arguments)))))
+
+
+  ;;
+;;;;;; ODBC/JDBC Database connection:
+  ;;
+
+(defclass CONNECTION-WRAPPER (LOGIC-THING)
+  :public-slots
+  ((wrapper-value :type SDBC/CONNECTION)))
+
+(defun (normalize-connection-argument STRING-WRAPPER) ((arg OBJECT))
+  ;; Coerce the connection argument `arg' to a string.
+  (typecase arg
+    (STRING-WRAPPER
+     (if (null-wrapper? arg) (return NULL) (return arg)))
+    (INTEGER-WRAPPER
+     (if (null-wrapper? arg) (return NULL) (return (integer-to-string arg))))
+    (LOGIC-OBJECT
+     (return (pli/get-name arg)))
+    (otherwise
+     (return NULL))))
+
+(defun (connect-to-database SDBC/CONNECTION) ((database LOGIC-OBJECT))
+  ;; Attempt to connect to a database based on the information associated with
+  ;; `database'.  Return a connection id.
+  (let ((protocol (access-binary-value database RDBMS/@protocol))
+        (serverType (access-binary-value database RDBMS/@server-type))
+        (host (access-binary-value database RDBMS/@host))
+        (port (access-binary-value database RDBMS/@port))
+	(user (access-binary-value database RDBMS/@user))
+	(password (access-binary-value database RDBMS/@password))
+	(dbName (access-binary-value database RDBMS/@db-name))
+	(connectionString
+         (if-output-language :java 
+            (first-defined (access-binary-value database RDBMS/@jdbc-connection-string)
+                           (access-binary-value database RDBMS/@connection-string))
+            (first-defined (access-binary-value database RDBMS/@odbc-connection-string)
+                           (access-binary-value database RDBMS/@connection-string))))
+	(dsn (access-binary-value database RDBMS/@dsn))
+	(connection /SDBC/CONNECTION NULL)
+	(connectionWrapper (new CONNECTION-WRAPPER)))
+    (setq connection 
+      (/SDBC/connect
+       :protocol (normalize-connection-argument protocol)
+       :server-type (normalize-connection-argument serverType)
+       :dsn (normalize-connection-argument dsn)
+       :db-name (normalize-connection-argument dbName)
+       :user (normalize-connection-argument user)
+       :password (normalize-connection-argument password)
+       :host (normalize-connection-argument host)
+       :port (normalize-connection-argument port)
+       :connection-string (normalize-connection-argument connectionString)))
+    (setf (wrapper-value connectionWrapper) connection)
+    (within-module (base-module *context*)
+      (special ((*invisibleAssertion?* TRUE))
+        ;; make sure we assert the connection proposition in the module and not
+        ;;    in some volatile inference cache; also, make it an invisible assertion
+        ;;    so it doesn't trigger invalidation of inference caches:
+        (pli/assert-nary-proposition
+         (bquote (& (get-relation RDBMS/@db-connection)
+                    & database
+                    & connectionWrapper))
+         NULL NULL)))
+    (return connection)))
+
+(defun disconnect-from-database ((database LOGIC-OBJECT))
+  ;; Detach the physical connection from the logical `database' object.
+  (let ((connection (access-binary-value database RDBMS/@db-connection)))
+    (typecase connection
+      (CONNECTION-WRAPPER
+       ;;; don't break if the connection isn't an SDBC connection:
+       (when (defined?  (wrapper-value connection))
+         (sdbc/disconnect (wrapper-value connection)))
+       (within-module (base-module *context*)
+         (pli/retract-nary-proposition
+          (bquote (& (get-relation RDBMS/@db-connection)
+                     & database
+                     & connection))
+          NULL NULL)))
+      (otherwise NULL))))
+
+(defun (get-connection-from-database SDBC/CONNECTION) ((database LOGIC-OBJECT))
+  ;; Retrieve the connection ID given a database  If there is no connection
+  ;; established for this database, attempt to establish one based on the
+  ;; connection information associated with the database.
+  ;; TODO: Make sure connection-related errors are properly handled.
+  (let ((connection (access-binary-value database RDBMS/@db-connection)))
+    (typecase connection
+      (CONNECTION-WRAPPER
+	(return (wrapper-value connection)))
+      (otherwise
+       (return (connect-to-database database))))))
+
+(defun (get-connection-from-predicate SDBC/CONNECTION) ((relationRef SURROGATE))
+  ;; Retrieve the connection ID given a predicate.  
+  (let ((database (access-binary-value (get-description relationRef)
+                                       RDBMS/@relation-database))
+	(connection (get-connection-from-database database)))
+    (return connection)))
+
+
+  ;;
+;;;;;; DB query support and specialist
+  ;;
+
+(defun (allocate-result-set-iterator (ITERATOR OF CONS))
+    ((connection SDBC/CONNECTION) (relation LOGIC-OBJECT) (sqlStatement STRING))
+  ;; Creates an iterator which represents a cursor into an RDBMS result set
+  ;;    for the SQL query `sqlStatement' on the database identified by
+  ;;    `connection'.
+  ;; Coercion of values is handled relative to `relation'.
+  (return
+    (new ALL-PURPOSE-ITERATOR
+         :iterator-nested-iterator (sdbc/get-result-set connection sqlStatement)
+         :iterator-object relation
+         :iterator-second-object (get-relation-table-info relation)
+         :iterator-next-code (the-code :function result-set-iterator-next?))))
+
+(defun (result-set-iterator-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; `next?' function for result set iterators that does appropriate coercion
+  ;;     of database values into PowerLoom objects.
+  (let ((resultSet (iterator-nested-iterator self))
+        ;(relation (iterator-object self))
+        (tableInfo (iterator-second-object self)))
+    (cond ((next? resultSet)
+	   (setf (slot-value self value)
+             (coerce-values (slot-value resultSet value) tableInfo))
+           (return TRUE))
+          (otherwise
+           (return FALSE)))))
+
+;;; Accessors to relation/table mapping and various meta information:
+
+(defun (get-table-relation NAMED-DESCRIPTION) ((table-name STRING)
+                                               (module MODULE))
+  ;; Given the name of a database table `table-name' and `module' lookup
+  ;;    the PowerLoom relation it corresponds to.
+  (let ((iter (pli/retrieve (bquote (1 (relation-table ?x & table-name)))
+			    module
+			    NULL)))
+    (if (next? iter)
+      (return (value iter))
+      (return NULL))))
+
+(defun (get-table-column-index INTEGER) ((table-relation NAMED-DESCRIPTION)
+                                         (column-name STRING)
+                                         (module MODULE))
+  ;; Returns the column number (1-based) of `column-name' for
+  ;;    `table-relation' as recorded in `module'.  Returns -1 if 
+  ;;    no such column is known.
+  (let ((iter (pli/retrieve (bquote (1 (relation-column-name & table-relation
+							     ?x
+							     & column-name)))
+			    module
+			    NULL)))
+    (if (next? iter)
+      (return (wrapper-value (cast (value iter) INTEGER-WRAPPER)))
+      (return -1))))
+
+(defun (get-table-column-module-name STRING-WRAPPER) ((tableRelation NAMED-DESCRIPTION)
+						      (columnIndex INTEGER))
+  ;; Return the module name of the `columnIndex'-th column of `tableRelation' or
+  ;;    NULL if no such column exists or its module name isn't known.
+  (return
+    (pop (pli/retrieve
+          (bquote (1 (RDBMS/relation-column-module-name & tableRelation
+                                                        & columnIndex
+                                                        ?x)))
+          NULL NULL))))
+
+(defun (get-table-column-module-reference STRING-WRAPPER) ((tableRelation NAMED-DESCRIPTION)
+							   (columnIndex INTEGER))
+  ;; Return the module reference of the `columnIndex'-th column of `tableRelation' or
+  ;;    NULL if no such column exists or its module reference isn't known.
+  (return
+    (pop (pli/retrieve
+          (bquote (1 (RDBMS/relation-column-module-reference & tableRelation
+                                                             & columnIndex
+                                                             ?x)))
+          NULL NULL))))
+
+(defun (get-table-column-name STRING-WRAPPER) ((tableRelation NAMED-DESCRIPTION)
+                                               (columnIndex INTEGER))
+  ;; Return the name of the `columnIndex'-th column of `tableRelation' or
+  ;;    NULL if no such column exists or its name isn't known.
+  (return
+    (pop (pli/retrieve
+          (bquote (1 (RDBMS/relation-column-name & tableRelation
+                                                 & columnIndex
+                                                 ?x)))
+          NULL NULL))))
+
+(defun (get-table-column-names (CONS OF STRING-WRAPPER))
+    ((tableRelation NAMED-DESCRIPTION))
+  ;; Return the ordered list of column names of `tableRelation' or NULL
+  ;;    if some of them have not been specified.
+  (let ((names
+         (collect (column-name column)
+                  foreach column in (column-list (get-relation-table-info tableRelation)))))
+    (if (member? names NULL)
+        (return NULL)
+      (return names))))
+
+;;; Table infos:
+
+(defclass RELATION-TABLE-INFO (STANDARD-OBJECT)
+  :documentation "Data structure that associates a PowerLoom relation representing
+a database table or query with various information about its columns, value coercion, etc."
+  :public-slots
+  ((relation :type NAMED-DESCRIPTION)
+   (database :type OBJECT)
+   (dbms-name :type KEYWORD)
+   (table-name :type STRING)
+   (table-alias :type STRING :initially "_T")
+   (column-list :type (CONS OF RELATION-COLUMN-INFO))
+   (column-vector :type (VECTOR OF RELATION-COLUMN-INFO))
+   (column-index :type (KEY-VALUE-MAP OF OBJECT RELATION-COLUMN-INFO)) 
+   (adjunct :type OBJECT)))
+
+(defclass RELATION-COLUMN-INFO (STANDARD-OBJECT)
+  :public-slots
+  ((table-info :type RELATION-TABLE-INFO)
+   (column-name :type STRING)
+   (column-variable :type SYMBOL)
+   (column-index :type INTEGER)  ;; 0-based
+   (column-type :type NAMED-DESCRIPTION)
+   (column-db-type :type STRING) ;; not yet used
+   (module-name :type STRING)
+   (module-reference :type STRING)
+   (module :type MODULE)
+   (module-local? :type BOOLEAN)
+   (module-reference-column :type RELATION-COLUMN-INFO)
+   (coercion-function :type FUNCTION-CODE) ;; not yet used
+   ))
+
+(defun (create-relation-table-info RELATION-TABLE-INFO) ((relation NAMED-DESCRIPTION))
+  ;; Create a complete table info structure for `relation' and return the result.
+  ;; This needs to be memoized and/or cached somewhere, since it is a bit expensive.
+  (let ((tableInfo (new RELATION-TABLE-INFO :relation relation))
+        (columnInfo RELATION-COLUMN-INFO NULL)
+        ;; don't use `arity' here so this will also work for variable arity:
+        (arity (length (io-variables relation)))
+        (columns NIL)
+        ;; default module to use for object internment; we start from `*context*' just
+        ;; in case its base module is not the same as `*module*'; it's ok to set this
+        ;; at info creation time, since it will be memoized context sensitively:
+        (defaultModule (base-module *context*)))
+    (setf (database tableInfo) (access-binary-value relation RDBMS/@relation-database))
+    (setf (dbms-name tableInfo)
+      ;; for :query-pattern's we could have multiple different databases,
+      ;; but there we handle all the quoting, etc. ourselves anyway:
+      (choose (defined? (database tableInfo))
+              (sdbc/get-dbms-name (get-connection-from-database (database tableInfo)))
+              :UNKNOWN))
+    (setf (table-name tableInfo)
+      (unwrap-string (access-binary-value relation RDBMS/@relation-table)))
+    (setf (column-index tableInfo) (new KEY-VALUE-MAP))
+    (foreach i in (interval 1 arity)
+        as var in (io-variable-names relation)
+        do (setq columnInfo (new RELATION-COLUMN-INFO :table-info tableInfo))
+           (setf (column-name columnInfo)
+             (unwrap-string (get-table-column-name relation i)))
+           (setf (column-variable columnInfo) var)
+           ;; ugly, this is 0-based but we want that to index into `column-vector':
+           (setf (column-index columnInfo) (1- i))
+           (setf (column-type columnInfo) (pli/get-nth-domain relation (1- i)))
+           (setf (module-name columnInfo)
+             (unwrap-string (get-table-column-module-name relation i)))
+           (setf (module-reference columnInfo)
+             (unwrap-string (get-table-column-module-reference relation i)))
+           ;; index the column under its name, its relation variable and relation var name:
+           (insert-at (column-index tableInfo) (column-name columnInfo) columnInfo)
+           (insert-at (column-index tableInfo) var columnInfo)
+           (insert-at (column-index tableInfo) (symbol-name var) columnInfo)
+        collect columnInfo into columns)
+    (setf (column-list tableInfo) columns)
+    (setf (column-vector tableInfo) (cons-to-vector columns))
+    (foreach column in (column-list tableInfo)
+        do (cond
+            ((defined? (module-name column))
+             ;; module was explicitly specified, intern instances locally:
+             (setf (module-local? column) TRUE)
+             (setf (module column) (get-stella-module (module-name column) FALSE))
+             (when (null? (module column))
+               (warn "RDBMS: Column module " (module-name column) " for column "
+                     (column-name column) " on relation " relation
+                     " is not defined; ignoring it...")
+               (setf (module column) defaultModule)))
+            ((defined? (module-reference column))
+             ;; module was explicitly specified, intern instances locally:
+             (setf (module-local? column) TRUE)
+             ;; we are not checking here whether this is a valid reference assuming
+             ;;    this has been (or should be) done at parse time:
+             (setf (module-reference-column column)
+               (lookup (column-index tableInfo) (module-reference column))))
+            (otherwise
+             (setf (module column) defaultModule))))
+    (return tableInfo)))
+
+(defun (get-module-using-reference MODULE) ((column RELATION-COLUMN-INFO)
+                                            (values CONS))
+  ;; Return the internment module for `column' which is defined via a
+  ;;    module reference to one of `values'.
+  (let ((refColumIndex (column-index (module-reference-column column)))
+        (moduleName (nth values refColumIndex))
+	(module (choose (defined? moduleName)
+                        (get-stella-module moduleName FALSE)
+                        NULL)))
+    (unless (defined? module)
+      (warn "RDBMS: Column module " moduleName " defined by reference for column "
+            (column-name column) " on relation " (relation (table-info column))
+            " is not defined; ignoring it...")
+      (setq module (base-module *context*)))
+    (return module)))
+
+(defun (get-relation-table-info RELATION-TABLE-INFO) ((tableRelation NAMED-DESCRIPTION))
+  ;; Get or create the table info structure for `tableRelation'.
+  ;; The table info structure associates a PowerLoom `tableRelation' representing a
+  ;;    database table or query with various information about its columns such as
+  ;;    names, data types, module information, coercion info, etc.  Using the table
+  ;;    info allows efficient processing of results without having to lookup
+  ;;    information over and over.
+  ;; We memoize the table info relative to the current context, since, conceivably,
+  ;;    a single table could have different meta information associated with it
+  ;;    in different modules.
+  (return
+    (memoize (tableRelation *context*)
+             :timestamps :META-KB-UPDATE :max-values 100
+             (create-relation-table-info tableRelation))))
+
+(defun (collection-valued-constraint? BOOLEAN) ((argument OBJECT))
+  ;; Return true if `argument' represents a collection-valued column constraint.
+  ;; Collection-valued constraints are those where we have a set or list of
+  ;;    values instead of a single value which will be interpreted as a disjunction.
+  ;;    For example, `(SETOF Hans Franz)' constraining a `name' column will be
+  ;;    interpreted as "name='Hans' or name='Franz'".
+  (return (and (defined? argument)
+               (or (enumerated-list? argument)
+                   (enumerated-set? argument)))))
+
+(defun (collection-valued-constraint-elements CONS) ((argument OBJECT))
+  ;; Return the individual elements of the collection-valued constraint `argument'.
+  (return (consify (asserted-collection-members argument TRUE))))
+
+(defun print-sql-value ((stream OUTPUT-STREAM)
+			(value OBJECT)
+			(column RELATION-COLUMN-INFO))
+  ;; Helping function for writing SQL code.
+  ;; Print `value' to `stream' based on `column' and `dbms-name' information.
+  ;; TO DO:  It really should use the DB type rather than the PowerLoom
+  ;;         type but we don't have that in place yet.
+  ;; TO DO:  MAKE THIS MORE EFFICIENT.  Hans?
+  (let ((target-type (column-type column))
+	(base-string (coerce-powerloom-object-to-string value target-type))
+	(quote-char (sdbc/sql-quote-character (dbms-name (table-info column))
+					      :STRING-CONSTANT)))
+    ;; Add redundant first test to handle the most common case quickly.
+    (cond ((eq? target-type (get-description @STRING))
+	   (print-stream stream quote-char 
+			        (sdbc/sql-escape-string base-string quote-char)
+				quote-char))
+	  ((or (subrelation-of? target-type (get-description @NUMBER))
+	       (subrelation-of? target-type (get-description @BOOLEAN)))
+	   (print-stream stream base-string))
+	  (otherwise 
+	   (print-stream stream quote-char 
+			        (sdbc/sql-escape-string base-string quote-char)
+				quote-char))) ))
+
+(defun print-column-constraint ((sql OUTPUT-STREAM)
+                                (column RELATION-COLUMN-INFO)
+                                (value STRING)
+                                (caseSensitive? BOOLEAN))
+  ;; Print a single `column=value' constraint to `sql'.
+  ;; If `caseSensitive?' is true, generate a case-sensitive comparison.
+  (let ((tableInfo (table-info column))
+        (tableAlias (table-alias tableInfo))
+        (columnName (column-name column)))
+    (when (defined? tableAlias)
+      (setq columnName (concatenate tableAlias "." columnName)))
+    (print-stream sql columnName "=")
+    (print-sql-value sql value column)
+    (when caseSensitive?
+      (case (dbms-name tableInfo)
+        (:MYSQL
+         ;; We perform both tests here, since the test below is unoptimizable which
+         ;; can cause slowdowns of a factor 10 or more with indexed columns.
+         (print-stream sql " AND " columnName " LIKE BINARY ")
+         (print-sql-value sql value column))
+        ;; Oracle seems to use case-sensitive comparison by default:
+        (otherwise NULL)))))
+
+(defun print-argument-constraint ((sql OUTPUT-STREAM)
+                                  (argument OBJECT)
+                                  (column RELATION-COLUMN-INFO))
+  ;; Print a single argument constraint binding column `column' to `argument'
+  ;;    to stream `sql'.  The `argument' will be coerced according to `column's type.
+  ;;    If `column' has a module reference column defined for it, additionally constrain
+  ;;    the module reference column with the home module of `argument'.
+  ;; Efficiency hack: if `argument' is a list or set instead of a single value,
+  ;;    we interpret it as a disjunctive constraint on the particular column.  This
+  ;;    allows us to ask a single query with a set of input bindings instead
+  ;;    of having to ask multiple queries one-by-one.
+  (let ((columnType (column-type column))
+	(argName (object-surrogate argument))
+	;; we intentionally use the module of the object's name, not its home module, since
+	;; in cases where those differ (e.g., if we accidentally allocated it in a different
+	;; module in a query) the name module is the one corresponding to the module column:
+	;; If the argument is a string literal, always use a case-sensitive test to match
+	;; normal PowerLoom semantics.
+        (argModule (choose (defined? argName) (interned-in argName) NULL))
+        (moduleRefColumn (module-reference-column column))
+        (caseSensitive? (or (and (defined? argModule)
+				 (case-sensitive? argModule))
+			    (isa? argument @STRING-WRAPPER))))
+    (cond ((collection-valued-constraint? argument)
+           (print-stream sql "(")
+           (foreach subArg in (collection-valued-constraint-elements argument)
+               as si in (interval 1 NULL)
+               do (when (> si 1)
+                    (print-stream sql " OR "))
+                  (print-column-constraint
+                   sql column (coerce-powerloom-object-to-string subArg columnType) caseSensitive?))
+           (print-stream sql ")"))
+          (otherwise
+           (print-column-constraint
+            sql column (coerce-powerloom-object-to-string argument columnType) caseSensitive?)))
+    (when (and (defined? moduleRefColumn)
+               (defined? argModule))
+      ;; we need to constrain the module column; for set-valued `argument's we currently
+      ;;    assume that they all come from the same module as the collection argument:
+      (print-stream sql " AND ")
+      (print-column-constraint sql moduleRefColumn (module-name argModule) FALSE))))
+
+(defun print-sql-column-list ((stream OUTPUT-STREAM) (table-info RELATION-TABLE-INFO))
+  ;; Helping function for writing SQL code.
+  ;; Print a list of columns from `table-info' onto `stream'
+  (let ((first? TRUE)
+        (alias (table-alias table-info)))
+    (foreach column in (column-list table-info)
+       do (if first?
+	      (setq first? false)
+	      (print-stream stream ", "))
+          (if (defined? alias)
+              (print-stream stream alias "." (column-name column))
+            (print-stream stream (column-name column))))))
+
+(defun print-sql-constraint-list ((stream OUTPUT-STREAM) (table-info RELATION-TABLE-INFO) (arguments VECTOR))
+  ;; Helping function for writing SQL code.
+  ;; Print a list of argument constraints from `table-info' and `arguments' onto `stream'
+  (let ((first? TRUE))
+    (foreach column in (column-list table-info)
+	     as arg in arguments
+	     do (setq arg (safe-argument-bound-to arg))
+	        (when (and (defined? arg) (not (skolem? arg)))
+		  ;; We have an argument constraint.
+		  (if first? 
+		      (progn 
+			(setq first? false)
+			(print-stream stream " WHERE "))
+		      (print-stream stream " AND "))
+		  (print-argument-constraint stream arg column)))))
+
+
+(defun (create-sql-from-proposition STRING) ((proposition PROPOSITION))
+  ;; Produce a SQL select statement from a proposition.  Currently
+  ;; this method selects all columns from a table associated with `proposition'.
+  ;; TO DO: Improve performance by memoizing part of the translation and
+  ;;    using prepared statements.
+  (let ((relation (get-description (relationRef proposition)))
+        (tableInfo (get-relation-table-info relation))
+        (tableAlias (table-alias tableInfo))
+        (arguments (arguments proposition))
+	(sql (new STRING-OUTPUT-STREAM)))
+    (print-stream sql "SELECT DISTINCT ")
+    (print-sql-column-list sql tableInfo)
+    (print-stream sql " FROM " (table-name tableInfo))
+    (when (defined? tableAlias)
+      (print-stream sql " " tableAlias))
+    (print-sql-constraint-list sql tableInfo arguments)
+    (return (the-string sql))))
+
+(defun (allocate-DBTABLE-specialist-iterator (ITERATOR OF CONS))
+    ((frame CONTROL-FRAME))
+  ;; Allocate a memoizable result set iterator for a `DBTABLE-specialist' frame.
+  (when (null? (iterator frame))
+    (let ((proposition (proposition frame))
+          (relationRef (relationRef proposition))
+          (relation (get-description relationRef)))
+      (check-for-external-db-updates
+       proposition
+       (access-binary-value relation RDBMS/@database))
+      (setf (iterator frame)
+        (clone-memoized-iterator
+         (memoize ((get-query-pattern-memoization-key proposition)
+                   *context* *reversePolarity?*)
+                  :timestamps (:META-KB-UPDATE :EXTERNAL-DB-UPDATE)
+                  :max-values 1000 ;; is this too much?
+                  (new MEMOIZABLE-ITERATOR
+                       :base-iterator
+                       (allocate-result-set-iterator
+                        (get-connection-from-predicate relationRef)
+                        relation
+                        (create-sql-from-proposition proposition))))))))
+  (return (iterator frame)))
+
+(defun (retrieve-next-db-query-solution KEYWORD) ((frame CONTROL-FRAME)
+                                                  (lastMove KEYWORD))
+  ;; Helper function for `DBTABLE-specialist' and friends.
+  ;; Assumes `frame' has been initialized with an iterator that produces
+  ;;    CONS tuples of coerced PowerLoom objects that can be assigned
+  ;;    by position to the arguments of `frame's proposition.
+  ;; Retrieves the next set of bindings and returns the appropriate
+  ;;    result/success keyword.
+  (let ((arguments (arguments (proposition frame)))
+        (iterator (ITERATOR OF CONS) (iterator frame)))
+    (ignore lastMove)
+    (unless (defined? iterator)
+      ;; iterator allocation must have failed:
+      (return :FAILURE))
+    (when (first-iteration? iterator)
+      (unless (next? iterator)
+        (return :FAILURE))
+      (setf (first-iteration? iterator) FALSE))
+    (loop
+      (let ((noNulls? TRUE)
+            (result NIL)
+            (binding OBJECT NULL))
+        (foreach col in (value iterator)
+            as arg in arguments
+            do (setq binding (argument-bound-to arg))
+               (cond ((null? col)
+                      (setq noNulls? FALSE))
+                     ((defined? binding)
+                      ;; set the corresponding result column to the binding, since we don't
+                      ;; really need to check and for arbitrary SQL-query's we don't
+                      ;; know whether the returned column value will match the input arg:
+                      (setq col binding)))
+            collect col into result)
+	(when (or (partial-match-mode?) noNulls?)
+	  ;; We're in partial match mode (where nulls are allowed), 
+	  ;; or we've found a set of solutions that don't have any nulls.
+          ;; Try to unify the pattern.  If successful, break out of loop.
+          ;; Otherwise, keep searching.
+	  (when (bind-vector-of-arguments-to-values? arguments result)
+	    (break)))
+	(unless (next? iterator)
+	  ;; We've looped through all the remaining possibilities
+          ;;    and haven't found anything:
+	  (return :FAILURE))))
+    ;; We've made it this far, we must have found a match:
+    ;; hc: tricky, he advances at the end but only advances twice the
+    ;;     very first time around:
+    (if (next? iterator)
+	(return :CONTINUING-SUCCESS)
+      (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	     (return :FINAL-SUCCESS)))))
+
+(defun (DBTABLE-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle predicates which are defined to map to RDBMS tables.
+  ;; An iterator is created to retrieve rows from a database.
+  (when (null? (iterator frame))
+    ;; first time through coming down?
+    (setf (iterator frame) (allocate-DBTABLE-specialist-iterator frame)))
+  (return (retrieve-next-db-query-solution frame lastMove)))
+
+
+  ;;
+;;;;;; Generic query support and specialists
+  ;;
+
+;;; This is a generalization of the DBTABLE mechanism above that allows the
+;;; dispatch of arbitrary query evaluation specialists that can generate
+;;; a sequence of tuples to serve as bindings for a query proposition.
+
+;;; Each evaluation specialist (e.g., `SQL-join') is expected to take the
+;;; query proposition, the database instance and an arguments string as inputs
+;;; and return an iterator that can generate a sequence of CONS tuples.  Each
+;;; tuple is expected to have the same arity as the queried proposition, and
+;;; its elements will be bound to the proposition/relation arguments in sequence.
+
+;;; The format of the arguments string will be different for each evaluator.
+;;; Output arguments will either be specified in the arguments string or can
+;;; be defaulted from the relation's variable/column specifications.
+
+(defun (get-query-pattern-evaluators (CONS OF CONS)) ((relationRef SURROGATE))
+  ;; Retrieve all query patterns that apply to relation `relationRef'
+  ;;    in the current context and return them as a list of
+  ;;    (<evaluator-code> <db-instance> <args>) triples.
+  (let ((evaluatorForms NIL)
+        (patterns (CONS OF CONS)
+         (memoize (relationRef *context*)
+                  :timestamps :META-KB-UPDATE :max-values 100
+                  (apply-retrieve (?rel ?ev ?db ?args)
+                                  (and (RDBMS/query-pattern ?rel ?ev ?db ?args)
+                                       (exists (?db-type)
+                                         (RDBMS/supports-db-type ?ev ?db-type)
+                                         (INSTANCE-OF ?db ?db-type)))
+                                  (relationRef NULL NULL NULL)
+                                  :dont-optimize? TRUE
+                                  :how-many :all
+                                  :inference-level :assertion))))
+    (foreach triple in patterns
+        do (let ((code (function-code-from-procedure (first triple))))
+             (when (defined? code)
+               (pushq evaluatorForms
+                      (cons-list code (second triple) (third triple))))))
+    (return (reverse evaluatorForms))))
+
+(defun (normalize-SQL-join-arguments CONS CONS) ((tableInfo RELATION-TABLE-INFO)
+                                                 (arguments OBJECT))
+  ;; Parse and normalize the `arguments' to an SQL-join and store the result
+  ;;    in `tableInfo'.  Computes the following values:
+  ;;    (1) a list of strings specifying output columns and adapts column names
+  ;;        of `tableInfo' accordingly.
+  ;;    (2) a list of strings (or pairs of strings) specifying the joined tables 
+  ;;           (or the tables + aliases); returned as the first result value.
+  ;;    (3) a list of list of strings specifying the joined column pairs;
+  ;;        returned as the second result value.
+  ;; If no output arguments are specified, try to derive them from `relation'.
+  ;; Signal an error in case any illegal syntax is encountered.
+  (when (defined? (adjunct tableInfo))
+    ;; we already normalized and cached the result in a previous call:
+    (return (first (cast (adjunct tableInfo) CONS))
+            (second (cast (adjunct tableInfo) CONS))))
+  (unless (string? arguments)
+    (signal-parsing-error "SQL-join: illegal pattern arguments: " arguments))
+  (let ((args (unstringify arguments))
+        (tables NIL)
+        (joinArgs NIL))
+    (typecase args
+      (CONS
+       (unless (and (>= (length args) 2)
+                    (<= (length args) 3)
+                    (forall arg in args
+                      always (cons? arg)))
+         (signal-parsing-error "SQL-join: illegal pattern arguments: "
+                               arguments))
+       (cond ((= (length args) 3)
+              ;; we have output arguments specified, update column names accordingly:
+              (foreach outArg in (cast (first args) CONS)
+                  as column in (column-list tableInfo)
+                  do (setf (column-name column) (coerce-to-string outArg))
+                     (insert-at (column-index tableInfo) (column-name column) column))
+              (setq args (rest args)))
+             (otherwise
+              ;; no output arguments specified, make sure we got them from the relation:
+              (foreach column in (column-list tableInfo)
+                  where (null? (column-name column))
+                  do (signal-parsing-error
+                      "SQL-join: missing output argument/column specifications for: "
+                      (relation (table-info column))))))
+       ;; collect tables and their aliases:
+       (foreach table in (cast (first args) CONS)
+		collect (choose (cons? table)
+				(bquote (& (coerce-to-string (first (cast table CONS)))
+					 & (coerce-to-string (second (cast table CONS)))))
+				(coerce-to-string table))
+		into tables)
+       ;; collect join arguments:
+       (foreach pair in (cast (second args) CONS)
+           do (unless (cons? pair)
+                (signal-parsing-error "SQL-join: illegal pattern arguments: "
+                                      arguments))
+              (setq pair
+                (cons-list (coerce-to-string (first (cast pair CONS)))
+                           (coerce-to-string (second (cast pair CONS)))))
+           collect pair into joinArgs))
+      (otherwise
+       (signal-parsing-error "SQL-join: illegal pattern arguments: "
+                             arguments)))
+    (setf (adjunct tableInfo) (cons-list tables joinArgs))
+    (return tables joinArgs)))
+
+#|
+;; Example SQL-join definitions:
+
+(DEFQUERY EDB-LinkWithArg1OfType (?arg1 ?arg2 ?linkType ?arg1Type)
+  :query-pattern
+  (RDBMS/SQL-JOIN edb
+    "((LINK.ENTITYID_ARG1 LINK.ENTITYID_ARG2
+       LINK.LINKTYPEID ENTITY.ENTITYTYPEID)   ;; output args (optional)
+      (LINK (ENTITY E))                       ;; joined tables, one with alias
+      ((LINK.ENTITYID_ARG1 E.ENTITYID)))"))   ;; joined columns
+
+;; if output args are ommitted, they need to be inferable from the relation
+;;    column specifications, for example:
+
+(DEFQUERY EDB-LinkWithArg2OfType
+    (LINK.ENTITYID_ARG1 LINK.ENTITYID_ARG2 LINK.LINKTYPEID ENTITY.ENTITYTYPEID)
+  :query-pattern
+  (RDBMS/SQL-JOIN edb
+    "((LINK ENTITY)                              ;; joined tables
+      ((LINK.ENTITYID_ARG2 ENTITY.ENTITYID)))")) ;; joined columns
+
+;; For example, given the definition of `EDB-LinkWithArg2OfType' the query
+;; `(EDB-LinkWithArg2OfType ?arg1 ?arg2 LT1021 ET1024)' will translate into the
+;; following join:
+
+   SELECT LINK.ENTITYID_ARG1, LINK.ENTITYID_ARG2,
+          LINK.LINKTYPEID, ENTITY.ENTITYTYPEID
+   FROM LINK, ENTITY
+   WHERE LINK.ENTITYID_ARG2=ENTITY.ENTITYID
+   AND LINK.LINKTYPEID="LT1021"
+   AND ENTITY.ENTITYTYPEID="ET1024"
+|#
+
+(defun (help-memoize-SQL-join (ITERATOR OF CONS)) ((proposition PROPOSITION)
+                                                   (database LOGIC-OBJECT)
+                                                   (arguments OBJECT))
+  ;; Helper function for `SQL-join' (which see).
+  (let ((relation (get-description (relationRef proposition)))
+        (tableInfo (get-relation-table-info relation))
+        (tables NIL)
+        (joinArgs (CONS OF CONS) NIL)
+	(sql (new STRING-OUTPUT-STREAM)))
+    (mv-setq (tables joinArgs)
+      (normalize-SQL-join-arguments tableInfo arguments))
+    (print-stream sql "SELECT DISTINCT ")
+    (foreach column in (column-list tableInfo)
+        as i in (interval 1 NULL)
+        do (when (> i 1)
+             (print-stream sql ", "))
+           (print-stream sql (column-name column)))
+    (print-stream sql " FROM ")
+    (foreach table in tables
+        as i in (interval 1 NULL)
+        do (when (> i 1)
+             (print-stream sql ", "))
+	(if (cons? table)
+            ;; table has an alias:
+	    (print-stream sql (unwrap-string (first (cast table CONS))) " "
+			  (unwrap-string (second (cast table CONS))))
+	  (print-stream sql (unwrap-string table))))
+    (print-stream sql " WHERE ")
+    (foreach pair in joinArgs
+        as i in (interval 1 NULL)
+        do (when (> i 1)
+             (print-stream sql " AND "))
+           (print-stream sql (unwrap-string (first pair)) "="
+                         (unwrap-string (second pair))))
+    (foreach arg in (arguments proposition)
+        as column in (column-list tableInfo)
+        do (setq arg (safe-argument-bound-to arg))
+           (when (defined? arg)
+             ;; we have an argument constraint:
+             (print-stream sql " AND ")
+             (print-argument-constraint sql arg column)))
+    (return
+      (allocate-result-set-iterator
+       (get-connection-from-database database) relation (the-string sql)))))
+
+(defun (SQL-join (ITERATOR OF CONS)) ((proposition PROPOSITION)
+                                      (database LOGIC-OBJECT)
+                                      (arguments OBJECT))
+  ;; Generic query evaluator that can execute simple joins on SQL databases.
+  ;; `SQL-join' expects an `arguments' string of the following format:
+  ;;    "([(<output-column>+)]
+  ;;      ({<joined-table> | ({<joined-table> <alias>)}+)
+  ;;      ({(<colX> <colY>)}+))"
+  ;; The list of <output-column>'s is optional and will be derived from
+  ;;    `proposition's relation if it was not supplied.
+  ;; The second mandatory argument is the list of joined tables.  Table aliases
+  ;;    can be supplied by specifying the table as a list of two names.
+  ;; The third argument is a list of column pairs that will be joined via `='.
+  ;; Any bound arguments of `proposition' will be translated into additional
+  ;;    column constraints (see SQL example above).
+  (check-for-external-db-updates proposition database)
+  (return
+    (clone-memoized-iterator
+     (memoize ((get-query-pattern-memoization-key proposition)
+               *context* *reversePolarity?*)
+              :timestamps (:META-KB-UPDATE :EXTERNAL-DB-UPDATE) :max-values 100
+              (new MEMOIZABLE-ITERATOR
+                   :base-iterator
+                   (help-memoize-SQL-join proposition database arguments))))))
+
+(defun collect-variable-binding ((name STRING)
+                                 (type OBJECT)
+                                 (binding OBJECT)
+                                 (bindings (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT)))
+  ;; Collect a non-NULL `binding' of variable `name' of `type' into `bindings'
+  ;;    (to be used by template instantiation routines).
+  ;; Appropriately handle collection-valued constraints.
+  (when (defined? binding)
+    (when (defined? type)
+      (setq type (get-description type)))
+    (cond ((collection-valued-constraint? binding)
+           (let ((args NIL))
+             (foreach elt in (collection-valued-constraint-elements binding)
+                 collect (coerce-powerloom-object-to-string elt type) into args)
+             (setq binding args)))
+          (otherwise
+           (setq binding
+             (coerce-powerloom-object-to-string binding type)))))
+  (insert-at bindings name binding))
+
+(defun (create-sql-QUERY-from-proposition STRING) ((proposition PROPOSITION)
+                                                   (database LOGIC-OBJECT)
+                                                   (arguments OBJECT))
+  ;; Helper function for `SQL-query' (which see).
+  ;; Produce an SQL select statement from a `proposition' defined via
+  ;; an `SQL-query' evaluator on `database' and `arguments'.
+  (ignore database)
+  (let ((relation (get-description (relationRef proposition)))
+        (template STRING arguments)
+        (bindings (new (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT)))
+        (sql STRING NULL))
+    (foreach var in (io-variable-names relation)
+        as arg in (arguments proposition)
+        as i in (interval 1 NULL)
+        do (collect-variable-binding (symbol-name var)
+                                     (pli/get-nth-domain relation i)
+                                     (safe-argument-bound-to arg)
+                                     bindings))
+    (setq sql (sdbc/instantiate-sql-cmd-template template bindings))
+    (setq sql (SQL-query-instantiate-constraints sql bindings))
+    (return sql)))
+
+(defun (help-memoize-SQL-query (ITERATOR OF CONS)) ((proposition PROPOSITION)
+                                                    (database LOGIC-OBJECT)
+                                                    (arguments OBJECT))
+  ;; Helper function for `SQL-query' (which see).
+  (return
+    (allocate-result-set-iterator
+     (get-connection-from-database database)
+     (get-description (relationRef proposition))
+     (create-sql-QUERY-from-proposition proposition database arguments))))
+
+(defun (SQL-query-instantiate-constraints STRING)
+    ((sql STRING) (bindings (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT)))
+  ;; Parse the SQL string `sql' and substitute variable `bindings' in
+  ;;    selection constraints according to a simplified/easier syntax
+  ;;    (compared to the more general #$ template syntax).
+  ;; The following constraint idioms are supported:
+  ;;    <ws><column>=<?var><ws>
+  ;;    <ws><column>='<?var>'
+  ;;    <ws><column>="<?var>"
+  ;;    <ws><column>=`<?var>`
+  ;;    <ws><column> {in|IN} <?var><ws>
+  ;;    <ws><column> {in|IN} '<?var>'
+  ;;    <ws><column> {in|IN} "<?var>"
+  ;;    <ws><column> {in|IN} `<?var>`
+  ;; Note that the syntax is very specific and restricted, for example,
+  ;;    there cannot be any whitespace between the `=' and its operands,
+  ;;    there needs to be exactly one space before and after `in' and
+  ;;    there needs to be <ws> (whitespace) before and after the constraint
+  ;;    to properly delimit it (or the beginning/end of the string); other
+  ;;    delimiters are not (yet) supported.  If any of these restrictions are
+  ;;    violated, the constraint will not be recognized and skipped.  This
+  ;;    can be used to intentionally prevent substitution where this would
+  ;;    interfere with other SQL syntax.
+  ;; If a variable value is NULL the whole expression including the column
+  ;;    name will be replaced by TRUE; therefore these constraints should
+  ;;    be somewhere in a WHERE clause where that makes sense.  Again, parsing
+  ;;    of the column name is very restricted and is simply looking for the
+  ;;    first whitespace character to the left of the `=' or ` IN ' as the
+  ;;    start of the column name.
+  ;; If the variable is surrounded by one of the supported quotes, the
+  ;;    substituted value(s) will be quoted and properly escaped if they contain
+  ;;    the quote character as part of the value.
+  ;; `IN' constraints substitute a list of values even if only one or an atomic
+  ;;    (non-collection) value was supplied.  `=' constraints are coerced into
+  ;;    `IN' constraints if they are bound to a collection/list of values.
+  ;;
+  ;; Example:
+  ;; (SQL-query-instantiate-constraints
+  ;;  "select col, col2, col3 from table
+  ;;   where col= '?foo' and col2=?bar and col3 IN `?fie`and col4 IN ?foo"
+  ;;  (dictionary @key-value-list
+  ;;              "?foo" "FO'O" "?bar" null "?fie" (cons-list "`1" "2" "3")))))
+  ;;  =>
+  ;;  "select col, col2, col3 from table
+  ;;          where col= '?foo' and TRUE and col3 IN (```1`,`2`,`3`)and col4 IN (FO'O)"
+  ;;
+  (let ((start 0)
+        (end (length sql))
+        (variable STRING NULL)
+        (value OBJECT NULL)
+        (varStart 0)
+        (varEnd 0)
+        (colStart 0)
+        (constraint :value)
+        (quotes "'`\"")
+        (quote CHARACTER NULL)
+        (result (CONS OF STRING-WRAPPER) NIL)
+        ;; use `1=1/0=1' as the default TRUE/FALSE conditions; unfortunately,
+        ;; `TRUE/FALSE' aren't supported by all database servers (such as Oracle):
+        (trueCondition "1=1")
+        (falseCondition "0=1"))
+    (loop
+      ;; find the next potential mention of a KIF variable:
+      (setq varStart (position sql #\? varEnd))
+      (when (null? varStart)
+        ;; we are done:
+        (cond ((empty? result)
+               (return sql)) ;; optimization
+              (otherwise
+               (pushq result (subsequence sql start NULL))
+               (break))))
+      
+      ;; find out which bound variable matches at the current ? position:
+      (setq variable NULL)
+      (foreach (var val) in bindings
+          where (starts-with? sql var varStart)
+          do (setq variable var)
+             (setq value val)
+             (setq varEnd (+ varStart (length variable)))
+             ;; check whether variable is properly terminated (very restrictive
+             ;; at the moment, might want to support other delimiters eventually):
+             (when (or (= varEnd end)
+                       (white-space-character? (nth sql varEnd))
+                       (member? quotes (nth sql varEnd)))
+               (break)))
+      (when (null? variable)
+        ;; nothing matched, find next ? position:
+        (setq varEnd (1+ varStart))
+        (continue))
+      
+      ;; check for a supported left-context for this match:
+      (setq quote NULL)
+      (cond ((eql? (nth sql (max (1- varStart) 0)) #\=)
+             ;; we have a "...<col>=?var..." constraint:
+             (setq colStart (- varStart 2))
+             (setq constraint :value))
+            ((and (eql? (nth sql (max (- varStart 2) 0)) #\=)
+                  (member? quotes (nth sql (1- varStart))))
+             ;; we have a "...<col>='?var'..." constraint:
+             (setq colStart (- varStart 3))
+             (setq constraint :value)
+             (setq quote (nth sql (1- varStart))))
+            ((or (starts-with? sql " IN " (max (- varStart 4) 0))
+                 (starts-with? sql " in " (max (- varStart 4) 0)))
+             ;; we have a "...<col> IN ?var..." constraint:
+             (setq colStart (- varStart 5))
+             (setq constraint :set))
+            ((and (or (starts-with? sql " IN " (max (- varStart 5) 0))
+                      (starts-with? sql " in " (max (- varStart 5) 0)))
+                  (member? quotes (nth sql (1- varStart))))
+             ;; we have a "...<col> IN '?var'..." constraint:
+             (setq colStart (- varStart 6))
+             (setq constraint :set)
+             (setq quote (nth sql (1- varStart))))
+            (otherwise
+             (setq constraint :none)
+             (continue)))
+
+      ;; dwim a :value constraint into :set if we are given a list of values:
+      (when (and (eql? constraint :value)
+                 (cons? value)
+                 (not (nil? value)))
+        (setq constraint :set)
+        (pushq result (subsequence sql start (1+ colStart)))
+        (pushq result " IN ")
+        (setq start (choose (defined? quote) (1- varStart) varStart)))
+      
+      ;; we have a match, now generate and substitute the value(s):
+      (cond ((or (null? value) (nil? value))
+             ;; need to find the start of the column name and replace
+             ;; the whole expression by TRUE (or FALSE for NIL):
+             (loop
+               (cond ((<= colStart 0)
+                      (setq colStart 0) ;; be paranoid
+                      (break))
+                     ((white-space-character? (nth sql colStart))
+                      (++ colStart)
+                      (break))
+                     (otherwise
+                      (-- colStart))))
+             (when (defined? quote) (++ varEnd))
+             (pushq result (subsequence sql start colStart))
+             (pushq result (choose (nil? value) falseCondition trueCondition)))
+            ((eql? constraint :set)
+             (when (defined? quote)
+               (-- varStart)
+               (++ varEnd))
+             (let ((set (new STRING-OUTPUT-STREAM)))
+               (print-stream set "(")
+               (foreach elt in (consify value)
+                   as i in (interval 1 NULL)
+                   do (print-stream set (choose (> i 1) "," ""))
+                      (if (defined? quote)
+                          (print-stream set quote (sdbc/sql-escape-string elt quote) quote)
+                        (print-stream set (unwrap-string elt))))
+               (print-stream set ")")
+               (pushq result (subsequence sql start varStart))
+               (pushq result (the-string set))))
+            (otherwise
+             (pushq result (subsequence sql start varStart))
+             (pushq result (choose (defined? quote)
+                                   (sdbc/sql-escape-string value quote)
+                                   value))))
+      (setq start varEnd)) ;; end loop
+    
+    ;; Now assemble the result from pieces:
+    (let ((res (new STRING-OUTPUT-STREAM)))
+      (foreach piece in (reverse result)
+          do (print-stream res (unwrap-string piece)))
+      (return (the-string res)))))
+
+#|
+;; Example SQL-QUERY that takes single and collection-valued arguments
+;; (see SQL templates in sdbc.ste for the full story on template syntax):
+
+(DEFQUERY EDB-phoneCalls
+    ((?seeds STRING) (?event STRING) (?caller STRING) (?callee STRING) (?context INTEGER))
+  :query-pattern
+  (RDBMS/SQL-QUERY edb
+    "SELECT DISTINCT '', UID, iteInitiator, iteRespondent, context
+     FROM TwoWayCommunicationEvent
+     WHERE #${UID='?event[TRUE]'}
+     AND ((#${iteInitiator='?seeds[0,TRUE]'}#${ OR iteInitiator='?seeds[1,:,]'})
+          OR (#${iteRespondent='?seeds[0,TRUE]'}#${ OR iteRespondent='?seeds[1,:,]'}))
+     AND #${context='?context'}"))
+
+;; Example expansions:
+
+(retrieve all (EDB-phoneCalls "In-6185" ?e ?i ?r ?c))
+=>
+"SELECT DISTINCT '', UID, iteInitiator, iteRespondent, context
+     FROM TwoWayCommunicationEvent
+     WHERE TRUE
+     AND ((iteInitiator='In-6185')
+          OR (iteRespondent='In-6185'))
+     AND TRUE"
+
+(retrieve all (EDB-phoneCalls (setof "In-6185" "In-2275") ?e ?i ?r ?c))
+=>
+"SELECT DISTINCT '', UID, iteInitiator, iteRespondent, context
+     FROM TwoWayCommunicationEvent
+     WHERE TRUE
+     AND ((iteInitiator='In-6185' OR iteInitiator='In-2275')
+          OR (iteRespondent='In-6185' OR iteRespondent='In-2275'))
+     AND TRUE"
+|#
+
+(defun (SQL-query (ITERATOR OF CONS)) ((proposition PROPOSITION)
+                                       (database LOGIC-OBJECT)
+                                       (arguments OBJECT))
+  ;; Generic SQL query evaluator.  Takes an SQL command template as defined by
+  ;;    `SDBC/instantiate-sql-cmd' and friends and substitutes any occurrences
+  ;;    of relation variables in the template with the corresponding variable
+  ;;    binding if it exists.  Single and collection valued input arguments
+  ;;    are allowed.  Template entries corresponding to unbound arguments will
+  ;;    be substituted by the respective default value (which is TRUE by default
+  ;;    but can be specified as part of the template variable range specification).
+  ;; See example above.
+  (check-for-external-db-updates proposition database)
+  (return
+    (clone-memoized-iterator
+     (memoize ((get-query-pattern-memoization-key proposition)
+               *context* *reversePolarity?*)
+              :timestamps (:META-KB-UPDATE :EXTERNAL-DB-UPDATE) :max-values 100
+              (new MEMOIZABLE-ITERATOR
+                   :base-iterator
+                   (help-memoize-SQL-query proposition database arguments))))))
+
+(defun (allocate-QUERY-specialist-iterator (ITERATOR OF CONS))
+    ((frame CONTROL-FRAME))
+  ;; Allocate an iterator for an `RDBMS/query-specialist' frame.
+  ;; If there are multiple appliable query patterns, the resulting iterator
+  ;;    will be a concatenation of each individual pattern evaluation iterator.
+  (when (null? (iterator frame))
+    (let ((iterator ITERATOR NULL)
+          (iterator2 ITERATOR NULL)
+          (proposition (proposition frame))
+          (relationRef (relationRef proposition)))
+      (foreach triple in (get-query-pattern-evaluators relationRef)
+          do (cond ((null? iterator)
+                    (setq iterator
+                      (funcall (cast (first triple) FUNCTION-CODE-WRAPPER)
+                               proposition (second triple) (third triple))))
+                   (otherwise
+                    (setq iterator2
+                      (funcall (cast (first triple) FUNCTION-CODE-WRAPPER)
+                            proposition (second triple) (third triple)))
+                    (when (defined? iterator2)
+                      (setq iterator (concatenate iterator iterator2))))))
+      (setf (iterator frame) iterator)))
+  (return (iterator frame)))
+
+(defun (QUERY-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Top-level specialist to dispatch generic query evaluation specialists
+  ;;    such as `SQL-join'.
+  ;; Evaluation specialists are expected to take the query proposiiton, the
+  ;;    database instance and an arguments string as input arguments and need
+  ;;    to return an iterator that generates a list of cons tuples whose
+  ;;    elements can be matched/bound against the arguments of `frame's
+  ;;    proposition.
+  (when (null? (iterator frame))
+    ;; first time through coming down?
+    (setf (iterator frame) (allocate-QUERY-specialist-iterator frame)))
+  (return (retrieve-next-db-query-solution frame lastMove)))
+
+
+  ;;
+;;;;;; Querying a database directly
+  ;;
+
+;;; All the support above was aimed at linking PowerLoom relations to
+;;; database tables or more general queries.  The following specialist
+;;; allows one to query a database directly via a query string and
+;;; use it to bind any free variables.  Some of the above machinery
+;;; could be reimplemented in terms of this mechanism.
+
+#|
+;;; Example query: note that we don't have to match on the collection
+;;; valued constraint - we couldn't, but do need to match on ?c:
+
+STELLA(50): (retrieve (?c ?n)
+             (and (= ?n (setof "region_origin_latitude"))
+                  (= ?c 75)
+                  (rdbms/query-database
+                   DF-SOURCES/|mcs-1|
+                   "select ' ', count(*) from mcs_file_string_attributes
+                    where Attribute_name='?N'"
+                   ?n ?c)
+                   ;; needed to type the variable:
+                   (integer ?c)))
+There is 1 solution so far:
+  #1: ?C=75, ?N=|SK|(SETOF "region_origin_latitude")
+STELLA(51):
+|#
+
+(defun (collect-query-database-specialist-bindings (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT))
+    ((frame CONTROL-FRAME) (firstArgIndex INTEGER))
+  ;; Collect any initial bindings in a query-database specialist
+  ;; `frame' starting with the `firstArgIndex' argument.  We only look
+  ;; at variables that are bound to a value but not constants on the
+  ;; assumptions that a constant can be taken care of directly in the
+  ;; query string.  Without this assumption, we would have to
+  ;; introduce positional variables such as ?1, ?2, etc. and
+  ;; substitute those in the query.
+  (let ((arguments (arguments (proposition frame)))
+        (bindings (new (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT))))
+    (foreach arg in arguments
+        as i in (interval 0 NULL)
+        where (and (>= i firstArgIndex)
+                   (variable? arg))
+        do (collect-variable-binding
+            (symbol-name (variable-name (cast arg PATTERN-VARIABLE)))
+            (logical-type arg)
+            (argument-bound-to arg)
+            bindings))
+    (return bindings)))
+
+(defun (bind-next-database-tuple-to-arguments KEYWORD) ((frame CONTROL-FRAME)
+                                                        (firstArgIndex INTEGER))
+  ;; Bind the next tuple in `frame's iterator (which needs to be a cons-list
+  ;; of strings) to the unbound arguments of `frame' (starting at `firstArgIndex')
+  ;; and return the appropriate success or failure keyword.
+  (let ((arguments (arguments (proposition frame)))
+        (nofOutputs (- (length arguments) firstArgIndex))
+        (iterator (ITERATOR OF SDBC/RDBMS-ROW) (iterator frame))
+        (patternRecord (current-pattern-record *queryIterator*))
+        (ubStackOffset (top-unbinding-stack-offset patternRecord))
+        (checkedUnboundOutputs? FALSE))
+    (while (next? iterator)
+      (when (forall output in (value iterator)
+                as i in (interval firstArgIndex (1- (length arguments)))
+                where (not (collection-valued-constraint?
+                            (argument-bound-to (nth arguments i))))
+                always (bind-argument-to-value?
+                        (nth arguments i)
+                        (coerce-string-to-powerloom-object
+                         (unwrap-string output) ;; gracefully handle NULL values
+                         ;; for now; we could compute types once and cache them:
+                         (get-description (logical-type (nth arguments i)))
+                         *module*
+                         FALSE)
+                        TRUE))
+        ;; TO DO: improve the guarding of this, since we redo this for every
+        ;; tuple upon call to `bind-next-database-tuple-to-arguments':
+        (when (and (not checkedUnboundOutputs?)
+                   (< (length (value iterator)) nofOutputs))
+          ;; it is ok to have fewer SQL output columns than output variables
+          ;; as long as all the remaining variables had initial bindings - this
+          ;; is useful if we instantiated a query pattern with some bindings:
+          (foreach i in (interval (+ (length (value iterator)) firstArgIndex)
+                                  (1- (length arguments)))
+              where (null? (argument-bound-to (nth arguments i)))
+              do (return :TERMINAL-FAILURE)))
+        (setq checkedUnboundOutputs? TRUE)
+        (return :CONTINUING-SUCCESS))
+      (unbind-variables-beginning-at patternRecord (1+ ubStackOffset)))
+    (return :TERMINAL-FAILURE)))
+
+(defun (query-SQL-database-specialist KEYWORD) ((frame CONTROL-FRAME)
+                                                (lastMove KEYWORD))
+  ;; Specialist to support the `query-SQL-database' relation.
+  (ignore lastMove)
+  (let ((arguments (arguments (proposition frame)))
+        (database (argument-bound-to (first arguments)))
+        (query (argument-bound-to (second arguments))))
+    (when (or (null? database)
+              (not (string? query))
+              (not (test-isa? database RDBMS/@SQL-Database)))
+      (return :TERMINAL-FAILURE))
+    (when (null? (iterator frame))
+      ;; first time around:
+      (let ((bindings (collect-query-database-specialist-bindings frame 2)))
+        (setq query (sdbc/instantiate-sql-cmd-template query bindings))
+        (setq query (SQL-query-instantiate-constraints query bindings))
+        (setf (iterator frame)
+          (sdbc/get-result-set (get-connection-from-database database) query))))
+    (return (bind-next-database-tuple-to-arguments frame 2))))
+
+(defun (query-database-specialist KEYWORD) ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to support the `query-database' relation.
+  (let ((proposition (proposition frame))
+        (arguments (arguments proposition))
+        (database (argument-bound-to (first arguments)))
+        (query (argument-bound-to (second arguments))))
+    (when (or (null? database)
+              (not (string? query)))
+      ;; We require `?database' and `?query' to be bound, even for non-SQL-DBs:
+      (return :TERMINAL-FAILURE))
+    (if (test-isa? database RDBMS/@SQL-Database)
+        (return (query-SQL-database-specialist frame lastMove))
+      ;; For other database types, we might have rules linking us to specialists:
+      (return :FAILURE))))
+
+
+  ;;
+;;;;;; Memoization/caching support
+  ;;
+
+(defun db-update-demon ((dbProposition PROPOSITION))
+  ;; Whenever one of the connection relations is updated, disconnect from
+  ;;    the physical database and clear out any caches.
+  (let ((db (first (arguments dbProposition))))
+    (disconnect-from-database db)
+    (bump-memoization-timestamp :EXTERNAL-DB-UPDATE)))
+
+(defun check-for-external-db-updates ((proposition PROPOSITION)
+                                      (database LOGIC-OBJECT))
+  ;; Check if there were any relevant updates to `database' that might
+  ;;    affect retrieval of bindings for `proposition', and if so,
+  ;;    bump appropriate timestamps.
+  ;; Dummy so far.
+  (ignore proposition database))
+
+(defun (get-query-pattern-memoization-key OBJECT) ((proposition PROPOSITION))
+  ;; Generate a memoization key for `proposition' that canonicalizes its
+  ;;    unbound arguments.
+  (let ((relationRef (relationRef proposition))
+        (ioVars (io-variables (get-description relationRef)))
+        (unboundVars (list))
+        (key (new STRING-OUTPUT-STREAM)))
+    (print-logical-form relationRef key)
+    (foreach arg in (arguments proposition)
+        do (print-stream key " ")
+           (cond
+            ((and (variable? arg)
+                  (null? (safe-argument-bound-to arg)))
+             ;; canonicalize variable names and handle multiple occurrences
+             ;;    of the same variable by saving them into `unboundVars':
+             (unless (member? unboundVars arg)
+               (insert-last unboundVars arg))
+             (print-logical-form (nth ioVars (position unboundVars arg 0)) key))
+            (otherwise
+             (print-logical-form (safe-argument-bound-to arg) key))))
+    (return (the-string key))))
+    
+
+  ;;
+;;;;;; Coercion
+  ;;
+
+(defun (coerce-values (CONS OF OBJECT)) ((values (CONS OF STRING-WRAPPER))
+					 (table RELATION-TABLE-INFO))
+  ;; Convert `values' according to the types and modules specified in `table'.
+  (let ((result NIL)
+        (module MODULE NULL)
+        (local? FALSE))
+    (foreach value in values
+        as column in (column-list table)
+        do (setq module (module column))
+           (setq local? (module-local? column))
+           (when (null? module)
+             (setq module (get-module-using-reference column values)))
+	collect (coerce-string-to-powerloom-object
+                 (unwrap-string value) ;; gracefully handle NULL values
+                 (column-type column)
+                 module
+                 local?)
+	into result)
+    (return result)))
+
+(defun (coerce-string-to-powerloom-object OBJECT) ((value STRING)
+                                                   (type NAMED-DESCRIPTION)
+						   (module MODULE)
+                                                   (local? BOOLEAN))
+  ;; Convert `value' from a string to an object of the type defined by `type'.
+  ;; Logic objects will be created in `module' and locally if `local?' is true.
+  ;; TODO: handle additional datatypes such as dates, etc. and make coercion extensible.
+  ;;    This could be done by either registering certain coercion functions by types
+  ;;    or by adding a :decoding-function keyword to column definitions.  By precomputing
+  ;;    coercion/decoding functions in table infos this would even be efficient.
+  (when (null? value)
+    (return NULL))
+  (let ((typeSurrogate (object-surrogate type))
+        (typeName (symbol-name typeSurrogate))
+	(result OBJECT NULL))
+    (cond ((eql? typeSurrogate @STRING)
+	   (setq result value))
+          ;; This is a little ugly... These cases are specific to the omega-schema ontology.
+	  ;; Maybe we should make this function a method or make it otherwise extensible?
+	  ((eql? typeName "KEYWORD")
+	   (setq result (intern-keyword value)))
+	  ((eql? typeName "SEXP")
+	   (setq result (unstringify value)))
+          ;; END OF UGLINESS
+          ((isa? (surrogate-value typeSurrogate) @NAMED-DESCRIPTION)
+           ;; If this is a named description, we create a logic instance
+           ;; and assert that it belongs to that named description.
+           (setq result
+                 (find-or-create-instance value type module local?))
+           (within-module module
+             (assert-isa-proposition result typeSurrogate)))
+	  ((subtype-of? typeSurrogate @BOOLEAN)
+	   (setq result (choose (eql? value "1") 
+				(surrogate-value @TRUE)
+				(surrogate-value @FALSE))))
+	  ((subtype-of? typeSurrogate @INTEGER)
+	   (setq result (number-string-to-integer value)))
+	  ((subtype-of? typeSurrogate @NUMBER)
+	   (setq result (string-to-float value)))
+	  ((subtype-of? typeSurrogate @THING)
+           (setq result (find-or-create-instance value type module local?)))
+	  (otherwise
+           (warn "RDBMS: Don't yet know how to coerce string \"" value "\" to type " typeName)))
+    (return result)))
+
+(defun (number-string-to-integer INTEGER) ((x STRING))
+  ;; KLUDGE: convert `x' into an INTEGER even if it is a string
+  ;;    representation of a float (generated by the buggy Linux
+  ;;    Oracle ODBC interface).
+  (exception-case
+      (return (string-to-integer x))
+    (NATIVE-EXCEPTION ()
+      (return (string-to-float x)))))
+
+(defun (coerce-powerloom-object-to-string STRING) ((object OBJECT)
+                                                   (type NAMED-DESCRIPTION))
+  ;; Coerce a PowerLoom `object' of `type' to a string representation that
+  ;;    can be used to constrain an SQL statement.
+  ;; Very simplistic for now:
+  (ignore type)
+  (special ((*printReadably?* TRUE))
+    (typecase object
+      (STRING (return (wrapper-value object)))
+      (LOGIC-OBJECT (return (symbol-name (surrogate-value-inverse object))))
+      (otherwise (return (stringify object))))))
+  
+
+  ;;
+;;;;;;; Utility functions
+  ;;
+
+(defun (find-or-create-instance OBJECT)
+    ((name STRING) (type NAMED-DESCRIPTION) (module MODULE) (local? BOOLEAN))
+  :documentation
+  "Find an existing instance with `name' in `module' or create one with `type'
+if it does not yet exist.  If `local?' do not look into any inherited modules."
+  :public? TRUE
+  (let ((instanceRef (lookup-surrogate-in-module name module local?))
+        (value (choose (defined? instanceRef) (surrogate-value instanceRef) NULL))
+        (typeRef SURROGATE NULL))
+    (cond ((defined? value)
+	   ;; TO DO: Should this always try to get the description?
+	   (if (stella-class? value)	; Need to get PowerLoom object for built-in class
+	       (return (class.get-description value))
+	       (return value)))
+          ((null? instanceRef)
+           (setq instanceRef (intern-surrogate-in-module name module local?))))
+    (setq typeRef (object-surrogate type))
+    (when (eql? typeRef @THING)
+      (setq typeRef NULL))
+    (within-module module
+      (return (create-logic-instance instanceRef typeRef)))))
+
+
+;;; Query examples:
+;;;
+;;; DB Startup from shell:
+;;; % mysql --user=scott --password=tiger --database=menagerie
+;;; select * from pet;
+;;;
+;;; (cc pl-user)
+;;;
+;;; 
+;;; STELLA>(defdb db1 :dsn "myodbc3" :connection-string "jdbc:mysql://localhost:3306/menagerie?user=scott&password=tiger" :host "blackcat.isi.edu" :user "scott" :password "tiger" :db-name "menagerie")
+;;; STELLA>(deftable pet db1 "pet" (name owner species sex (birth STRING) (death STRING)))
+
+;;; STELLA> (retrieve all (pet ?name ?owner ?species ?sex ?birth ?death))
+;;; There is 1 solution:
+;;;   #1: ?NAME=BOWSER, ?OWNER=DIANE, ?SPECIES=DOG, ?SEX=M, ?BIRTH="1998-08-31", ?DEATH="1995-07-29"
+;;; STELLA> (eval (call-retrieve-partial (bquote (all (pet ?name ?owner ?species ?sex ?birth ?death) :match-mode kojak/eeld))))
+;;; There are 8 solutions:
+;;;   #1: ?NAME=FLUFFY, ?OWNER=HAROLD, ?SPECIES=CAT, ?SEX=F, ?BIRTH="1993-02-04", ?DEATH=NULL 1.0
+;;;   #2: ?NAME=CLAWS, ?OWNER=GWEN, ?SPECIES=CAT, ?SEX=M, ?BIRTH="1994-03-17", ?DEATH=NULL 1.0
+;;;   #3: ?NAME=BUFFY, ?OWNER=HAROLD, ?SPECIES=DOG, ?SEX=F, ?BIRTH="1989-05-13", ?DEATH=NULL 1.0
+;;;   #4: ?NAME=FANG, ?OWNER=BENNY, ?SPECIES=DOG, ?SEX=M, ?BIRTH="1990-08-27", ?DEATH=NULL 1.0
+;;;   #5: ?NAME=BOWSER, ?OWNER=DIANE, ?SPECIES=DOG, ?SEX=M, ?BIRTH="1998-08-31", ?DEATH="1995-07-29" 1.0
+;;;   #6: ?NAME=CHIRPY, ?OWNER=GWEN, ?SPECIES=BIRD, ?SEX=F, ?BIRTH="1998-09-11", ?DEATH=NULL 1.0
+;;;   #7: ?NAME=WHISTLER, ?OWNER=GWEN, ?SPECIES=BIRD, ?SEX=NULL, ?BIRTH="0000-00-00", ?DEATH="1997-12-09" 1.0
+;;;   #8: ?NAME=SLIM, ?OWNER=BENNY, ?SPECIES=SNAKE, ?SEX=M, ?BIRTH="1996-04-29", ?DEATH=NULL 1.0
+;;; STELLA> (eval (call-retrieve-partial (bquote (all (pet ?name Gwen ?species ?sex ?birth ?death) :match-mode kojak/eeld))))
+;;; There are 3 solutions:
+;;;   #1: ?NAME=CLAWS, ?SPECIES=CAT, ?SEX=M, ?BIRTH="1994-03-17", ?DEATH=NULL 1.0
+;;;   #2: ?NAME=CHIRPY, ?SPECIES=BIRD, ?SEX=F, ?BIRTH="1998-09-11", ?DEATH=NULL 1.0
+;;;   #3: ?NAME=WHISTLER, ?SPECIES=BIRD, ?SEX=NULL, ?BIRTH="0000-00-00", ?DEATH="1997-12-09" 1.0
+
+  ;;
+;;;;;;; Assertion Handling
+  ;;
+
+;;; Plan for (R x y z)
+;;; Assumptions.  Right now assume that all columns are represented in the
+;;;               PowerLoom relation.  I don't see how we can really relax
+;;;               this unless the defaults work out, but it would seem to
+;;;               be difficult.  I think this will likely remain.
+;;; ASSERTIONS:
+;;;   R is a function
+;;;      Option a:  Use DB to do the work.  MYSQL specific??
+;;;         Table needs unique key of x,y
+;;;         INSERT INTO r-table VALUES (x, y, z) ON DUPLICATE KEY UPDATE Z=z
+;;;      Option b:  Check for values
+;;;         SELECT Z FROM r-table WHERE X=x AND Y=y
+;;;         Cases
+;;;             Z = z 
+;;;                 Do Nothing.
+;;;             Z = z'
+;;;                 UPDATE r-table SET Z=z WHERE X=x AND Y=y
+;;;             No value
+;;;                 INSERT INTO r-table VALUES (x, y, z)
+;;;       Option c:  Brute force.
+;;;          DELETE FROM r-table WHERE X=x AND Y=y
+;;;          INSERT INTO r-table VALUES (x, y, z)
+;;;   R is not a function
+;;;      Option a:  Check for values.
+;;;          unless SELECT TRUE WHERE X=x AND Y=y AND Z=z
+;;;          INSERT INTO r-table VALUES (x, y, z)
+;;;       Option b:  Brute force.
+;;;          DELETE FROM r-table WHERE X=x AND Y=y AND Z=z
+;;;          INSERT INTO r-table VALUES (x, y, z)
+;;; RETRACTIONS:
+;;;   DELETE FROM r-table WHERE X=x AND Y=y AND Z=z
+;;;
+
+
+(defun (create-sql-assertion-from-proposition STRING)
+    ((proposition PROPOSITION) (mode KEYWORD))
+  ;; Produce a SQL statement to update a proposition, either adding it
+  ;; if `assert?' is true or removing it if false.  For functions this
+  ;; will use all but the last value in the delete statement, which is
+  ;; the way that we implement value clipping without explicit retraction
+  ;; of the previous function value.
+  ;; TO DO: move some of the lower level functionality into sdbc.ste
+  ;;    similar to what we do for insertion via `sdbc/insert-row/s'.
+  (let ((relation-ref (get-proposition-base-operator proposition))
+	(relation (get-description relation-ref))
+	(isFunction? (function? relation-ref))
+        (table-info (get-relation-table-info relation))
+        (table-alias (table-alias table-info))
+	(skolem-term SKOLEM NULL)
+	(function-value OBJECT NULL)
+        (arguments VECTOR NULL)
+	(sql (new STRING-OUTPUT-STREAM))
+	(first? TRUE))
+    ;; temporarily disable table name aliasing, since update
+    ;; statements don't support them:
+    (setf (table-alias table-info) NULL)
+    (if isFunction?
+	(progn 
+	  (mv-setq (skolem-term function-value)
+		   (get-skolem-and-value-terms proposition))
+	  (let ((args (arguments (defining-proposition skolem-term)))
+		(args-length (length args)))
+	    (setq arguments (new ARGUMENTS-VECTOR 
+				 :array-size (choose (eq? mode :CLIP)
+						     (- args-length 1)
+						     args-length)))
+	    ;; Copy all but last original argument.
+	    (foreach i in (interval 0 (- args-length 2))
+		     do (setf (nth arguments i) (nth args i)))
+	    (unless (eq? mode :CLIP)
+	      (setf (nth arguments (- args-length 1)) function-value))))
+	(setq arguments (arguments proposition)))
+    (case mode
+      (:ASSERT
+       ;; Note: If there are some undefined or skolem arguments, then
+       ;;       the column list and the value list will be different lengths.
+       ;; Should this throw an error or is there a better way to handle it?
+       (print-stream sql "INSERT INTO " (table-name table-info))
+       (print-stream sql " (")
+       (print-sql-column-list sql table-info)
+       (print-stream sql ") VALUES (")
+       (foreach column in (column-list table-info)
+		as arg in arguments
+		do (cond ((or (null? arg) (skolem? arg))
+			  (error "Can't assert non-ground items to table from "
+				 proposition))
+			 (first?
+			  (setq first? false))
+			 (otherwise
+			  (print-stream sql ", ")))
+	            (print-sql-value sql arg column))
+       (print-stream sql ")"))
+      ((:RETRACT :CLIP)
+       (print-stream sql "DELETE FROM " (table-name table-info) " ")
+       (print-sql-constraint-list sql table-info arguments)))
+    ;; restore table name aliasing:
+    (setf (table-alias table-info) table-alias)
+    ;; invalidate query caches due to new or deleted values:
+    (bump-memoization-timestamp :EXTERNAL-DB-UPDATE)
+    (return (the-string sql))))
+
+(defun db-relation-goes-true ((proposition PROPOSITION))
+  ;; Run when a db-relation proposition "goes true".  Assert the
+  ;;    proposition in the DB.
+  ;; Currently does a brute-force approach of deleting and then
+  ;;    inserting into the DB.  This is conservative and insures
+  ;;    that there are no duplicate DB records.
+  (let ((base-relation (get-proposition-base-operator proposition))
+	(connection (get-connection-from-predicate base-relation)))
+    (if (and *clippingEnabled?*
+	     (function? (get-description base-relation)))
+	(sdbc/execute-sql connection (create-sql-assertion-from-proposition proposition :CLIP))
+	(sdbc/execute-sql connection (create-sql-assertion-from-proposition proposition :RETRACT)))
+    (sdbc/execute-sql connection (create-sql-assertion-from-proposition proposition :ASSERT))
+    ;; TO DO:  Remove from local storage.
+    ))
+
+(defun db-relation-goes-unknown ((proposition PROPOSITION))
+  ;; Run when a db-relation proposition "goes unknown".  Retract the
+  ;;    proposition in the DB.
+  (let ((connection (get-connection-from-predicate
+                     (get-proposition-base-operator proposition))))
+    (sdbc/execute-sql connection (create-sql-assertion-from-proposition proposition :RETRACT))
+    ;; TO DO:  Remove from local storage.  Is this needed?
+    ))
+
+(defun db-relation-goes-false ((proposition PROPOSITION))
+  ;; Run when a db-relation proposition "goes false".  This can't really
+  ;; be represented, so we sqawk and treat it as unknown.
+  ;; TO DO:  Can this be one outside the DB?
+  (warn "RDBMS: DB relations can't be made false.  Making " proposition " unknown instead.")
+  (db-relation-goes-unknown proposition)
+  ;; TO DO: Do we need to change the truth-value of `proposition' to UNKNOWN?
+  )
+
+(defun db-relation-update-demon ((proposition PROPOSITION) (update-mode KEYWORD))
+  (case update-mode
+    ((:ASSERT-TRUE :PRESUME-TRUE)
+     (db-relation-goes-true proposition)
+     (destroy-redundant-proposition proposition))
+    (:RETRACT-TRUE
+     (db-relation-goes-unknown proposition)
+     (destroy-redundant-proposition proposition))
+    (:RETRACT-FALSE
+     (warn "RDBMS: DB relations can't be false.")
+     (db-relation-goes-unknown proposition)
+     (destroy-redundant-proposition proposition))
+    ((:ASSERT-FALSE :PRESUME-FALSE)
+     (db-relation-goes-false proposition)
+     (destroy-redundant-proposition proposition))
+    (:CONCEIVE
+     NULL)))
+     
+

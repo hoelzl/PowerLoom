@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: backlinks.ste,v 1.40 2006/05/10 22:31:06 hans Exp
+;;; Version: backlinks.ste,v 1.43 2009/02/07 06:00:06 hans Exp
 
 ;;; Indexing that maps proposition arguments to dependent propositions
 
@@ -293,6 +293,35 @@ specialized indices.")
 ;;;;;; Logic Argument Wrappers
   ;;
 
+;;; TO DO:
+;;; - the wrapper tables should be replaced by a single KEY-VALUE-MAP to allow
+;;;   us to iterate over them
+;;; - once that is changed, we should add a cleanup function that is called
+;;;   from the clear-module-hook in order to eliminate wrappers that now don't
+;;;   have any dependent propositions anymore; alternatively, we could build
+;;;   this cleanup into `remove-dependent-proposition-link'
+;;; - as a trick we can do the lookup using the plain wrapper as a key (since it
+;;;   will have the same hash-code as the logic wrapper) and then insert the
+;;;   logic wrappers only (to avoid storing the plain wrapper also).
+;;; - eliminate the current scheme of mixed rewrapping/backlinking, since it is
+;;;   problematic for various reasons:
+;;;   - `index-ith-domain?' rewraps functions only and only for the first argument,
+;;;     it's not clear why we wouldn't want to handle relations also and why not
+;;;     for all argument positions
+;;;   - rewrapping only occurs if argument types are declared as literal types
+;;;     but not if they are untyped and the argument just happen to be literals
+;;;   - object-eql? for the various literal types such as STRING, INTEGER, etc.
+;;;     as defined in STELLA treats the wrapper types as final for speed which
+;;;     makes it fail when a plain wrapper is compared to a logic wrapper (but
+;;;     not the other way round); for any mixed rewrapping scheme this needs to
+;;;     be fixed
+;;;   - if we fix object-eql? for wrappers, the various rewrap kludges in
+;;;     find-similar-proposition and find-duplicate-complex-proposition can
+;;;     probably go away
+;;; + disable mixed rewrapping for now; the only way to get literal indexing then
+;;;   is to turn on `*backlink-all-proposition-arguments?*'.
+;;; - `*backlink-all-proposition-arguments?*' should become a setable feature
+
 (startup-time-progn
   (setq *wrapped-type-table*
         (concatenate
@@ -334,19 +363,24 @@ specialized indices.")
        (return argument)))
     (return wrapper) ))
 
+;;; We'd like to turn this on by default but not until cleanup of the
+;;; wrapper hash tables has been addressed:
+
 (defglobal *backlink-all-proposition-arguments?* BOOLEAN FALSE
   :documentation "If TRUE, wrap all literal proposition arguments
 so that they can all support backlink indices.")
 
-;; TO DO: INVENT SCHEME FOR DECLARING INDICES ON RELATION DOMAINS, AND
-;;    ADD IT IN HERE:
 (defun (index-ith-domain? BOOLEAN) ((description NAMED-DESCRIPTION) (i INTEGER))
   ;; Return TRUE if the ith domain of the relation 'description' is
   ;;    indexed.
   ;; If 'description' is a non-computed function with all literal arguments,
   ;;    then we backindex on the first argument.
+  ;; THIS IS PROBLEMATIC, SEE ABOVE.
+  ;; TO DO: INVENT SCHEME FOR DECLARING INDICES ON RELATION DOMAINS, AND
+  ;;    ADD IT IN HERE:
   (return
-   (and (function-description? description)
+   (and FALSE
+        (function-description? description) ;; eliminate this
         (not (computed-relation? description))
         (eql? i 0)
         (forall t in (but-last (io-variable-types description))
@@ -361,9 +395,10 @@ so that they can all support backlink indices.")
      (return FALSE))
     (otherwise
      (return
-      (or *backlink-all-proposition-arguments?*
-          (and (member? (quote (:PREDICATE :FUNCTION)) (kind proposition))
-               (index-ith-domain? (get-description (relationRef proposition)) i)))))) )
+       (and (not (isa? argument @BACKLINKS-MIXIN))  ;; already rewrapped?
+            (or *backlink-all-proposition-arguments?*
+                (and (member? (quote (:PREDICATE :FUNCTION)) (kind proposition))
+                     (index-ith-domain? (get-description (relationRef proposition)) i))))))))
 
 (defun rewrap-proposition-arguments ((self PROPOSITION))
   ;; Wrap those non-LOGIC-OBJECT arguments of 'self' that need
@@ -771,6 +806,9 @@ so that they can all support backlink indices.")
              (LOGIC-OBJECT
               (when (non-empty? (variable-value-inverse key))
                 (return key)))
+;;;;;; BUG: THIS DOES NOT WORK FOR BACKLINKED LITERALS WHICH MAKES QUERIES SUCH AS
+;;;;;;      (= (F ?X) 3) FAIL.  SINCE BACKLINK-MIXIN DOESN'T HAVE A VARIABLE-VALUE-
+;;;;;;      INVERSE LINK, WE WOULD HAVE TO LOOK AT EQUIVALENCE PROPS HERE:
              (otherwise NULL)))
     (return NULL)))
 
@@ -835,7 +873,8 @@ so that they can all support backlink indices.")
         (keys (rest arguments))
         (anchor (some key in keys
                     where (and (defined? key)
-                               (instance-has-backlinks? key)))))
+                               (instance-has-backlinks? key))))
+        (function-skolem SKOLEM NULL))
     (when (null? anchor)
       ;; we have a relation extension pattern:
       (let ((description (get-description relation)))
@@ -859,9 +898,22 @@ so that they can all support backlink indices.")
       (when (empty? sequence)
         (return NIL-NON-PAGING-INDEX))
       ;; this also selects matching :ISA propositions:
+      ;; For functions, we also handle backlinked equivalence propositions
+      ;;   by substituting the underlying defining proposition.
+      ;; TO DO: A MORE THOROUGH FIX IS NEEDED, SINCE ONCE WE'VE CROSSED
+      ;;    OVER TO HASHTABLES IN THE BACKLINKS INDEX, WE WON'T SEE THESE
+      ;;    EQUIVALENCE PROPOSITIONS ANYMORE.
       (foreach prop in sequence
-          where (equal? relation (operator prop)) ;; BUG!  FAILS FOR FUNCTION PROPOSITIONS BECAUSE THEY HAVE @EQUIVALENT AS THEIR OPERATOR RATHER THAN THE FUNCTION NAME!
-          do (when (null? allKeyValues)
+          do (unless (equal? relation (operator prop))
+               (cond ((eql? (kind prop) :EQUIVALENT)
+                      (setq function-skolem (get-skolem-and-value-terms prop))
+                      (when (defined? function-skolem)
+                        (setq prop (defining-proposition function-skolem)))
+                      (unless (equal? relation (operator prop))
+                        (continue)))
+                     (otherwise
+                      (continue))))
+             (when (null? allKeyValues)
                (setq allKeyValues NIL)
                (when (non-empty? (rest keys))
                  ;; we have at least one key besides the anchor or need to
@@ -1290,7 +1342,8 @@ isn't visible in the corresponding class extension.")
   ;; Side-effect: May create a new (primitive) class description.
   ;; Tricky: We avoid duplicates by calling 'update-description-extension'
   ;;    only upon first conception of the corresponding proposition.
-  (when (description-mode?)
+  (when (or (description-mode?)
+            (descriptive? self))
     (return))
   (case (kind self)
     ((:ISA :PREDICATE :FUNCTION)

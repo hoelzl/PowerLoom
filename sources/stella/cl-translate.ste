@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cl-translate.ste,v 1.146 2006/05/11 07:05:47 hans Exp
+;;; Version: cl-translate.ste,v 1.150 2009/08/18 16:53:09 tar Exp
 
 ;;; Stella parse tree to Common Lisp translator.
 
@@ -855,7 +855,9 @@
   (setf (value tree) (quote CL:PROGN))
   (setf (rest tree) (cl-translate-list-of-trees (rest tree)))
   (return
-   (bquote (CL:EVAL-WHEN (CL:LOAD CL:EVAL) & tree))) )
+   (bquote (CL:EVAL-WHEN (& (new VERBATIM-STRING-WRAPPER :wrapper-value ":LOAD-TOPLEVEL")
+			    & (new VERBATIM-STRING-WRAPPER :wrapper-value ":EXECUTE"))
+	     & tree))) )
 
 (defun  (cl-translate-unwind-protect-tree CONS) ((tree CONS))
   (setf (value tree) (quote CL:UNWIND-PROTECT))
@@ -900,6 +902,38 @@
              " is not of type " type ".")))
   (return value) )
 
+(defun (coerce-numeric-constant NUMBER-WRAPPER) ((constant NUMBER-WRAPPER)
+                                                 (type TYPE))
+  ;; Coerce the numeric `constant' to `type' at translation time.
+  ;; Ensures the creation of the correct wrapper class when coercing between
+  ;; integers and long integers, since that will affect how such constants
+  ;; are output in C++ and Java.
+  (typecase constant
+    (INTEGER-WRAPPER
+     (cond ((subtype-of? type @FLOAT)
+            (return (coerce-to-float constant)))
+           ((subtype-of? type @INTEGER)
+            (return constant))
+           ((subtype-of? type @LONG-INTEGER)
+            (return (wrap-long-integer (cast (wrapper-value constant) LONG-INTEGER))))))
+    (LONG-INTEGER-WRAPPER
+     (cond ((subtype-of? type @FLOAT)
+            (return (coerce-to-float constant)))
+           ((subtype-of? type @INTEGER)
+            ;; we simply assume it fits, the same as in C++ or Java:
+            (return (wrap-integer (cast (wrapper-value constant) INTEGER))))
+           ((subtype-of? type @LONG-INTEGER)
+            (return constant))))
+    (FLOAT-WRAPPER
+     (cond ((subtype-of? type @FLOAT)
+            (return constant))
+           ((subtype-of? type @INTEGER)
+            (return (wrap-integer (cast (wrapper-value constant) INTEGER))))
+           ((subtype-of? type @LONG-INTEGER)
+            (return (wrap-long-integer (cast (wrapper-value constant) LONG-INTEGER))))))
+    (otherwise NULL))
+  (return constant))
+
 (defun (cl-translate-cast-tree OBJECT) ((tree CONS))
   ;; Translate a cast expression.
   ;; Omit the cast if *safety* is less than 2.
@@ -908,19 +942,19 @@
     (setf (second tree) (cl-translate-a-tree expression))
     (setf (third tree) (cl-translate-a-tree type))
     ;; Convert integer to float and vice versa similar to C++:
-    (when (subtype-of? type @FLOAT)
-      (if (isa? expression @INTEGER-WRAPPER)
-	(return (cl-translate-atomic-tree  ;; Make sure floats print properly as doubles.
-		 (wrap-literal (cast (wrapper-value (cast expression INTEGER-WRAPPER))
-				     @FLOAT))))
-	(return (bquote (CL:float & (second tree)
-				  & (new VERBATIM-STRING-WRAPPER
-					 :wrapper-value "0.0d0"))))))
-    (when (subtype-of? type @INTEGER)
-      (if (isa? expression @FLOAT-WRAPPER)
-	(return (wrap-literal (cast (wrapper-value (cast expression FLOAT-WRAPPER))
-				    @INTEGER)))
-	(return (bquote (CL:truncate & (second tree))))))
+    (cond ((and (subtype-of? type @NUMBER)
+                (isa? expression @NUMBER-WRAPPER))
+           ;; we have a numeric constant:
+           (return
+             (cl-translate-atomic-tree ;; make sure floats print properly as doubles
+              (coerce-numeric-constant expression type))))
+          ((subtype-of? type @FLOAT)
+           (return (bquote (CL:float & (second tree)
+                                     & (new VERBATIM-STRING-WRAPPER
+                                            :wrapper-value "0.0d0")))))
+          ((or (subtype-of? type @INTEGER)
+               (subtype-of? type @LONG-INTEGER))
+           (return (bquote (CL:truncate & (second tree))))))
     (when (or (< *safety* 2)
               (eq? (first tree) (quote SAFE-CAST))
               (null? (safe-lookup-slot (type-to-class type) (quote primary-type))))
@@ -1038,7 +1072,10 @@
           (when (method-call-inlining-enabled?)
             ;; Inline NULL? and DEFINED?:
             (case owner
-              ((@OBJECT @SECOND-CLASS-OBJECT @NATIVE-VECTOR @STRING @CODE @FLOAT @ARRAY)
+              ((@OBJECT @SECOND-CLASS-OBJECT
+                @STRING @NATIVE-VECTOR @ARRAY
+                @INTEGER @LONG-INTEGER @FLOAT
+                @CODE)
 	       (if (eq? owner @ARRAY)
 		   ;; KLUDGE: Because we don't have the full type-spec available to figure
 		   ;; out the rank of the array at translation time, we have to call this
@@ -1049,9 +1086,12 @@
 				    & (cl-translate-a-tree (first arguments)))))
 		   (setq tree
 			 (bquote
-			  (CL:eq & (cl-translate-a-tree (first arguments))
-				 & (cl-translate-a-tree
-				    (type-to-walked-null-value-tree owner owner))))))
+			  (& (choose (subtype-of? owner @NUMBER)
+                                     (quote CL:=)
+                                     (quote CL:eq))
+                           & (cl-translate-a-tree (first arguments))
+                           & (cl-translate-a-tree
+                              (type-to-walked-null-value-tree owner owner))))))
                (case owner
                  (@FLOAT (setf (first tree) (quote CL:=)))
                  (otherwise NULL))
@@ -1586,7 +1626,7 @@
            (otherwise
 	    ;; cl-array-null
 	    ;; NOTE: Any change to this requires updates to the set
-	    ;;       of null values in cl-lib/cl-primal.ste as well
+	    ;;       of null values in cl-lib/cl-setup.lisp and primal.ste as well
             (let ((rank (array-type-rank type))
                   (dimensions NIL))
               (when (<= rank 5)           ; Limit of CL array NULL values!
@@ -1664,9 +1704,10 @@
                  (global-variable-type-spec global))))
     (if (defined? clType)
         (return
-          (bquote
-           (CL:type & clType
-                    & (cl-translate-global-symbol (variable-name global)))))
+          (cl-conditionalize-type-declaration-tree
+           (bquote
+            (CL:type & clType
+                     & (cl-translate-global-symbol (variable-name global))))))
 	(return NULL))))
 
 (defun (cl-yield-method-arglist-type-declarations CONS) ((method METHOD-SLOT))
@@ -1677,6 +1718,8 @@
         do (setq clType
              (lookup-cl-type-from-stella-type
               (compute-relative-type-spec tSpec (slot-owner method))))
+           (when (sub-type-spec-of? tSpec @ARGUMENT-LIST)
+             (pushq types (quote CL:&rest)))
            (if (defined? clType)
              (pushq types clType)
 	     (pushq types (quote CL:T))))
@@ -1711,14 +1754,15 @@
   (let ((clType (lookup-cl-type-from-stella-type (slot-base-type method))))
     (if (defined? clType)
         (return
-          (bquote
-           (CL:ftype
-	    (CL:FUNCTION
-	     & (cl-yield-method-arglist-type-declarations method)
-	     & (cl-yield-method-return-type-declaration method))
-	    & (cl-translate-global-symbol
-	       (yield-renamed-name-if-native
-		(slot-name method) :common-lisp :function)))))
+          (cl-conditionalize-type-declaration-tree
+           (bquote
+            (CL:ftype
+             (CL:FUNCTION
+              & (cl-yield-method-arglist-type-declarations method)
+              & (cl-yield-method-return-type-declaration method))
+             & (cl-translate-global-symbol
+                (yield-renamed-name-if-native
+                 (slot-name method) :common-lisp :function))))))
 	(return NULL))))
 
 (defun (cl-yield-declare-tree CONS) ((declarations (CONS OF CONS)) 
@@ -1754,8 +1798,49 @@
                  do (concatenate decl (rest (rest otherDecl)))
                     (substitute otherDeclarations NULL otherDecl)))
            (setq otherDeclarations (rest otherDeclarations)))
-    (return (bquote ((CL:declare && (remove declarations NULL))
+    (return (bquote (& (cl-conditionalize-type-declaration-tree
+                        (bquote (CL:declare && (remove declarations NULL))))
                      && typeChecks)))))
+
+(defun (cl-conditionalize-type-declaration-tree OBJECT) ((declaration OBJECT))
+  ;; Conditionalize the type `declaration' for Lisps where it might cause problems.
+  ;; Assumes `declaration' is fully translated so we can print it to a verbatim
+  ;; wrapper (otherwise, these would break when evaluated interactively in Lisp).
+  ;;
+  ;; This is of course a KLUDGE to get around the issue we continue to have in
+  ;; CMUCL and friends where the null value of a type does not match the type.
+  ;; Ideally, we'd have a universal NULL value as in Java or C++, almost as
+  ;; ideally, we could use CL:NIL and declare all types as (or <type> null).
+  ;; However, this would then not allow us anymore to distinguish a NULL from
+  ;; and empty cons in Lisp.  We could introduce a NULL-CONS just for that,
+  ;; however, that might get us into trouble when we downcast a NULL OBJECT to
+  ;; a cons, since we'd also have to change the value at this point, so, no
+  ;; good alternative at this point...
+  ;;
+  ;; Even without any type declarations in CMUCL, we might still get problems due
+  ;; to their aggressive type inference, e.g., if we have a method with a self
+  ;; parameter of type KV-CONS (as in KV-CONS.length) to which we later assign
+  ;; NULL (when we use self as a cursor to iterate over the list).  Since the
+  ;; self parameter can't be NULL, CMUCL thinks that a test such as (null? self)
+  ;; is actually always false and creates unreachable code.  Currently, we
+  ;; special-cased the STELLA code to deal with this issue.  Eventually, we might
+  ;; want to generate type declarations in CMUCL just for those cases to be safe
+  ;; and not provide any other types.  To make this more palatable, we should
+  ;; have special definition macros such as `stsys:defun', etc. that more or less
+  ;; mirror the STELLA definition syntax and generate the ugly Lisp declarations
+  ;; behind the scenes.  Until all that is in place, we use this kludge.
+  #|
+  (when (or (null? declaration)
+            (nil? declaration))
+    (return declaration))
+  (return
+    (new VERBATIM-STRING-WRAPPER
+         :wrapper-value
+         (concatenate "#-(OR CMU SBCL)" (stringify declaration))))
+  |#
+  ;; disabled for now, since we are "confident" that what we declare is correct:
+  (return declaration))
+
 
   ;;
 ;;;;;; CL-translation of translation units:
@@ -1823,6 +1908,20 @@
       (setf (rest oTree) (bquote (CL:&rest && (rest oTree)))))
     (return (reverse oTree))))
 
+(defun (cl-method-definition-operator SYMBOL) ((method METHOD-SLOT))
+  ;; Return the definition operator to be used for `method's native definition.
+  (cond ((method-function? method)
+         (return (quote CL:DEFUN)))
+        ((abstract? method)
+         (return (quote CL:DEFGENERIC)))
+        ((use-defconsmethod? method)
+         (return (quote %%DEFCONSMETHOD)))
+        ((or (eql? (slot-owner method) @INTEGER)
+             (eql? (slot-owner method) @LONG-INTEGER))
+         (return (quote %%DEFINTEGERMETHOD)))
+        (otherwise
+         (return (quote CL:DEFMETHOD)))))
+
 (defun (cl-translate-define-method-unit CONS) ((unit TRANSLATION-UNIT))
   ;; Translate a definition of a method, function, or operator into a
   ;;    Lisp parse tree definition.
@@ -1859,17 +1958,13 @@
     (if (and (not function?)
              (abstract? method))
       (setq oTree
-            (bquote (CL:DEFGENERIC
+            (bquote (& (cl-method-definition-operator method)
                       & (cl-translate-global-symbol
                          (yield-renamed-name-if-native
                           methodName :common-lisp :function))
                       & (cl-translate-method-parameters method))))
       (setq oTree
-            (bquote (& (choose function?
-                               (quote CL:DEFUN)
-                               (choose (use-defconsmethod? method)
-                                       (quote %%DEFCONSMETHOD)
-                                       (quote CL:DEFMETHOD)))
+            (bquote (& (cl-method-definition-operator method)
                        & (cl-translate-global-symbol
                           (yield-renamed-name-if-native
                            methodName :common-lisp :function))
@@ -1909,11 +2004,12 @@
   ;;   Common Lisp types.
   (let ((clType (lookup-cl-type-from-stella-type (slot-base-type slot))))
     (if (defined? clType) ;; (and (generate-cl-type-declarations?))
-      (return (bquote (:TYPE & clType
-			     :INITFORM & (cl-translate-a-tree
-					  (type-to-walked-null-value-tree
-					   (type-specifier slot)
-					   (slot-base-type slot))))))
+      (return (bquote (& (cl-conditionalize-type-declaration-tree :TYPE)
+                       & (cl-conditionalize-type-declaration-tree clType)
+                       :INITFORM & (cl-translate-a-tree
+                                    (type-to-walked-null-value-tree
+                                     (type-specifier slot)
+                                     (slot-base-type slot))))))
       (return NIL)) ))
 
 
@@ -2042,7 +2138,8 @@
 			    (type-to-walked-null-value-tree
 			     (type-specifier slot)
 			     (slot-base-type slot)))
-			 :TYPE & clType)))
+                         & (cl-conditionalize-type-declaration-tree :TYPE)
+                         & (cl-conditionalize-type-declaration-tree clType))))
       (return (bquote (& (cl-translate-local-symbol (slot-name slot))
 			 & (cl-translate-global-symbol (quote NULL)))))
       ) ))
@@ -2199,11 +2296,13 @@
         ;;(operator (quote CL:DEFPARAMETER))
         (operator (quote CL:DEFVAR))
         (oTree NIL))
+    #|
+    ;; TO DO: Enable this again after we finished debugging:
     (when (and (variable-constant? global)
                ;; (CL:constantp initialValueTree)
-               ;; TO DO: Enable this again after we finished debugging:
                FALSE)
       (setq operator (quote CL:DEFCONSTANT)))
+    |#
     (setq oTree
       (choose unboundSpecial?
               (bquote (CL:DEFVAR & name))

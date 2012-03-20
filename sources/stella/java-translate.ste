@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: java-translate.ste,v 1.70 2006/05/11 07:06:11 hans Exp
+;;; Version: java-translate.ste,v 1.72 2008/09/04 02:13:11 hans Exp
 
 ;;; Routines for translating Stella parse trees into Java trees.
 
@@ -1348,14 +1348,9 @@
   ;; `tree' has form (CAST <expression> <type>)
   (let ((expression (second tree))
         (type (type-spec-to-base-type (third tree))))
-    (when (and (subtype-of? type @FLOAT) (isa? expression @INTEGER-WRAPPER))
-      (return (java-translate-a-tree
-	       (wrap-literal (cast (wrapper-value (cast expression INTEGER-WRAPPER))
-				   @FLOAT)))))
-    (when (and (subtype-of? type @INTEGER) (isa? expression @FLOAT-WRAPPER))
-      (return (java-translate-a-tree
-	       (wrap-literal (cast (wrapper-value (cast expression FLOAT-WRAPPER))
-				   @INTEGER)))))
+    (when (and (subtype-of? type @NUMBER)
+               (isa? expression @NUMBER-WRAPPER))
+      (return (java-translate-a-tree (coerce-numeric-constant expression type))))
     (setf (first tree) (quote JAVA_CAST))
     (setf (second tree) (java-translate-a-tree (second tree)))
     (setf (third tree) (java-translate-type-spec (third tree)))
@@ -1672,6 +1667,7 @@
          (third tree))
         (dimensions (java-translate-list-of-trees (rest (rest (rest tree)))))
         (elementType (extract-parameter-type arrayType (quote ANY-VALUE))))
+    (ignore initialElement)
     (return
       (bquote
        (JAVA_MAKE_ARRAY
@@ -2662,40 +2658,15 @@
 (defun (java-translate-defined-or-null CONS) ((classType TYPE) (object OBJECT) (null? BOOLEAN))
   ;; Helping function for "java-translate-method-call".   
   ;; Handles DEFINED? or NULL? special case.
-  (let ((operator (choose null? "==" "!=")))
-    (cond 
-     ((subtype-of? classType @OBJECT)
-      (return (java-translate-operator-call 
-	       (bquote (& operator))
-	       (bquote (& object NULL))
-	       2)))
-     ((subtype-of? classType @INTEGER)
-      (return (java-translate-operator-call 
-	       (bquote (& operator))
-	       (bquote (& object NULL-INTEGER))
-	       2)))
-     ((subtype-of? classType @FLOAT)
-      (return (java-translate-operator-call 
-	       (bquote (& operator))
-	       (bquote (& object NULL-FLOAT))
-	       2)))
-     ((subtype-of? classType @SINGLE-FLOAT)
-      (return (java-translate-operator-call 
-	       (bquote (& operator))
-	       (bquote (& object NULL-SINGLE-FLOAT))
-	       2)))
-     ((subtype-of? classType @CHARACTER)
-      (return (java-translate-operator-call 
-	       (bquote (& operator))
-	       (bquote (& object NULL-CHARACTER))
-	       2)))
-     (otherwise 
-      ;; Assume general pointer type
-      (return (java-translate-operator-call 
-	       (bquote (& operator))
-	       (bquote (& object NULL))
-	       2))))
-  ))
+  (let ((operator (choose null? "==" "!="))
+        (nullValue
+         (choose (subtype-of? classType @LITERAL)
+                 (type-to-walked-null-value-tree classType classType)
+                 (quote NULL))))
+    (return (java-translate-operator-call 
+             (bquote (& operator))
+             (bquote (& object & nullValue))
+             2))))
 
 (defun (java-translate-method-call CONS) ((tree CONS))
   ;; Translate a method call to appropriate Java syntax

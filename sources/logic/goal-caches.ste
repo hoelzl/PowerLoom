@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: goal-caches.ste,v 1.15 2006/05/11 07:05:12 hans Exp
+;;; Version: goal-caches.ste,v 1.17 2008/06/11 23:50:11 hans Exp
 
 ;;; Caching of backchaining goals.
 
@@ -102,10 +102,35 @@ and set of input bindings."
 (defun (yield-goal-bindings GOAL-BINDINGS) ((goal PROPOSITION))
   ;; Return a cons list representing the current bindings of the arguments
   ;;    of 'goal'.
+  ;; TO DO: make this handle external variables of descriptions (see below).
   (let ((result NIL))
     (foreach arg in (arguments goal)
              collect (argument-bound-to arg) into result)
     (return result) ))
+
+#|
+;;; Alternative that also takes external bindings of description arguments
+;;; into account, but we'd have to update various testing and matching
+;;; machinery that currently expects one binding per goal argument.
+
+(defun (yield-goal-bindings GOAL-BINDINGS) ((goal PROPOSITION))
+  ;; Return a cons list representing the current bindings of the arguments
+  ;;    of 'goal'.
+  (let ((value OBJECT NULL)
+        (result NIL))
+    (foreach arg in (arguments goal)
+        do (setq value (argument-bound-to arg))
+           (pushq result value)
+           (typecase value
+             (NAMED-DESCRIPTION NULL)
+             (DESCRIPTION
+              (let ((extVars (external-variables value)))
+                (when (defined? extVars)
+                  (foreach var in extVars
+                      do (pushq result (argument-bound-to var))))))
+             (otherwise NULL)))
+    (return (reverse result))))
+|#
 
 (defun (find-goal-cache-table GOAL-CACHE-TABLE) ((goal PROPOSITION))
   ;; Return a goal cache table for the class or slot associated with 'goal',
@@ -456,8 +481,9 @@ and possibly open `proposition' relative to a set of variable `bindings'."
     ;;    TO MAKE CACHED RESULTS AVAILABLE IN HYPOTHETICAL SUBCONTEXTS.
     (setq code (hash-code *context*))
     (when (reverse-polarity? frame)
-      ;; 48312004 = (hash-string "REVERSE-POLARITY" 0):
-      (setq code (logxor (rotate-hash-code code) 48312004)))
+      ;; 48312004 = (hash-string "REVERSE-POLARITY" 0), drop leading "4"
+      ;; to make this fit in 24 bits for some lisp systems:
+      (setq code (logxor (rotate-hash-code code) 8312004)))
     (setq code (logxor (rotate-hash-code code) (safe-hash-code operator)))
     ;; Use `goal-bindings' so we don't have to recompute `argument-bound-to'
     ;;    to dereference surrogates and the-like:
@@ -708,6 +734,14 @@ for some named description")
   (ignore keepFrame?)
   (when (eql? (state frame) :ATOMIC-GOAL)
     (when (null? (goal-bindings frame)) (return))
+    (foreach binding in (goal-bindings frame)
+        where (defined? binding)
+        do (typecase binding
+             (DESCRIPTION
+              (when (defined? (external-variables binding))
+                ;; can't handle these yet, see `yield-goal-bindings'
+                (return)))
+             (otherwise NULL)))
     (when success?
       ;; Make sure we do this all the time regardless of `clockTicks':
       (setf (dont-cache-goal-failure? frame) TRUE))

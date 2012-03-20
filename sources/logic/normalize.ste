@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: normalize.ste,v 1.42 2006/05/11 07:05:24 hans Exp
+;;; Version: normalize.ste,v 1.45 2009/06/12 00:53:54 tar Exp
 
 ;;; Normalization of propositions
 
@@ -524,6 +524,11 @@
     (cond
      ((defined? surrogate)
       (setq description (evaluate-predicate surrogate (nth holdsArguments 1)))
+      (when (null? description)
+	;; This can happen if we get a HOLDS proposition with a first argument that
+	;;     isn't really a description.  This should normally only happen if the
+	;;     argument to the HOLDS has not been properly defined.
+	(signal-proposition-error "Relation argument " (symbol-name surrogate) " in HOLDS proposition is not defined as a relation: " self))
       (cond ((class? description)
              (setf (kind self) :ISA))
             ((function? description)
@@ -752,53 +757,38 @@
     ((:IMPLIES :FAIL :COLLECT-INTO :CONSTANT)
      NULL)) )
 
-(defun normalize-top-level-proposition ((self PROPOSITION)
-                                        (ioVariables VARIABLES-VECTOR))
+(defun normalize-top-level-proposition ((self PROPOSITION))
   ;; Normalize a top-level proposition `self'.
-  ;; If `ioVariables' are given, it is assumed that they are from the
-  ;;    description that has `self' as its proposition.
+  ;; Performs additional normalization and optimization for
+  ;;   top-level forall propositions.
   (normalize-proposition self)
-  (when (or (eql? (kind self) :FORALL)
-            (defined? ioVariables))
-    (normalize-top-level-descriptive-proposition self ioVariables)))
+  (when (eql? (kind self) :FORALL)
+    (let ((ioVars (io-variables self))
+          (args (arguments self)))
+      (normalize-descriptive-proposition (first args) ioVars :TAIL)
+      (normalize-descriptive-proposition (second args) ioVars :HEAD))))
 
-(defun normalize-top-level-descriptive-proposition ((self PROPOSITION)
-                                                    (ioVariables VARIABLES-VECTOR))
-  ;; Normalize top-level descriptive propositions from a description (if
-  ;;   `ioVariables' is non-NULL) or a FORALL rule.
+(defun normalize-descriptive-proposition ((self PROPOSITION)
+                                          (ioVariables VARIABLES-VECTOR)
+                                          (kind KEYWORD))
+  ;; Normalize a descriptive propositions from a description or a FORALL rule.
   ;; Evaluates top-level equivalences, collapes resulting variable value chains
   ;;   and simplifies and re/normalizes the result if necessary.
-  ;; This used to be done after propositions were fastened down, however, since
-  ;;   it causes further structural changes it messes up the new duplicate
-  ;;   detection mechanism; so, now we do this as part of normalization so that
-  ;;   all structural changes are performed before we look for a duplicate.
-  ;;   This means that any evaluations done by `equate-top-level-equivalences'
-  ;;   that depend on backlinks will fail - however, this doesn't seem to hurt us.
-  (cond ((and (null? ioVariables)
-              (eql? (kind self) :FORALL))
-         (special ((*evaluationMode* :DESCRIPTION))
-           (let ((proposition PROPOSITION NULL))
-             (setq ioVariables (io-variables self))
-             (foreach i in (interval 0 1)
-                 do (setq proposition (nth (arguments self) i))
-                    (exception-case
-                        (equate-top-level-equivalences proposition)
-                      (CLASH (e)
-                        (print-stream STANDARD-ERROR (exception-message e) EOL)))
-                    (tighten-argument-bindings proposition ioVariables)
-                    (simplify-proposition proposition))))
-         ;; THIS IS STILL POTENTIALLY TOO RADICAL BUT SEEMS TO WORK SO FAR:
-         (collapse-value-of-chains-for-io-variables ioVariables))
-        ((defined? ioVariables)
-         ;; we have a top-level description proposition:
-         (special ((*evaluationMode* :DESCRIPTION))
-           (exception-case
-               (equate-top-level-equivalences self)
-             (CLASH (e)
-               (print-stream STANDARD-ERROR (exception-message e) EOL)))
-           (tighten-argument-bindings self ioVariables)
-           (simplify-proposition self)
-           (collapse-value-of-chains-for-io-variables ioVariables)))))
+  ;; The collapsing of equivalences is controlled by `kind', which has to be
+  ;;   one of :TOP-LEVEL, :TAIL or :HEAD.  For top-level propositions and rule
+  ;;   antecedents (tails) all equivalences are collapsed; for heads, only those
+  ;;   between internal exist variables are collapsed, since, otherwise, equating
+  ;;   of objects in forward chaining rule consequents will fail (we'd eliminate
+  ;;   the necessary equivalence propositions (e.g., we'd get (= ?x ?x) instead
+  ;;   of (= ?x ?y)).
+  (special ((*evaluationMode* :DESCRIPTION))
+    (exception-case
+        (equate-top-level-equivalences self ioVariables kind)
+      (CLASH (e)
+        (print-stream STANDARD-ERROR (exception-message e) EOL)))
+    (tighten-argument-bindings self ioVariables)
+    (simplify-proposition self)
+    (collapse-value-of-chains-for-io-variables ioVariables)))
 
 
   ;;

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: specialists.ste,v 1.71 2006/05/11 07:05:37 hans Exp
+;;; Version: specialists.ste,v 1.88 2009/08/21 20:23:03 tar Exp
 
 ;;; Specialists that perform procedural computations to evaluate
 ;;;    relational queries.
@@ -301,48 +301,152 @@ keyword indicating success or failure of a proof."
       (setq p1 (string-search super sub (+ p1 1))))
     (return count)))
 
+(defun (compute-relation-value OBJECT) ((proposition PROPOSITION)
+                                        (code FUNCTION-CODE)
+                                        (error? BOOLEAN))
+  ;; Helper function to compute values of computed functions and relations.
+  ;; Checks if all arguments of `proposition' are bound (to non skolems), and,
+  ;;    if so, apply `code' to them to compute a value which will be returned.
+  ;; If `code' is null, try to look it up via `lookup-computation'.
+  ;; Failure to compute a value is indicated by a NULL result.
+  ;; If `error?' is true, raise an error if there is an argument type mismatch,
+  ;;    otherwise, fail silently.
+  ;; This function can be called in both backward and forward chaining contexts
+  ;;    as well as for descriptive propositions.
+  ;; Note that it makes the following unchecked assumptions:
+  ;; - there is computation code associated with the relation of `proposition'
+  ;; - we are not violating any argument number constraints (they are checked
+  ;;   during proposition construction)
+  ;; - relations do return a boolean wrapper as their computed value
+  (let ((arguments (arguments proposition))
+        (description (get-description (relationRef proposition)))
+        (function? (function-description? description))
+        (computationCode (first-defined code (lookup-computation description)))
+        (argTypes (the-cons-list (io-variable-types description)))
+        (argTypesIter ITERATOR NULL)
+        (argType TYPE NULL)
+        (value OBJECT NULL)
+        (boundArguments NIL)
+        (variableArity? (variable-arity? description)))
+    (when variableArity?
+      ;; only pay the cost of iterator allocation for variable arity relations:
+      (setq argTypesIter
+        (choose function?
+                (all-domain-types description)
+                (all-argument-types description))))
+    (foreach arg in arguments
+        as i in (interval (choose function? 2 1) (length arguments))
+        do (ignore i)
+           (if (defined? argTypesIter)
+               ;; note that the iterator exhausts after the first vararg:
+               (setq argType (first-defined (pop argTypesIter) argType))
+             (setq argType (popq argTypes)))
+           (setq value (safe-argument-bound-to arg))
+           (when (or (null? value)
+                     (and (skolem? value)
+                          ;; we allow SETOF terms, since those represent themselves;
+                          ;; maybe generally allow function outputs of total functions?
+                          (not (logical-collection? value))))
+             ;; unbound input argument, fail:
+             (return NULL))
+           (when (not (check-strict-type? value argType TRUE))
+             (if error?
+                 (signal-proposition-error "compute-relation-value: incorrect argument type for "
+                                           value " in " proposition "; should be " argType)
+               (return NULL)))
+        collect value into boundArguments)
+    (when variableArity?
+      (if-output-language :java
+          ;; KLUDGE to handle variable args in Java passed as lists:
+          (let ((nFixed (- (length argTypes) (choose function? 2 1))))
+            ;; e.g., nFixed=2 then (1 2 3 4) => (1 2 (3 4))
+            (setf (nth-rest boundArguments nFixed)
+              (cons (nth-rest boundArguments nFixed) NIL)))
+          NULL))
+    (setq value (apply computationCode boundArguments))
+    (return value)))
+
 (defun (/PL-KERNEL-KB/computation-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; Specialist that applies computations.
   ;; Check if all arguments are bound (to non skolems), and if so, apply
   ;;    a computation to evaluate the function or predicate.
   (let ((proposition (proposition frame))
-        (arguments (arguments proposition))
-        (description (get-description (relationRef proposition)))
-        (computationCode (lookup-computation description))
-        (value OBJECT NULL)
-        (boundArguments NIL)
-        (success? BOOLEAN NULL))
-    (ignore lastMove)
-    (cond
-     ((function-description? description)
-      (foreach arg in arguments
-        as domain in (all-domain-types description)
-        do (setq value (argument-bound-to arg))
-           (when (or (null? value)
-                     (skolem? value)
-                     (not (check-strict-type? arg domain TRUE)))
-               (return :FAILURE))
-          collect value into boundArguments)
-      (setq value (apply computationCode boundArguments))
-      (when (null? value)
-        (return :FAILURE))
-      (let ((lastArg (last-argument proposition)))
+        (value (compute-relation-value proposition NULL FALSE))
+        (success? BOOLEAN-WRAPPER NULL))
+    (when (null? value)
+      (return :FAILURE))
+    (if (function-description? (get-description (relationRef proposition)))
         (setq success?
-              (choose (isa? lastArg @PATTERN-VARIABLE)
-                      (bind-variable-to-value? lastArg value TRUE)
-                      (eql? (value-of lastArg) value)))))
-     (otherwise
-      (foreach arg in arguments
-        as domain in (all-argument-types description)
-        do (setq value (argument-bound-to arg))
-        (when (or (null? value)
-                  (skolem? value)
-                  (not (check-strict-type? arg domain TRUE)))
-          (return :FAILURE))
+          (bind-argument-to-value? (last-argument proposition) value TRUE))
+      (setq success? value))
+    (return (select-test-result success? TRUE frame))))
+
+(defun (compute-simple-relation-constraint OBJECT INTEGER) ((proposition PROPOSITION)
+                                                            (code FUNCTION-CODE)
+                                                            (error? BOOLEAN))
+  ;; Helper function to compute values of simple computed constraint functions
+  ;;    and relations.  We call them simple constraints, since they can handle
+  ;;    at most one unbound argument at any position.  In the future, we might
+  ;;    support constraints that can handle arbitrary binding patterns.
+  ;; Check if all or all but one arguments of `proposition' are bound (to
+  ;;    non-skolems), and, if so, apply `code' to them to compute a value for
+  ;;    the missing binding which will be returned.  As a second value, the
+  ;;    position of the missing value will be returned.  If all arguments are
+  ;;    bound, the returned value will be true or false and the position -1.
+  ;; If `code' is null, try to look it up via `lookup-constraint'.
+  ;; Failure to compute a value is indicated by a NULL result.
+  ;; If `error?' is true, raise an error if there is an argument type mismatch,
+  ;;    otherwise, fail silently.
+  ;; This function can be called in both backward and forward chaining contexts
+  ;;    as well as for descriptive propositions.
+  ;; Note that this makes the following unchecked assumptions:
+  ;; - there is computation code associated with the relation of `proposition'
+  ;; - we are not violating any argument number constraints (they are checked
+  ;;   during proposition construction)
+  ;; - relations do return a boolean wrapper as their computed value
+  (let ((arguments (arguments proposition))
+        (description (get-description (relationRef proposition)))
+        (constraintCode (first-defined code (lookup-constraint description)))
+        (argTypes (the-cons-list (io-variable-types description)))
+        (argTypesIter ITERATOR NULL)
+        (argType TYPE NULL)
+        (value OBJECT NULL)
+	(nullCount 0)
+        (variableIndex -1)
+        (boundArguments NIL))
+    (when (variable-arity? description)
+      ;; only pay the cost of iterator allocation for variable arity relations
+      ;; (which seems a pretty unlikely scenario for computed constraints):
+      (setq argTypesIter (all-argument-types description)))
+    (foreach arg in arguments
+        as i in (interval 0 NULL)
+        do (if (defined? argTypesIter)
+               ;; note that the iterator exhausts after the first vararg:
+               (setq argType (first-defined (pop argTypesIter) argType))
+             (setq argType (popq argTypes)))
+           (setq value (safe-argument-bound-to arg))
+           (cond ((or (null? value)
+                      (skolem? value))
+                  ;; if we have a skolem value, we must be in forward/evaluation
+                  ;; mode, since, otherwise, `argument-bound-to' had returned NULL:
+                  (setq value NULL)
+                  (++ nullCount)
+                  (setq variableIndex i))
+                 ((not (check-strict-type? value argType TRUE))
+                  (if error?
+                      (signal-proposition-error "compute-relation-value: incorrect argument type for "
+                                                value " in " proposition "; should be " argType)
+                    (return NULL -1))))
         collect value into boundArguments)
-      (setq success? (apply computationCode boundArguments))))
-    (return (select-test-result success? TRUE frame)) ))
+    (case nullCount
+      (0 (setq value (apply constraintCode (cons variableIndex boundArguments))))
+      (1 (when *reversePolarity?*
+           (return NULL -1))
+         (setq value (apply constraintCode (cons variableIndex boundArguments))))
+      (otherwise ;; too many unbound arguments, fail
+       (return NULL -1)))
+    (return value variableIndex)))
 
 (defun (/PL-KERNEL-KB/constraint-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
@@ -351,41 +455,17 @@ keyword indicating success or failure of a proof."
   ;;   if it holds.
   ;; If all but one argument is bound, and the unbound argument is
   ;;   a pattern variable, then the missing value is computed.
-  (let ((proposition (proposition frame))
-        (description (get-description (relationRef proposition)))
-        (computationCode (lookup-constraint description))
-	(value OBJECT NULL)
-	(nullCount 0)
-        (variableIndex -1)
-        (argumentValues NIL))
-    (ignore lastMove)
-    (foreach arg in (arguments proposition)
-      as domain in (all-argument-types description)
-      as i in (interval 0 NULL)
-      do (setq value (argument-bound-to arg))
-      (cond ((and (null? value)
-                  (isa? arg @PATTERN-VARIABLE))
-             (++ nullCount)
-             (setq variableIndex i))
-            ;; Can't do anything with a SKOLEM here.
-            ((and (defined? value)
-                  (isa? value @SKOLEM))
-             (return :FAILURE))
-            ((not (check-strict-type? value domain TRUE))
-             (return :FAILURE)))
-      collect value into argumentValues)
-    (case nullCount
-      (0 (setq value (apply computationCode (cons variableIndex argumentValues)))
-	 (return (select-test-result (unwrap-boolean value) TRUE frame)))
-      (1 (when *reversePolarity?* (return :FAILURE))
-       (setq value (apply computationCode (cons variableIndex argumentValues)))
-       (when (null? value)  ;; Not enough information for constraint
-         (return :FAILURE))
-       (return (select-test-result 
-                (bind-variable-to-value?
-                 (nth (arguments proposition) variableIndex) value TRUE) TRUE frame)))
+  (ignore lastMove)
+  (mv-bind (value variableIndex)
+      (compute-simple-relation-constraint (proposition frame) NULL FALSE)
+    (when (null? value)
+      (return :FAILURE))
+    (case variableIndex
+      (-1 (return (select-test-result (unwrap-boolean value) TRUE frame)))
       (otherwise
-       (return :FAILURE))) ))
+       (return (select-test-result 
+                (bind-argument-to-value?
+                 (nth (arguments (proposition frame)) variableIndex) value TRUE) TRUE frame))))))
 
 (defun (/PL-KERNEL-KB/square-root-specialist KEYWORD)
     ((frame CONTROL-FRAME) (lastMove KEYWORD))
@@ -809,6 +889,7 @@ keyword indicating success or failure of a proof."
             (backlinkedArg OBJECT NULL)
             (backlinkedArgPosition -1)
             (noMatches? FALSE))
+        (ignore noMatches?)
         ;; ISSUE: should we do what INSTANCE-OF does for types by including
         ;;    subsuming concepts and relations?
         (when (null? iterator)
@@ -907,11 +988,15 @@ keyword indicating success or failure of a proof."
   ;; Evaluate the first argument.  If true, return the result of
   ;;    evaluating the second argument.  Otherwise, return the result
   ;;    of evaluating the third argument.
+  ;; TO DO: consider overlaying the condition frame with the
+  ;;    THEN or ELSE goal.
   (case lastMove
     (:DOWN (return :MOVE-DOWN))
     (:UP-TRUE
      (when (> (argument-cursor frame) 0)
-       (return :CONTINUING-SUCCESS))
+       (if (defined? (down frame))
+           (return :CONTINUING-SUCCESS)
+         (return :FINAL-SUCCESS)))
      ;; must be that the (first) test argument succeeded:
      (setf (down frame) NULL)
      (setf (argument-cursor frame) 1)
@@ -923,6 +1008,7 @@ keyword indicating success or failure of a proof."
      (setf (down frame) NULL)
      (setf (argument-cursor frame) 2)
      (return :MOVE-DOWN))) )
+
 
   ;;
 ;;;;;; EXPERIMENTAL 'query' specialist
@@ -1070,10 +1156,11 @@ keyword indicating success or failure of a proof."
         (setq partialQuery? TRUE))
       (collect-free-variables proposition ioVariables (list) (list))
       (setf (query-specialist-io-variables frame) ioVariables)
-      (setq subQueryDescription
-        (new DESCRIPTION
-             :io-variables (copy-list-to-arguments-vector ioVariables)
-             :proposition proposition))
+      (special ((*evaluationMode* :DESCRIPTION))
+	(setq subQueryDescription
+	      (new DESCRIPTION
+		   :io-variables (copy-list-to-arguments-vector ioVariables)
+		   :proposition proposition)))
       (compute-internal-variables subQueryDescription)
       (setq ioVariableBindings (new VECTOR :array-size (length ioVariables)))
       (setq trueFalseQuery? TRUE)
@@ -1105,6 +1192,7 @@ keyword indicating success or failure of a proof."
   (let ((subQueryIterator QUERY-ITERATOR (iterator frame))
         (trueFalseQuery? FALSE)
         (partialQuery? FALSE)
+        (sortedQuery? FALSE)
         (success? FALSE)
         (result CONTROL-FRAME NULL))
     (ignore lastMove)
@@ -1115,22 +1203,30 @@ keyword indicating success or failure of a proof."
            (if (null? subQueryIterator)
                (return :TERMINAL-FAILURE)
              (setf (iterator frame) subQueryIterator))
-           (when partialQuery?
-             ;; use `call-ask/retrieve-partial', since they know how to generate
-             ;;    the properly optimized and ordered set of solution(s):
-             (if trueFalseQuery?
-                 (call-ask-partial subQueryIterator)
-               (call-retrieve-partial subQueryIterator))))
+           (cond (partialQuery?
+                  ;; use `call-ask/retrieve-partial', since they know how to generate
+                  ;;    the properly optimized and ordered set of solution(s):
+                  (if trueFalseQuery?
+                      (call-ask-partial subQueryIterator)
+                    (call-retrieve-partial subQueryIterator)))
+                 ((and (not trueFalseQuery?) ;; sanity check
+                       (defined? (lookup-query-option subQueryIterator :SORT-BY)))
+                  ;; solutions need to be sorted which means we have to retrieve them eagerly:
+                  (setq sortedQuery? TRUE)
+                  (call-retrieve subQueryIterator))))
           (otherwise
            ;; slightly tricky, we don't need to set `trueFalseQuery?' here
            ;;    since we terminally succeed or fail the first time around
            ;;    (maybe we need to relax this for partial true/false queries
            ;;    that might generate multiple explanations):
            (setq partialQuery?
-             (defined? (partial-match-strategy subQueryIterator)))))
+             (defined? (partial-match-strategy subQueryIterator)))
+           (setq sortedQuery?
+             (defined? (lookup-query-option subQueryIterator :SORT-BY)))))
     (trace-if :GOAL-TREE EOL)
     (loop
-      (cond (partialQuery?
+      (cond ((or partialQuery?
+                 sortedQuery?)
              ;; we already eagerly precomputed any solutions above; now just
              ;;    supply them one-by-one from their storage in the iterator:
              (setq success? (query-succeeded? subQueryIterator))
@@ -1143,8 +1239,9 @@ keyword indicating success or failure of a proof."
                  (setf (truth-value result) (truth-value solution))
                  (when (record-justifications?)
                    (setf (justification result) (justification solution)))
-                 (setf (positive-score (partial-match-frame result))
-                   (match-score solution)))))
+                 (when partialQuery?
+                   (setf (positive-score (partial-match-frame result))
+                     (match-score solution))))))
             (otherwise
              (special ((*queryIterator* subQueryIterator)
                        (*reversePolarity?* (reverse-polarity? frame))
@@ -1213,7 +1310,7 @@ keyword indicating success or failure of a proof."
 ;;; Note (hc 01/06/2006): Due to the recent change in `create-hypothesized-instance'
 ;;;    prototypes are now skolems which is what they should be anyway.  We could make
 ;;;    them regular instances again by calling `create-anonymous-instance'.
-  
+
 (defun (/PL-KERNEL-KB/CONCEPT-PROTOTYPE-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; Initialize the logic object created to represent the prototype:
@@ -1221,7 +1318,7 @@ keyword indicating success or failure of a proof."
   ;;    Block insertion into the class extension.
   ;;    Mark as hypothesized skolem.
   (let ((proposition (proposition frame))
-        (class DESCRIPTION (argument-bound-to (first (arguments proposition))))
+        (class (argument-bound-to (first (arguments proposition))))
         (prototypeArgument (second (arguments proposition)))
         (prototype LOGIC-OBJECT NULL))
     (ignore lastMove)
@@ -1230,16 +1327,21 @@ keyword indicating success or failure of a proof."
       (return :TERMINAL-FAILURE))
     (setq prototype (access-binary-value class PL-KERNEL/@CONCEPT-PROTOTYPE))
     (when (null? prototype)
-      (within-context (home-context class)
-        (setq prototype
-          (create-hypothesized-instance
-           (choose (isa? class @NAMED-DESCRIPTION)
-                   (concatenate "proto-" (symbol-name (description-name class)))
-                   "prototype")))
-        (special (;(*suppressInsertionIntoClassExtension?* TRUE)
-                  (*invisibleAssertion?* TRUE))
-          (assert-member-of-proposition prototype class)
-          (assert-binary-value PL-KERNEL/@CONCEPT-PROTOTYPE class prototype))))
+      (let ((equivalence PROPOSITION NULL))
+        (within-context (home-context (cast class DESCRIPTION))
+          (setq prototype
+            (create-hypothesized-instance
+             (choose (isa? class @NAMED-DESCRIPTION)
+                     (concatenate "proto-" (object-name-string class))
+                     "prototype")))
+          (special (;(*suppressInsertionIntoClassExtension?* TRUE)
+                    (*invisibleAssertion?* TRUE))
+            (assert-member-of-proposition prototype class)
+            (setq equivalence
+              (assert-binary-value PL-KERNEL/@CONCEPT-PROTOTYPE class prototype))))
+        ;; since we were asserting invisibly above, we now need to make sure the
+        ;; variable-value link will be inferred between function output and prototype:
+        (react-to-inference-update equivalence)))
     (return
      (select-proof-result 
       (bind-argument-to-value? prototypeArgument prototype TRUE)
@@ -1318,9 +1420,10 @@ keyword indicating success or failure of a proof."
                  (and (defined? (equivalent-value self))
                       (help-closed-term? (equivalent-value self) activeTerms)))))
     (DESCRIPTION
-     (return (help-closed-proposition? (proposition self) activeTerms)))
+     (return (or (closed-by-assertion? self)
+                 (help-closed-proposition? (proposition self) activeTerms))))
     (SURROGATE (return (help-closed-term? (value-of self) activeTerms)))
-    (PATTERN-VARIABLE (return TRUE))
+    (PATTERN-VARIABLE (return FALSE))
     (SKOLEM
      (let ((definingProp (defining-proposition self)))
        (return (or (and (defined? definingProp)
@@ -1353,16 +1456,21 @@ keyword indicating success or failure of a proof."
   (case (kind self)
     ((:AND :OR :NOT :FORALL :EXISTS)
      (return (forall arg in (arguments self)
-                     always (help-closed-proposition? arg activeTerms))))
+                 always (help-closed-proposition? arg activeTerms))))
     ((:PREDICATE :FUNCTION :ISA)
      (case (relationRef self)
        (PL-KERNEL/@MEMBER-OF
-        (return (help-closed-term? (second (arguments self)) activeTerms)))
+        (let ((collectionArg (second (arguments self)))
+              (collectionValue (safe-argument-bound-to collectionArg)))
+          (if (defined? collectionValue)
+              (return (help-closed-term? collectionValue activeTerms))
+            ;; we have a variable, see whether it is the output of a collection term:
+            (return
+              (exists prop in (unfiltered-dependent-propositions collectionArg NULL)
+                  where (and (eql? collectionArg (last (arguments prop)))
+                             (collectionOf-proposition? prop)))))))
        (otherwise
-        (let ((description (get-description (relationRef self))))
-          (return (or (help-closed-term? description activeTerms)
-                      (and (single-valued-term? description)
-                           (test-property? description PL-KERNEL/@TOTAL))))))))
+        (return (help-closed-term? (get-description (relationRef self)) activeTerms)))))
     (:FAIL (return TRUE))
     (otherwise (return FALSE))))
 
@@ -1512,6 +1620,12 @@ keyword indicating success or failure of a proof."
     ;; convert :PATTERN frame into collection frame:
     (setf (collection-list (pattern-record downFrame)) (new LIST)) ))
 
+(defun (collect-description-extension-frame? BOOLEAN) ((frame CONTROL-FRAME))
+  ;; Return TRUE if `frame' is a pattern frame that collects instances of a description.
+  (return (and ;(eql? (state frame) :PATTERN)    ;; can we get :POPPED here?
+               (defined? (pattern-record frame))
+               (defined? (collection-list (pattern-record frame)))))) 
+
 (defun (/PL-KERNEL-KB/COLLECT-INTO-SET-specialist KEYWORD)
        ((frame CONTROL-FRAME) (lastMove KEYWORD))
   ;; Compute as many members of the first collection argument as possible,
@@ -1569,11 +1683,14 @@ keyword indicating success or failure of a proof."
     ;; we have collected instances of a named description:
     (when (null? (down frame))
       (return :FAILURE))
-    (let ((list (collection-list (pattern-record (down frame)))))
+    (let ((patternFrame (down frame))
+          (list (collection-list (pattern-record patternFrame))))
       ;; we are now done with :PATTERN frame:
-      (pop-frames-up-to (down frame))
+      (pop-frames-up-to patternFrame)
+      (when (defined? (inference-cutoff-reason patternFrame))
+        (return :FAILURE))
       ;; NOTE: this doesn't yet eliminate (some) skolems - should it?
-      (remove-duplicates list)
+      (setq list (reverse (remove-duplicates list)))
       (bind-argument-to-value? listArg (create-enumerated-set list) TRUE)
       (return :FINAL-SUCCESS)) ))
 
@@ -1930,11 +2047,13 @@ keyword indicating success or failure of a proof."
   ;;    both classes, elaborate, and look for a clash.
   ;; Note: Not called when polarity is reversed.
   (let ((proposition (proposition frame))
-        (class1 DESCRIPTION (argument-bound-to (first (arguments proposition))))
-        (class2 DESCRIPTION (argument-bound-to (second (arguments proposition)))))
+        (arg1 (argument-bound-to (first (arguments proposition))))
+        (arg2 (argument-bound-to (second (arguments proposition)))))
     (ignore lastMove)
-    (when (or (null? class1)
-              (null? class2)
+    (when (or (null? arg1)
+              (null? arg2)
+              (not (isa? arg1 @DESCRIPTION))
+              (not (isa? arg2 @DESCRIPTION))
               (> (length (arguments proposition)) 2))
       (return :TERMINAL-FAILURE))
     ;; note: We can't fork a parallel world here because the parallel machinery
@@ -1943,7 +2062,7 @@ keyword indicating success or failure of a proof."
     (initialize-inference-world *context*)
     (exception-case
      (let ((skolem (create-hypothesized-instance "refutation-disjoint")))
-       (foreach c in (cast (cons-list class1 class2) (CONS OF DESCRIPTION))
+       (foreach c in (cast (cons-list arg1 arg2) (CONS OF DESCRIPTION))
                 do (assert-member-of-proposition skolem c))
        (elaborate-instance skolem))
      (CLASH ()
@@ -2030,10 +2149,11 @@ keyword indicating success or failure of a proof."
 
 (defclass SAVED-CONTEXT-PROOF-ADJUNCT (PROOF-ADJUNCT)
   ;; Stores the saved context for an IST predicate.
-  :slots ((saved-context :type CONTEXT)))
+  :slots ((saved-context :type CONTEXT)
+          (down-frame :type CONTROL-FRAME)))
 
-(defun (/PL-KERNEL-KB/IST-specialist KEYWORD)
-       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+(defun (/PL-KERNEL-KB/IST-specialist KEYWORD) ((frame CONTROL-FRAME)
+                                               (lastMove KEYWORD))
   ;; Arg1 is a context; Arg2 is a proposition.  Return TRUE if the
   ;;    proposition is TRUE in the context.
   ;; Note: If we were really good, we could handle an unbound first
@@ -2042,21 +2162,24 @@ keyword indicating success or failure of a proof."
   ;;    feeling that energetic yet.
   (let ((proposition (proposition frame))
         (contextValue (argument-bound-to (first (arguments proposition))))
-        (propositionValue (argument-bound-to (second (arguments proposition))))
         (adjunct SAVED-CONTEXT-PROOF-ADJUNCT (proof-adjunct frame)))
     (case lastMove
       (:DOWN
-       ;; first time through:
-       (when (or (null? contextValue)
-                 (null? propositionValue)
-                 (not (isa? contextValue @CONTEXT)))
-         (return :TERMINAL-FAILURE))
-       ;; save current query context:
-       (setf (proof-adjunct frame)
-             (new SAVED-CONTEXT-PROOF-ADJUNCT :saved-context *context*))
-       (change-context (cast contextValue CONTEXT))
-       ;; point cursor at 'proposition' argument:
-       (setf (argument-cursor frame) 1)
+       (when (null? adjunct)
+         ;; first time through:
+         (let ((propositionValue (argument-bound-to (second (arguments proposition)))))
+           (when (or (null? contextValue)
+                     (null? propositionValue)
+                     (not (isa? contextValue @CONTEXT)))
+             (return :TERMINAL-FAILURE))
+           (setq adjunct
+             (new SAVED-CONTEXT-PROOF-ADJUNCT
+                  :saved-context *context*
+                  :down-frame (create-down-frame frame propositionValue)))
+           ;; save current query context and down frame so we can switch back and forth:
+           (setf (proof-adjunct frame) adjunct)))
+       (setf (down frame) (down-frame adjunct))
+       (change-context (best-inference-cache (cast contextValue CONTEXT)))
        (return :MOVE-DOWN))
       ;; returning from below:
       (:UP-TRUE
@@ -2071,9 +2194,15 @@ keyword indicating success or failure of a proof."
                :inference-rule :IST-INTRODUCTION
                :antecedents (cons (justification (result frame)) NIL))))
        (change-context (saved-context adjunct))
-       (if (defined? (down frame))
-         (return :CONTINUING-SUCCESS)
-         (return :FINAL-SUCCESS)))
+       (cond ((defined? (down frame))
+              ;; save the current down frame and set the `down' frame of this `frame' to
+              ;; NULL, so it will be reentered upon the next down move; this ensures that
+              ;; we'll properly establish the context before retrieving the next solution:
+              (setf (down-frame adjunct) (down frame))
+              (setf (down frame) NULL)
+              (return :CONTINUING-SUCCESS))
+             (otherwise
+              (return :FINAL-SUCCESS))))
       (:UP-FAIL
        (propagate-frame-truth-value (result frame) frame)
        (when (partial-match-mode?)
@@ -2177,10 +2306,10 @@ specialists.")
                do
                (pushq minCards
                       (compute-stored-bound-on-roleset subR instance :LOWER)))
-      (let ((maxMin (first minCards)))
+      (let ((maxMin INTEGER (first minCards)))
         (foreach lb in (rest minCards)
                  where (defined? lb)
-                 do (setq maxMin (max lb maxMin)))
+                 do (setq maxMin (max maxMin lb)))
         (return maxMin))) )))
                         
 (defun (/PL-KERNEL-KB/RANGE-MIN-CARDINALITY-specialist KEYWORD)
@@ -2252,10 +2381,10 @@ specialists.")
                do
                (pushq maxCards
                       (compute-stored-bound-on-roleset superR instance :UPPER)))
-      (let ((minMax (first maxCards)))
+      (let ((minMax INTEGER (first maxCards)))
         (foreach ub in (rest maxCards)
                  where (defined? ub)
-                 do (setq minMax (min ub minMax)))
+                 do (setq minMax (min minMax ub)))
         (return minMax))) )))
 
 (defun (/PL-KERNEL-KB/RANGE-MAX-CARDINALITY-specialist KEYWORD)
@@ -2303,15 +2432,19 @@ specialists.")
       (let ((filler (access-binary-value instance relationRef)))
         (when (defined? filler)
           (return (test-type-on-instance? filler valueSurrogate)))))
-    (let ((roleset (get-roleset-of relation instance)))
-      (when (and (defined? roleset)
-                 (or (collection-implies-collection? roleset valueType)
-                     (and (or (closed-term? relation)
-                              (closed-term? roleset))
-                          (forall filler in (all-slot-values instance relationRef)
-                                  always 
-                                  (test-type-on-instance? filler valueSurrogate)))))
-        (return TRUE)))
+    (let ((roleset (get-roleset-of relation instance))
+          (closed? (or (closed-term? relation)
+                       (closed-term? roleset))))
+      (if (defined? roleset)
+        (when (or (collection-implies-collection? roleset valueType)
+                  (and closed?
+                       (forall filler in (all-slot-values instance relationRef)
+                               always (test-type-on-instance? filler valueSurrogate))))
+          (return TRUE))
+        (when (and closed?
+                   (forall filler in (all-slot-values instance relationRef)
+                               always (test-type-on-instance? filler valueSurrogate)))
+          (return TRUE))))
     (foreach superR in (all-superrelations relation FALSE)
              do
              (let ((superRoleSet (get-roleset-of superR instance)))
@@ -2378,6 +2511,7 @@ specialists.")
       (return (select-test-result FALSE TRUE frame))
       (return :FAILURE))))
 
+
   ;;
 ;;;;;; object-name and name-to-object computation
   ;;
@@ -2389,20 +2523,25 @@ specialists.")
       (return null)
       (return name-string))))
 
-(defun (/PL-KERNEL-KB/name-to-object-computation OBJECT) ((nameArg STRING-WRAPPER))
+(defun (/PL-KERNEL-KB/name-to-object-computation OBJECT) ((nameArg OBJECT))
   ;; Find or create the logic object named by `nameArg'.
   ;; We are interpreting `nameArg' literally here, i.e., it is not a print name
   ;;    as assumed by PLI functions and an object with exactly that name will
-  ;;    be looked up or created.
+  ;;    be looked up or created (we will first coerce to a string if necessary).
   ;; TO DO: conceivably, we might want to have a variant of this that uses a print
   ;;    name as its argument.
   (within-module (base-module *context*) ;; don't create in inference caches...
-    (return
-      (first-defined
-       (get-instance nameArg)
-       (create-logic-instance
-        (intern-surrogate-in-module nameArg *module* TRUE)
-        NULL)))))
+    (let ((instance (get-instance nameArg))
+          (nameArgString STRING NULL))
+      (when (defined? instance)
+        (return instance))
+      (setq nameArgString (pli/object-to-string nameArg))
+      (return
+        (first-defined
+         (get-instance nameArgString)
+         (create-logic-instance
+          (intern-surrogate-in-module nameArgString *module* TRUE)
+          NULL))))))
 
 
   ;;
@@ -2725,7 +2864,7 @@ specialists.")
 ;;  #1: ?I=|SK|(LISTOF 2 12 22)
 
 
-;; Doesn't bind.
+;; Doesn't bind. XXX Works now.
 (retrieve all (?i ?j ?k)  
    (project-column 0
 		   (listof (listof 0 1 2  3) (listof 10 11 12 13) (listof 20 21 22 23))
@@ -2873,7 +3012,8 @@ specialists.")
 (defun (lookup-native-specialist FUNCTION-CODE) ((native-name STRING))
   :public? TRUE
   :documentation "Returns the native funtion code for `native-name' if it exists
-and the underlying programming languages supports such lookups."
+and the underlying programming languages supports such lookups.  Uses the signature
+of a specialist function."
   (let ((code FUNCTION-CODE NULL))
     (verbatim :common-lisp "(cl:setq code (cl:symbol-function (cl:read-from-string native-name)))"
               :java "int lastPeriod = nativeName.lastIndexOf('.');
@@ -2909,4 +3049,52 @@ the resulting code or knowledge bases non-portable to other target languages."
   (register-specialist-function stella-name (lookup-native-specialist native-name)))
 
 
-  
+(defun (lookup-native-computation FUNCTION-CODE) ((native-name STRING) (arity INTEGER))
+  :public? TRUE
+  :documentation "Returns the native funtion code for `native-name' if it exists
+and the underlying programming languages supports such lookups.  It is looked up
+using the signature of a computation function supported by the computation specialist."
+  (let ((code FUNCTION-CODE NULL))
+    (verbatim :common-lisp "(cl:setq code (cl:symbol-function (cl:read-from-string native-name)))"
+              :java "int lastPeriod = nativeName.lastIndexOf('.');
+    java.lang.Class [] classes = new java.lang.Class[arity];
+    java.lang.Class sclass = Native.find_java_class(\"edu.isi.stella.Stella_Object\");
+    for (int i = 0; i < arity; i++) {
+      classes[i] = sclass;
+    }
+    code = Native.find_java_method(nativeName.substring(0,lastPeriod),
+                                   nativeName.substring(lastPeriod+1),
+                                   classes)"
+              :otherwise (error "Not implemented in " (running-in-language)))
+    (when (null? code)
+      (error "Couldn't locate native function for " native-name))
+    (return code)))
+
+(defun register-computation-function ((name STRING) (code FUNCTION-CODE) (arity INTEGER))
+  :documentation "Creates a registration entry for `name' as a computation which
+executes `code'.  Essentially just builds the Stella meta-information
+tructure needed to funcall `name' as a computation function by the
+computation specialist.  The function definition in `code' needs to
+accept ARITY Stella OBJECTs as arguments and return a Stella OBJECT 
+suitable for PowerLoom use.  (These are generally LOGIC-OBJECTs and the
+literal wrappers FLOAT-WRAPPER, INTEGER-WRAPPER and STRING-WRAPPER.)"
+  :public? TRUE
+  (let ((definition-string "(DEFUN ("))
+     (setq definition-string (concatenate definition-string name " OBJECT) ("))
+     (foreach i in (interval 1 arity)
+        do (setq definition-string (concatenate definition-string "(X" (integer-to-string i) " OBJECT) ")))
+     (setq definition-string (concatenate definition-string "))"))
+     (define-function-object
+	 (concatenate " " name)
+	 definition-string
+       code
+       NULL)))
+
+(defun register-computation-function-name ((stella-name STRING) (native-name STRING) (arity INTEGER))
+  :public? TRUE
+  :command? TRUE
+  :documentation "registers a computation function `stella-name' based on the `native-name'
+for the particular programming language in question.  Use of this command makes
+the resulting code or knowledge bases non-portable to other target languages."
+  (register-computation-function stella-name (lookup-native-computation native-name arity) arity))
+

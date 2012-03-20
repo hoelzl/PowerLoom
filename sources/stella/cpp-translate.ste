@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cpp-translate.ste,v 1.106 2006/05/11 07:05:55 hans Exp
+;;; Version: cpp-translate.ste,v 1.109 2008/09/04 02:13:07 hans Exp
 
 ;;; Routines for translating Stella parse trees into C++ trees.
 
@@ -581,14 +581,10 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
   ;; `tree' has form (CAST <expression> <type>)
   (let ((expression (second tree))
         (type (type-spec-to-base-type (third tree))))
-    (when (and (subtype-of? type @FLOAT) (isa? expression @INTEGER-WRAPPER))
-      (return (cpp-translate-a-tree
-	       (wrap-literal (cast (wrapper-value (cast expression INTEGER-WRAPPER))
-				   @FLOAT)))))
-    (when (and (subtype-of? type @INTEGER) (isa? expression @FLOAT-WRAPPER))
-      (return (cpp-translate-a-tree
-	       (wrap-literal (cast (wrapper-value (cast expression FLOAT-WRAPPER))
-				   @INTEGER)))))
+    (when (and (subtype-of? type @NUMBER)
+               (isa? expression @NUMBER-WRAPPER))
+      ;; we have a numeric constant:
+      (return (cpp-translate-a-tree (coerce-numeric-constant expression type))))
     (setf (first tree) (quote CPP_CAST))
     (setf (second tree) (cpp-translate-a-tree (second tree)))
     (setf (third tree) (cpp-translate-and-pointerize-type-spec (third tree)))
@@ -1065,6 +1061,41 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
                      (yield-constructor-name (type-spec-to-class typeSpec))))
                  & (cpp-translate-actual-parameters (rest (rest tree)))))))))
 
+(defun (cpp-non-pointer-type? BOOLEAN) ((typeSpec TYPE-SPEC))
+  ;; Return TRUE if `type' is not represented by a pointer type in C++.
+  ;; We use this to determine whether the garbage collector can treat an
+  ;; object that only has non-pointer components (e.g., an integer array)
+  ;; as atomic (instead of having to scan its interior elements for
+  ;; references to other objects).
+  (let ((baseType (type-spec-to-base-type typeSpec)))
+    (case baseType
+      ;; we explicitly list them here instead of doing a subtype test, to
+      ;; be safe in case we later add other literal types that are pointers:
+      ((@INTEGER @SHORT-INTEGER @LONG-INTEGER @UNSIGNED-LONG-INTEGER
+        @FLOAT @SINGLE-FLOAT @DOUBLE-FLOAT
+        @CHARACTER @BYTE @OCTET)
+       (return TRUE))
+      (otherwise
+       (return FALSE)))))
+
+(defun (cpp-type-without-interior-pointers? BOOLEAN) ((typeSpec TYPE-SPEC))
+  ;; Return TRUE if none of `typeSpec's elements (slots or array elements)
+  ;; are pointer types.  These can be treated as atomic by the garbage collector.
+  (let ((baseType (type-spec-to-base-type typeSpec))
+        (class (type-class baseType)))
+    (when (array-type-specifier? typeSpec)
+      (return (cpp-non-pointer-type? (extract-parameter-type typeSpec (quote ANY-VALUE)))))
+    (when (and (create-native-class? class)
+               ;; exception classes inherit a system class that might have additional slots:
+               (not (subtype-of? baseType @NATIVE-EXCEPTION)))
+      (return
+        (forall slot in (class-slots class)
+            where (and (storage-slot? slot)
+                       (native-slot? slot)
+                       (not (slot-has-unknown-type? slot class)))
+            always (cpp-non-pointer-type? (slot-base-type slot)))))
+    (return FALSE)))
+
 (defun (cpp-translate-new-array CONS) ((tree CONS))
   ;; Translate a NEW `tree' for an array type.
   (let ((arrayType PARAMETRIC-TYPE-SPECIFIER (second tree))
@@ -1076,11 +1107,16 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
          (third tree))
         (dimensions (cpp-translate-list-of-trees (rest (rest (rest tree)))))
         (elementType (extract-parameter-type arrayType (quote ANY-VALUE))))
+    (ignore initialElement)
     (return
       (bquote
        (CPP_FUNCTION_CALL
         (CPP_IDENT
-         & (choose (cpp-use-garbage-collector?) "new (GC)" "new"))
+         & (choose (cpp-use-garbage-collector?)
+                   (choose (cpp-non-pointer-type? elementType)
+                           "new (PointerFreeGC)"
+                           "new (GC)")
+                   "new"))
         (CPP_ACTUALS
          (CPP_ARRAY_REFERENCE
           (CPP_IDENT & (cpp-translate-and-pointerize-type-spec elementType))
@@ -1153,10 +1189,17 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
         (nativeType (class-cpp-native-type class))
         (arguments (cpp-translate-actual-parameters (rest (rest tree)))))
     (cond ((null? nativeType)
-           (return
-             (bquote
-              (CPP_MAKE (CPP_IDENT & (cpp-translate-class-name className))
-                        & arguments))))
+           (if (cpp-type-without-interior-pointers? (class-type class))
+               ;; tell the GC that this object can be treated as atomic.
+               (return
+                 (bquote
+                  (CPP_MAKE (CPP_ACTUALS (CPP_IDENT "PointerFreeGC"))
+                            (CPP_IDENT & (cpp-translate-class-name className))
+                            & arguments)))
+             (return
+               (bquote
+                (CPP_MAKE (CPP_IDENT & (cpp-translate-class-name className))
+                          & arguments)))))
           ((cpp-native-pointer-type? nativeType)
            (return
              (bquote
@@ -1972,12 +2015,14 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
   ;;    named `functionName'.
   (let ((function (lookup-function functionName)))
     (if (defined? function)
-        (return (cpp-translate-function-name function))
+        (return (cpp-translate-function-name function TRUE))
       (return (cpp-translate-name functionName)))))
     
-(defun (cpp-translate-function-name STRING-WRAPPER) ((function METHOD-SLOT))
+(defun (cpp-translate-function-name STRING-WRAPPER) ((function METHOD-SLOT)
+						     (qualify? BOOLEAN))
   ;; Create a name for the C++ function defined by METHOD-SLOT.
   ;; Do not prefix the name with the method's class.
+  ;; If `qualify?', then possibly add namespace qualifier.
   (let ((functionName
          (yield-renamed-name-if-native (slot-name function) :cpp :function))
 	(translatedName STRING NULL))
@@ -1992,10 +2037,12 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
       (setq translatedName (concatenate translatedName "_setter")))
     (when (slot-reader? function)
       (setq translatedName (concatenate translatedName "_reader")))
-    (return
-      (cpp-yield-qualified-name
-       translatedName
-       (cpp-fixup-name-symbol (slot-name function) (home-module function))))))
+    (if qualify?
+	(return
+	  (cpp-yield-qualified-name
+	   translatedName
+	   (cpp-fixup-name-symbol (slot-name function) (home-module function))))
+	(return translatedName))))
 
 (defun (cpp-translate-method-name-from-name STRING-WRAPPER) 
     ((methodName SYMBOL) (methodOwner TYPE-SPEC))
@@ -2003,6 +2050,7 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
   ;;    function from `methodName' and `methodOwner'.
   ;; KLUDGE: we generate reader names and setter names in the translator.
   ;;    The walker generates setter names.  Should it generate reader names?
+  ;; NOTE: Does this need to consider namespace prefixes as well?
   (let ((translatedName STRING
           (cpp-translate-name
            (yield-renamed-name-if-native methodName :cpp :function))))
@@ -2013,11 +2061,13 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
                    "::"
                    translatedName))))
 
-(defun (cpp-translate-method-name STRING-WRAPPER) ((method METHOD-SLOT))
+(defun (cpp-translate-method-name STRING-WRAPPER) ((method METHOD-SLOT)
+						   (qualify? BOOLEAN))
   ;; Create an appropriate name for the C++ (member or non-member) 
   ;;   function from METHOD-SLOT
+  ;; If `qualify?', then possibly add namespace qualifier.
   (let ((methodType (slot-owner method))
-	(translatedName (cpp-translate-function-name method)))
+	(translatedName (cpp-translate-function-name method qualify?)))
     (if (cpp-method-object-is-function? method)
         (return translatedName)
       (return
@@ -2140,7 +2190,7 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
 			   (quote CPP_FUNCTION)
 			   (quote CPP_METHOD))
 		   & returnType
-		   & (cpp-translate-method-name method)
+		   & (cpp-translate-method-name method FALSE)
 		   & (cpp-translate-function-parameters method)
 		   & translatedMethodBody)))
       (return oTree) )))
@@ -2586,7 +2636,7 @@ file module (occurs in some PowerLoom files - I thought we had outlawed that).")
         (setq oTree 
 	  (bquote (CPP_FUNCTION_CALL 
 		   (CPP_IDENT
-		    & (cpp-translate-function-name function))
+		    & (cpp-translate-function-name function TRUE))
 		   & (choose (and (method-variable-arguments? function)
                                   (not (pass-variable-arguments-as-list?
                                         function)))

@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2010      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: PrintStringStream.java,v 1.7 2006/05/11 07:06:48 hans Exp
+// Version: PrintStringStream.java,v 1.8 2010/02/10 22:15:39 hans Exp
 
 // Native Print String Stream
 //
@@ -62,14 +62,17 @@ import java.io.*;
 public class PrintStringStream extends java.io.PrintStream {
 
   public PrintStringStream () {
-    // Create a new PrintStream containing a new ByteArrayOutputStream
+    // Create a new PrintStream containing a new ByteArrayOutputStream.
     super (new ByteArrayOutputStream());
       }
 
   public String toString() {
-    // Return the String that the encapsulated ByteArrayOutputStream contains
+    // Return the String that the encapsulated ByteArrayOutputStream contains.
     return (this.out.toString());
   }
 
+  public byte[] toByteArray() {
+    // Return the bare byte array the encapsulated ByteArrayOutputStream contains.
+    return ((ByteArrayOutputStream)this.out).toByteArray();
+  }
 }
-

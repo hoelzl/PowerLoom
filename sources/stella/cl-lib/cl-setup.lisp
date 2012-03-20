@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: cl-setup.lisp,v 1.56 2006/05/11 07:06:36 hans Exp
+;;; Version: cl-setup.lisp,v 1.69 2010/02/10 22:11:20 hans Exp
 
 ;;; Common-Lisp package setup and boot support.
 
@@ -48,7 +48,7 @@
 
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (unless (>= (integer-length most-positive-fixnum) 24)
+  (unless (>= (eval '(integer-length most-positive-fixnum)) 24) ;; use `eval' to avoid unreachable code warns
     (error "The maximum fixnum size of this lisp implementation (~D)~%is too small.  It must be at least 24 bits."
 	   (integer-length most-positive-fixnum)))
   (unless (find-package "STELLA")
@@ -68,6 +68,12 @@
            #+allegro CL:*READTABLE*)
     do (shadowing-import symbol "STELLA"))
 
+
+;; Other setup items.
+;; Suppress compiler notes for general use.
+;;    This should perhaps be turned on for internal diagnostic use, though:
+;; hc: disabled again, since some of the warnings are crucial to find subtle bugs:
+;#+:SBCL (declaim (sb-ext:muffle-conditions sb-ext:compiler-note cl:style-warning))
 
 ;; Load support libraries for TCP/IP
 
@@ -104,19 +110,79 @@
 
 (CL:declaim
  (CL:special
-     NULL NULL-INTEGER TRUE FALSE
+     NULL-INTEGER NULL-FLOAT
      ;; Avoid some warnings:
      NIL NIL-LIST NULL-STRING-WRAPPER NULL-CODE-WRAPPER
-     NULL-FLOAT NULL-STRING NULL-CHARACTER NULL-NATIVE-VECTOR))
+     NULL-STRING NULL-CHARACTER NULL-NATIVE-VECTOR))
 
 ;; These need to be set here to avoid bootstrapping problems
 ;; when compiling the code in a fresh lisp.
 ;; Set these via 'CL:setq' so we'll avoid multiple definitions:
-(CL:setq NULL :null_value)
+(CL:defconstant NULL :null_value)
 (CL:setq NULL-INTEGER CL:MOST-NEGATIVE-FIXNUM)
 (CL:setq NULL-FLOAT CL:MOST-NEGATIVE-DOUBLE-FLOAT)
-(CL:setq TRUE CL:t)
-(CL:setq FALSE CL:nil)
+
+(CL:defvar NULL-STRING (cl:make-string 1 :initial-element (CL:code-char 0)))
+(CL:defvar NULL-NATIVE-VECTOR (cl:vector))
+
+;; values for cl-array-null 
+;; NOTE:  Any change to the set of supported null values also needs
+;;        to change the type declaration function LOOKUP-CL-TYPE-FROM-STELLA-TYPE
+;;        in file cl-translate.ste
+;; NOTE:  Changes will also have to be made to LISP-NULL-ARRAY-SYMBOL-STRING
+;;        in file primal.ste
+(CL:defvar NULL-1D-ARRAY NULL-NATIVE-VECTOR)
+(CL:defvar NULL-2D-ARRAY (cl:make-array '(0 0)))
+(CL:defvar NULL-3D-ARRAY (cl:make-array '(0 0 0)))
+(CL:defvar NULL-4D-ARRAY (cl:make-array '(0 0 0 0)))
+(CL:defvar NULL-5D-ARRAY (cl:make-array '(0 0 0 0 0)))
+;; NOTE: This cannot declare the type of "value", because it is possible
+;; that it will be called with a non-specialized NULL value for those
+;; arrays of rank greater than 5.  We could just ignore them if we really
+;; wanted to get speed, since they are likely to be exceedingly rare in
+;; Stella code.
+
+(CL:defun null-array? (value)
+  (CL:TYPECASE value
+    (CL:ARRAY    
+     (CL:CASE (CL:ARRAY-RANK value)
+       (1 (CL:eq value NULL-1D-ARRAY))
+       (2 (CL:eq value NULL-2D-ARRAY))
+       (3 (CL:eq value NULL-3D-ARRAY))
+       (4 (CL:eq value NULL-4D-ARRAY))
+       (5 (CL:eq value NULL-5D-ARRAY))
+       (CL:t (CL:eq value NULL))))
+    (CL:t (CL:eq value NULL))))
+
+
+(CL:defconstant TRUE CL:T)
+(CL:defconstant FALSE CL:NIL)
+
+  ;;
+;;;;;;  Definitions and declarations to speed up some key integer methods
+  ;;
+
+(CL:defgeneric arity (self))
+(CL:defgeneric buffered-input-length (TOKENIZER-STREAM-STATE))
+(CL:defgeneric compute-depth (graph))
+(CL:defgeneric equal-hash-code (self))
+(CL:defgeneric get-saved-state (TOKENIZER-STREAM-STATE table))
+(CL:defgeneric hash-code (self))
+(CL:defgeneric last-position (self object end))
+(CL:defgeneric length (self))
+(CL:defgeneric method-argument-count (self))
+(CL:defgeneric position (self object start))
+
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) arity))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) buffered-input-length))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) compute-depth))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) equal-hash-code))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T CL:T) CL:FIXNUM) get-saved-state))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) hash-code))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T CL:T CL:FIXNUM) CL:FIXNUM) last-position))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) length))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T) CL:FIXNUM) method-argument-count))
+(CL:declaim (CL:FTYPE (CL:FUNCTION (CL:T CL:T CL:FIXNUM) CL:FIXNUM) position))
 
 
   ;;
@@ -195,7 +261,8 @@
 
 (clsys-define-fast-slot-accessors 30)
 
-;;; Support for Allegro-CL (ACL) fast-slot hack:
+;;; Support for Allegro-CL (ACL) fast-slot hack (this seems obsolete
+;;; now, given we are using primarily structs for speed):
 
 ;;; If in ACL we compile a slot access to a vector struct with the highest
 ;;; possible optimization, all dynamic type checking is eliminated and we
@@ -237,6 +304,7 @@
   ;; NOTE: We use CL-USER as the package for '*compile-file-pathname*' to
   ;;       avoid importing that symbol into the CL package in Lisps that
   ;;       do not define 'CL:*compile-file-pathname*'.
+  #+(or allegro-v4.2 allegro-v4.3)
   (CL:when (CL:and (CL:boundp 'CL-USER::*compile-file-pathname*)
                    CL-USER::*compile-file-pathname*
                    ;; Disable fast slots for now, since multiple
@@ -446,27 +514,73 @@
      (CL:defmethod ,name ((,selfVar (CL:eql CL:nil)) ,@otherArgs)
        ,@body)))
 
+(CL:defvar CLSYS-NULL-CONS (CL:cons NULL CL:NIL))
+
 (CL:defmacro %%value (x)
   ;; Read access macro for the `value' slot on a Lisp cons.
   ;; Slightly complicated, since it has to return NULL if applied to CL:nil.
-  (CL:if (CL:symbolp x)
-      `(CL:if ,x (CL:car (CL:the CL:cons ,x)) NULL)
-    (CL:let ((var (CL:gensym)))
-      `(CL:let ((,var ,x))
-         (CL:if ,var (CL:car (CL:the CL:cons ,var)) NULL)))))
+  ;; The NULL-CONS approach works around some unreachable code warnings in
+  ;; CMUCL due to their aggressive type inference.
+  `(CL:car (CL:the CL:cons (CL:or ,x CLSYS-NULL-CONS))))
+
+;; we use a separate variable for the setf case, just in case anybody ever
+;; sets the car of NIL to something non-NULL - maybe hiding that is a bad idea:
+(CL:defvar CLSYS-SETF-NULL-CONS (CL:cons NULL CL:NIL))
 
 (CL:defsetf %%value (x) (new-value)
   ;; Write access macro for the `value' slot on a Lisp cons.
-  ;; Slightly complicated, since it has to return NULL if applied to CL:nil.
-  (CL:if (CL:symbolp x)
-      `(CL:if ,x (CL:setf (CL:car (CL:the CL:cons ,x)) ,new-value) NULL)
-    (CL:let ((var (CL:gensym)))
-      `(CL:let ((,var ,x))
-         (CL:if ,var (CL:setf (CL:car (CL:the CL:cons ,var)) ,new-value) NULL)))))
+  ;; Slightly complicated, since it has to return NULL if applied to CL:nil
+  ;; (in which case `new-value' better be NULL).
+  `(CL:setf (CL:car (CL:the CL:cons (CL:or ,x CLSYS-SETF-NULL-CONS))) ,new-value))
 
 (CL:defmacro %%rest (x)
   ;; Access macro for the `rest' slot on a Lisp cons.
   `(CL:cdr (CL:the CL:list ,x)))
+
+;;; Dealing with methods defined on subtypes of CL:INTEGER:
+
+(CL:defmacro %%defintegermethod (name ((selfVar selfType) CL:&rest otherArgs)
+                                 CL:&body body)
+  ;; Define a method `name' on one of the subtypes of INTEGER.
+  ;; This approach decides dynamically which method to call which is
+  ;; similar to what we do in Lisp for other literal types such as STRING.
+  ;; However, it is semantically different from what happens in the C++
+  ;; and Java translations which really decide at translation time which
+  ;; method will be called based on the data type of the first argument.
+  ;; In the dynamic approach, we will always call "fixnum foo" for the
+  ;; call `(foo 2)', while in the static approach it will depend on the
+  ;; data type of the argument determined at translation time.
+  ;; We keep the dynamic approach for now until we decide to translate all
+  ;; literal methods into functions similar to what we do in C++ & Java
+  ;; (which would also result in more efficient code).
+  #+(or allegro cmu sbcl)
+  ;; Both ACL and CMUCL (and maybe others) support methods on
+  ;; CL:FIXNUM, so nothing special needs to be done there:
+  `(CL:defmethod ,name ((,selfVar ,selfType) ,@otherArgs)
+       ,@body)
+  #-(or allegro cmu sbcl)
+  ;; Otherwise, we treat the bignum method as the main method, and the
+  ;; fixnum method as an around method that catches fixnums dynamically:
+  (CL:ecase selfType
+    (CL:FIXNUM  ;; the CL-native type of INTEGER
+     (CL:let* ((preamble CL:nil)
+               (code body))
+       (CL:when (CL:stringp (CL:first code))
+         ;; extract the documentation string:
+         (CL:push (CL:pop code) preamble))
+       (CL:when (CL:and (CL:consp (CL:first code))
+                        (CL:eql (CL:first (CL:first code)) 'CL:declare))
+         ;; extract any declarations:
+         (CL:push (CL:pop code) preamble))
+       `(CL:defmethod ,name :around ((,selfVar CL:INTEGER) ,@otherArgs)
+          ,@(CL:reverse preamble)
+          (CL:cond ((CL:typep ,selfVar 'CL:fixnum)
+                    ,@code)
+                   (CL:t (CL:call-next-method))))))
+    (CL:INTEGER ;; the CL-native type of LONG-INTEGER
+     `(CL:defmethod ,name ((,selfVar ,selfType) ,@otherArgs)
+       ,@body))))
+
 
 ;;; %%print-stream:
 
@@ -528,7 +642,7 @@
             (CL:loop for sub on list
                 do (CL:if (CL:listp (CL:car sub))
                        (%%print-cons stream (CL:car sub))
-                     (CL:prin1 (CL:car sub) stream))
+		       (%%print-object stream (CL:car sub)))
                    (CL:when (CL:rest sub)
                      (CL:write-string " " stream)))
             (CL:write-string ")" stream)))
@@ -630,7 +744,7 @@
   (comm:open-tcp-stream host port)
   #+:CLISP
   (socket:socket-connect port host)
-  #+:CMUCL
+  #+:CMU
   (extensions:connect-to-inet-socket host port :stream)
   #+:SBCL
   (cl:let ((s (cl:make-instance 'sb-bsd-sockets:inet-socket :type :stream
@@ -638,8 +752,8 @@
 	   (host (sb-bsd-sockets:host-ent-address (sb-bsd-sockets:get-host-by-name host))))
     (sb-bsd-sockets:socket-connect s host port)
     (sb-bsd-sockets:socket-make-stream s :input cl:t :output cl:t :buffering :none))
-  #-(or :allegro :MCL :Lispworks :CLISP :CMUCL :SBCL)
-  (CL:error "Don't know how to open a network stream in this Lisp dialect")
+  #-(or :allegro :MCL :Lispworks :CLISP :CMU :SBCL)
+  (CL:error "Don't know how to open a network stream in this Lisp dialect (~s:~s)" host port)
   )
 
 ;;; Condition message handling.
@@ -657,6 +771,9 @@
       (CL:symbol-function (CL:find-symbol "SIMPLE-CONDITION-FORMAT-CONTROL" "COMMON-LISP")))
     '(CL:setf (CL:symbol-function '%%simple-condition-format-control)
       (CL:symbol-function (CL:find-symbol "SIMPLE-CONDITION-FORMAT-STRING" "COMMON-LISP"))))
+;; declare this to make the compiler happy - not sure why we didn't simply use a defun here
+;; with a conditionalized body, but let's assume for now that there was a good reason:
+(cl:declaim (cl:ftype (cl:function (cl:t) cl:t) %%simple-condition-format-control))
 
 (cl:defun %%get-exception-message (condition)
   ;; Common Lisp has to run through format since some Lisp systems
@@ -669,16 +786,18 @@
     (cl:apply #'cl:format cl:nil 
 	      (%%simple-condition-format-control condition)
 	      (cl:simple-condition-format-arguments condition))
-    ""))
+    (cl:princ-to-string condition)))
 
 (cl:defun %%print-exception-context (condition stream)
   ;; System dependent printing of error context
   (cl:declare (cl:ignore condition))
   (cl:let ((cl:*debug-io* stream))
-    #+:EXCL (tpl::zoom-print-stack-1 stream 20)
-    #+:MCL  (ccl:print-call-history)
-    #+:CMU  (debug:backtrace)
-    #+:SBCL (sb-debug:backtrace)
+    #+:EXCL  (tpl::zoom-print-stack-1 stream 20)
+    #+:MCL   (ccl:print-call-history)
+    #+:CMU   (debug:backtrace)
+    #+:SBCL  (sb-debug:backtrace)
+    #+:CLISP (system::print-backtrace :out stream)
+    #+:LISPWORKS (dbg:output-backtrace :stream stream)
     ))
 
 ;;; %%translate-logical-pathname
@@ -759,7 +878,7 @@
 (CL:defvar *clsys-sxhash-supported-object-types*
     `(,@(CL:and (clsys-test-sxhash-support :STRUCT) '(:STRUCT))
         ,@(CL:and (clsys-test-sxhash-support :CLOS) '(:CLOS))))
-(cl:declaim (cl:type cl:cons *clsys-sxhash-supported-object-types*))
+(cl:declaim (cl:type cl:list *clsys-sxhash-supported-object-types*))
 
 (CL:defun clsys-sxhash-supported-object-p (type)
   ;; Return true if `CL:sxhash' computes reasonable hash codes for objects
@@ -808,7 +927,7 @@
                                        cl:most-positive-fixnum)))))
             (hashCodeForm
              `(CL:logand (CL:the CL:INTEGER (CL:sxhash ,object)) ,mask))
-            (objectVar (CL:if (CL:atom object) object (CL:gensym)))
+            (objectVar (CL:gensym))
             (hashCodeSlot
              (CL:if (clsys-use-structs-p)
                  `(|CLSYS-ROOT-STRUCT.%HaShCoDe| ,objectVar)
@@ -818,8 +937,7 @@
                     (CL:and (CL:not (clsys-use-structs-p))
                             (CL:not (clsys-sxhash-supported-object-p :CLOS))))
       (CL:setq hashCodeForm
-        `(CL:let* (,@(CL:when (CL:not (CL:atom object))
-                       `((,objectVar ,object)))
+        `(CL:let* ((,objectVar ,object)
                    ;; TRICKY: if we are using Lisp conses, we don't have a
                    ;; hash code slot and need to use `CL:sxhash' (which
                    ;; returns a non-negative fixnum so we don't have to test
@@ -827,10 +945,15 @@
                    (code (CL:if (CL:listp ,objectVar)
                              (CL:sxhash ,objectVar)
                            ,hashCodeSlot)))
-           (CL:declare (CL:type CL:FIXNUM code))
+           (CL:declare (CL:type CL:FIXNUM code)
+                       (CL:type CL:t ,objectVar))
            (CL:when (CL:= code -1)
              (CL:setq code (CL:random ,mask))
-             (CL:setf ,hashCodeSlot code))
+             (CL:setf ,hashCodeSlot code)
+             ;; we do this to outsmart CMUCL type inference, otherwise we get
+             ;; unreachable code warnings in a context where `object' either
+             ;; always is or can't be a CL:cons (correct but annoying):
+             #+(or cmu sbcl) (CL:setq ,objectVar CL:nil))
            code)))
     hashCodeForm))
 
@@ -845,9 +968,9 @@
   #+Allegro   (MP:MAKE-PROCESS-LOCK)
   #+Lispworks (MP:MAKE-LOCK)
   #+MCL       (CCL:MAKE-LOCK)
-  #+CMUCL     (MULTIPROCESSING:MAKE-LOCK)
+  #+CMU       (MULTIPROCESSING:MAKE-LOCK)
   #+SBCL      (SB-THREAD:MAKE-MUTEX)
-  #-(or Allegro Lispworks MCL CMUCL SBCL) 'NO-LOCK)
+  #-(or Allegro Lispworks MCL CMU SBCL) 'NO-LOCK)
 
 (cl:defmacro with-process-lock (lock CL:&body forms)
   ;; Macro to synchronize a body of code based on a lock.  Conditionalized
@@ -855,10 +978,11 @@
   `(#+Allegro   MP:WITH-PROCESS-LOCK
     #+Lispworks MP:WITH-LOCK
     #+MCL       CCL:WITH-LOCK-GRABBED
-    #+CMUCL     MULTIPROCESSING:WITH-LOCK-HELD
+    #+CMU       MULTIPROCESSING:WITH-LOCK-HELD
     #+SBCL      SB-THREAD:WITH-RECURSIVE-LOCK
-    #+(or Allegro Lispworks MCL CMUCL SBCL) (,lock)
-    #-(or Allegro Lispworks MCL CMUCL SBCL) CL:PROGN
+    #+(or Allegro Lispworks MCL CMU SBCL) (,lock)
+    #-(or Allegro Lispworks MCL CMU SBCL) CL:PROGN
+    ,@(CL:when lock CL:nil) ;; avoid unused var warnings for the PROGN case
     ,@forms))
 
   ;;
@@ -872,8 +996,10 @@
 	    #+:LUCID(USER::*REDEFINITION-ACTION* CL:NIL)
 	    #+:TI(TICL::INHIBIT-FDEFINE-WARNINGS CL:T)
 	    #+:LISPWORKS(LISPWORKS::*REDEFINITION-ACTION* CL:NIL)
-	    #+:CLISP(CLOS::*WARN-IF-GF-ALREADY-CALLED* CL:NIL)
-	    #+:CLISP(CLOS::*GF-WARN-ON-REPLACING-METHOD* CL:NIL)
+;; Not in newer versions of CLISP.  Perhaps CLOS::*ENABLE-CLOS-WARNINGS* instead?
+;; or maybe a more global (EXT:SET-GLOBAL-HANDLER 'CLOS:CLOS-WARNING 'CL:MUFFLE-WARNING)
+;;	    #+:CLISP(CLOS::*WARN-IF-GF-ALREADY-CALLED* CL:NIL)
+;;	    #+:CLISP(CLOS::*GF-WARN-ON-REPLACING-METHOD* CL:NIL)
 	    #+:CLISP(CUSTOM:*SUPPRESS-CHECK-REDEFINITION* CL:T)
 	    )
      ,@forms ))
@@ -883,6 +1009,28 @@
   `(#-:EXCL Cl:with-compilation-unit #+:EXCL CL:handler-bind 
    (  #+:EXCL(EXCL:compiler-undefined-functions-called-warning
 	      #'(Cl:lambda (c) (CL:declare (CL:ignore c))
-			   (CL:muffle-warning)))
-	     )
+			   (CL:muffle-warning))))
     ,@forms ))
+
+(cl:defmacro with-style-warnings-suppressed (CL:&body forms)
+  ;; Wrap form with code to suppress undefined function warnings
+  #|
+  ;; disabled for now, since some of these warnings are important clues
+  ;; (e.g., that CMUCL's aggressive type inference might cause problems):
+  `(CL:handler-bind 
+       ((CL:style-warning #'CL:muffle-warning))
+    ,@forms )
+  |#
+  `(CL:progn ,@forms))
+
+
+  ;;
+;;;;;; Another convenience function:
+  ;;
+
+(cl:defun quit ()
+  (cl:let ((quit-symbol (cl:or (cl:find-symbol "QUIT" "CL-USER")
+			       (cl:find-symbol "EXIT" "CL-USER"))))
+    (cl:if (cl:fboundp quit-symbol)
+	   (cl:funcall quit-symbol)
+	   "QUIT Function doesn't seem to exist in this lisp.")))

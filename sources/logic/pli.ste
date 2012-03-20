@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: pli.ste,v 1.48 2006/05/11 07:05:28 hans Exp
+;;; Version: pli.ste,v 1.54 2010/01/27 18:19:38 tar Exp
 
 ;;; Application Program Interface (API) for PowerLoom
 
@@ -107,6 +107,10 @@ loaded STELLA systems if they do reference PowerLoom symbols in their code."
 (defconstant INFERENCE-ENV ENVIRONMENT (new ENVIRONMENT :level "INFERENCE")
   :public? TRUE)
 
+(defun (test-environment-level? BOOLEAN) ((env ENVIRONMENT) (level STRING))
+  :public? FALSE :globally-inline? TRUE
+  :documentation "Test if `env' has level set to `level'"
+  (return (and (defined? env) (string-eql? (level env) level))))
 
   ;;
 ;;;;;; PL ITERATOR
@@ -630,7 +634,7 @@ v.
   (when (null? relation)
     (return NIL))
   (with-logic-environment module environment
-    (let ((specialize? (not (eql? environment ASSERTION-ENV)))
+    (let ((specialize? (not (test-environment-level? environment "ASSERTION")))
           (argumentWithBacklinks (some arg in arguments
                                        where (and (defined? arg)
                                                   (isa? arg @LOGIC-OBJECT))))
@@ -946,8 +950,7 @@ Non-reflexive."
 Include instances of subconcepts of `concept'.  Depending on `concept',
 the return values could be (wrapped) literals."
   (with-logic-environment module environment
-    (if (and (defined? environment)
-             (eql? (level environment) "ASSERTION"))
+    (if (test-environment-level? environment "ASSERTION")
       (return 
        (list-to-pl-iterator 
         (remove-deleted-members (asserted-collection-members concept FALSE))))
@@ -977,8 +980,7 @@ If no module can be found with the name `module-name', then a Stella
 Exclude instances of subconcepts of `concept'.  Depending on `concept',
 the return values could be (wrapped) literals."
   (with-logic-environment module environment
-    (if (and (defined? environment)
-             (eql? (level environment) "ASSERTION"))
+    (if (test-environment-level? environment "ASSERTION")
       (return 
        (list-to-pl-iterator 
         (remove-deleted-members (asserted-collection-members concept TRUE))))
@@ -1048,7 +1050,6 @@ has an attribute matching `value' for the binary relation `relation', i.e.,
   :documentation "Return all named concepts that `object' belongs to."
   (with-logic-environment module environment
     (return (cons-to-pl-iterator (all-direct-types object)))))
-|#
 
 (defun (get-types (PL-ITERATOR OF LOGIC-OBJECT))
        ((object LOGIC-OBJECT) (module MODULE) (environment ENVIRONMENT))
@@ -1066,17 +1067,35 @@ has an attribute matching `value' for the binary relation `relation', i.e.,
                       (when (not (member? types c))
                         (pushq types c))))
     (return (cons-to-pl-iterator types))))
+|#
+
+(defun (help-get-types (CONS OF LOGIC-OBJECT))
+    ((object LOGIC-OBJECT) (module MODULE) (environment ENVIRONMENT))
+  :public? FALSE
+  (with-logic-environment module environment
+    (let ((derivableTypes NIL))
+      (cond ((or (null? environment)
+		 (test-environment-level? environment "INFERENCE"))
+	     (setq derivableTypes (all-types object)))
+	    ((test-environment-level? environment "ASSERTION")
+	     (setq derivableTypes (all-asserted-types object)))
+	    ((test-environment-level? environment "TAXONOMIC")
+	     (setq derivableTypes (all-taxonomic-types object))))
+      (return derivableTypes))))  
+
+(defun (get-types (PL-ITERATOR OF LOGIC-OBJECT))
+       ((object LOGIC-OBJECT) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation "Return all named concepts that `object' belongs to."
+  (return (cons-to-pl-iterator (help-get-types object module environment))))
 
 (defun (get-direct-types (PL-ITERATOR OF LOGIC-OBJECT))
        ((object LOGIC-OBJECT) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
   :documentation "Return most specific concepts that `object' belongs to."
-  (with-logic-environment module environment
-   (let ((derivableTypes NIL))
-     (foreach prop in (all-true-dependent-propositions object NULL FALSE)
-              where (eql? (kind prop) :ISA)
-              do (pushq derivableTypes (get-nth-value prop 0 module environment)))
-     (return (cons-to-pl-iterator (most-specific-named-descriptions derivableTypes))))))
+  (return (cons-to-pl-iterator 
+	   (most-specific-named-descriptions 
+	     (help-get-types object module environment)))))
 
 (defun (get-relation-extension (PL-ITERATOR OF PROPOSITION))
        ((relation LOGIC-OBJECT) (module MODULE) (environment ENVIRONMENT))
@@ -1085,7 +1104,7 @@ Include propositions that satisfy subrelations of `relation'."
   (with-logic-environment module environment
     (return (cons-to-pl-iterator
              (help-get-true-extension-members
-              relation (not (= environment ASSERTION-ENV)))))))
+              relation (not (test-environment-level? environment "ASSERTION")))))))
 
 (defun (s-get-relation-extension (PL-ITERATOR OF PROPOSITION))
        ((relation-name STRING) (module MODULE) (environment ENVIRONMENT))
@@ -1479,6 +1498,47 @@ The function found must conform to the signature for specialist functions."
     (/logic/register-specialist-function-name name native-name)))
 
 
+(defun register-computation-function ((name STRING) (function-reference FUNCTION-CODE)
+				      (arity INTEGER) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation
+  "Register `name' as a function name in `module' which will invoke the
+native code procedure described by `function-reference.'  The `name'
+is a fully-qualified name which will be interpreted by the normal
+rules for reading names in PowerLoom.  The function must conform
+to the signature for computation functions used by the computation
+specialist.  Arity specifies the number of arguments the computation
+accepts.
+
+The exact form of `function-reference' depends on the underlying
+programming language.  The following type mappings are used:
+          C++:  cpp_function_code (a pointer to the function code)
+  Common Lisp:  FUNCTION   (result of #' or (FUNCTION ...))
+         Java:  java.lang.reflect.Method"
+  (with-logic-environment module environment
+    (/logic/register-computation-function name function-reference arity)))
+
+(defun s-register-computation-function ((name STRING) (native-name STRING) (arity INTEGER)
+                                       (module-name STRING) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation
+  "Register `name' as a function name in the module named `module-name'.
+This function will the native code named `native-name'.  The `name'
+is a fully-qualified name which will be interpreted by the normal
+rules for reading names in PowerLoom.  The `native-name' will be
+processed in a manner that depends on the underlying programming
+language.  The following type mappings are used:
+          C++:  Not available.  Error signaled.
+  Common Lisp:  The native-name is read by READ-FROM-STRING and then
+                the SYMBOL-FUNCTION is taken.
+         Java:  A fully package-qualified name is required.  It is
+                looked up using the Reflection tools.
+The function found must conform to the signature for computation functions.
+Arity specifies the number of arguments the computation accepts."
+  (with-logic-environment (safely-get-module module-name environment) environment
+    (/logic/register-computation-function-name name native-name arity)))
+
+
 (defun (create-enumerated-list LOGIC-OBJECT) 
        ((members CONS) (module MODULE) (environment ENVIRONMENT))
   :public? TRUE
@@ -1498,11 +1558,11 @@ in `module' using `environment'."
   (with-logic-environment module environment
     (return (/logic/create-enumerated-set (new LIST :the-cons-list members)))))
 
-(defun destroy-object ((object LOGIC-OBJECT))
+(defun destroy-object ((object OBJECT))
   :public? TRUE
   :documentation "Delete the object `object', retracting all facts attached to it."
   (with-process-lock *powerloom-lock*
-    (destroy-instance object)))
+    (/logic/destroy-object object)))
 
 (defun s-destroy-object
  ((object-name STRING) (module-name STRING) (environment ENVIRONMENT))
@@ -1852,23 +1912,47 @@ then a Stella `no-such-context-exception' is thrown."
 (defun load ((filename STRING) (environment ENVIRONMENT))
   :public? TRUE
   :documentation "Read logic commands from the file named `filename' and evaluate them.
-The file should begin with an `in-module' declaration that specifies
-the module within which all remaining commands are to be evaluated
-The remaining commands are evaluated one-by-one, applying the function
-`evaluate' to each of them."
+The file should contain an `in-module' declaration that specifies the module
+within which all remaining commands are to be evaluated.  The remaining commands
+are evaluated one-by-one, applying the function `evaluate' to each of them."
   (with-logic-environment *module* environment
     (LOGIC/load filename)))
+
+(defun load-in-module ((filename STRING) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation "Read logic commands from the file named `filename' and evaluate them.
+If the file does not have an `in-module' declaration that specifies the module
+within which all remaining commands are to be evaluated, it will be loaded
+in the `module' specified.  If no `module' is specified and the file does
+not contain an `in-module' declaration, an error will be signaled.
+The remaining commands are evaluated one-by-one, applying the function
+`evaluate' to each of them."
+  (with-logic-environment module environment
+    (LOGIC/load filename :module module)))
 
 (defun load-stream ((stream INPUT-STREAM) (environment ENVIRONMENT))
   :public? TRUE
   :documentation
   "Read logic commands from the STELLA stream `stream' and evaluate them.
-The stream should begin with an `in-module' declaration that specifies
-the module within which all remaining commands are to be evaluated
+The stream should contain an `in-module' declaration that specifies
+the module within which all remaining commands are to be evaluated.
 The remaining commands are evaluated one-by-one, applying the function
 `evaluate' to each of them."
   (with-logic-environment *module* environment
     (LOGIC/load-stream stream)))
+
+(defun load-stream-in-module ((stream INPUT-STREAM) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation
+  "Read logic commands from the STELLA stream `stream' and evaluate them.
+If the stream does not supply an `in-module' declaration that specifies the
+module within which all remaining commands are to be evaluated, it will be
+loaded in the `module' specified.  If no `module' is specified and the file 
+does not supply an `in-module' declaration, an error will be signaled.
+The remaining commands are evaluated one-by-one, applying the function
+`evaluate' to each of them."
+  (with-logic-environment module environment
+    (LOGIC/load-stream-in-module stream module)))
 
 (defun load-native-stream ((stream NATIVE-INPUT-STREAM) (environment ENVIRONMENT))
   :public? TRUE
@@ -1882,6 +1966,21 @@ The remaining commands are evaluated one-by-one, applying the function
 `evaluate' to each of them."
   (with-logic-environment *module* environment
     (LOGIC/load-stream (new INPUT-STREAM :native-stream stream))))
+
+(defun load-native-stream-in-module ((stream NATIVE-INPUT-STREAM) (module MODULE) (environment ENVIRONMENT))
+  :public? TRUE
+  :documentation
+  "Read logic commands from the native input stream `stream' and evaluate them.
+Assumes `stream' is a line-buffered stream which is a safe compromise but does
+not generate the best efficiency for block-buffered streams such as files.
+If the stream does not supply an `in-module' declaration that specifies the
+module within which all remaining commands are to be evaluated, it will be
+loaded in the `module' specified.  If no `module' is specified and the file 
+does not supply an `in-module' declaration, an error will be signaled.
+The remaining commands are evaluated one-by-one, applying the function
+`evaluate' to each of them."
+  (with-logic-environment module environment
+    (LOGIC/load-stream-in-module (new INPUT-STREAM :native-stream stream) module)))
 
 (defun save-module ((module MODULE) (filename STRING) (ifexists STRING) (environment ENVIRONMENT))
   :public? TRUE
@@ -1953,7 +2052,8 @@ be of type proposition, cons, vector or PL-iterator.  For a proposition,
 the number includes both the predidate and arguments. For the PL-iterator
 case,the number of columns is for the current value of the iterator.
 
-For non sequence objects, the column count is zero."
+For a null item, the column count is zero.
+For non sequence objects, the column count is one."
   (when (null? obj)
     (return 0))
   (typecase obj

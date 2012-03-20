@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: hierarchy.ste,v 1.184 2006/05/11 07:06:02 hans Exp
+;;; Version: hierarchy.ste,v 1.189 2010/02/10 21:54:28 hans Exp
 
 ;;; STELLA built-in classes.
 
@@ -556,18 +556,20 @@ accessing symbols within it."
   :initializer initialize-vector)
 
 (defclass VECTOR-SEQUENCE (VECTOR) ;;(VECTOR SEQUENCE)
-  :abstract? TRUE
-  :public-slots ((resize-increment :type INTEGER :hardwired? TRUE :initially 100)
-          (sequence-length :type INTEGER))
-  :initializer initialize-vector
-  ;;:print-form (print-vector-sequence self stream)
-  :synonyms (VSEQ) )
+  :documentation "Extensible sequence implemented by a vector.  Whenever we run
+out of room, we grow the sequence by a factor of two.  Note that this keeps the
+average insertion cost per element constant.  This is generally preferable over
+linked lists unless we need within-list insertions or removals, since it uses
+less space and has better cache locality."
+  :public-slots (;(resize-factor :type FLOAT :initially 2.0)
+                 (sequence-length :type INTEGER :initially 0))
+  :initializer initialize-vector)
 
-(defclass SHORT-VECTOR-SEQUENCE (VECTOR-SEQUENCE)
-  :public-slots ((resize-increment :type INTEGER :hardwired? TRUE :initially 4)
-          (sequence-length :type INTEGER :initially 0))
-  :initializer initialize-vector
-  :synonyms (SVSEQ) )
+(defclass CUSTOM-VECTOR-SEQUENCE (VECTOR-SEQUENCE)
+  :documentation "VECTOR-SEQUENCE (which see) with a customizable resize factor.
+The resize factor needs to be > 1."
+  :public-slots ((resize-factor :type FLOAT :initially 2.0)))
+
 
 ;;; TO DO: Fix literal vectors, use wrapped literals for now.
 
@@ -872,7 +874,7 @@ of the class `self'."
   :print-form (print-native-stream stream
 				   "|C|" ; (choose *printReadably?* "" "|C|")
 				   (choose (defined? (class-type self))
-					   (relative-name (class-symbol self))
+					   (relative-name (class-symbol self) FALSE) ; *printReadably?*
 					   "??")))
 
 (defclass POLYMORPHIC-RELATION (RELATION)
@@ -1365,6 +1367,10 @@ the whole graph non-incrementally."
 that are not compatible with the requested operation.  For example,
 comparing dates and time durations.")
 
+(defclass TIMEOUT-EXCEPTION (STELLA-EXCEPTION)
+  :public? TRUE)
+
+
 ;;;
 ;;;  QUANTITY Class
 ;;;
@@ -1417,7 +1423,7 @@ comparing dates and time durations.")
 ;;; will not work in all Lisps.
 
 (defclass INTEGER (NUMBER)
-  :cl-native-type "INTEGER"   ;; Really FIXNUM
+  :cl-native-type "FIXNUM"
   :cpp-native-type "int"
   :idl-native-type "long"
   :java-native-type "int"
@@ -1460,23 +1466,23 @@ comparing dates and time durations.")
 
 ;;; Extended Literal Class Hierarchy needed for IDL schema translation:
 
-(defclass SHORT-INTEGER (INTEGER)
-  :cl-native-type "INTEGER"
+(defclass SHORT-INTEGER (NUMBER)
+  :cl-native-type "FIXNUM"
   :cpp-native-type "short int"
   :idl-native-type "short int"
   :java-native-type "short"
   :initial-value NULL-SHORT-INTEGER
   :equality-test eql?)
 
-(defclass LONG-INTEGER (INTEGER)
+(defclass LONG-INTEGER (NUMBER)
   :cl-native-type "INTEGER"
-  :cpp-native-type "long int"
+  :cpp-native-type "long long int"
   :idl-native-type "long int"
   :java-native-type "long"
   :initial-value NULL-LONG-INTEGER
   :equality-test eql?)
 
-(defclass UNSIGNED-SHORT-INTEGER (INTEGER)
+(defclass UNSIGNED-SHORT-INTEGER (NUMBER)
   :cl-native-type "INTEGER"
   :cpp-native-type "unsigned short int"
   :idl-native-type "unsigned short int"
@@ -1484,7 +1490,7 @@ comparing dates and time durations.")
   :initial-value NULL-UNSIGNED-SHORT-INTEGER
   :equality-test eql?)
 
-(defclass UNSIGNED-LONG-INTEGER (INTEGER)
+(defclass UNSIGNED-LONG-INTEGER (NUMBER)
   :cl-native-type "INTEGER"
   :idl-native-type "unsigned long int"
   :cpp-native-type "unsigned long int"
@@ -1492,7 +1498,7 @@ comparing dates and time durations.")
   :initial-value NULL-UNSIGNED-LONG-INTEGER
   :equality-test eql?)
 
-(defclass SINGLE-FLOAT (FLOAT)
+(defclass SINGLE-FLOAT (NUMBER)
   :cl-native-type "FLOAT"
   :java-native-type "float"
   :idl-native-type "float"
@@ -1502,7 +1508,7 @@ comparing dates and time durations.")
 
 ;; This is identical to FLOAT, but it defines
 ;;    a better name for the NULL value:
-(defclass DOUBLE-FLOAT (FLOAT)
+(defclass DOUBLE-FLOAT (NUMBER)
   :cl-native-type "FLOAT"
   :cpp-native-type "double"
   :java-native-type "double"
@@ -1548,6 +1554,17 @@ comparing dates and time durations.")
                   (if *printReadably?*
                     (print-native-stream stream (quote NULL-INTEGER))
                     (print-native-stream stream "|L|NULL-INTEGER"))
+                  (if *printReadably?*
+                    (print-native-stream stream value)
+                    (print-native-stream stream "|L|" value)))))
+
+(defclass LONG-INTEGER-WRAPPER (NUMBER-WRAPPER)
+  :slots ((wrapper-value :type LONG-INTEGER))
+  :print-form (let ((value (wrapper-value self)))
+                (if (null? value)
+                  (if *printReadably?*
+                    (print-native-stream stream (quote NULL-LONG-INTEGER))
+                    (print-native-stream stream "|L|NULL-LONG-INTEGER"))
                   (if *printReadably?*
                     (print-native-stream stream value)
                     (print-native-stream stream "|L|" value)))))
@@ -1702,6 +1719,7 @@ that constitute Stella applications."
    (lisp-only-files :type (CONS OF STRING-WRAPPER))
    (cpp-only-files :type (CONS OF STRING-WRAPPER))
    (java-only-files :type (CONS OF STRING-WRAPPER))
+   (data-files :type (CONS OF STRING-WRAPPER))
    (preprocessed-files :type (CONS OF STRING-WRAPPER))
    (required-systems :type (CONS OF STRING-WRAPPER))
    (loaded? :type BOOLEAN)

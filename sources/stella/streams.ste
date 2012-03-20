@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2010      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: streams.ste,v 1.84 2006/05/11 07:06:25 hans Exp
+;;; Version: streams.ste,v 1.91 2010/02/10 22:02:06 hans Exp
 
 ;;; Procedures that manipulate streams.
 
@@ -302,7 +302,7 @@ with `context' supplying context for the error message."
     (return
      (bquote
       (special ((*printReadably?* TRUE))
-         ;(signal-translation-warning)
+         (signal-translation-note)
          (unless (suppress-warnings?)
            (print-error-context ">> NOTE: " STANDARD-OUTPUT)
            (print-stream STANDARD-OUTPUT EOL " " && messageArguments "." EOL))))) ))
@@ -509,14 +509,15 @@ opening operation will be aborted and NULL will be returned."
     (setf (native-output-stream self)
       (verbatim
         :common-lisp
-        (cl:open filename
-                 :direction :output
-                 :if-exists (CL:if append :append :supersede)
-                 :if-does-not-exist :create)
+        (cl:progn (cl:ensure-directories-exist filename)
+                  (cl:open filename
+                           :direction :output
+                           :if-exists (CL:if append :append :supersede)
+                           :if-does-not-exist :create))
         ;; don't GC C++ streams, since it is unnecessary and can cause
         ;;    problems during closing/deletion:
         :cpp "(new std::ofstream(filename, append ? std::ios::app : std::ios::out))"
-        :java "new java.io.PrintStream(Native.openOutputFileStream(filename, append))"))
+        :java "NativeFileOutputStream.open(filename, append)"))
     (when (verbatim
             :cpp "!*(self->nativeStream)"
             :otherwise (eq? (native-output-stream self) NULL))
@@ -592,7 +593,7 @@ the opening operation will be aborted and NULL will be returned."
         ;; don't GC C++ streams, since it is unnecessary and can cause
         ;;    problems during closing/deletion:
         :cpp "(new std::ifstream(filename))"
-        :java "new java.io.PushbackInputStream(Native.openInputFileStream(filename))"))
+        :java "NativeFileInputStream.open(filename)"))
     (when (verbatim
             :cpp "!*(self->nativeStream)"
             :otherwise (eq? (native-input-stream self) NULL))
@@ -723,7 +724,8 @@ as an input/output stream pair."
       (error "Network streams not yet implemented for this target language"))
     (return (new INPUT-STREAM
                  :native-input-stream in
-                 :state :OPEN)
+                 :state :OPEN
+                 :buffering-scheme :BLOCK)
             (new OUTPUT-STREAM
                  :native-output-stream out
                  :state :OPEN))))
@@ -789,6 +791,110 @@ streams. Syntax is (WITH-NETWORK-STREAM (varIn varOut hostname port) body+)"
 	     (free & var-in))
            (when (defined? & var-out)
 	     (free & var-out))))))))
+
+
+  ;;
+;;;;;; File/stream position
+  ;;
+
+;;; We currently only support repositioning of file streams; conceivably
+;;; we could also allow it on other seekable streams such as string streams.
+
+;;; TO DO:
+;;; - proper exception handling when we are trying to set a stream pointer
+;;;   past the end of a file.
+
+(defun (native-file-input-stream-position LONG-INTEGER) ((nstream NATIVE-INPUT-STREAM))
+  :public? TRUE :globally-inline? TRUE
+  ;; see below, but not sure the clear is actually needed:
+  (verbatim :cpp "nstream->clear(std::ios::goodbit)"
+            :otherwise NULL)
+  (return
+    (verbatim :common-lisp "(CL:file-position nstream)"
+              :cpp "nstream->tellg()"
+              :java "((NativeFileInputStream)nstream).position()")))
+
+(defun (native-file-input-stream-position-setter LONG-INTEGER)
+    ((nstream NATIVE-INPUT-STREAM) (newpos LONG-INTEGER))
+  :public? TRUE :globally-inline? TRUE
+  (verbatim :common-lisp "(CL:file-position nstream newpos)"
+            ;; we need to clear an eof bit in case reading from the
+            ;; current position has moved us to the end of the file:
+            :cpp "nstream->clear(std::ios::goodbit);nstream->seekg(newpos)"
+            :java "((NativeFileInputStream)nstream).position(newpos)")
+  (return newpos))
+
+(defmethod (stream-position LONG-INTEGER) ((self FILE-INPUT-STREAM))
+  :documentation "Return the current position of the file input cursor in `self'."
+  :public? TRUE
+  (let ((position (native-file-input-stream-position (native-stream self)))
+        (state (tokenizer-state self)))
+    (when (defined? state)
+      ;; we buffered some input during tokenization, subtract the unprocessed portion:
+      (-- position (buffered-input-length state)))
+    (return position)))
+
+(defmethod (stream-position-setter LONG-INTEGER) ((self FILE-INPUT-STREAM)
+                                                  (newpos LONG-INTEGER))
+  :documentation
+  "Set the current position of the file input cursor in `self' to `newpos'.
+If `self' has any tokenizer state associated with it, this will also reset
+to the start state of the tokenizer table; otherwise, behavior would be
+unpredictable unless the character class of the new position is exactly the
+same as the one following the most recent token."
+  :public? TRUE
+  (let ((nstream (native-stream self))
+        (state (tokenizer-state self)))
+    (when (defined? state)
+      ;; check whether `newpos' lies within currently buffered input,
+      ;; and, if so, simply change the cursor; otherwise, set the length
+      ;; of the buffer to zero and set to a new file position:
+      (let ((filePosition (native-file-input-stream-position nstream))
+            (offset (- filePosition newpos))
+            (buffered 0))
+        (when (> offset 0)
+          (setq buffered (buffered-input-length state))
+          (when (<= offset buffered)
+            (setf (cursor state)
+              (mod (+ (cursor state) (- buffered offset)) (buffer-size state)))
+            (reset state)
+            (return newpos)))
+        ;; new position is outside the current buffer, truncate to zero and reset:
+        (clear state)
+        (reset state)))
+    (setf (native-file-input-stream-position nstream) newpos)
+    (return newpos)))
+
+(defun (native-file-output-stream-position LONG-INTEGER) ((nstream NATIVE-OUTPUT-STREAM))
+  :globally-inline? TRUE
+  (return
+    (verbatim :common-lisp "(CL:file-position nstream)"
+              :cpp "nstream->tellp()"
+              :java "((NativeFileOutputStream)nstream).position()")))
+
+(defun (native-file-output-stream-position-setter LONG-INTEGER)
+    ((nstream NATIVE-OUTPUT-STREAM) (newpos LONG-INTEGER))
+  :globally-inline? TRUE
+  (verbatim :common-lisp "(CL:file-position nstream newpos)"
+            :cpp "nstream->seekp(newpos)"
+            :java "((NativeFileOutputStream)nstream).position(newpos)")
+  (return newpos))
+
+(defmethod (stream-position LONG-INTEGER) ((self FILE-OUTPUT-STREAM))
+  :documentation "Return the current position of the file input cursor in `self'."
+  :public? TRUE
+  ;; NOTE: flushing of buffered output is assumed to be handled natively.
+  (return (native-file-output-stream-position (native-stream self))))
+
+(defmethod (stream-position-setter LONG-INTEGER) ((self FILE-OUTPUT-STREAM)
+                                                  (newpos LONG-INTEGER))
+  :documentation
+  "Set the current position of the file input cursor in `self' to `newpos'."
+  :public? TRUE
+  ;; NOTE: flushing of buffered output is assumed to be handled natively.
+  (setf (native-file-output-stream-position (native-stream self)) newpos)
+  (return newpos))
+
 
   ;;
 ;;;;;; Basic HTML & XML support:
@@ -936,22 +1042,17 @@ streams. Syntax is (WITH-NETWORK-STREAM (varIn varOut hostname port) body+)"
   :PUBLIC? TRUE
   :documentation "Writes a string and replaces unallowed URL characters according to RFC 2396
 with %-format URL escape sequences."
+
   (foreach ch in input
-      do (case ch
-	   (#\space (print-stream stream "%20"))
-	   (#\?  (print-stream stream "%3F"))
-	   (#\#  (print-stream stream "%23"))
-	   (#\=  (print-stream stream "%3D"))
-	   (#\&  (print-stream stream "%26"))
-	   (#\%  (print-stream stream "%25"))
-	   (#\+  (print-stream stream "%2B"))
-	   (#\<  (print-stream stream "%3C"))
-	   (#\>  (print-stream stream "%3E"))
-	   (#\/  (print-stream stream "%2F"))
-	   (#\:  (print-stream stream "%3A"))
-	   (#\"  (print-stream stream "%22"))
-	   (#\'  (print-stream stream "%27"))
-	   (otherwise (print-stream stream ch))))
+      do (if (or (letter-character? ch) (digit-character? ch))
+	     (print-stream stream ch)
+	     (case ch
+	       ((#\- #\_ #\. #\~) (print-stream stream ch))
+	       (otherwise
+		(let ((code (character-code ch)))
+		  (if (< code 16)
+		      (print-stream stream "%0" (integer-to-hex-string code))
+		      (print-stream stream #\% (integer-to-hex-string code))))))))
   (return))
 
 
@@ -1228,12 +1329,12 @@ value is defined."
   :LOG-LEVELS - a cons list of legal levels in ascending log level order;
                 for example, (:NONE :LOW :MEDIUM :HIGH) or (0 1 2 3).
   :LEVEL      - the current log level for `module'
-  :STREAM     - the stream to log to (defaults to STANDARD-OUTPUT)
+  :STREAM     - the stream or file to log to (defaults to STANDARD-OUTPUT)
   :PREFIX     - the prefix to use to identify the module (defaults to `module')
   :MAX-WIDTH  - logging output lines will be kept to approximately this width
                 (defaults to 10000, minimum width of about 30 is used to
                 print line header information)."
-  :public? TRUE
+  :public? TRUE :command? TRUE
   ;; TO DO: SUPPORT DIFFERENT LOGGING FORMATS.
   (let ((options (vet-options (coerce-&rest-to-cons params&values)
                               (quote (:LOG-LEVELS :LEVEL :STREAM :PREFIX :MAX-WIDTH))))
@@ -1247,6 +1348,12 @@ value is defined."
     (foreach (key value) in options
         do (insert-at logInfo key value))))
 
+(defun set-log-level ((module STRING) (level OBJECT))
+  :documentation "Set the log-level for `module' to `level'.  This is a
+convenience function for this common operation."
+  :public? TRUE :command? TRUE
+  (set-logging-parameters module :level level))
+
 (defun (log-level<= BOOLEAN) ((level OBJECT) (module STRING))
   :documentation "Return TRUE if `level' is lower than or equal to the current
 log level of `module'.  Return FALSE if any of them are undefined."
@@ -1259,47 +1366,76 @@ log level of `module'.  Return FALSE if any of them are undefined."
                  (defined? pos2)
                  (<= pos1 pos2)))))
 
+(defglobal *log-indent-level* INTEGER 0
+  :documentation "The number of spaces to print before the content of a log message."
+  :public? TRUE)
+
+(defun bump-log-indent ()
+  :documentation "Increase the indentation level for subsequent log messages."
+  :public? TRUE :command? TRUE
+  (++ *log-indent-level* 2))
+
+(defun unbump-log-indent ()
+  :documentation "Decrease the indentation level for subsequent log messages."
+  :public? TRUE :command? TRUE
+  (-- *log-indent-level* 2))
+
+(defun (get-log-stream OUTPUT-STREAM) ((module STRING))
+  :documentation "Return a valid log stream for `module'."
+  :public? TRUE
+  (let ((streamSpec (lookup-logging-parameter module :STREAM STANDARD-OUTPUT)))
+    (typecase streamSpec
+      (STRING-WRAPPER
+       (return (open-output-file streamSpec :if-exists :append :if-not-exists :create)))
+      (OUTPUT-STREAM
+       (return streamSpec)))))
+
 (defun log-message ((module STRING) (logLevel OBJECT) (message CONS))
   :documentation "Log all elements of `message' to `module's log stream if
 `logLevel' is the same or lower than the `module's log level.  Interprets `EOL'
 or :EOL to print a line terminator."
   :public? TRUE
   (when (log-level<= logLevel module)
-    (let ((log OUTPUT-STREAM (lookup-logging-parameter module :STREAM STANDARD-OUTPUT))
+    (let ((log (get-log-stream module))
           (modulePrefix STRING (lookup-logging-parameter module :PREFIX module))
           (maxRoom INTEGER (lookup-logging-parameter module :MAX-WIDTH 10000))
           (room maxRoom)
           (eltString STRING NULL))
-      (print-stream log
-                    "["
-                    (calendar-date-to-string
-                     (make-current-date-time)
-                     *logging-local-time-zone*
-		     FALSE
-                     FALSE)
-                    (choose (empty? modulePrefix) "" " ")
-                    modulePrefix
-                    "] ")
-      (-- room (+ 27 (length modulePrefix)))
-      (special ((*printReadably?* TRUE))
-        (foreach elt in message
-            do (typecase elt
-                 (STRING-WRAPPER
-                  (setq eltString (wrapper-value elt)))
-                 (SYMBOL
-                  (cond ((eql? (symbol-name elt) "EOL")
-                         (print-stream log EOL)
-                         (setq room maxRoom)
-                         (continue))
-                        (otherwise
-                         (setq eltString (stringify elt)))))
-                 (otherwise
-                  (setq eltString (stringify elt))))
-               (if (< room (length eltString))
-                   (print-stream log (subsequence eltString 0 room) "...")
-                 (print-stream log eltString))))
-      (print-stream log EOL)
-      (flush-output log))))
+      (unwind-protect
+          (progn
+            (print-stream log
+                          "["
+                          (calendar-date-to-string
+                           (make-current-date-time)
+                           *logging-local-time-zone*
+                           FALSE
+                           FALSE)
+                          (choose (empty? modulePrefix) "" " ")
+                          modulePrefix
+                          "] ")
+            (print-spaces log *log-indent-level*)
+            (-- room (+ 27 (length modulePrefix) *log-indent-level*))
+            (special ((*printReadably?* TRUE))
+              (foreach elt in message
+                  do (typecase elt
+                       (STRING-WRAPPER
+                        (setq eltString (wrapper-value elt)))
+                       (GENERALIZED-SYMBOL
+                        (cond ((eql? (symbol-name elt) "EOL")
+                               (print-stream log EOL)
+                               (setq room maxRoom)
+                               (continue))
+                              (otherwise
+                               (setq eltString (stringify elt)))))
+                       (otherwise
+                        (setq eltString (stringify elt))))
+                     (if (< room (length eltString))
+                         (print-stream log (subsequence eltString 0 room) "...")
+                       (print-stream log eltString))))
+            (print-stream log EOL)
+            (flush-output log)))
+      (when (isa? log @FILE-OUTPUT-STREAM)
+        (close-stream log)))))
 
 (defun logmsg ((module STRING) (logLevel OBJECT) &rest (message OBJECT))
   :documentation "Log all elements of `message' to `module's log stream if

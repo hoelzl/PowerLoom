@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-powerloom.lisp,v 1.13 2006/05/15 18:08:38 tar Exp
+;;; Version: load-powerloom.lisp,v 1.14 2006/11/22 01:41:52 hans Exp
 
 ;;; Load PowerLoom.
 
@@ -52,11 +52,17 @@
 ;; when classes are redefined.  Use for production versions only.
 (defvar *load-cl-struct-stella?* t)
 
+;; Set this to t to load various optional extension systems such as RDBMS support.
+;; Alternatively, you can load systems individually via `stella::make-system'.
+(defvar *load-all-extensions?* nil)
+
 (load (merge-pathnames "translations" *load-pathname*))
 (unless (find-package "STELLA")
   (load (merge-pathnames "load-stella" *load-pathname*)))
 (unless (stella::system-loaded? "logic")
-  (stella::make-system "powerloom" :common-lisp))
+  (stella::make-system "powerloom"))
+(when *load-all-extensions?*
+  (stella::load-all-extension-systems))
 
 (defun powerloom ()
   (stella::powerloom))

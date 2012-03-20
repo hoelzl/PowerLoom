@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: query.ste,v 1.178 2006/05/11 07:05:33 hans Exp
+;;; Version: query.ste,v 1.185 2009/06/25 23:22:09 hans Exp
 
 ;;; Incremental backward chaining.
 
@@ -855,6 +855,17 @@ all boolean vectors.")
      (return (value-of self)))
     (otherwise (return (value-of self)))) )
 
+(defun (safe-argument-bound-to OBJECT) ((arg OBJECT))
+  ;; Safe version of `argument-bound-to' (which see) that does not
+  ;; break if we are called outside of a query or on a variable
+  ;; that isn't allocated on the binding stack.
+  (if (variable? arg)
+      (if (and (defined? *queryIterator*)
+               (defined? (bound-to-offset (cast arg PATTERN-VARIABLE))))
+          (return (argument-bound-to arg))
+        (return NULL))
+    (return (argument-bound-to arg))))
+
 (defun (help-unify-attributes? BOOLEAN) ((value1 OBJECT) (value2 OBJECT))
   ;; Helping function for 'help-bind-variable-to-value?'.
   ;; Evaluate equivalence of 'value1' and 'value2' (possibly recursively).
@@ -942,9 +953,11 @@ all boolean vectors.")
        (mv-setq (typeIsOK? value) (check-coerced-type? value (skolem-type variable) TRUE))
        (when (and (not typeIsOK?)
                   (non-inferable? (surrogate-to-description (skolem-type variable))))
-         (trace-if :PERFORMANCE-CLUES
-          "TYPE CHECK VIOLATION in 'bind-variable-to-value?'.  Type= "
-          (skolem-type variable) " Value= " value EOL)
+         ;; trace type violation failures in the goal tree, since they can
+         ;; lead to very mysterious and hard to debug inference failures:
+         (trace-if :GOAL-TREE
+          "*** type violation: var=" (skolem-name variable) " type="
+          (skolem-type variable) " value=" value EOL)
          (return FALSE))))
     (:NONE NULL))
   (let ((boundToValue (bound-to variable))
@@ -959,12 +972,19 @@ all boolean vectors.")
      ((null? boundToValue)
       (set-pattern-variable-binding variable value))
      ((equal? (value-of boundToValue) (value-of value))
+      ;; Disabled: changing the variable value to an equivalent is a bad idea, since
+      ;; the equivalence might be due to a hypothetical context (e.g., in PL-Mediator),
+      ;; which, once the context goes away, leaves us with an incorrect binding.  We
+      ;; now dereference bindings at the top level, since collecting all members of an
+      ;; equivalence class will need a specialist and a LISTOF result term anyway.
+      #|
       (unless (eql? boundToValue (value-of boundToValue))
         ;; in some cases the elaboration above might discover additional equivalences
         ;; and we change the binding here to the newly discovered equivalent representative
         ;; - we could do that when the bindings are collected at the top-level but that
         ;; would prevent us from ever retrieving all members of an equivalence class:
         (change-pattern-variable-binding variable (value-of boundToValue)))
+      |#
       (return TRUE))                    ; quick exit, succeed
      (otherwise (return FALSE)))        ; fail
     ;; 'variable' is newly-bound to 'value';
@@ -2450,15 +2470,21 @@ variable bindings appear relative to the frame '*printInFrame*'.")
   (setf (optimal-pattern self) NULL)
   (return TRUE))
 
-(defun (copy-pattern-arguments ARGUMENTS-VECTOR)
-       ((arguments OBJECT-VECTOR) (description DESCRIPTION))
-  ;; Make a copy of 'arguments'.
+(defun (copy-pattern-arguments ARGUMENTS-VECTOR) ((arguments OBJECT-VECTOR)
+                                                  (description DESCRIPTION))
+  ;; Make a copy of (external) 'arguments'.  Conceivably, there could be more
+  ;; than are consumed by `description' which is why we are using its arity.
   (when (null? arguments)
     (return NULL))
   (let ((argumentCount (arity description))
-        (copiedArguments (new ARGUMENTS-VECTOR :array-size argumentCount)))
+        (copiedArguments ARGUMENTS-VECTOR NULL))
+    (when (= argumentCount -1)
+      ;; `description is variable arity, consume all arguments:
+      (setq argumentCount (length arguments)))
+    (setq copiedArguments
+      (new ARGUMENTS-VECTOR :array-size argumentCount))
     (foreach i in (interval 0 (1- argumentCount))
-             do (setf (nth copiedArguments i) (nth arguments i)))
+        do (setf (nth copiedArguments i) (nth arguments i)))
     (return copiedArguments)) )
 
 
@@ -2534,7 +2560,7 @@ variable bindings appear relative to the frame '*printInFrame*'.")
           (inherit-proposition (proposition self) bindings))
         ;; do check for duplicates here, otherwise we might get multiple
         ;;    concept prototypes for the same description in subsumption tests:
-        (return (finish-building-description description TRUE)))))
+        (return (finish-building-description description TRUE :TOP-LEVEL)))))
   (return self))
 
 (defun (check-for-single-valued-goal? BOOLEAN) 
@@ -3377,7 +3403,10 @@ if the table is empty."
 `predicate', and return the result.  If `predicate' has a '<' semantics, the
 result will be in ascending order."
   :public? TRUE
-  (let ((solutions (sort (consify self) predicate))
+  (let ((thePredicate
+         (first-defined predicate
+                        (the-code :function query-solution-less-than?)))
+        (solutions (sort (consify self) thePredicate))
         (current QUERY-SOLUTION NULL)
         (next QUERY-SOLUTION NULL))
     (setf (first self) (first solutions))
@@ -3393,6 +3422,24 @@ result will be in ascending order."
             (otherwise
              (break))))
     (return self)))
+
+(defun (query-solution-less-than? BOOLEAN) ((x QUERY-SOLUTION)
+                                            (y QUERY-SOLUTION))
+  ;; Default predicate that sorts solutions by their binding columns.
+  (foreach xBinding in (bindings x)
+      as yBinding in (bindings y)
+      do (cond ((eql? xBinding yBinding)
+                (continue))
+               ((logic-form-less? xBinding yBinding)
+                (return TRUE))
+               (otherwise
+                (return FALSE))))
+  (return FALSE))
+
+(defun (query-solution-greater-than? BOOLEAN) ((x QUERY-SOLUTION)
+                                               (y QUERY-SOLUTION))
+  ;; Predicate that sorts solutions by their binding columns (for descending order).
+  (return (query-solution-less-than? y x)))
 
 (defclass QUERY-SOLUTION-TABLE-ITERATOR (DICTIONARY-ITERATOR)
   :slots ((the-table :type QUERY-SOLUTION-TABLE)
@@ -3799,7 +3846,7 @@ with a full stack of control frames."
          ;; transfer bindings:
          (foreach ev in (external-variables self)
              as i in (interval 0 NULL)
-             do (setf (nth (bindings solution) i) (bound-to ev)))
+             do (setf (nth (bindings solution) i) (value-of (bound-to ev))))
          (setf (found-at-least-one-solution? self) TRUE)
          (setf (truth-value solution)
            (first-defined (truth-value baseFrame) UNKNOWN-TRUTH-VALUE))
@@ -4003,7 +4050,9 @@ with a full stack of control frames."
       (setf (atomic-singletons? query) TRUE))
     (special ((*evaluationMode* :DESCRIPTION)
               (*logicVariableTable* NIL)
-              (*termUnderConstruction* prefixQueryTree))
+              (*termUnderConstruction* prefixQueryTree)
+              ;; block variable bindings in case of nested calls:
+              (*queryIterator* NULL))
       (within-module *module*       
         (setq description 
               (evaluate-DESCRIPTION-term prefixQueryTree FALSE))))
@@ -4169,6 +4218,12 @@ with a full stack of control frames."
                  (cond
                   ((string-eql? (symbol-name value) "SCORE")
                    (insert-at theOptions key :SCORE))
+                  ((string-eql? (symbol-name value) "VALUES")
+                   (insert-at theOptions key :VALUES))
+                  ((string-eql? (symbol-name value) "VALUES-DESCENDING")
+                   (insert-at theOptions key :VALUES-DESCENDING))
+                  ((string-eql? (symbol-name value) "VALUES-ASCENDING")
+                   (insert-at theOptions key :VALUES-ASCENDING))
                   (otherwise
                    (signal-parsing-error "Illegal :SORT-BY value: " value))))
                 (otherwise
@@ -4462,6 +4517,15 @@ queries and logical expressions."
           do (when (trace-keyword? :TRACE-SOLUTIONS)
                ;; trace solution generation; useful for expensive queries:
                (trace-solution *queryIterator* solution i)))
+      (let ((sortOption KEYWORD (lookup-query-option theQuery :SORT-BY)))
+        (case sortOption
+          ((:VALUES :VALUES-ASCENDING)
+           (sort (solutions theQuery)
+                 (the-code :function query-solution-less-than?)))
+          (:VALUES-DESCENDING
+           (sort (solutions theQuery)
+                 (the-code :function query-solution-greater-than?)))
+          (otherwise NULL)))
       (return *queryIterator*))))
 
 (defglobal *most-recent-query* QUERY-ITERATOR NULL)
@@ -4567,8 +4631,6 @@ inference engine."
 of result tuples.  If `:SINGLETONS? TRUE', collect a list of atoms rather than a
 list of lists for tuples of arity=1."
   :public? TRUE
-  (when (null? self)
-    (return NIL))
   (let ((solutions (solutions self))
         (listifiedSolutions NIL)
         (arity (arity (query-description self)))
@@ -4587,8 +4649,6 @@ list of lists for tuples of arity=1."
 of result tuples.  If `:SINGLETONS? TRUE', collect a list of atoms rather than a
 list of lists for tuples of arity=1."
   :public? TRUE
-  (when (null? self)
-    (return NIL))
   (special ((*queryIterator* self)
 	    ;; initialize this for the sake of recursive queries:
 	    (*reversePolarity?* FALSE))
@@ -4925,6 +4985,8 @@ value of the query."
     (STRING-WRAPPER
      (return
        (coerce-to-instance (lookup-surrogate (wrapper-value self)) original)))
+    (CONS
+     (return (coerce-to-instance (evaluate-term self) original)))
     ;; print warning message and then return NULL:
     (otherwise (return (coerce-to-instance NULL original)))) )
 

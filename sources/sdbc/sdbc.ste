@@ -1,0 +1,2033 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: sdbc.ste,v 1.23 2008/08/30 03:39:33 hans Exp
+
+;;; ODBC/JDBC connectivity.
+
+(in-package "STELLA")
+
+(in-module "/SDBC")
+
+
+;;; STILL TODO:
+;;; 1. (If Possible) Make get-result-set accept prepared-statements.
+;;; 2. Implement MetaData API such as list-all-database-tables, list-all-table-columns
+;;; 3. Use MetaData to automatically coerce to the correct types
+;;; 4. hc: figure out whether a connection always uniquely specifies a database/catalog,
+;;;    or if we could access multiple catalogs per connection.  IT DOES.
+;;; 5. hc: finish implementation of :PROTOCOL specification
+;;; 6. hc: support AODBC and CLSQL in Allegro
+
+;;;;
+;;;;  Support Files.
+;;;;     Allegro Common Lisp requires the AODBC system, v2.
+;;;;     OpenMCL requires a function CL-USER::LOAD-CLSQL
+;;;;         In init file:   (load "home:lisp;asdf")
+;;;;                          (pushnew (translate-logical-pathname "home:lisp;uffi;")
+;;;;	                                asdf:*central-registry*)
+;;;;                          (pushnew (translate-logical-pathname "home:lisp;clsql;")
+;;;; 	                                asdf:*central-registry*)
+;;;;         Prototpe: (defun load-clsql ()
+;;;;                      (asdf:operate 'asdf:load-op 'clsql))
+;;;;
+
+(verbatim
+    :cpp "#include \"sdbc/sdbc-support.hh\""
+    :common-lisp "#+:EXCL (cl:require :aodbc-v2)
+#+(or :openmcl :sbcl) (cl:eval-when (:compile-toplevel :load-toplevel :execute)
+   (cl-user::load-clsql)
+   (cl:pushnew :CLSQL CL:*FEATURES*))"
+    :otherwise NULL)
+
+(startup-time-progn
+   (set-logging-parameters "SDBC"
+                           :log-levels (quote (:none :low :medium :high))
+                           :level :none
+                           :max-width 250))
+
+(defclass NATIVE-CONNECTION ()
+  :abstract? TRUE
+  :cpp-native-type "sdbc::NativeConnection*"
+  :java-native-type "edu.isi.sdbc.NativeConnection"
+  :cl-native-type "#+:EXCL DB-INTERFACE::ODBC-DB #+:CLSQL CLSQL:DATABASE  #-(OR :EXCL :CLSQL) CL:STANDARD-OBJECT")
+
+(defclass NATIVE-RESULT-SET ()
+  :abstract? TRUE
+  :cpp-native-type "NativeResultSet*"
+  :java-native-type "edu.isi.sdbc.ResultSet"
+  :cl-native-type "#+:EXCL DB-INTERFACE::QUERY #+:CLSQL CL:LIST  #-(OR :EXCL :CLSQL) CL:STANDARD-OBJECT")
+
+(defclass CONNECTION (STANDARD-OBJECT)
+  :public-slots
+  ((native-connection :type NATIVE-CONNECTION :public? TRUE)
+   (connection-string :type STRING)
+   (protocol :type STRING)
+   (dbms-name :type KEYWORD
+              :documentation "Indicates to what kind of DBMS we are connected.")
+   (statement :type PREPARED-STATEMENT
+              :documentation "Prepared statement associated with this connection.")
+   (auto-commit? :type BOOLEAN :initially TRUE
+                 :documentation "State of connection's auto-commit feature.")
+   (creation-time :type CALENDAR-DATE
+                  :documentation "Time at which connection was created.")
+   (last-access-time :type CALENDAR-DATE
+                     :documentation "Time at which connection was last accessed.")
+   (renewal-time :type CALENDAR-DATE
+                 :documentation "Time at or after which connection should be renewed."))
+  :print-form (print-native-stream stream "|CON|\"" (connection-string self) "\""))
+
+(defclass PREPARED-STATEMENT (STANDARD-OBJECT)
+  :slots
+  ((connection :type CONNECTION)
+   (statement :type NATIVE-PREPARED-STATEMENT)
+   (sql :type STRING)
+   (parameters :type (KEY-VALUE-LIST OF INTEGER-WRAPPER CONS)
+               :initially (new KEY-VALUE-LIST)
+               :documentation
+               "Stores parameters bound so far to support connection renewal.")))
+
+(defclass NATIVE-PREPARED-STATEMENT ()
+  :abstract? TRUE
+  :java-native-type "java.sql.PreparedStatement")
+
+(defclass DATABASE-EXCEPTION (STELLA-EXCEPTION))
+
+(deftype RDBMS-ROW (CONS OF STRING-WRAPPER))
+
+(defclass RESULT-SET-ITERATOR (ITERATOR)
+  :documentation "Iterator class for a table returned by a SQL query."
+  :parameters ((any-value :type RDBMS-ROW))
+  :public-slots ((result-set :type NATIVE-RESULT-SET)
+		 (types :type CONS)))
+
+(defun (connect CONNECTION) (&rest (keys-and-values OBJECT))
+  :documentation
+   "Create a connection to a database.  Currently-supported parameters
+are (values need to be strings):
+  :PROTOCOL          - \"ODBC\", \"JDBC\", \"CLSQL\" or \"MYSQL\" (defaults to \"ODBC\")
+  :SERVER-TYPE       - Type of database server (for JDBC strings)
+  :DSN               - Name of ODBC Datasource
+  :DB-NAME           - Name of physical database
+  :USER              - Database user id.
+  :PASSWORD          - Database password
+  :HOST              - Host database server runs on
+  :PORT              - Port to use to connect to the server
+  :CONNECTION-STRING - Connection string to be used by ODBC or JDBC drivers
+                       instead of DSN, USER, PASSWORD, etc.
+A DATABASE-EXCEPTION is thrown if the connection is unsuccessful."
+  :public? TRUE :command? TRUE
+  (return (call-connect (coerce-&rest-to-cons keys-and-values))))
+
+(defun (call-connect CONNECTION) ((keys-and-values CONS))
+  :public? TRUE
+  :documentation "Functional interface to `connect'.  See its documentation"
+  (let ((result (new CONNECTION))
+	(nativeConnection NATIVE-CONNECTION NULL)
+	(options
+         (vet-options keys-and-values
+		      (quote (:PROTOCOL :SERVER-TYPE :DSN :DB-NAME
+					:USER :PASSWORD :HOST :PORT
+					:CONNECTION-STRING))))
+        (protocol
+         (string-upcase
+          (first-defined
+           (lookup options :PROTOCOL)
+           ;; for now Java means JDBC:
+	   (verbatim :common-lisp "#+:CLSQL \"CLSQL\" #-:CLSQL \"ODBC\""
+		     :java "\"JDBC\""
+		     :cpp "\"ODBC\""))))
+	(server-type
+	  (unwrap-string (lookup options :SERVER-TYPE)))
+        (connectionString STRING NULL))
+    (case protocol
+      ("CLSQL"
+       (setq nativeConnection
+	     (verbatim
+	      :common-lisp
+	      "(cl:multiple-value-setq (nativeConnection connectionString)
+                    (cl-native-clsql-connect options server-type))"
+	      :otherwise NULL)))
+      ("ODBC"
+       (setq connectionString (make-odbc-connection-string options))
+       (setq nativeConnection
+         (verbatim
+           :common-lisp
+           "(cl:multiple-value-setq (nativeConnection connectionString)
+               (cl-native-odbc-connect connectionString))"
+          :cpp "sdbc::getConnection(connectionstring)"
+          :otherwise NULL)))
+      ("JDBC"
+       (setq connectionString (make-jdbc-connection-string options))
+       (setq nativeConnection
+         (verbatim
+          :java "SDBCSupport.getConnection(connectionstring)"
+          :otherwise NULL)))
+      (otherwise
+       (signal DATABASE-EXCEPTION "Database Error: unsupported protocol " protocol)))
+    (when (eql? nativeConnection NULL)
+      (signal DATABASE-EXCEPTION "Database Error: " protocol
+              " not supported in "
+              (verbatim :common-lisp "\"Lisp\"" :cpp "\"C++\"" :java "\"Java\"")))
+    (setf (native-connection result) nativeConnection)
+    (setf (connection-string result) connectionString)
+    (setf (protocol result) protocol)
+    (setf (creation-time result) (make-current-date-time))
+    (setf (last-access-time result) (creation-time result))
+    (setf (renewal-time result)
+      (time-add (creation-time result)
+                (make-time-duration 0 (* (get-max-connection-lifetime result) 1000))))
+    (logmsg "SDBC" :low "Connect via " protocol ": " connectionString)
+    (return result)))
+
+(defun (get-max-connection-lifetime INTEGER) ((con CONNECTION))
+  ;; Return the maximum lifetime of connection `con' in seconds after which its
+  ;;    native connection should be renewed to avoid timeouts.
+  (ignore con)
+  (return 60)) ;; this is a bit conservative, but hey...
+
+(defun maybe-renew-connection ((con CONNECTION))
+  ;; Check whether `native-connection' of `con' has become too old and
+  ;;    renew it if necessary to avoid breakage due to timeouts.
+  ;; Also bump `con's `last-access-time'.
+  ;; We can't renew connections that are not in auto-commit mode, since
+  ;;    renewal would prevent us from comitting or rolling back.
+  (unless (auto-commit? con)
+    (return))
+  (let ((currentTime (make-current-date-time))
+        (statement (statement con))
+        (newCon CONNECTION NULL))
+    (setf (last-access-time con) currentTime)
+    (when (greater-equal? currentTime (renewal-time con))
+      (logmsg "SDBC" :low "Renewing " (protocol con) " connection: " (connection-string con))
+      (setq newCon (connect :protocol (protocol con)
+                            :connection-string (connection-string con)))
+      (disconnect con)
+      (setf (native-connection con) (native-connection newCon))
+      (setf (connection-string con) (connection-string newCon))
+      (setf (protocol con) (protocol newCon))
+      (setf (creation-time con) (creation-time newCon))
+      (setf (last-access-time con) (last-access-time newCon))
+      (setf (renewal-time con) (renewal-time newCon))
+      (when (defined? statement)
+        ;; if we had a prepared statement, re-prepare it for the new connection
+        ;; and destructively update the original prepared statement wrapper:
+        (prepare-statement con (sql statement))
+        ;; copy the new native statement into the old statement wrapper:
+        (setf (statement statement) (statement (statement con)))
+        ;; point the connection back to the old statement wrapper:
+        (setf (statement con) statement)
+        (foreach (pos entry) in (parameters statement)
+            do (bind-parameter statement pos (first entry) (second entry)))))))
+
+(defun (jdbc-connection-string? BOOLEAN) ((string STRING))
+  ;; Return TRUE if `string' is a JDBC connection string.
+  (return (= (string-search string "jdbc:" 0) 0)))
+
+(defun (make-jdbc-connection-string STRING)
+    ((options (PROPERTY-LIST OF KEYWORD OBJECT)))
+  ;; Generate a JDBC connection string from connection `options'.  The
+  ;;    syntax of the generated string (see more notes below) depends
+  ;;    on the value of the :SERVER-TYPE option which defaults to "mysql".
+  ;; Option values (except :PORT) are expected to be strings.
+  ;; If `options' already contains a :CONNECTION-STRING entry use it
+  ;;    and ignore all other entries.
+  ;; Unfortunately, the syntax of JDBC connection strings/URLs is not standardized.
+  ;;    The syntax specification given in JDBC is  `jdbc:subprotocol:subname'.
+  ;;    The only two components that are explicitly recognized in JDBC are user
+  ;;    and password which can be passed to one version of
+  ;;    `java.sql.DriverManager.getConnection'.  There is another version that also
+  ;;    takes a list of properties as an argument, but there is no standard set of
+  ;;    properties.  For example, for the MySQL version one can supply user and
+  ;;    password as properties but not the server host.
+  ;;    There is an alternative `javax.sql.DataSource' interface, however, it relies
+  ;;    on driver-specific configuration files (usually XML-ified .odbc files).
+  ;; MySQL URL syntax for Connector/J (`com.mysql.jdbc.Driver') is as follows:
+  ;;    jdbc:mysql://[host:port]/[database][?property1][=value1][&property2][=Value2]...
+  ;;    For example: "jdbc:mysql://localhost:3306/menagerie?user=scott&password=tiger"
+  ;;    See http://dev.mysql.com/doc/connector/j/en/cj-configuration-properties.html
+  ;;    for more info (there was also the following syntax floating around which
+  ;;    DOESN'T WORK: "jdbc:mysql://scott@tiger:localhost:3306/kojak?DRIVER=MySQL4.1").
+  ;; Oracle URL syntax for thin client (e.g., ojdbc14.jar):
+  ;;    jdbc:oracle:thin:[<user>/<password>]@//<host>[:<port>]/<service>
+  ;;    Examples: "jdbc:oracle:thin:@//myserver.com/customer_db"
+  ;;              "jdbc:oracle:thin:scott/tiger@//myserver.com:5521/customer_db"
+  ;;              "jdbc:oracle:thin:KOJAK/tiger@//blackcat.isi.edu:1521/test"
+  ;;    See http://www.oracle.com/technology/tech/java/sqlj_jdbc/htdocs/jdbc_faq.htm#05_00
+  ;;        http://www.oracle.com/technology/tech/java/sqlj_jdbc/htdocs/jdbc_faq.htm#02_05
+  ;;    for more information.
+  ;; Note that MySQL and Oracle have a very different notion of database (what is the
+  ;;    database in MySQL we usually model as a user in Oracle).
+  (when (defined? (lookup options :CONNECTION-STRING))
+    (return (lookup options :CONNECTION-STRING)))
+  (let ((con (new STRING-OUTPUT-STREAM))
+        (value STRING NULL))
+    (print-stream con "jdbc:")
+    (setq value
+      (string-downcase
+       (first-defined (unwrap-string (lookup options :SERVER-TYPE)) "mysql")))
+    (print-stream con value ":")
+    (case value
+      ("mysql"
+       (print-stream con "//")
+       (setq value (unwrap-string (lookup options :HOST)))
+       (when (defined? value) (print-stream con value))
+       (let ((port (lookup options :PORT)))
+         (typecase port
+           (STRING-WRAPPER (print-stream con ":" (unwrap-string port)))
+           (INTEGER-WRAPPER (print-stream con ":" (unwrap-integer port)))
+           (otherwise NULL)))
+       (print-stream con "/")
+       (setq value (unwrap-string (lookup options :DB-NAME)))
+       (when (defined? value) (print-stream con value))
+       (let ((separator #\?))
+         (foreach (option val) in options
+             where (defined? val)
+             do (case option
+                  ((:SERVER-TYPE :DSN :HOST :PORT :DB-NAME :PROTOCOL)
+                   (continue))
+                  ((:USER :PASSWORD)
+                   (print-stream con separator (string-downcase (symbol-name option))))
+                  (otherwise
+                   (print-stream con separator (symbol-name option) "=" (unwrap-string val))))
+                (print-stream con "=" (unwrap-string val))
+                (setq separator #\&))))
+      ("oracle"
+       (print-stream con "thin:") ;; we only support the thin client for now
+       ;; user/password are optional but have to be supplied both if they are:
+       (setq value (unwrap-string (lookup options :USER)))
+       (when (defined? value) (print-stream con value))
+       (setq value (first-defined (unwrap-string (lookup options :PASSWORD)) ""))
+       (print-stream con "/" value)
+       ;; host is mandatory so we use localhost as a default:
+       (setq value (first-defined (unwrap-string (lookup options :HOST)) "localhost"))
+       (print-stream con "@//" value)
+       ;; port needs to be defined for the thin client which is why we use a default:
+       (let ((port (first-defined (lookup options :PORT) (wrap-string "1521"))))
+         (typecase port
+           (STRING-WRAPPER (print-stream con ":" (unwrap-string port)))
+           (INTEGER-WRAPPER (print-stream con ":" (unwrap-integer port)))))
+       ;; this really needs to be defined for the thin client:
+       (setq value (unwrap-string (lookup options :DB-NAME)))
+       (when (defined? value) (print-stream con "/" value)))
+      (otherwise
+       (signal DATABASE-EXCEPTION
+               "Don't know how to generate JDBC connection string"
+               " for servers of :SERVER-TYPE " (lookup options :SERVER-TYPE))))
+    (return (the-string con))))
+
+(defun (odbc-connection-string? BOOLEAN) ((string STRING))
+  ;; Return TRUE if `string' is (likely to be) an ODBC connection string.
+  ;; Example: "DSN=KOJAK;DB=kojak_test;SERVER=blackcat;UID=scott;PWD=foo"
+  ;; |  The genericly recognized keys are DSN | UID | PWD | DRIVER, all others
+  ;;    are driver-specific.
+  ;; For now this is a very simplistic test, but we probably can't do much
+  ;;    better than this given that the space of driver-specific keywords is
+  ;;    unknown.
+  ;; See `http://msdn.microsoft.com/library/default.asp?url=/library/en-us/odbc/htm/odbcsqldriverconnect.asp'
+  ;;    for a description of ODBC connection string syntax.  An extract appears below:
+  ;; A connection string has the following syntax:
+  ;; 
+  ;;   connection-string ::= empty-string[;] | attribute[;]
+  ;; 			| attribute; connection-string
+  ;;   empty-string ::=
+  ;;   attribute ::= attribute-keyword=attribute-value
+  ;; 		| DRIVER=[{]attribute-value[}]
+  ;;   attribute-keyword ::= DSN | UID | PWD 
+  ;;                 | driver-defined-attribute-keyword
+  ;;   attribute-value ::= character-string
+  ;;   driver-defined-attribute-keyword ::= identifier
+  ;; 
+  ;; where character-string has zero or more characters; identifier has one
+  ;; or more characters; attribute-keyword is not case-sensitive;
+  ;; attribute-value may be case-sensitive; and the value of the DSN
+  ;; keyword does not consist solely of blanks.
+
+  (return (and (> (length string) 0)
+               (not (jdbc-connection-string? string))
+               (defined? (position string #\= 1)))))
+
+(defun (make-odbc-connection-string STRING)
+    ((options (PROPERTY-LIST OF KEYWORD STRING-WRAPPER)))
+  ;; Generate an ODBC connection string from connection `options'.
+  ;; If `options' already contains a :CONNECTION-STRING entry use it
+  ;;    and ignore all other entries.
+  (when (defined? (lookup options :CONNECTION-STRING))
+    (return (lookup options :CONNECTION-STRING)))
+  (let ((con (new STRING-OUTPUT-STREAM)))
+    (foreach (option value) in options
+        where (defined? value)
+        do (case option
+             (:USER (print-stream con "UID"))
+             (:PASSWORD (print-stream con "PWD"))
+             (:DB-NAME (print-stream con "DATABASE"))
+             (:HOST (print-stream con "SERVER"))
+             ((:PROTOCOL :SERVER-TYPE) (continue))
+             (otherwise
+              (print-stream con (symbol-name option))))
+           (print-stream con "=" (unwrap-string value) ";"))
+    (return (the-string con))))
+
+;; NOTE: THIS HAS TO BE DONE IN THE cl-native-clsql-connect FUNCTION BECAUSE OF
+;; LOADING DEPENDENCIES IN clsql CODE. 
+#|
+(defun (make-clsql-connection-string STRING)
+    ((options (PROPERTY-LIST OF KEYWORD STRING-WRAPPER)))
+  ;; Generate a CLSQL connection string from connection `options'.
+  ;; If `options' already contains a :CONNECTION-STRING entry use it
+  ;;    and ignore all other entries.
+  (when (defined? (lookup options :CONNECTION-STRING))
+    (return (lookup options :CONNECTION-STRING)))
+  (let ((server-type (unwrap-string (lookup options :SERVER-TYPE)))
+	(user (unwrap-string (lookup options :USER)))
+	(password (unwrap-string (lookup options :PASSWORD)))
+	(db-name (unwrap-string (lookup options :DB-NAME)))
+	(host (unwrap-string (lookup options :HOST)))
+	(error-message STRING NULL)
+	(connection-string STRING NULL))
+    (if (defined? server-type)
+	(setq server-type (string-upcase server-type))
+	(signal BAD-ARGUMENT-EXCEPTION 
+		"CLSQL connection require specifying :SERVER-TYPE"))
+    (verbatim :common-lisp
+	      "#+:CLSQL
+	      (cl:handler-case
+		  (cl:let ((server (cl:intern server-type :keyword))) 
+		    (cl:case server
+		      ((:MYSQL :POSTGRESQL :POSTGRESQL-SOCKET)
+		       (cl:setq connection-string
+				(CLSQL:DATABASE-NAME-FROM-SPEC (CL:LIST host db-name user password) server)))
+		      ((:ODBC :AODBC :ORACLE)
+		       (cl:setq connection-string
+				(CLSQL:DATABASE-NAME-FROM-SPEC (CL:LIST db-name user password)  server)))
+		      ((:SQLITE)
+		       (cl:setq connection-string
+				(CLSQL:DATABASE-NAME-FROM-SPEC (CL:LIST db-name) server)))
+		      (otherwise
+		       (cl:setq error-message
+				(concatenate \"Unrecognized server-type `\" server-type \"'\")))))
+		(clsql:SQL-CONNECTION-ERROR (c)
+		  (cl:setq error-message (cl:format cl:nil \"Database Connection Spec Error: ~A\" c)))
+		(clsql:SQL-ERROR (c)
+		  (cl:setq error-message (cl:format cl:nil \"Database Error: ~A\" c)))
+		(cl:ERROR (c)
+		  (cl:setq error-message (cl:format cl:nil \"Unhandled DB connect error: ~A\" c))))
+	      #-CLSQL
+	      (cl:setq error-message
+		       (cl:format cl:nil \"CLSQL not available in ~A.\" (cl:lisp-implementation-type)))"
+	      :otherwise NULL)
+    (if (defined? error-message)
+	(signal-exception (new DATABASE-EXCEPTION :message error-message))
+	(return connection-string)) ))
+|#
+
+(defun (cl-native-odbc-connect NATIVE-CONNECTION STRING) ((connectionString STRING))
+  ;; STELLA wrapper for the native Lisp ODBC connect.
+  ;; Returns a native connection and a fully expanded connection string.
+  (let ((errorMsg STRING NULL)
+        (nativeConnection NATIVE-CONNECTION NULL))
+    (verbatim
+      :common-lisp 
+      "#+:allegro
+       (cl:handler-case
+          (cl:progn
+            (cl:require :aodbc-v2)
+            (cl:setq nativeConnection
+               (dbi:CONNECT :connect-string (lispify connectionString))))
+        (dbi:ODBC-ERROR (c)
+          (cl:setq errorMsg (cl:format cl:nil \"Database Error: ~A\" c)))
+        (cl:ERROR (c)
+          (cl:setq errorMsg (cl:format cl:nil \"Unhandled DB connect error: ~A\" c))))
+       #-:allegro
+       (cl:setq errorMsg
+          (cl:format cl:nil \"ODBC not available in ~A.\" (cl:lisp-implementation-type)))"
+      :otherwise (ignore nativeConnection))
+    (when (defined? errorMsg)
+      (signal-exception (new DATABASE-EXCEPTION :message errorMsg)))
+    (return nativeConnection connectionString)))
+
+(defun (cl-native-clsql-connect NATIVE-CONNECTION STRING)
+    ((options (PROPERTY-LIST OF KEYWORD STRING-WRAPPER)) (server-type STRING))
+  ;; STELLA wrapper for the native Lisp CLSQL connect.
+  ;; Returns a native connection and a fully expanded connection string.
+  ;; Uses :NEW as the :if-exists option because the SDBC code renews connections
+  ;;  before dropping the old ones, so we need can't reuse the old connection,
+  ;;  since it will soon be disconnected on reconnect operations.
+  (let ((connection-string (unwrap-string (lookup options :CONNECTION-STRING)))
+	(user (unwrap-string (lookup options :USER)))
+	(password (unwrap-string (lookup options :PASSWORD)))
+	(db-name (unwrap-string (lookup options :DB-NAME)))
+	(host (unwrap-string (lookup options :HOST)))
+	(error-message STRING NULL)
+        (native-connection NATIVE-CONNECTION NULL))
+    (verbatim
+      :common-lisp 
+      "#+:CLSQL
+       (cl:handler-case
+	  (cl:let ((database-type (cl:intern (cl:string-upcase server-type) :KEYWORD))
+		   (connection-list cl:nil)
+                   (db (cl:and (defined? connection-string) 
+                               (clsql:find-database connection-string :errorp cl:nil)))
+		   ;; Hack, because calling CLSQL:CONNECT can trigger loading and compilation
+		   ;; of files that rely on CL symbols being visible so that DEFPACKAGE
+		   ;; and IN-PACKAGE at the top of the files are properly interpreted.
+		   (cl:*package* (cl:find-package \"COMMON-LISP\")))
+            (cl:if db			; Assume a reconnect.
+                (cl:setq native-connection (clsql:reconnect :database db :error cl:nil))
+                (cl:progn
+		  (cl:case database-type
+		    ((:MYSQL :POSTGRESQL :POSTGRESQL-SOCKET)
+		       (cl:setq connection-list (CL:LIST host db-name user password)))
+		    ((:ODBC :AODBC :ORACLE)
+		       (cl:setq connection-list (CL:LIST db-name user password)))
+		    ((:SQLITE)
+		       (cl:setq connection-list (CL:LIST db-name)))
+		    (otherwise
+		       (cl:setq error-message
+				(concatenate \"Unrecognized server-type `\" server-type \"'\"))))
+		  (cl:when connection-list
+		     (cl:setq native-connection (clsql:connect connection-list 
+							    :database-type database-type
+							    :if-exists :new))
+		     (cl:setq connection-string (clsql:database-name native-connection))))))
+	  (clsql:SQL-CONNECTION-ERROR (c)
+	     (cl:setq error-message (cl:format cl:nil \"Database Connection Spec Error: ~A\" c)))
+	  (clsql:SQL-ERROR (c)
+	     (cl:setq error-message (cl:format cl:nil \"Database Error: ~A\" c)))
+	  (cl:ERROR (c)
+	     (cl:setq error-message (cl:format cl:nil \"Unhandled DB connect error: ~A\" c))))
+       #-:CLSQL
+       (cl:setq error-message
+          (cl:format cl:nil \"CLSQL not available in ~A.\" (cl:lisp-implementation-type)))"
+      :otherwise (ignore native-connection))
+    (when (defined? error-message)
+      (signal-exception (new DATABASE-EXCEPTION :message error-message)))
+    (return native-connection connection-string)))
+
+(defun disconnect ((connection CONNECTION))
+  :documentation
+  "Disconnect `connection' from a database.  A DATABASE-EXCEPTION is thrown if
+the disconnect is unsuccessful."
+  :public? TRUE :command? TRUE
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  (let ((nativeConnection (native-connection connection)))
+    (unless (eql? nativeConnection NULL)
+      (verbatim
+          :common-lisp "(cl-native-disconnect nativeConnection)"
+          :cpp "sdbc::nativeDisconnect(nativeconnection)"
+          :java "SDBCSupport.nativeDisconnect(nativeconnection)")
+      (logmsg "SDBC" :low "Disconnecting " (protocol connection) " connection: "
+              (connection-string connection))
+      ;; clear out native connection to allow multiple disconnects without breakage:
+      (setf (native-connection connection) NULL))))
+
+(defun cl-native-disconnect ((native-connection NATIVE-CONNECTION))
+  ;; Temporary hack until disconnect is made protocol-specific.
+  (verbatim :common-lisp
+	    "#+:EXCL (cl-native-odbc-disconnect native-connection)
+    #+:CLSQL (cl-native-clsql-disconnect native-connection)"
+	    :otherwise NULL))
+
+(defun cl-native-odbc-disconnect ((nativeConnection NATIVE-CONNECTION))
+  ;; STELLA wrapper for the native Lisp ODBC disconnect.
+  (let ((errorMsg STRING NULL))
+    (verbatim
+      :common-lisp 
+      "#+:allegro
+       (cl:handler-case
+          (cl:progn
+            (cl:require :aodbc-v2)
+            (dbi:disconnect nativeConnection))
+        (dbi:ODBC-ERROR (c)
+          (cl:setq errorMsg
+             (cl:format cl:nil \"Database Error: ~A\" c)))
+        ;; NOTE: An ODBC error isn't thrown if we try to disconnect twice:
+        (cl:SIMPLE-ERROR (c)
+          (cl:setq errorMsg (cl:format cl:nil \"Database Error: ~A\" c)))
+        (cl:ERROR (c)
+          (cl:setq errorMsg (cl:format cl:nil \"Unhandled DB disconnect error: ~A\" c))))
+       #-:allegro
+       (cl:setq errorMsg
+          (cl:format cl:nil \"ODBC not available in ~A.\" (cl:lisp-implementation-type)))"
+      :otherwise (ignore nativeConnection))
+    (when (defined? errorMsg)
+      (signal-exception (new DATABASE-EXCEPTION :message errorMsg)))))
+
+(defun cl-native-clsql-disconnect ((native-connection NATIVE-CONNECTION))
+  ;; STELLA wrapper for the native Lisp CLSQL disconnect.
+  (let ((error-msg STRING NULL))
+    (verbatim
+      ;; Check to make sure the DB is still connected, or else we get
+      ;; a fatal error!
+      :common-lisp 
+      "#+:CLSQL
+       (cl:handler-case
+            (cl:when (cl:member native-connection (clsql:connected-databases))
+               (clsql:disconnect :database native-connection :error cl:nil))
+        (clsql:SQL-ERROR (c)
+          (cl:setq error-msg (cl:format cl:nil \"Database Error: ~A\" c)))
+        (cl:ERROR (c)
+          (cl:setq error-msg (cl:format cl:nil \"Unhandled DB disconnect error: ~A\" c))))
+       #-:CLSQL
+       (cl:setq error-msg
+          (cl:format cl:nil \"CLSQL not available in ~A.\" (cl:lisp-implementation-type)))"
+      :otherwise (ignore native-connection))
+    (when (defined? error-msg)
+      (signal-exception (new DATABASE-EXCEPTION :message error-msg)))))
+
+(defun (sql-query? BOOLEAN) ((sql-expression STRING))
+  :documentation "Return `true' if `sql-expression' is a SQL command string which returns
+values."
+  :public? FALSE
+  ;; Currently a bit of a hack.  We should pass this decision up to the
+  ;; calling code.  See note on EXECUTE-SQL about introducing SQL-QUERY 
+  ;; and EXECUTE-SQL-COMMAND.
+  (let ((start 0)
+        (end 0)
+        (operator ""))
+    (while (white-space-character? (nth sql-expression start))
+      (++ start))
+    (setq end start)
+    (while (letter-character? (nth sql-expression end))
+      (++ end))
+    (setq operator (subsequence sql-expression start end))
+    (return (or (string-equal? operator "SELECT")
+		(string-equal? operator "SHOW")
+		(string-equal? operator "DESCRIBE")
+		(string-equal? operator "EXPLAIN")
+		(string-equal? operator "ANALYZE"))) ))
+
+(defun (stellify-with-nil-to-null OBJECT) ((self OBJECT))
+  :documentation "Convert a Lisp object into a STELLA object."
+  :public? TRUE
+  ;; Note: This resembles `stellify', but it converts NILs inside Cons lists to NULLs
+  (let ((result self))
+    (verbatim
+      :common-lisp
+      "(CL:typecase self
+        (CL:NULL (cl:setq result STELLA::NIL))
+        (CL:CONS (cl:setq result 
+                     (stella::cons 
+                        (cl:if (CL:NULL (CL:car self))
+                            NULL
+                            (stellify-with-nil-to-null (CL:car self)))
+                        (stellify-with-nil-to-null (CL:cdr self)))))
+        (CL:KEYWORD (cl:setq result (intern-keyword (CL:symbol-name self))))
+        (CL:SYMBOL
+         (CL:if (cl:eq self CL:t)
+           (cl:setq result TRUE-WRAPPER)
+           (cl:setq result (intern-symbol (CL:symbol-name self)))))
+        ((CL:or CL:NUMBER CL:STRING) (cl:setq result (wrap-literal self)))
+        (STELLA::OBJECT (cl:setq result self))
+        (CL:t (CL:error \"Can't stellify: \" self)))"
+      :otherwise NULL)
+    (return result) ))
+
+(defun (cl-translate-sql-parameter-type-specifier OBJECT) ((stellaType OBJECT))
+  ;; Translate `stellaType' into an appropriate Lisp sql parameter type specification
+  ;;    for the Allegro ODBC interface.  We cheat a little bit on the return types
+  ;;    here knowing that they won't be checked in Lisp.
+  (let ((result OBJECT NULL))
+    (cond ((or (null? stellaType)
+               (eql? stellaType (quote NULL)))
+           (verbatim :common-lisp "(cl:setq result :varchar)" :otherwise NULL))
+          (otherwise
+           (case stellaType
+             (@CALENDAR-DATE
+              (verbatim :common-lisp "(cl:setq result :varchar)" :otherwise NULL))
+             (@STRING
+              (verbatim :common-lisp "(cl:setq result :varchar)" :otherwise NULL))
+             (@INTEGER
+              (verbatim :common-lisp "(cl:setq result :int)" :otherwise NULL))
+             (@LONG-INTEGER
+              (verbatim :common-lisp "(cl:setq result :long)" :otherwise NULL))
+             (@DOUBLE-FLOAT
+              (verbatim :common-lisp "(cl:setq result :double)" :otherwise NULL))
+             (otherwise
+              (verbatim :common-lisp "(cl:setq result :unknown)" :otherwise NULL)))))
+    (return result)))
+
+(defun (cl-translate-sql-type-specifier OBJECT) ((stellaType OBJECT))
+  ;; Translate `stellaType' into an appropriate Lisp sql type specification
+  ;;    for the Allegro ODBC interface.  We cheat a little bit on the return types
+  ;;    here knowing that they won't be checked in Lisp.
+  (let ((result OBJECT NULL))
+    (cond ((or (null? stellaType)
+               (eql? stellaType (quote NULL)))
+           (verbatim :common-lisp "(cl:setq result cl:t)" :otherwise NULL))
+          (otherwise
+           (case stellaType
+             (@CALENDAR-DATE
+              (verbatim :common-lisp "(cl:setq result cl:t)" :otherwise NULL))
+             (@STRING
+              (verbatim :common-lisp "(cl:setq result cl:t)" :otherwise NULL))
+             (@INTEGER
+              (verbatim :common-lisp "(cl:setq result :int)" :otherwise NULL))
+             (@LONG-INTEGER
+              (verbatim :common-lisp "(cl:setq result :long)" :otherwise NULL))
+             (@DOUBLE-FLOAT
+              (verbatim :common-lisp "(cl:setq result :double)" :otherwise NULL))
+             (otherwise
+              (verbatim :common-lisp "(cl:setq result :unknown)" :otherwise NULL)))))
+    (return result)))
+
+(defun (cl-translate-sql-type-specifiers CONS) ((stellaTypes CONS))
+  (return
+    (collect (cl-translate-sql-type-specifier type)
+             foreach type in stellaTypes)))
+
+(defun (execute-sql OBJECT) ((connection CONNECTION) (sql OBJECT) &rest (options OBJECT))
+  :public? TRUE :command? TRUE
+  :documentation "Execute a SQL statement, and return a table as the reuslt
+                  of a SQL query (represented as a (CONS OF (CONS OF OBJECT))),
+                  or NULL as the result of a successfull SQL insert, update,
+                  delete or other command.
+                  `sql' can either be a string representing a SQL command or
+                  a PREPARED-STATEMENT.
+                  Options include: 
+                     :types <typelist>, where <typelist> is a cons list of surrogates
+                  specifying the expected Stella types.  Legal surrogate values are
+                  @INTEGER, @LONG-INTEGER, @DOUBLE-FLOAT, @CALENDAR-DATE, @STRING, and
+                  NULL.  If NULL is specified, values are returned as strings.
+                  A DATABASE-EXCEPTION is thrown if execution is unsuccessful."
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  ;; TODO??: Change name to query, add execute for insert, update, delete, exceptions.
+  ;; query will return (CONS OF (CONS OF OBJECT)), execute will return INTEGER.
+  (maybe-renew-connection connection)
+  (let ((result OBJECT NULL)
+	(ncon (native-connection connection))
+	(propList (vet-options (coerce-&rest-to-cons options)
+			       (quote (:TYPES))))
+	(types CONS (lookup propList :TYPES)))
+    ;; TODO: validate types here
+    (typecase sql
+      (@STRING-WRAPPER
+       (logmsg "SDBC" :high "execute-sql: sql=" sql)
+       (setq result 
+	 (verbatim 
+           :common-lisp "(cl-execute-sql ncon (unwrap-string sql) types)"
+	   :cpp "sdbc::executeSQL(ncon, stella::unwrapString((StringWrapper*)sql), types)"
+	   :java "SDBCSupport.executeSQL(ncon, StringWrapper.unwrapString((StringWrapper)sql), types)")))
+      (@PREPARED-STATEMENT
+       (logmsg "SDBC" :high "execute-sql: prepared sql=" (sql sql)
+               ", parameters=" (parameters sql))
+       (setq result
+         (verbatim
+           :common-lisp "(cl-do-execute-prepared-statement ncon sql)"
+	   :cpp "sdbc::doExecutePreparedStatement(ncon)"
+	   :java "SDBCSupport.doExecutePreparedStatement((PreparedStatement)sql)")))
+      (otherwise
+       (error "`sql' argument must be of type STRING-WRAPPER or PREPARED-STATEMENT")))
+    (return (coerce-uncoerced-values-in-table result types))))
+
+(defun (cl-execute-sql OBJECT) ((connection NATIVE-CONNECTION) (sql STRING) (types CONS))
+  (return
+    (verbatim 
+      :common-lisp
+      "#+:EXCL
+         (cl:progn 
+          (cl:require :aodbc-v2)
+          (cl:handler-case
+              (cl:or
+               (stellify-with-nil-to-null
+                (cl:if (null? types) 
+                    (dbi:sql sql :db connection)
+                    (dbi:sql sql :db connection 
+                             :types (cl-translate-sql-type-specifiers types))))
+               NULL)
+            (dbi:ODBC-ERROR (c)
+              (cl:error
+               (NEW-DATABASE-EXCEPTION (cl:format cl:nil \"Database Error: ~A~%\" c))))
+            (cl:ERROR (c)
+              (cl:error
+               (NEW-UNHANDLED-EXCEPTION
+                (cl:format cl:nil \"execute-sql: Caught unhandled exception ~A.~%\" c))))))
+         #+:CLSQL
+         (cl:handler-case
+            (cl:or
+               (stellify-with-nil-to-null
+                (cl:cond ((cl:not (sql-query? sql))
+                          (clsql:execute-command sql :database connection)
+                          NULL)
+                         ((null? types) 
+                          (clsql:query sql :database connection :result-types cl:nil))
+                         (cl:t
+                           (clsql:query sql :database connection 
+                                        :result-types (cl-translate-sql-type-specifiers types)))))
+               NULL)
+            (clsql:SQL-ERROR (c)
+              (cl:error
+               (NEW-DATABASE-EXCEPTION (cl:format cl:nil \"Database Error: ~A~%\" c))))
+            (cl:ERROR (c)
+              (cl:error
+               (NEW-UNHANDLED-EXCEPTION
+                (cl:format cl:nil \"execute-sql: Caught unhandled exception ~A.~%\" c)))))
+         #-(OR :EXCL :CLSQL) NULL"
+      :otherwise NULL)))
+
+(defun (cl-do-execute-prepared-statement OBJECT) ((connection NATIVE-CONNECTION)
+                                                  (sql PREPARED-STATEMENT))
+  ;; For now ignore `sql'.  Allegro ODBC only allows us to execute the most
+  ;; recently prepared statement which is associated with the connection -
+  ;; maybe that's a general restricition on prepared statements.
+  (ignore sql)
+  (return
+    (verbatim
+      :common-lisp
+      "#+:EXCL
+         (cl:progn
+           (cl:require :aodbc-v2)
+           (cl:handler-case
+               (cl:or
+                (stellify-with-nil-to-null
+                 (dbi:run-prepared-sql :db connection))
+                NULL)
+             (dbi:ODBC-ERROR (c)
+               (cl:error
+                (NEW-DATABASE-EXCEPTION (cl:format cl:nil \"Database Error: ~A~%\" c))))
+             (cl:ERROR (c)
+               (cl:error
+                (NEW-UNHANDLED-EXCEPTION
+                 (cl:format cl:nil \"execute-sql: Caught unhandled exception ~A.~%\" c))))))
+         #+:CLSQL
+         (CL:error (NEW-BAD-ARGUMENT-EXCEPTION \"CLSQL does not support prepared statements.\"))
+         #-(OR :EXCL :CLSQL) NULL"
+      :otherwise NULL)))
+
+(defun (get-result-set RESULT-SET-ITERATOR) ((connection CONNECTION) (sql STRING) &rest (options OBJECT))
+  :public? TRUE
+  :documentation "Execute a SQL query, and return a ResultSet object.
+                  Options include: 
+                     :types <typelist>, where <typelist> is a cons list of surrogates
+                  specifying the expected Stella types.  Legal surrogate values are
+                  @INTEGER, @LONG-INTEGER, @DOUBLE-FLOAT, @CALENDAR-DATE, @STRING, and
+                  NULL.  If NULL is specified, values are returned as strings.
+                  A DATABASE-EXCEPTION is thrown if execution is unsuccessful."
+  ;; TODO: - MAKE THIS PROTOCOL-SPECIFIC.
+  ;;       - Generalize to also work for prepared statements
+  ;;       - Implement result for insert, update, delete, exceptions
+  ;;       - Describe `sql' in error messages (do the same in `execute-sql')
+  (maybe-renew-connection connection)
+  (let ((nativeResultSet NATIVE-RESULT-SET NULL)
+	(nativeConnection (native-connection connection))
+	(resultSetIterator (NEW RESULT-SET-ITERATOR))
+	(propList (vet-options (coerce-&rest-to-cons options)
+			       (quote (:TYPES))))
+	(types CONS (lookup propList :TYPES)))
+    (setf (types resultSetIterator) types)
+    (logmsg "SDBC" :high "get-result-set: sql=" sql)
+    (setq nativeResultSet 
+      (verbatim 
+       :common-lisp "(cl-get-native-result-set nativeConnection sql types)"
+       :cpp "sdbc::getNativeResultSet(nativeconnection, sql, types)"
+       :java "SDBCSupport.getNativeResultSet(nativeconnection, sql, types)"))
+    (setf (result-set resultSetIterator) nativeResultSet)
+    (return resultSetIterator)))
+
+(defun (cl-get-native-result-set NATIVE-RESULT-SET) ((connection NATIVE-CONNECTION)
+                                                     (sql STRING)
+                                                     (types CONS))
+  (return
+    (verbatim 
+      :common-lisp
+      "#+:EXCL
+       (cl:progn 
+         (cl:require :aodbc-v2)
+         (cl:handler-case
+             (cl:if (null? types) 
+                 (dbi:sql sql :db connection :query cl:t)
+                 (dbi:sql sql :db connection :query cl:t
+                              :types (cl-translate-sql-type-specifiers types)))
+           (dbi:ODBC-ERROR (c)
+             (cl:error
+              (NEW-DATABASE-EXCEPTION (cl:format cl:nil \"Database Error: ~A~%\" c))))
+           (cl:ERROR (c)
+             (cl:error
+              (NEW-UNHANDLED-EXCEPTION
+               (cl:format cl:nil \"get-result-set: Caught unhandled exception ~A.~%\" c))))))
+       #+:CLSQL
+       (cl:handler-case
+          (cl:if (null? types) 
+                 (clsql:query sql :database connection :result-types cl:nil)
+                 (clsql:query sql :databasae connection
+                            :result-types (cl-translate-sql-type-specifiers types)))
+           (clsql:SQL-ERROR (c)
+             (cl:error
+              (NEW-DATABASE-EXCEPTION (cl:format cl:nil \"Database Error: ~A~%\" c))))
+           (cl:ERROR (c)
+             (cl:error
+              (NEW-UNHANDLED-EXCEPTION
+               (cl:format cl:nil \"get-result-set: Caught unhandled exception ~A.~%\" c)))))
+         #-(OR :EXCL :CLSQL) NULL"
+      :otherwise NULL)))
+
+(defmethod (next? BOOLEAN) ((self RESULT-SET-ITERATOR))
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  (let ((native-result-set (result-set self))
+	(result CONS NULL))
+    ;; Verbatim required for null test because this is a native object.
+    (when (null? native-result-set)
+      (return FALSE))
+    (if-output-language
+     :common-lisp
+     (progn
+       (setq result
+          (verbatim
+            :common-lisp
+            "#+:EXCL (dbi:fetch-row native-result-set cl:nil NULL)
+            #+:CLSQL (cl:if native-result-set
+                         (cl:pop native-result-set)
+                         NULL)
+            #-(OR :EXCL CLSQL) NULL"
+	   :otherwise NULL))
+       ;; for the benefit of CLSQL - done this way for generic slot access:
+       (setf (result-set self) native-result-set)
+       (when (defined? result)
+         (setq result (stellify-with-nil-to-null result))))
+     ;; C++ and Java:
+     (setq result 
+       (verbatim :cpp "sdbc::fetchRow(nativeResultSet)"
+                 :java "SDBCSupport.fetchRow(nativeResultSet)")))
+    (setf (slot-value self value) 
+      (choose (defined? result)
+              (coerce-uncoerced-column-values result (types self))
+              NULL))
+    (cond ((defined? result)
+           (return TRUE))
+          (otherwise
+           (verbatim :common-lisp "#+:EXCL (dbi:close-query native-result-set)"
+                     ;; TO DO: FIGURE OUT WHETHER WE HAVE TO CLOSE IN C++ and JAVA ALSO?
+                     :otherwise NULL)
+           (setf (result-set self) null)
+           (return FALSE)))))
+
+(defun (sql-escape-string STRING) ((value STRING) (quoteChar CHARACTER))
+  ;; If `value' contains any occurrences of `quoteChar', replace
+  ;;    replace them with a double `quoteChar', otherwise, return
+  ;;    the string unmodified.
+  ;; Since this is called often, we hand-optimized the loop.
+  (let ((cursor (1- (length value))))
+    (while (>= cursor 0)
+      (when (eql? (nth value cursor) quoteChar)
+        (return (replace-substrings value
+                                    (make-string 2 quoteChar)
+                                    (make-string 1 quoteChar))))
+      (-- cursor))
+    (return value)))
+
+(defun (sql-quote-character CHARACTER) ((dbms-name KEYWORD)
+                                        (lexicalType KEYWORD))
+  ;; Return the appropriate quote character for `lexicalType'
+  ;;    which needs to be one of :STRING-CONSTANT or :IDENTIFIER.
+  ;; Uses DBMS-specific characters where required.
+  ;; NOTE: The standard SQL quote character for string constants is
+  ;;    #\', for identifiers it is #\".  However, MySQL unless when
+  ;;    run in ANSI mode uses #\`.
+  (case lexicalType
+    (:STRING-CONSTANT (return #\'))
+    (:IDENTIFIER
+     (case dbms-name
+       (:MYSQL (return #\`))
+       (otherwise (return #\"))))))
+
+(defun print-value-list ((stream OUTPUT-STREAM)
+                         (values CONS)
+                         (quoteChar CHARACTER))
+  (foreach value in values
+      as i in (interval 1 NULL)
+      do (when (> i 1) (print-stream stream ","))
+         (cond ((or (null? value)
+                    (eql? value (quote NULL))
+                    (eql? value :NULL))
+                (print-stream stream "NULL"))
+               ((or (eql? value (quote DEFAULT))
+                    (eql? value :DEFAULT))
+                (print-stream stream "DEFAULT"))
+               (otherwise
+                (typecase value
+                  ((INTEGER-WRAPPER FLOAT-WRAPPER VERBATIM-STRING-WRAPPER)
+                   (print-stream stream (wrapper-value value)))
+                  (STRING-WRAPPER
+                   (print-stream stream quoteChar
+                                 (sql-escape-string value quoteChar)
+                                 quoteChar))
+                  (otherwise
+                   (print-stream stream quoteChar
+                                 (sql-escape-string
+                                  (stringify value) quoteChar)
+                                 quoteChar)))))))
+
+(defun insert-row ((connection CONNECTION)
+                   (table STRING)
+                   (columns (CONS OF STRING-WRAPPER))
+                   (values CONS))
+  :documentation "Insert a row of `values' into `table'.  `columns'
+can be NULL or NIL in which case `values' must be suppied for all
+columns.  If `columns' are given `values' will be only inserted in
+the specified columns.  Table and column names will be quoted which
+means their casing must match exactly their definition (no case
+conversion will be performed).  Supplied `values' can be strings,
+integers or floats.  Strings will be quoted and escaped appropriately.
+The values NULL, :NULL or (quote NULL) translate into NULL.  The
+values :DEFAULT or (quote DEFAULT) translate into DEFAULT.  Arbitrary
+unquoted strings can be generated via VERBATIM-STRING-WRAPPERs as
+values (e.g., for something like `seq.nextval' in Oracle)."
+  :public? TRUE :command? TRUE
+  (when (or (null? values) (empty? values)) (return))
+  (insert-rows connection table columns (cons values NIL)))
+
+(defun insert-rows ((connection CONNECTION)
+                    (table STRING)
+                    (columns (CONS OF STRING-WRAPPER))
+                    (rows (CONS OF RDBMS-ROW)))
+  :documentation "Insert a set of `rows' into `table'.  `columns'
+can be NULL or NIL in which case values must be suppied for all
+columns.  If `columns' are given `values' will be only inserted in
+the specified columns.  Table and column names will be quoted which
+means their casing must match exactly their definition (no case
+conversion will be performed).  See `insert-row' for a description
+of supported value formats.  DEFAULT values are currently not supported
+for Oracle!  This function performs a fairly efficient multi-row
+insert which is significantly faster than inserting rows one by one."
+  :public? TRUE :command? TRUE
+  ;; TO DO: With full ODBC or JDBC we could do multi-row inserts directly
+  ;;    instead of doing the trickery that's currently required for
+  ;;    Oracle (we couldn't do it in Allegro ODBC).
+  (when (or (null? rows) (empty? rows)) (return))
+  (let ((sql STRING-OUTPUT-STREAM NULL)
+        (idQuote (sql-quote-character (get-dbms-name connection) :IDENTIFIER))
+        (valueQuote (sql-quote-character (get-dbms-name connection) :STRING-CONSTANT))
+        (blockLength 1000)
+        ;; the idiom supports blocks to at least 1000 rows in Oracle 10g,
+        ;; but performance seems to deteriorate; 100 is a good compromise:
+        (oracleBlockLength 100))
+    (loop
+      (setq sql (new STRING-OUTPUT-STREAM))
+      (print-stream sql "INSERT INTO "
+                    idQuote
+                    (sql-escape-string table idQuote)
+                    idQuote)
+      (when (and (defined? columns)
+                 (non-empty? columns))
+        (print-stream sql "(")
+        (print-value-list sql columns idQuote)
+        (print-stream sql ")"))
+      (cond
+       ((and (eql? (get-dbms-name connection) :ORACLE)
+             (non-empty? (rest rows))) ;; optimize single-row case below
+        ;; Oracle doesn't support multiple rows in a VALUES clause,
+        ;; so we use a little trickery here:
+        (foreach values in rows
+            as i in (interval 1 oracleBlockLength)
+            do (when (> i 1) (print-stream sql " UNION"))
+               (print-stream sql " SELECT ")
+               (print-value-list sql values valueQuote)
+               (print-stream sql " FROM DUAL")
+               (setq rows (rest rows))))
+       (otherwise
+        ;; we either have only a single row or something like :MYSQL:
+        (print-stream sql " VALUES")
+        (foreach values in rows
+            as i in (interval 1 blockLength)
+            do (when (> i 1) (print-stream sql ","))
+               (print-stream sql "(")
+               (print-value-list sql values valueQuote)
+               (print-stream sql ")")
+               (setq rows (rest rows)))))
+      (execute-sql connection (the-string sql))
+      (when (empty? rows) (break)))))
+
+
+  ;;
+;;;;;; Type conversion for complex types (e.g., dates)
+  ;;
+
+(defun (coerce-uncoerced-values-in-table CONS) ((table CONS) (types CONS))
+  (when (null? types)
+    (return table))
+  (let ((result NIL))
+    (foreach row in table
+	collect (coerce-uncoerced-column-values row types)
+	into result)
+    (return result)))
+
+(defun (coerce-uncoerced-column-values CONS) ((row CONS) (types CONS))
+  (when (null? types)
+    (return row))
+  (let ((result NIL))
+    (foreach value in row
+	as type in types
+	collect (choose (string? value)
+			(convert-string-to-typed-object value type)
+			value)
+	into result)
+    (return result)))
+
+(defun (convert-string-to-typed-object OBJECT) ((valueString STRING)
+                                                (typeSpec GENERALIZED-SYMBOL))
+  (case typeSpec
+    (@CALENDAR-DATE
+     (return (string-to-calendar-date valueString)))
+    (otherwise
+     (return valueString))))
+
+
+  ;;
+;;;;;; Prepared statements
+  ;;
+
+;;; NOTES:
+
+;;; - Currently we can only have one "active" prepared statement per connection
+;;;   which is the last statement prepared via `prepare-statement' before `execute-sql'
+;;;   is called.  This is a restriction of the Allegro ODBC interface, it doesn't seem
+;;;   to be a restriction in ODBC or JDBC.  There is a similar restriction in the current
+;;;   version of C++ SDBC support where the prepared statement is stored inside the native
+;;;   connection object.  If we ever generalize this, that needs to be fixed too.
+;;;   One can still have multiple prepared statements by opening multiple connections.
+;;; - Prepared statements don't seem to be faster than regular ones (at least in Lisp),
+;;;   and currently we don't support them for `get-result-set' which makes them not
+;;;   too useful.  ODBC documentation says that they should be faster as soon as a statement
+;;;   is executed more than 3 times.
+
+(defun (prepare-statement PREPARED-STATEMENT) ((connection CONNECTION) (sql STRING))
+  :documentation "Prepare the `sql' statement for execution at the server and return
+a prepared statement object.  After binding all its paramters via `bind-parameter'
+the statement can be executed via `execute-sql'.
+IMPORTANT: Only one prepared statement can be associated with a connection at a time."
+  :public? TRUE :command? TRUE
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  (maybe-renew-connection connection)
+  (let ((result (new PREPARED-STATEMENT))
+	(nativeConnection (native-connection connection)))
+    (setf (connection result) connection)
+    ;; needed to support connection renewal, since the most recently
+    ;; prepared statement is associated with the native connection:
+    (setf (statement connection) result)
+    (setf (sql result) sql)
+    (verbatim
+      :common-lisp "#+:EXCL (dbi:prepare-sql sql :db nativeConnection)"
+      :cpp "sdbc::doPrepareStatement(nativeconnection, sql)"
+      :java "SDBCSupport.doPrepareStatement(nativeconnection, result, sql)")
+    (return result)))
+
+(defun bind-parameter ((statement PREPARED-STATEMENT) (position INTEGER)
+                       (typeSpec SURROGATE) (value OBJECT))
+  :documentation "Bind the parameter at `position' (1-based) in the prepared
+statement `statement' to `value'.  `typeSpec' characterizes the type of
+`value' for proper translation and coercion."
+  :public? TRUE :command? TRUE
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  (let ((connection (connection statement))
+        (ncon NATIVE-CONNECTION NULL))
+    (maybe-renew-connection connection)
+    (setq ncon (native-connection connection))
+    ;; store bound parameter to support connection renewal:
+    (insert-at (parameters statement) position (cons-list typeSpec value))
+    ;; Convert dates to strings, they seem to work just fine when treated as strings:
+    (when (eql? typeSpec @CALENDAR-DATE)
+      (setq typeSpec @STRING)
+      (when (defined? value)
+	(setq value (calendar-date-to-sql-string value))))
+    (verbatim
+      :common-lisp "(cl-do-bind-parameter statement position typeSpec value)"
+      :cpp "sdbc::doBindParameter(ncon, position, typespec, value)"
+      :java "SDBCSupport.doBindParameter(statement, position, typespec, value)")))
+
+(defun cl-do-bind-parameter ((statement PREPARED-STATEMENT) (position INTEGER)
+                             (typeSpec SURROGATE) (value OBJECT))
+  (let ((nativeConnection (native-connection (connection statement)))
+        (null? (null? value))
+        (wrapper? (isa? value @WRAPPER)))
+    (verbatim
+      :common-lisp
+      "#+EXCL
+       (cl:let* ((transTypeSpec (cl-translate-sql-parameter-type-specifier typeSpec))
+                 (par (dbi:bind-parameter position cl:nil
+                                          (cl:if null? :null transTypeSpec)
+                                          (cl:cond (null? 0)
+                                                   ((cl:eq transTypeSpec :varchar) 255)
+                                                   (cl:t cl:nil))
+                                          :db nativeConnection)))
+         (cl:cond (null? (cl:setq value cl:nil))
+                  (wrapper? (cl:setq value (lispify value))))
+         (cl:unless null?
+           (cl:setf (ff:fslot-value par :data) value))
+         par)"
+      :otherwise NULL)))
+
+
+  ;;
+;;;;;; Transactions
+  ;;
+
+(defun set-auto-commit ((connection CONNECTION) (flag BOOLEAN))
+  :documentation "Set the auto-commit feature of `connection' to TRUE or FALSE.
+If a connection is in auto-commit mode, then all its SQL statements will be executed
+and committed as individual transactions.  Otherwise, its SQL statements are grouped
+into transactions that are terminated by a call to either `commit' or `rollback'.
+By default, new connections are in auto-commit mode."
+  :public? TRUE :command? TRUE
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  (maybe-renew-connection connection)
+  (let ((native-connection (native-connection connection)))
+    (verbatim
+      :common-lisp "#+:EXCL (dbi:set-autocommit flag :db native-connection)
+     #+:CLSQL (clsql:set-autocommit flag :database native-connection)"
+      :cpp "sdbc::setAutocommitFlag(nativeConnection, flag)"
+      :java "SDBCSupport.setAutocommitFlag(nativeConnection, flag)")
+    (setf (auto-commit? connection) flag)))
+
+(defun commit ((connection CONNECTION))
+  :documentation "Commit the current transaction.  Makes all changes made since the
+previous commit/rollback permanent and releases any database locks currently held
+by this `connection' object.  This function is a no-op if auto-commit mode is
+enabled (see `set-auto-commit')."
+  :public? TRUE :command? TRUE
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  (unless (auto-commit? connection)
+    (let ((native-connection (native-connection connection)))
+      (verbatim
+        :common-lisp "#+:EXCL (dbi:end-transaction :commit :db native-connection)
+    #+:CLSQL (clsql:commit :database native-connection)"
+        :cpp "sdbc::doCommit(nativeConnection)"
+        :java "SDBCSupport.doCommit(nativeConnection)"))))
+
+(defun rollback ((connection CONNECTION))
+  :documentation "Rollback the current transaction.  Undoes all changes made in
+the current transaction and releases any database locks currently held by this
+`connection' object.  This function is a no-op if auto-commit mode is enabled
+ (see `set-auto-commit')."
+  :public? TRUE :command? TRUE
+  ;; TODO: MAKE THIS PROTOCOL-SPECIFIC.
+  (unless (auto-commit? connection)
+    (let ((native-connection (native-connection connection)))
+      (verbatim
+        :common-lisp "#+:EXCL (dbi:end-transaction :rollback :db native-connection)
+      #+:CLSQL (clsql:rollback :database native-connection)"
+        :cpp "sdbc::doRollback(nativeConnection)"
+        :java "SDBCSupport.doRollback(nativeConnection)"))))
+
+
+  ;;
+;;;;;; Meta-information
+  ;;
+
+(defclass TABLE-INFO (STANDARD-OBJECT)
+  :public-slots
+  ((database :type STRING);; may be null
+   (catalog :renames database)
+   (schema :type STRING)  ;; may be null
+   (name :type STRING)
+   (type :type STRING)    ;; Typical types are "TABLE", "VIEW", "SYSTEM TABLE",
+                          ;; "GLOBAL TEMPORARY", "LOCAL TEMPORARY", "ALIAS", "SYNONYM".
+   (remarks :type STRING)
+   (columns :type (LIST OF COLUMN-INFO))
+   ;; what about primary key, foreign keys, index, etc.?
+   ))
+
+(defclass COLUMN-INFO (STANDARD-OBJECT)
+  :public-slots
+  ((database :type STRING);; may be null
+   (catalog :renames database)
+   (schema :type STRING)  ;; may be null
+   (table-name :type STRING)
+   (name :type STRING)
+   (data-type :type INTEGER
+     :documentation "SQL type from java.sql.Types.")
+   (data-type-name :type STRING
+     :documentation "Data source dependent type name, for a UDT the type name is fully qualified.")
+   (column-size :type INTEGER
+     :documentation "Column size. For char or date types this is the maximum number of characters,
+for numeric or decimal types this is precision.")
+   (buffer-length :type INTEGER
+     :documentation "Not used.")
+   (decimal-digits :type INTEGER
+     :documentation "The number of fractional digits.")
+   (radix :type INTEGER
+     :documentation "Radix (typically either 10 or 2).")
+   ;; `nullable?' vs. `is-nullable?' is a strange modal distinction....
+   (nullable? :type THREE-VALUED-BOOLEAN
+     :documentation "TRUE means definitely allows NULL values, FALSE means might not allow
+NULL values, NULL means nullability unknown.")
+   (is-nullable? :type THREE-VALUED-BOOLEAN
+     :documentation "TRUE means might allow NULL values, FALSE means definitely does not
+allow NULL values, NULL means nullability unknown.")
+   (documentation :type STRING
+     :documentation "Comment describing column (may be null).")
+   (remarks :renames documentation)
+   (default-value :type STRING) ;; may be null
+   (sql-data-type :type INTEGER
+     :documentation "Not used.")
+   (sql-datetime-sub :type INTEGER
+     :documentation "Not used.")
+   (char-octet-length :type INTEGER
+     :documentation "For char types the maximum number of bytes in the column.")
+   (ordinal-position :type INTEGER
+     :documentation "Index of column in table (starting at 1).")
+   ))
+
+(defun (get-tables (CONS OF TABLE-INFO)) ((connection CONNECTION)
+                                          (catalog-name STRING)
+                                          (schema-name STRING)
+                                          (table-name STRING)
+                                          (table-type STRING))
+  :documentation "Get the tables of the database identified by `connection'
+and return the result as a list of objects containing all the relevant
+meta information.  If any of the remaining arguments is supplied as
+non-NULL, only tables whose corresponding field matches will be returned.
+This is less general than what is supported by JDBC and ODBC, but Allegro
+ODBC does not support filtering based on patterns, so we only do simple
+manual filtering here."
+  :public? TRUE :command? TRUE
+ ;;;;; TO DO: IMPLEMENT C++ !!!!!!
+  (maybe-renew-connection connection)
+  (let ((ncon (native-connection connection))
+        (result-set NATIVE-RESULT-SET NULL)
+        (result-iterator (ITERATOR OF CONS) NULL)
+        (filterTables?
+         (and (verbatim :common-lisp TRUE
+                        :otherwise FALSE)
+              (or (defined? catalog-name)
+                  (defined? schema-name)
+                  (defined? table-name)
+                  (defined? table-type))))
+        (table-info TABLE-INFO NULL)
+        (tables NIL))
+
+    (verbatim
+     ;; TODO.  Fix CLSQL implementation.  Right now it uses a simple
+     ;;        hack, because there is no corresponding function call.
+      :common-lisp "(CL:setq result-iterator
+                      (allocate-iterator
+                        (stellify-with-nil-to-null 
+                          #+:EXCL (dbi:list-all-database-tables :db ncon)
+                          #+:CLSQL (cl:append
+                                    (cl:mapcar #'(cl:lambda (name) (cl:list nil nil name \"TABLE\"))
+                                       (clsql:list-tables :database ncon :owner cl:nil))
+                                    (cl:mapcar #'(cl:lambda (name) (cl:list nil nil name \"VIEW\"))
+                                       (clsql:list-views :database ncon :owner cl:nil)))
+                          #-(OR :EXCL :CLSQ) cl:nil)))"
+      ;; needs to be implemented via `SQLTables()' (returns a result set):
+      ;:cpp "resultSet = sdbc::getTables(ncon, catalogName, schemaName, tableName, tableType)"
+      :java "resultSet = SDBCSupport.getTables(ncon, catalogName, schemaName, tableName, tableType)"
+      :otherwise (error "get-tables not yet implemented"))
+    (when (null? result-iterator)
+      (setq result-iterator (new RESULT-SET-ITERATOR :result-set result-set)))
+    (foreach table-row in result-iterator
+        do (when (and filterTables?
+                      ;; with AODBC we have to filter by hand (doesn't support patterns):
+                      (or (and (defined? catalog-name)
+                               (not (eql? catalog-name (first table-row))))
+                          (and (defined? schema-name)
+                               (not (eql? schema-name (second table-row))))
+                          (and (defined? table-name)
+                               (not (eql? table-name (third table-row))))
+                          (and (defined? table-type)
+                               (not (eql? table-type (fourth table-row))))))
+             (continue))
+          (setq table-info
+             (new TABLE-INFO
+                  :database (first table-row)
+                  :schema (second table-row)
+                  :name (third table-row)
+                  :type (fourth table-row)
+                  :remarks (fifth table-row)))
+           (when (empty? (database table-info))
+             (setf (database table-info) NULL))
+           (when (empty? (schema table-info))
+             (setf (schema table-info) NULL))
+           (pushq tables table-info))
+    (return (reverse tables))))
+
+#|
+getColumns(String catalog, String schemaPattern, String tableNamePattern, String columnNamePattern)
+
+STELLA(105): (cl:pprint (dbi:list-all-table-columns "ENTITY" :db ncon))
+
+(("" "" "ENTITY" "ENTITYID" "12" "varchar" "50" "50" () () "0" "" () "12"
+  () "50" () "NO")
+ ("" "" "ENTITY" "ENTITYTYPEID" "12" "varchar" "50" "50" () () "0" "" ()
+  "12" () "50" () "NO")
+ ("" "" "ENTITY" "REPORTID" "12" "varchar" "50" "50" () () "1" "" () "12"
+  () "50" () "YES")
+ ("" "" "ENTITY" "SOURCEID" "12" "varchar" "50" "50" () () "1" "" () "12"
+  () "50" () "YES")
+ ("" "" "ENTITY" "LABEL" "12" "varchar" "128" "128" () () "1" "" () "12" ()
+  "128" () "YES"))
+|#
+
+(defun (get-columns (CONS OF COLUMN-INFO)) ((connection CONNECTION)
+                                            (catalogName STRING)
+                                            (schemaName STRING)
+                                            (tableName STRING)
+                                            (columnName STRING))
+  :public? TRUE :command? TRUE
+  (print "FINISH ME")
+  (return NULL))
+
+#|
+How to get server info without ODBC/JDBC:
+
+for Mysql:
+% (sdbc/execute-sql (get-parameter "con") "select @@myisam_max_sort_file_size")
+% (sdbc/execute-sql (get-parameter "con") "select version()")
+
+for Oracle:
+select * from v$version where banner like 'Oracle%'
+|#
+
+(defun (get-server-info WRAPPER) ((connection CONNECTION) (property STRING))
+  ;; Get information about the database server connected via `connection'.
+  ;; Which type of wrapper (string, boolean, integer, float) is returned
+  ;;    depends on `property'.
+  ;; Currently supported properties are:
+  ;;    "DBMS-NAME", "DBMS-VERSION"
+  :public? TRUE :command? TRUE
+  (let ((ncon (native-connection connection)))
+    (case (protocol connection)
+      ("ODBC"
+       (verbatim
+        :cpp "return(sdbc::doGetServerInfo(ncon, property))"
+        :otherwise NULL))
+      ("JDBC"
+       (verbatim
+         :java "return(SDBCSupport.doGetServerInfo(ncon, property))"
+         :otherwise NULL))
+      (otherwise NULL))
+    (case (string-upcase property)
+      ("DBMS-NAME"
+       (return (guess-dbms-name connection)))
+      ("DBMS-VERSION"
+       (case (get-dbms-name connection)
+         (:MYSQL
+          (return (cons-tree-nth (execute-sql connection "select version()") 0 0)))
+         (:ORACLE
+          (return (cons-tree-nth (execute-sql connection "select * from v$version where banner like 'Oracle%'") 0 0)))
+         (otherwise NULL)))
+      (otherwise NULL))
+    (return NULL)))
+
+(defun (guess-dbms-name STRING) ((connection CONNECTION))
+  ;; Tries to guess the vendor name of the DBMS connected via `connection'
+  ;;    by testing some commands and evaluating the response.  
+  ;; Return NULL if no determination could be made.
+  (let ((dbmsName STRING NULL)
+	(ncon (native-connection connection)))
+    (verbatim :common-lisp 
+	      "#+:CLSQL (cl:return-from guess-dbms-name (cl:symbol-name (clsql:database-type ncon)))"
+	      :otherwise NULL)
+    (exception-case
+        (progn
+          (execute-sql connection "select @@myisam_max_sort_file_size")
+          (setq dbmsName "MySQL"))
+      (DATABASE-EXCEPTION ()))
+    (when (null? dbmsName)
+      (exception-case
+        (progn
+          ;; we might want to look for something more selective:
+          (execute-sql connection "select 1 from dual")
+          (setq dbmsName "Oracle"))
+        (DATABASE-EXCEPTION ())))
+    (return dbmsName)))
+
+(defun (get-dbms-name KEYWORD) ((connection CONNECTION))
+  ;; Determine the vendor name of the DBMS connected via `connection'
+  ;;    and return it as a canonicalized keyword (currently supported
+  ;;    are :MYSQL and :ORACLE).
+  ;; Return :UNKNOWN if no determination could be made.
+  ;; Caches the name in `connection' for future lookups.
+  (let ((cachedDbmsName (dbms-name connection))
+        (dbmsName STRING-WRAPPER NULL))
+    (when (defined? cachedDbmsName)
+      (return cachedDbmsName))
+    (exception-case
+        (setq dbmsName (get-server-info connection "DBMS-NAME"))
+      (STELLA-EXCEPTION ()))
+    (if (defined? dbmsName)
+        (setq cachedDbmsName (intern-keyword (string-upcase dbmsName)))
+      (setq cachedDbmsName (intern-keyword "UNKNOWN")))
+    (setf (dbms-name connection) cachedDbmsName)
+    (return cachedDbmsName)))
+
+
+  ;;
+;;;;;; Utilities
+  ;;
+
+(defun print-table ((table OBJECT))
+  (when (null? table)
+    (return))
+  (let ((consTable (cast table (CONS OF CONS))))
+    (foreach row in consTable
+	do (print "row = " row EOL))))
+
+(defun (calendar-date-to-sql-string STRING) ((date CALENDAR-DATE))
+  ;; Return months in numerical format:  YYYY-MM-DD hh:mm:ss.mmm
+  (return (calendar-date-to-string date 0.0 TRUE FALSE)))
+
+
+  ;;
+;;;;;; SQL command templates
+  ;;
+
+;; SQL command templates allow one to templatize SQL commands to, for
+;; example, configure them with different syntax or optimizations for 
+;; different RDBMS without having to (hopefully) find them in code
+;; and modify them there.  Command templates are also the basic
+;; mechanism to specify arbitrary RDBMS/SQL-query relations in RDBMS.
+
+;; Templates can be loaded from a file and then instantiated via
+;; `instantiate-sql-cmd'.  Alternatively, template strings can
+;; be instantiated directly by `instantiate-sql-cmd-template'.
+
+;; Templates are arbitrary strings that contain variable regions marked by
+;; #${ ... } syntax, for example, #${FOO}, #${x='%FOO'} or #${x='?FOO[0,TRUE]}.
+;; These variables can then be instantiated by supplying appropriate values
+;; to `instantiate-sql-cmd' and friends.  The substitution mechanism supports
+;; the following functionality:
+;;
+;; (1) simple value substitution: for example, given the template
+;;     "SELECT x FROM #${%TABLE} WHERE x='foo'" and the variable/value pair
+;;     "%TABLE" and "mytable" supplied to `instantiate-sql-cmd' will produce
+;;     "SELECT x FROM mytable WHERE x='foo'" as the instantiation.  Note that
+;;     #${%TABLE} could occur multiple times in the template and that there
+;;     is no special syntax for the variable name itself, i.e., "%TABLE" or
+;;     "TABLE" or "***TABLE", etc. will all work and can be picked by the user.
+;;     Also, any substring of a #${ ... } template can be used as the variable.
+;;     For example, given the template above and the variable/value pair
+;;     "AB"/"blah" will produce "SELECT x FROM %TblahLE WHERE x='foo'".  The
+;;     usefulness of this feature will become apparant below.  For each template
+;;     variable specification #${ ... } only the first occurence of a matching
+;;     variable will be replaced.  Variable syntax should be chosen so that
+;;     no variable is a substring of another variable to avoid unwanted effects.
+;;     Picking a variable prefix such as % or ? will achieve that.
+;;
+;; (2) default value substitution: SQL templates are often used with varying
+;;     constraints, for example, for one call we might want to constrain
+;;     column x to "value", for another call we might not want to have any
+;;     constraint on that column.  To allow the same template to be used
+;;     for different situations a default value mechanims is available.
+;;     For example, the template "SELECT * FROM MYTABLE WHERE #${x='%VAL'}"
+;;     can be instantiated in two ways.  Given the "%VAL"/"value" substitution
+;;     will produce "SELECT * FROM MYTABLE WHERE x='value'".  Given the
+;;     substitution "%VAL"/NULL will substitute the variable with the default
+;;     value and yield "SELECT * FROM MYTABLE WHERE 1=1" (the default default
+;;     value is "1=1" which is a dummy true condition that should be supported
+;;     by all database servers).  Note that when a non-NULL value is supplied only
+;;     the variable name (e.g., "%VAL") in the template variable is replaced.
+;;     For default value substitution, the whole template variable is replaced.
+;;     A different default value can be supplied as part of the variable range,
+;;     for example, "SELECT * FROM MYTABLE WHERE #${x='%VAL[TRUE]'}" will
+;;     produce "SELECT * FROM MYTABLE WHERE TRUE" when "%VAL" is NULL.  Note that
+;;     NULL-valued variables have to be explicitly supplied to the instantiation
+;;     function, otherwise it wouldn't know that the particular string actually
+;;     is a variable.
+;;
+;; (3) list value substitutions: finally, it is sometimes necessary to construct
+;;     a substitution from a list of values.  To allow that variables can have
+;;     a range specification associated with them to allow them to be instantiated
+;;     with particular elements or sublists of the supplied values.  For example,
+;;     "SELECT * FROM MYTABLE WHERE #${x='%VAL[0,TRUE]'}#${ OR x='%VAL[1,:,]'}"
+;;     will expand in the following ways depending on the value of "%VAL":
+;;     "%VAL"/NULL:           "SELECT * FROM MYTABLE WHERE TRUE"
+;;     "%VAL"/"a":            "SELECT * FROM MYTABLE WHERE x='a'"
+;;     "%VAL"/("a"):          "SELECT * FROM MYTABLE WHERE x='a'"
+;;     "%VAL"/("a" "b" "c"):  "SELECT * FROM MYTABLE WHERE x='a' OR x='b' OR x='c'"
+;;     Note that the default value we supplied for the second template is the
+;;     empty string.  Range specifications for a variable can have the following forms:
+;;
+;;     %var[]:           specifies empty default value
+;;     %var[def]:        specifies "def" as the default value
+;;     %var[1]:          specifies the start & end index as 1
+;;     %var[1,def]:      specifies the start & end index as 1 and "def" as default
+;;     %var[1,2]:        specifies the start as 1 and end as 2 (default default is 1=1)
+;;     %var[1,:]:        specifies the start as 1 and the end as the end of the list
+;;     %var[1,3,def]:    specifies start as 1, end as 3 and "def" as the default
+;;     %var[1,3, d,e,f]: specifies start as 1, end as 3 and " d,e,f" as the default
+;;
+;;     During variable substitution, the template will be substituted for each of the
+;;     elements in the value list between start and end index (inclusive).  If there
+;;     is no value available at a particular index, the default value will be used.
+;;     Anything after the second `,' will be interpreted as a default value.  If no
+;;     default value is specified, the default default 1=1 is used.  Indices are 0-based.
+
+;; SQL Templates can be stored in files as disembodied property lists.  They can then
+;; be loaded via `load-sql-cmd-templates' and instantiated based on their name with
+;; `instantiate-sql-cmd'.  Each template has to have a :command entry giving it a
+;; unique name and an :sql entry specifying the template.  A :data-source entry can
+;; be specified to allow a template to be instantiated differently for different
+;; databases or data sources (e.g., for MySQL and for Oracle).  Other entries can be
+;; supplied also but are simply stored and ignored by the substitution machinery.
+;; Here is an example template:
+;;
+;;    (:command :set_hypothesis_counter
+;;     :data-source :kojak
+;;     :sql "UPDATE hypothesis_sequence SET count=#${COUNT}")
+;;
+;; After loading it this template can then be instantiated via the following call:
+;;
+;;    (instantiate-sql-cmd :set_hypothesis_counter :kojak "COUNT" "0")
+;;
+;; which will yield "UPDATE hypothesis_sequence SET count=0" as its result.
+;;
+;; A template with a particular :command name can be defined multiple times for
+;; different data sources to allow different instantiations.  Specifying :default
+;; as the :data-source makes the template act like an `otherwise' clause, i.e.,
+;; if the data source specified in `instantiate-sql-cmd' does not match any of
+;; the defined templates with that name the :default template (if it exists) will
+;; be used.  A :data-source specification of a template can also be specified as
+;; a list of multiple data sources in which case the template is defined for each
+;; listed data source.
+
+
+(defspecial *sql-command-templates*
+    (KEY-VALUE-MAP OF OBJECT (KEY-VALUE-LIST OF OBJECT PROPERTY-LIST))
+    (new KEY-VALUE-MAP))
+
+(defun load-sql-cmd-templates ((file STRING))
+  ;; Load command templates from template file `file'.  By keeping them in
+  ;;    an editable file we allow customization (and optimization) for a
+  ;;    different RDBMS without having to change any code.
+  (with-input-file (in file)
+    (foreach command in (s-expressions in)
+        do (insert-sql-command-template
+            (new PROPERTY-LIST :the-plist command)))))
+
+(defun insert-sql-command-template ((template PROPERTY-LIST))
+  ;; Check and normalize `template' (in particular, its :data-source
+  ;;    specification) and insert it into the global template table.
+  ;; :data-source can be ommitted (which means this is a
+  ;;    :default template), be specified via a single string or
+  ;;    keyword, or supplied via a list of strings and/or keywords
+  ;;    in which case it applies to each of the listed sources.
+  ;; The special values :default or :otherwise specify default
+  ;;    templates which match any data source in case there is
+  ;;    no specific match.
+  (let ((commandName (lookup template :command))
+        (dataSources
+         (consify (first-defined (lookup template :data-source) :DEFAULT)))
+        (sql (lookup template :sql))
+        (templates (lookup *sql-command-templates* commandName)))
+    (when (null? commandName)
+      (error "Missing :command name in SQL template: " template))
+    (unless (string? sql)
+      (error "Illegal or missing :sql specification in SQL template: "
+             sql EOL "   String expected."))
+    (when (null? templates)
+      (setq templates (new KEY-VALUE-LIST))
+      (insert-at *sql-command-templates* commandName templates))
+    (foreach dataSource in dataSources
+        do (when (eql? dataSource :OTHERWISE)
+             (setq dataSource :DEFAULT))
+           (insert-at templates dataSource template))))
+
+(defun (lookup-sql-cmd-template PROPERTY-LIST) ((commandName OBJECT)
+                                                (dataSource OBJECT))
+  ;; Lookup the command template `commandName' for `dataSource' (which
+  ;;    can be NULL or :DEFAULT)
+  ;; If there is no matching template for `commandName' but there is a
+  ;;    :DEFAULT template, return that; otherwise, return NULL.  That
+  ;;    is, the :DEFAULT template works like an `otherwise' clause.
+  (let ((templates (lookup *sql-command-templates* commandName))
+        (template PROPERTY-LIST NULL))
+    (when (null? templates)
+      (return NULL))
+    (setq template (lookup templates (first-defined dataSource :DEFAULT)))
+    (if (null? template)
+        (return (lookup templates :DEFAULT))
+      (return template))))
+
+(defun (instantiate-sql-cmd STRING) ((cmdName OBJECT)
+                                     (dataSource OBJECT)
+                                     &rest (vars&values STRING))
+  ;; Instantiate the SQL cmd named `cmdName' with the values defined by
+  ;;    `vars&values' (an alternating variable/value list).  Variables that
+  ;;    have a NULL value need to be specified explicitly.
+  (let ((template (lookup-sql-cmd-template cmdName dataSource))
+        (variables (new KEY-VALUE-LIST))
+        (key STRING-WRAPPER NULL))
+    (when (null? template)
+      (error "Undefined SQL command template: " cmdName))
+    (foreach item in vars&values
+        do (cond ((defined? key)
+                  ;; tricky: we exploit that keys need to be non-NULL and use that
+                  ;; as a switch to convert the flat list into a key/value list:
+                  (insert-at variables key (choose (null? item) NULL item))
+                  (setq key NULL))
+                 (otherwise
+                  (setq key item))))
+    (return
+      (instantiate-sql-cmd-template
+       (lookup template :SQL)
+       variables))))
+
+(defglobal *sql-cmd-template-variable-prefix* STRING "#$")
+
+(defun (instantiate-sql-cmd-template STRING)
+    ((template STRING) (variables (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT)))
+  ;; Substitute all template `variables' in `template' with their supplied
+  ;;    values and return the result.
+  (let ((prefix *sql-cmd-template-variable-prefix*)
+        (prefixLength (length prefix))
+        (cursor 0)
+        (variableStart 0)
+        (length (length template))
+        (result STRING-OUTPUT-STREAM NULL)
+        (variable STRING NULL))
+    (when (null? (string-search template prefix NULL))
+      (return template))
+    (setq result (new STRING-OUTPUT-STREAM))
+    (loop
+      (setq variableStart (string-search template prefix cursor))
+      (print-stream result (subsequence template cursor variableStart))
+      (when (null? variableStart)
+        (break))
+      (mv-setq (variable cursor)
+        (read-sql-cmd-template-variable template (+ variableStart prefixLength) length))
+      (print-stream result (instantiate-sql-cmd-template-variable variable variables)))
+    (return (the-string result))))
+
+(defun (read-sql-cmd-template-variable STRING INTEGER)
+    ((template STRING) (start INTEGER) (end INTEGER))
+  ;; Read the current template variable from `template' and return the result.
+  ;;    Return the start of the rest of `template' as a second value.
+  ;; Assumes `start' points right after the variable prefix and `end'
+  ;;    delimits the search region.
+  (let ((cursor start)
+        (escaped? FALSE))
+    (cond ((or (>= cursor end)
+               (not (eql? (nth template cursor) #\{)))) ;; error
+          (otherwise
+           (while (< cursor end)
+             ;; can't use `case' here, otherwise `break' will be ambiguous
+             ;; in C++ (it breaks the `switch' not the `while' loop):
+             (let ((c (nth template cursor)))
+               (cond ((eql? c #\\)
+                      (setq escaped? TRUE)
+                      (++ cursor))
+                     ((eql? c #\})
+                      (break))
+                     (otherwise NULL))
+               (++ cursor)))
+           (when (< cursor end)
+             (if escaped?
+                 (return
+                   (unescape-token-string
+                    (subsequence template (1+ start) cursor) #\\ FALSE)
+                   (1+ cursor))
+               (return (subsequence template (1+ start) cursor)
+                       (1+ cursor))))))
+    (error "Illegal template variable syntax at position " cursor " in" EOL
+           EOL "    " template)))
+
+(defun (instantiate-sql-cmd-template-variable STRING)
+    ((templateVariable STRING)
+     (variables (KEY-VALUE-LIST OF STRING-WRAPPER OBJECT)))
+  ;; Given a particular `templateVariable' string, replace it or the
+  ;;    subregion corresponding to one of the `variables' with the
+  ;;    corresponding value and return the resulting substitution.
+  ;; If the value is NULL, replace the whole `templateVariable' with a
+  ;;    default value.  If a value is a list of values perform the
+  ;;    substitution multiple times according to the range indices give
+  ;;    with the variable.
+  ;; If the variable is surrounded by quotes, the substituted value will
+  ;;    be escaped for that quote character.
+  ;; See the documentation at the beginning of this section for more info
+  ;;    and examples about variable substitution policies.
+  (let ((start 0)
+        (quotes "'`\"")
+        (quote CHARACTER NULL))
+    (foreach (var value) in variables
+        do (setq start (string-search templateVariable var 0))
+           (when (defined? start)
+             (mv-bind (varSpec from to default)
+                 (parse-sql-cmd-template-variable-range-and-default
+                  templateVariable var start)
+               (when (and (> start 0)
+                          (member? quotes (nth templateVariable (1- start))))
+                 (setq quote (nth templateVariable (1- start))))
+               (typecase value
+                 (STRING-WRAPPER
+                  (when (or (null? (unwrap-string value))
+                            (> from 0))
+                    (return default))
+                  (when (defined? quote)
+                    (setq value (sql-escape-string value quote)))
+                  (return (replace-substrings templateVariable value varSpec)))
+                 (CONS
+                  (if (or (empty? value)
+                          (>= from (length value)))
+                      (return default)
+                    (let ((result (new STRING-OUTPUT-STREAM)))
+                      (foreach elt in (cast value (CONS OF STRING-WRAPPER))
+                          as i in (interval 0 NULL)
+                          where (and (>= i from)
+                                     (or (null? to) (<= i to)))
+                          do (when (defined? quote)
+                               (setq elt (sql-escape-string elt quote)))
+                             (print-stream result
+                                           (replace-substrings templateVariable elt varSpec)))
+                      (return (the-string result)))))
+                 (otherwise
+                  (return default))))))
+    (error "Undefined template variable: " templateVariable)))
+
+(defun (parse-sql-cmd-template-variable-range-and-default STRING INTEGER INTEGER STRING)
+    ((templateVariable STRING) (variableName STRING) (start INTEGER))
+  ;; Parse the range specification of `variableName' within `templateVariable' and
+  ;;    return the following values:
+  ;;    - the substring within `templateVariable' that needs to be substituted with
+  ;;      a value
+  ;;    - the start index of the variable range (i.e., the index of the first element
+  ;;      of a corresponding value list that should be substituted).
+  ;;    - the end index of the variable range (NULL if it correspongs to the end of
+  ;;      the list)
+  ;;    - the default value to be used for this variable if the corresponding value
+  ;;      is NULL
+  ;; `start' points to the beginning of `variableName' within `templateVariable'.
+  ;; This is a bit messy due to the various possible ommissions and context-specific
+  ;;    interpretation.  See the documentation at the beginning of this section for
+  ;;    examples of variable range specifications.
+  (let ((variableStart start)
+        (end (length templateVariable))
+        (startIdx 0)
+        (endIdx 0)
+        ;; use `1=1' as the default TRUE condition; unfortunately, `TRUE'
+        ;; isn't supported by all database servers (such as Oracle):
+        (default "1=1")
+        (cursor 0)
+        (range (CONS OF STRING-WRAPPER) NIL)
+        (element STRING NULL)
+        (nofElements 0))
+    (++ start (length variableName))
+    (when (or (>= start end)
+              (not (eql? (nth templateVariable start) #\[)))
+      (return variableName startIdx endIdx default))
+    (++ start)
+    (setq end (position templateVariable #\] start))
+    (when (null? end)
+      (error "Missing right parenthesis in template variable range: " templateVariable))
+    (setq cursor start)
+    (while (< cursor end)
+      (cond ((and (eql? (nth templateVariable cursor) #\,)
+                  ;; everything after the second comma is interpreted as part of
+                  ;; the default value, even additional commas:
+                  (< nofElements 2))
+             (pushq range (subsequence templateVariable start cursor))
+             (++ nofElements)
+             (++ cursor)
+             (setq start cursor))
+            (otherwise
+             (++ cursor))))
+    (++ nofElements)
+    (pushq range (subsequence templateVariable start cursor))
+    (foreach elt in (reverse range)
+        as i in (interval 1 NULL)
+        do (setq element elt)
+           (case i
+             (1 (cond ((= i nofElements)
+                       ;; could be start or default:
+                       (cond ((empty? element)
+                              (setq default element))
+                             ((forall char in element
+                                  always (digit-character? char))
+                              (setq startIdx (string-to-integer element))
+                              (setq endIdx startIdx))
+                             (otherwise
+                              (setq default element))))
+                      ((forall char in element
+                           always (digit-character? char))
+                       (setq startIdx (string-to-integer element))
+                       (setq endIdx startIdx))
+                      (otherwise
+                       (error  "Illegal template variable range: " templateVariable))))
+             (2 (cond ((= i nofElements)
+                       ;; could be end or default:
+                       (cond ((empty? element)
+                              (setq default element))
+                             ((eql? element ":")
+                              (setq endIdx NULL))
+                             ((forall char in element
+                                  always (digit-character? char))
+                              (setq endIdx (string-to-integer element)))
+                             (otherwise
+                              (setq default element))))
+                      ((empty? element)
+                       (setq endIdx startIdx))
+                      ((eql? element ":")
+                       (setq endIdx NULL))
+                      ((forall char in element
+                           always (digit-character? char))
+                       (setq endIdx (string-to-integer element)))
+                      (otherwise
+                       (error  "Illegal template variable range: " templateVariable))))
+             (3 (setq default element))))
+    (return (subsequence templateVariable variableStart (1+ end)) startIdx endIdx default)))
+
+
+  ;;
+;;;;;; Testing
+  ;;
+
+(defun test-prepared-statement ()
+  (exception-case
+      (let ((con 
+	     (connect :dsn "myodbc3" :user "scott" :password "tiger"
+		      :connectionString "jdbc:mysql://localhost:3306/menagerie?user=scott&password=tiger"))
+	    (preparedSql "insert into customer4 values (?, ?, ?, ?)")
+;;;	    (preparedSql "select * from customer2 where a = ?")
+	    (selectSql "select * from customer4")
+	    (preparedStatement PREPARED-STATEMENT NULL)
+	    (result CONS NULL))
+	(print "Table before executing prepared statement:" EOL)
+	(print-table (execute-sql con selectSql))
+	(setq preparedStatement (prepare-statement con preparedSql))
+;;;	(bind-parameter preparedStatement 1 @INTEGER 23)
+;;;	(setq result
+;;;	  (execute-sql con preparedStatement))
+
+	(bind-parameter preparedStatement 1 @INTEGER 23)
+	(bind-parameter preparedStatement 2 @STRING "k")
+	(bind-parameter preparedStatement 3 @DOUBLE-FLOAT 5.3)
+	(bind-parameter preparedStatement 4 @CALENDAR-DATE (string-to-calendar-date "1997-02-14"))
+	
+	(setq result
+	  (execute-sql con preparedStatement))
+
+	;; NOTE: Can't bind Nulls for prepared-statements in common lisp implementation
+	
+	(bind-parameter preparedStatement 1 @INTEGER 24)
+	(bind-parameter preparedStatement 2 @STRING NULL)
+	(bind-parameter preparedStatement 3 @DOUBLE-FLOAT NULL)
+	(bind-parameter preparedStatement 4 @CALENDAR-DATE NULL)
+	(setq result
+	  (execute-sql con preparedStatement))
+
+	(print "Table after executing prepared statements:" EOL)
+	(print-table (execute-sql con selectSql)))
+;;;	(print-table result)
+	
+    (DATABASE-EXCEPTION (e)
+      (print "Caught Database Exception: " (message e) EOL))))
+
+(defun test-transactions ()
+  (print "testing transactions..." EOL)
+  (exception-case
+      (let ((con 
+	     (connect :dsn "myodbc3" :user "scott" :password "tiger"
+		      :connectionString "jdbc:mysql://localhost:3306/menagerie?user=scott&password=tiger"))
+	    (selectSql "select * from customer2")
+	    (insertSql1 "insert into customer2 values (28, 'aa')")
+	    (insertSql2 "insert into customer2 values (29, 'z')"))
+	;; Turn on transactions:
+	(set-auto-commit con FALSE)
+	(print "Table before insert:" EOL)
+	(print-table (execute-sql con selectSql))
+	(execute-sql con insertSql1)
+	(print "Table after insert1:" EOL)
+	(print-table (execute-sql con selectSql))
+	(commit con)
+	(print "Table after commit:" EOL)
+	(print-table (execute-sql con selectSql))
+	(execute-sql con insertSql2)
+	(print "Table after insert2:" EOL)
+	(print-table (execute-sql con selectSql))
+	(rollback con)
+	(print "Table after rollback:" EOL)
+	(print-table (execute-sql con selectSql))
+	(disconnect con))
+    (DATABASE-EXCEPTION (e)
+      (print "Caught Database Exception: " (message e) EOL))))
+
+(defun test-result-set ()
+  (print "Testing result set..." EOL)
+  (exception-case
+      (let ((con 
+	     (connect :dsn "myodbc3" :user "scott" :password "tiger"
+		      :connectionString "jdbc:mysql://localhost:3306/menagerie?user=scott&password=tiger"))
+	    (types (bquote (@INTEGER @DOUBLE-FLOAT @LONG-INTEGER NULL @STRING @CALENDAR-DATE)))
+;;;	    (sql "select * from pet")
+	    (sql "select intcol, floatcol, bigintcol, blobcol, varcharcol, datecol from typetest")
+	    (result (get-result-set con sql :types types)))
+	(foreach row in result
+	    do (print "Retrieved row : " (value result) EOL))
+	(disconnect con))
+    (DATABASE-EXCEPTION (e)
+      (print "Caught Database Exception: " (message e) EOL))))
+
+(defun test-retrieve-all ()
+  (print "Testing retrieve all..." EOL)
+  (exception-case
+      (let ((con 
+	     (connect :dsn "myodbc3" :user "scott" :password "tiger"
+		      :connectionString "jdbc:mysql://localhost:3306/menagerie?user=scott&password=tiger"))
+;;;	    (sql "select * from pet")
+;;;	    (sql "insert into pet values ('Bitsy6', 'Benny', 'hamster', 'm', '1997-02-03', '1997-04-03')")
+	    (sql "select intcol, floatcol, bigintcol, blobcol, varcharcol, datecol from typetest")
+;;;	    (sql (new FLOAT-WRAPPER :wrapper-value 5.3)) ; to test error
+;;;	    (result (execute-sql con sql))
+	    (types (bquote (@INTEGER @DOUBLE-FLOAT @LONG-INTEGER NULL @STRING @CALENDAR-DATE)))
+	    (result (execute-sql con sql :types types))
+	    )
+	(when (defined? result)
+	  (print-table result))
+	(disconnect con)
+	;; For testing: try disconnecting an already-disconnect connection:
+	;(disconnect con)
+	(print "connection string: " con EOL)
+	)
+    (DATABASE-EXCEPTION (e)
+      (print "Caught Database Exception: " (message e) EOL))))
+
+(startup-time-progn
+    (verbatim
+	:cpp "sdbc::initializeSymbols()"
+	:otherwise NULL))
+
+(defmain ()
+    (print "Start..." EOL)
+    (test-retrieve-all)
+    (test-result-set)
+    (test-transactions)
+    (test-prepared-statement)
+    (print "done!" EOL))

@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: collections.ste,v 1.39 2006/05/11 07:05:49 hans Exp
+;;; Version: collections.ste,v 1.42 2008/09/16 21:13:45 hans Exp
 
 ;;; Procedures that implement sets, hash tables, arrays, etc.
 
@@ -206,7 +206,7 @@ is O(N) in the number of elements of `self'."
 
 
   ;;
-;;;;;; VECTORS, EXTENSIBLE-VECTORs, and VECTOR-SEQUENCEs
+;;;;;; VECTORS, EXTENSIBLE-VECTORs and VECTOR-SEQUENCEs
   ;;
 
 (defmethod print-vector ((self VECTOR) (stream NATIVE-OUTPUT-STREAM))
@@ -229,14 +229,12 @@ is O(N) in the number of elements of `self'."
 
 (defmethod (empty? BOOLEAN) ((self VECTOR))
   :documentation "Return `true' if `self' has length 0."
-  :public? TRUE
-  :globally-inline? TRUE
+  :public? TRUE ;:globally-inline? TRUE ;; now shadowed by VSEQ
   (return (eql? (array-size self) 0)) )
 
 (defmethod (non-empty? BOOLEAN) ((self VECTOR))
-  :public? TRUE
   :documentation "Return `true' if `self' has length > 0."
-  :globally-inline? TRUE
+  :public? TRUE ;:globally-inline? TRUE ;; now shadowed by VSEQ
   (return (> (array-size self) 0)) )
 
 (defmethod (first (LIKE (any-value self))) ((self VECTOR))
@@ -442,14 +440,50 @@ equivalent.  Uses `equal?' to test equality of elements."
   (when (> offset (top-symbol-offset self))
     (setf (top-symbol-offset self) offset)) )
 
+
+(defmethod (empty? BOOLEAN) ((self VECTOR-SEQUENCE))
+  :documentation "Return `true' if `self' has length 0."
+  :public? TRUE :globally-inline? TRUE
+  (return (eql? (length self) 0)) )
+
+(defmethod (non-empty? BOOLEAN) ((self VECTOR-SEQUENCE))
+  :documentation "Return `true' if `self' has length > 0."
+  :public? TRUE :globally-inline? TRUE
+  (return (> (length self) 0)) )
+
+(defmethod (length INTEGER) ((self VECTOR-SEQUENCE))
+  :public? TRUE :globally-inline? TRUE
+  (return (sequence-length self)) )
+
+(defmethod (last (LIKE (any-value self))) ((self VECTOR-SEQUENCE))
+  :public? TRUE
+  :documentation "Return the last item in the vector `self'."
+  (return (nth self (1- (length self)))) )
+
+(defmethod (last-setter (LIKE (any-value self)))
+    ((self VECTOR-SEQUENCE) (value (LIKE (any-value self))))
+  :public? TRUE
+  (return (setf (nth self (1- (length self))) value)))
+
 (defmethod insert ((self VECTOR-SEQUENCE) (value (LIKE (any-value self))))
   :documentation "Append `value' to the END of the sequence `self'.  
 Resize the array if necessary."
   :public? TRUE
   (let ((oldLength (sequence-length self)))
     (when (eq? oldLength (array-size self))
-      (resize-vector self (+ (array-size self) (resize-increment self))))
-    ;; offset of position of `value' is one less than the new length:
+      (resize-vector self (* (array-size self) 2)))
+    (setf (nth self oldLength) value)
+    (setf (sequence-length self) (1+ oldLength)) ))
+
+(defmethod insert ((self CUSTOM-VECTOR-SEQUENCE) (value (LIKE (any-value self))))
+  :documentation "Append `value' to the END of the sequence `self'.  
+Resize the array if necessary."
+  :public? TRUE
+  (let ((oldLength (sequence-length self)))
+    (when (eq? oldLength (array-size self))
+      (safety 1 (> (resize-factor self) 1.0)
+              "CUSTOM-VECTOR-SEQUENCE.insert: resize factor needs to be > 1")
+      (resize-vector self (* (array-size self) (resize-factor self))))
     (setf (nth self oldLength) value)
     (setf (sequence-length self) (1+ oldLength)) ))
 
@@ -462,10 +496,9 @@ the values after it to close the gap."
         (firstShiftOffset -1)           ; initialize to impossible value
         (lastShiftOffset (- (sequence-length self) 1)))
     (foreach i in (interval 0 lastShiftOffset)
-             do
-             (when (eql? (nth array i) value)
-               (setq firstShiftOffset (1+ i))
-               (break)))
+        do (when (eql? (nth array i) value)
+             (setq firstShiftOffset (1+ i))
+             (break)))
     (when (eq? firstShiftOffset -1)     ; exit if `value' not found
       (return self))
     (when (<= firstShiftOffset lastShiftOffset)
@@ -475,20 +508,60 @@ the values after it to close the gap."
     (setf (sequence-length self) lastShiftOffset)
     (return self)))
 
-(defmethod (length INTEGER) ((self VECTOR-SEQUENCE))
-  :public? TRUE
-  (return (sequence-length self)) )
+(defun copy-vector-sequence ((source VECTOR-SEQUENCE) (copy VECTOR-SEQUENCE))
+  ;; Copy the active portion of `source' into `copy'.
+  (let ((sourceArray (the-array source))
+        (copyArray (the-array copy))
+        (length (sequence-length source)))
+    (setf (sequence-length copy) length)
+    (foreach i in (interval 0 (1- length))
+        do (setf (nth copyArray i) (nth sourceArray i)))))
 
-  ;;
-;;;;;; Iteration over VECTORs
-  ;;
+(defmethod (copy (VECTOR-SEQUENCE OF (LIKE (any-value self)))) ((self VECTOR-SEQUENCE))
+  :documentation "Return a copy of the vector sequence `self'."
+  :public? TRUE
+  (let ((copy (new VECTOR-SEQUENCE :array-size (array-size self))))
+    (copy-vector-sequence self copy)
+    (return copy)))
+
+(defmethod (copy (CUSTOM-VECTOR-SEQUENCE OF (LIKE (any-value self))))
+    ((self CUSTOM-VECTOR-SEQUENCE))
+  :documentation "Return a copy of the vector sequence `self'."
+  :public? TRUE
+  (let ((copy (new CUSTOM-VECTOR-SEQUENCE :array-size (array-size self))))
+    (setf (resize-factor copy) (resize-factor self))
+    (copy-vector-sequence self copy)
+    (return copy)))
+
+(defmethod clear ((self VECTOR-SEQUENCE))
+  :documentation "Clear `self' by setting its active length to zero."
+  :public? TRUE
+  (setf (sequence-length self) 0))
+
+(defmethod (object-equal? BOOLEAN) ((x VECTOR-SEQUENCE) (y OBJECT))
+  :documentation "Return TRUE iff the sequences `x' and `y' are structurally
+equivalent.  Uses `equal?' to test equality of elements."
+  :public? TRUE
+  (typecase y
+    (VECTOR-SEQUENCE
+     (when (= (length x) (length y))
+       (foreach eltX in x
+           as eltY in y
+           where (not (equal? eltX eltY))
+           do (return FALSE))
+       (return TRUE)))
+    (otherwise NULL))
+  (return FALSE))
+
+
+;;; Iteration over VECTORs
 
 (defmethod (allocate-iterator (ITERATOR OF (LIKE (any-value self))))
     ((self VECTOR))
   (let ((iterator (new ALL-PURPOSE-ITERATOR)))
     (setf (iterator-object iterator) self)
     (setf (iterator-integer iterator) 0)
-    (setf (iterator-second-integer iterator) (array-size self))
+    (setf (iterator-second-integer iterator) (length self))
     (setf (iterator-next-code iterator)
       (the-code :function vector-next?))
     (return iterator)))
@@ -513,6 +586,371 @@ the values after it to close the gap."
     (setf (iterator-next-code iterator)
       (the-code :function vector-next?))
     (return iterator)))
+
+
+;;; Sorting:
+
+(defmethod (sort (VECTOR OF (LIKE (any-value self))))
+    ((self VECTOR) (predicate FUNCTION-CODE))
+  :public? TRUE
+  :documentation "Perform a destructive sort of `self' according to
+`predicate', and return the result.  If `predicate' has a '<' semantics, the
+result will be in ascending order.  If `predicate' is `null', a
+suitable '<' predicate is chosen depending on the first element of `self',
+and it is assumed that all elements of `self' have the same type (supported
+element types are GENERALIZED-SYMBOL, STRING, INTEGER, and FLOAT)."
+  (let ((length (length self)))
+    (cond ((= length 0)
+           (return self))
+          ((null? predicate)
+           (setq predicate (choose-sort-predicate (nth self 0)))))
+    ;; note: using `length' here will make this work for VECTOR-SEQUENCEs, etc. as well:
+    (heap-sort-native-vector (the-array self) (length self) predicate)
+    (return self)))
+
+(defun heap-sort-native-vector ((vector NATIVE-VECTOR)
+                                (size INTEGER)
+                                (predicate FUNCTION-CODE))
+  (heap-sort-heapify vector size predicate) ;; generate max heap
+  (let ((end (1- size))
+        (aux OBJECT NULL))
+    (while (> end 0)
+      ;; swap the root (the max value) with the last element of the heap:
+      (setq aux (nth vector 0))
+      (setf (nth vector 0) (nth vector end))
+      (setf (nth vector end) aux)
+      (-- end)
+      ;; put the remaining heap back in max heap order:
+      (heap-sort-sift-down vector 0 end predicate))))
+
+(defun heap-sort-heapify ((vector NATIVE-VECTOR) (size INTEGER) (predicate FUNCTION-CODE))
+  (let ((start (1- (shift-right size 1)))) ;; index of the last parent node
+    (while (>= start 0)
+      ;; sift down node at start to the proper place such that all
+      ;; nodes below start are in heap order:
+      (heap-sort-sift-down vector start (1- size) predicate)
+      (-- start))))
+
+(defun heap-sort-sift-down
+    ((vector NATIVE-VECTOR) (start INTEGER) (end INTEGER) (predicate FUNCTION-CODE))
+  (let ((root start)
+        (child 0)
+        (aux OBJECT NULL))
+    (loop
+      (setq child (1+ (shift-left root 1))) ;; left child
+      (when (> child end)
+        ;; root has no children:
+        (break))
+      ;; If the child has a sibling and is smaller than the sibling:
+      (when (and (< child end)
+                 (funcall predicate (nth vector child) (nth vector (1+ child))))
+        ;; point to the right child instead:
+        (++ child))
+      (cond ((funcall predicate (nth vector root) (nth vector child))
+             ;; out of max-heap order:
+             (setq aux (nth vector root))
+             (setf (nth vector root) (nth vector child))
+             (setf (nth vector child) aux)
+             (setq root child))
+            (otherwise
+             (return))))))
+
+;;; Here is a quick sort which does a stable sort; unfortunately, it does very
+;;; badly if we have long runs of equal elements (there is probably a way to fix this).
+
+(defun (quick-sort-pick-split-element OBJECT)
+    ((vector NATIVE-VECTOR) (start INTEGER) (end INTEGER) (predicate FUNCTION-CODE))
+  ;; Try to pick a good split element for sorting `vector' by finding the middle of
+  ;; the first, middle and last elements.  Assumes that the length of `vector' is >= 3.
+  ;; This performs between two and three comparisons.  We could also use `random' here.
+  ;; TO DO: WE SHOULD USE THIS FOR THE CONS-SORT AS WELL.
+  (let ((splitElement (nth vector start))
+        (middle (shift-right (+ start end) 1)))
+    (-- end)
+    (if (funcall predicate splitElement (nth vector middle))
+        ;; s < m
+        (cond ((funcall predicate (nth vector middle) (nth vector end))
+               ;; s < m < e
+               (setq splitElement (nth vector middle))
+               (setf (nth vector middle) (nth vector start)))
+              ((funcall predicate splitElement (nth vector end))
+               ;; s < e < m
+               (setq splitElement (nth vector end))
+               (setf (nth vector end) (nth vector start)))
+              (otherwise
+               ;; e < s < m
+               NULL))
+      ;; m < s
+      (cond ((funcall predicate splitElement (nth vector end))
+             ;; m < s < e
+             NULL)
+            ((funcall predicate (nth vector middle) (nth vector end))
+             ;; m < e < s
+             (setq splitElement (nth vector end))
+             (setf (nth vector end) (nth vector start)))
+            (otherwise
+             ;; e < m < s
+             (setq splitElement (nth vector middle))
+             (setf (nth vector middle) (nth vector start)))))
+    (return splitElement)))
+                      
+(defun quick-sort-native-vector
+    ((vector NATIVE-VECTOR) (start INTEGER) (end INTEGER) (predicate FUNCTION-CODE))
+  ;; Use Quick Sort to sort `vector' between `start' and `end' according to `predicate'.
+  (loop
+    (let ((length (- end start))
+          (splitElement OBJECT NULL)
+          (element OBJECT NULL)
+          (lowCursor start)
+          (highCursor end))
+      (cond ((<= length 1)
+             (return))
+            ((>= length 10)  ;; not sure what the optimum choice is here
+             (setq splitElement (quick-sort-pick-split-element vector start end predicate)))
+            (otherwise       ;; we could use an insertion sort for small vectors
+             (setq splitElement (nth vector start))))
+      (while (< lowCursor highCursor)
+        (while (< lowCursor highCursor)
+          (-- highCursor)
+          (setq element (nth vector highCursor))
+          (when (funcall predicate element splitElement)
+            (setf (nth vector lowCursor) element)
+            (break)))
+        (while (< lowCursor highCursor)
+          (++ lowCursor)
+          (setq element (nth vector lowCursor))
+          (when (funcall predicate splitElement element)
+            (setf (nth vector highCursor) element)
+            (break))))
+      (setf (nth vector highCursor) splitElement)
+      ;; recurse on the shorter partition and handle the other one in-line via iteration:
+      (cond ((< (shift-right (+ start end) 1) highCursor)
+             ;; split-point is above half:
+             (quick-sort-native-vector vector (1+ highCursor) end predicate)
+             (setq end highCursor))
+            (otherwise
+             (quick-sort-native-vector vector start highCursor predicate)
+             (setq start (1+ highCursor)))))))
+
+
+  ;;
+;;;;;; HEAPs
+  ;;
+
+(defclass HEAP (VECTOR)
+  :documentation "Implements a Min or Max heap depending on the semantics
+of `predicate' (Min if `predicate' has a `<' semantics).  This is useful
+for in-place sorting (even though we have specialzed sort routines for that)
+or to maintain top-N lists with log(N) insertion time.  We place this under
+VECTOR instead of VECTOR-SEQUENCE for now, since sequential order isn't
+really maintained or accessible until we sort the heap."
+  :public? TRUE
+  :parameters ((any-value :type OBJECT))
+  :slots ((predicate :type FUNCTION-CODE :required? true)
+          (fill-pointer :type INTEGER :initially 0))
+  :initializer initialize-heap)
+
+(defmethod initialize-heap ((self HEAP))
+  ;; Forcing a non-empty heap array makes some of the top-level
+  ;; functions below simpler, since they don't have to test for
+  ;; this not very useful case.
+  (let ((size (array-size self)))
+    (safety 1 (> size 0) "Trying to create an empty heap")))
+
+(defmethod clear ((self HEAP))
+  :documentation "Clear `self' by setting its active length to zero."
+  :public? TRUE
+  (setf (fill-pointer self) 0))
+
+(defmethod (length INTEGER) ((self HEAP))
+  :documentation "Return the length of the currently filled portion of `self'."
+  :public? TRUE
+  (return (fill-pointer self)))
+
+(defmethod (empty? BOOLEAN) ((self HEAP))
+  :documentation "Return TRUE if `self' is empty."
+  :public? TRUE
+  (return (= (fill-pointer self) 0)))
+
+(defmethod (heap-root (LIKE (any-value self))) ((self HEAP))
+  :documentation "Return the root of `self' (NULL if `self' is empty)."
+  :public? TRUE
+  (return (choose (empty? self) NULL (nth self 0))))
+
+(defmethod (fast-heap-root (LIKE (any-value self))) ((self HEAP))
+  :documentation "Return the root of `self' which is assumed to be non-empty."
+  :public? TRUE :globally-inline? TRUE
+  (return (nth self 0)))
+
+(defun heap-sift-up ((heap NATIVE-VECTOR)
+                     (start INTEGER)
+                     (end INTEGER)
+                     (value (LIKE (any-value self)))
+                     (predicate FUNCTION-CODE))
+  ;; Min-heap inserter/up-sifter (if `predicate' has `<' semantics) for a
+  ;; `heap' array of values between `start' and `end'.  Insert `value'
+  ;; at `heap[end]' (assumed to be a free and valid array element) and
+  ;; restore the heap property up to `start'.
+  (let ((parent INTEGER NULL)
+        (child end))
+    (setf (nth heap end) value)
+    (while (> child start)
+      (if (= (logand child 1) 0) ;; even?
+          (setq parent (shift-right (- child 2) 1))
+        (setq parent (shift-right (1- child) 1)))
+      (cond ((funcall predicate value (nth heap parent))
+             (setf (nth heap child) (nth heap parent))
+             (setf (nth heap parent) value)
+             (setq child parent))
+            (otherwise
+             (break))))))
+
+(defun heap-sift-down ((heap NATIVE-VECTOR)
+                       (start INTEGER)
+                       (end INTEGER)
+                       (value (LIKE (any-value self)))
+                       (predicate FUNCTION-CODE))
+  ;; Min-heap down-sifter (if `predicate' has `<' semantics) for a
+  ;; `heap' array of values between `start' and `end'.  Destructively
+  ;; replace `heap[start]' (assumed to be a valid array element) with
+  ;; `value' and restore the heap property down to `end'.
+  (let ((parent start)
+        (child INTEGER NULL)
+        (leftChild OBJECT NULL)
+        (rightChild OBJECT NULL))
+    (setf (nth heap start) value)
+    (-- end) ;; point at last element
+    (loop
+      (setq child (1+ (shift-left parent 1)))
+      (cond ((> child end)
+             ;; no more children to check:
+             (break))
+            ((= child end)
+             ;; we only have a left child; swap if child < value:
+             (unless (funcall predicate (nth heap child) value)
+               (break)))
+            (otherwise
+             ;; we have two children, determine which one to swap:
+             (setq leftChild (nth heap child))
+             (setq rightChild (nth heap (1+ child)))
+             (cond ((funcall predicate leftChild value)
+                    ;; swap, but test whether right child is the correct choice:
+                    (when (and (funcall predicate rightChild value)
+                               (funcall predicate rightChild leftChild))
+                      ;; right child is smaller than both:
+                      (++ child)))
+                   ((funcall predicate rightChild value)
+                    ;; only right child is smaller than `value':
+                    (++ child))
+                   (otherwise
+                    (break)))))
+      (setf (nth heap parent) (nth heap child))
+      (setf (nth heap child) value)
+      (setq parent child))))
+
+(defmethod insert ((self HEAP) (value (LIKE (any-value self))))
+  :documentation "Insert `value' into `self' and restore the heap property.
+Signal an error if there is no more room in `self'.  Maintains `self' as
+a Min-heap if `self's `predicate' has `<' semantics; otherwise as a Max-heap."
+  :public? TRUE
+  (let ((values (the-array self))
+        (fillPointer (fill-pointer self))
+        (predicate (predicate self)))
+    (cond ((< fillPointer (array-size self))
+           (heap-sift-up values 0 fillPointer value predicate)
+           (setf (fill-pointer self) (1+ fillPointer)))
+          ;; in case we want to implement extensible heaps, this is the
+          ;; only method we need to override:
+          ;((extensible-heap? self)
+          ; (resize-vector self (* (array-size self) (resize-increment self)))
+          ; (heap-sift-up values 0 fillPointer value predicate))
+          (otherwise
+           (error "HEAP.insert: heap overflow, can't insert new value: " value)))))
+
+(defmethod replace-heap-root ((self HEAP) (value (LIKE (any-value self))))
+  :documentation "Replace the current root of `self' with `value' and restore
+the heap property.  Signal an error if `self' is empty.  Maintains `self' as
+a Min-heap if `self's `predicate' has `<' semantics; otherwise as a Max-heap."
+  :public? TRUE
+  (let ((values (the-array self))
+        (fillPointer (fill-pointer self))
+        (predicate (predicate self)))
+    (if (= fillPointer 0)
+        (error "HEAP.replace-heap-root: can't replace root of an empty heap")
+      (heap-sift-down values 0 fillPointer value predicate))))
+
+(defmethod insert-if-better ((self HEAP) (value (LIKE (any-value self))))
+  :documentation "Insert `value' into `self' and restore the heap property.
+If `self' has available room, simply insert `value'.  If the heap is full, only
+insert `value' if it is better than the current root (i.e., the minimum of `self'
+if `self's `predicate' has `<' semantics).  In that case, replace the root of
+`self' and restore the heap property.  This is useful to build and maintain a
+heap with some top-N elements (relative to `predicate') where the root (or
+minimum) of `self' is the currently weakest element at the end of the list."
+  :public? TRUE
+  (let ((values (the-array self))
+        (fillPointer (fill-pointer self))
+        (predicate (predicate self)))
+    ;; Note that we enforce non-empty heap arrays, which means `(nth
+    ;; self 0)' will be defined if the heap is full and there will be
+    ;; a free element to insert into if it isn't:
+    (cond ((= fillPointer (array-size self))
+           (when (funcall predicate (nth self 0) value)
+             (heap-sift-down values 0 fillPointer value predicate)))
+          (otherwise
+           (heap-sift-up values 0 fillPointer value predicate)
+           (setf (fill-pointer self) (1+ fillPointer))))))
+
+(defmethod heapify ((self HEAP))
+  :documentation "Restore the heap property of `self' according to its
+`predicate'.  Normally, this is not needed, since insert operations
+preserve the heap property.  However, this can be useful after bulk
+insertion of values or if `predicate' has been changed."
+  :public? TRUE
+  (let ((values (the-array self))
+        (fillPointer (fill-pointer self))
+        (predicate (predicate self)))
+    (foreach i in (interval 0 (1- fillPointer))
+        do (heap-sift-up values 0 i (nth values i) predicate))))
+
+(defmethod (sort (HEAP OF (LIKE (any-value self)))) ((self HEAP)
+                                                     (predicate FUNCTION-CODE))
+  :documentation "Sort the heap `self' according to `predicate' (in
+ascending order if `predicate' has `<' semantics).  If `predicate'
+is NULL simply use `self's internal predicate (the normal case).
+If it is different from `self's internal predicate, heapify `self' first
+according to the new predicate, store the new predicate in `self' and
+then sort the heap.  Note that a sorted array automatically satisfies
+the heap property.  This is slightly different than a regular heap
+sort due to the way HEAP's are maintained; however, the complexity is
+the same."
+  :public? TRUE
+  (let ((values (the-array self))
+        (cursor (fill-pointer self))
+        (value OBJECT NULL))
+    (cond ((null? predicate)
+           (setq predicate (predicate self))) 
+          ((not (eql? predicate (predicate self)))
+           (setf (predicate self) predicate)
+           (heapify self)))
+    (while (> cursor 0)
+      ;; move the current minimum to the end:
+      (-- cursor)
+      (setq value (nth values cursor))
+      (setf (nth values cursor) (nth values 0))
+      ;; sift down the replaced value:
+      (heap-sift-down values 0 cursor value predicate))
+    ;; now reverse the order - in a specialized heap sort we wouldn't
+    ;; have to do that, since we'd construct the heap in the proper way:
+    (setq cursor (fill-pointer self))
+    (foreach i in (interval 0 NULL)
+        do (-- cursor)
+           (when (>= i cursor)
+             (break))
+           (setq value (nth values i))
+           (setf (nth values i) (nth values cursor))
+           (setf (nth values cursor) value))
+    (return self)))
 
 
 #|
@@ -971,6 +1409,13 @@ to corruption or undefined results."
   :documentation "Point where we switch from using a KV-CONS table
 representation to a STELLA hash table to preserve O(1) access.")
 
+;;; Storage requirements per entry (for table with 1000 entries
+;;; not counting storage required for key and value objects):
+;;; in Lisp (using structs): 6.5 slots per entry (extra hash-code slot)
+;;; C++ and Java:            5.5 slots per entry
+;;; KEY-VALUE-LIST (Lisp):   5.0 slots per entry
+;;; C++, Java:               4.0 slots per entry
+
 (defclass KEY-VALUE-MAP (DICTIONARY)
   :documentation "Full-featured dictionary class that supports `eql?' or
 `equal?' equality tests, O(1) access operations even for large numbers
@@ -1229,8 +1674,27 @@ is O(N) in the number of entries of `self'."
     (foreach (key value) in table
         do (print key value EOL))
     (return table)))
+
+(defun print-key-value-map-stats ((map KEY-VALUE-MAP))
+  ;; Performance debugging aid.
+  ;; So far, this only prints the size of the biggest bucket.
+  (let ((theMap (the-map map))
+        (bucket KV-CONS NULL)
+        (maxLength 0))
+    (typecase theMap
+      (STELLA-HASH-TABLE
+       (foreach i in (interval 0 (1- (size theMap)))
+           do (setq bucket (aref (the-table theMap) i))
+              (when (and (defined? bucket)
+                         (> (length bucket) maxLength))
+                (setq maxLength (length bucket)))))
+      (KV-CONS
+       (setq maxLength 1))
+      (otherwise NULL))
+    (print maxLength)))
 |#
 
+;;; TO DO: FIX THIS TO ONLY TAKE AN any-value PARAMETER!!!
 (defclass HASH-SET (KEY-VALUE-MAP SET-MIXIN)
   :documentation "Full-featured set class that supports `eql?' or `equal?'
 equality tests, O(1) insert and `member?' operations & O(N) `intersection'
@@ -1248,6 +1712,25 @@ however, that wastes at most 25% space."
     (foreach v in values
         do (insert-at set v v))
     (return set)))
+
+(defun (coerce-to-hash-set HASH-SET) ((self OBJECT) (equalTest? BOOLEAN))
+  :documentation "Coerce the collection `self' into a HASH-SET.  Use an
+equal test if `equalTest?' is TRUE (`equalTest?' will be ignored if `self'
+already is a HASH-SET)."
+  :public? TRUE
+  (let ((theSet HASH-SET
+         (choose (isa? self @HASH-SET)
+                 self
+                 (new HASH-SET :equal-test? equalTest?))))
+    (typecase self
+      (HASH-SET NULL)
+      ((CONS LIST VECTOR COLLECTION)
+       (foreach elt in self
+           do (insert-at theSet elt elt)))
+      (otherwise
+       (error "coerce-to-hash-set: don't know how to coerce a "
+              (primary-type self) " into a hash-set")))
+    (return theSet)))
 
 (defmethod (member? BOOLEAN) ((self HASH-SET) (object OBJECT))
   :documentation "Return TRUE iff `object' is a member of the set `self'.
@@ -1446,3 +1929,181 @@ is O(N) in the number of elements of `self'."
         ;; exploits the fact that `XOR' is commutative:
         do (setq code (logxor code (equal-hash-code elt))))
     (return code)))
+
+
+  ;;
+;;;;;; Dimensional arrays
+  ;;
+
+;;; TO DO:
+;;; + problem 1: globally-inline? gives us problems on mixin methods, since during
+;;;   the expansion we get variables that have a mixin class type
+;;; + problem 2: calls to fill-array don't translate right; somehow the anchored
+;;;   type doesn't get handled properly during the varargs call.
+;;; - problem 2b: translating the `fill-array' method breaks the Java translator
+;;;   during the varargs foreach so the method is commented for now.
+;;; + problem 3: we don't seem to generate appropriate startup code to generate
+;;;   mixin method objects; probably because they have unknown types and are not
+;;;   defined inside the class as some others in hierarchy.ste
+;;; - Need to inform the AREF walker to translate into these accessors if indicated.
+;;;   Think about that some more, this would mean that we'd lose some of the
+;;;   dimensionality checking at translation time, since the walker would translate
+;;;   into 1d-aref, 2d-aref, etc. depending on how many dimensions were supplied,
+;;;   which could lead to strange bugs if one forgot to include a dimension.
+;;; - update neural-network.ste to use the new array data structures
+
+;;; This is an attempt to have multidimensional arrays in STELLA that can be fully
+;;; dynamic, i.e., where none of their dimensions has to be known at translation
+;;; time.  In Lisp and Java this is already supported, but for C++ we can only leave
+;;; one dimension open.  The current ARRAY data type caters to this lowest common
+;;; denominator which gives us maximum native array access speed.  However, it seems
+;;; very uncommon to have multidimensional arrays where one dimension can be fixed,
+;;; and the workarounds are kind of ugly (e.g., use a vector of vectors often with
+;;; wrapped element types).  So here we have a STELLA type implementation that does
+;;; the trick.  Actually, it is kind of nifty and might become a template for other
+;;; similar situations, where we specify a set of template operations with an
+;;; UNKNOWN value type on a mixin class and then instantiate that class multiple
+;;; times with different element types.  The inheriting down of mixin methods then
+;;; gives us the equivalent of template instantiation and allows us to easily handle
+;;; literal element types such as float or integer without wrapping.
+
+;;; Alternatively, we could try to write some native support in C++ (or as Tom
+;;; suggested use some existing C++ array library) and simply wrap this functionality
+;;; in STELLA.  This would most definitely require template syntax in C++ (or we'd
+;;; have to work with void pointers and casting); additionally, if we ever go this
+;;; route, we'd want to ensure that the resulting type is a subtype of OBJECT, so
+;;; we can easily stick it into other containers.  What we have here for now was
+;;; easier and also still gives us the option of maximum access speed on the native
+;;; array without any address arithmetic.
+
+(defclass DIMENSIONAL-ARRAY-MIXIN ()
+  :mixin? TRUE
+  :parameters ((any-value :type UNKNOWN))
+  :slots ((dim1 :type INTEGER :required? TRUE)
+          (the-array :type (ARRAY () OF (LIKE (any-value self)))))
+  :initializer initialize-dimensional-array)
+
+(defmethod initialize-dimensional-array ((self DIMENSIONAL-ARRAY-MIXIN))
+  (setf (the-array self)
+    (new (ARRAY () OF (LIKE (any-value self))) :size (length self))))
+
+(defmethod (length INTEGER) ((self DIMENSIONAL-ARRAY-MIXIN))
+  :documentation "Return the total number of elements in `self'."
+  :public? TRUE
+  (return (dim1 self)))
+
+(defmethod initialize-array ((self DIMENSIONAL-ARRAY-MIXIN)
+                             (initialValue (LIKE (any-value self))))
+  :documentation "Initialize the elements of `self' with `initialValue'."
+  :public? TRUE
+  (let ((array (the-array self)))
+    (foreach i in (interval 0 (1- (length self)))
+        do (setf (aref array i) initialValue))))
+
+;(defmethod fill-array ((self DIMENSIONAL-ARRAY-MIXIN) &rest (values (LIKE (any-value self))))
+;  :documentation "Fill the array `self' in row-major-order from `values'.
+;Missing values will retain their old values, extraneous values will be ignored."
+;  :public? TRUE
+;  (let ((array (the-array self)))
+;    (foreach i in (interval 0 (1- (length self)))
+;        as value in values
+;        do (setf (aref array i) value))))
+
+(defmethod (1D-aref (LIKE (any-value self))) ((self DIMENSIONAL-ARRAY-MIXIN)
+                                              (i INTEGER))
+  :documentation "Return the element of `self' at position `[i]'."
+  :public? TRUE :globally-inline? TRUE
+  (return (aref (the-array self) i)))
+
+(defmethod (1D-aref-setter (LIKE (any-value self))) ((self DIMENSIONAL-ARRAY-MIXIN)
+                                                     (value (LIKE (any-value self)))
+                                                     (i INTEGER))
+  :documentation "Set the element of `self' at position `[i]' to `value'
+and return the result."
+  :public? TRUE :globally-inline? TRUE
+  (return (setf (aref (the-array self) i) value)))
+
+(defmethod (1D-aref-address INTEGER) ((self DIMENSIONAL-ARRAY-MIXIN) (i INTEGER))
+  :documentation "Return the 1D address of the element at position `[i]'.
+This is useful for fast element-wise iteration that doesn't need arithmetic."
+  :public? TRUE :globally-inline? TRUE
+  (return i))
+
+
+(defclass 2-DIMENSIONAL-ARRAY-MIXIN (DIMENSIONAL-ARRAY-MIXIN)
+  :mixin? TRUE :public? TRUE
+  :slots ((dim2 :type INTEGER :required? TRUE)))
+
+(defmethod (length INTEGER) ((self 2-DIMENSIONAL-ARRAY-MIXIN))
+  :documentation "Return the total number of elements in `self'."
+  :public? TRUE
+  (return (* (dim1 self) (dim2 self))))
+
+(defmethod (2D-aref (LIKE (any-value self))) ((self 2-DIMENSIONAL-ARRAY-MIXIN)
+                                              (i INTEGER)
+                                              (j INTEGER))
+  :documentation "Return the element of `self' at position `[i, j]'."
+  :public? TRUE :globally-inline? TRUE
+  (return (aref (the-array self) (+ (* i (dim2 self)) j))))
+
+(defmethod (2D-aref-setter (LIKE (any-value self))) ((self 2-DIMENSIONAL-ARRAY-MIXIN)
+                                                     (value (LIKE (any-value self)))
+                                                     (i INTEGER)
+                                                     (j INTEGER))
+  :documentation "Set the element of `self' at position `[i, j]' to `value'
+and return the result."
+  :public? TRUE :globally-inline? TRUE
+  (return (setf (aref (the-array self) (+ (* i (dim2 self)) j)) value)))
+
+(defmethod (2D-aref-address INTEGER) ((self 2-DIMENSIONAL-ARRAY-MIXIN) (i INTEGER) (j INTEGER))
+  :documentation "Return the 1D address of the element at position `[i, j]'.
+This is useful for fast element-wise iteration that doesn't need arithmetic."
+  :public? TRUE :globally-inline? TRUE
+  (return (+ (* i (dim2 self)) j)))
+
+
+;;; Instantiate mixins on a set of common element types:
+
+(defclass ABSTRACT-DIMENSIONAL-ARRAY (ABSTRACT-COLLECTION)
+  :documentation "Array objects that are aware of their dimensions."
+  :public? TRUE :abstract? TRUE
+  :parameters ((any-value :type UNKNOWN)))
+
+(defclass 1D-ARRAY (ABSTRACT-DIMENSIONAL-ARRAY DIMENSIONAL-ARRAY-MIXIN)
+  :documentation "1-dimensional array with OBJECT values.  This is more or
+less equivalent to VECTOR (fewer methods) but kept here for symmetry."
+  :public? TRUE
+  :synonyms (OBJECT-ARRAY)
+  :parameters ((any-value :type OBJECT)))
+
+(defclass 1D-FLOAT-ARRAY (ABSTRACT-DIMENSIONAL-ARRAY DIMENSIONAL-ARRAY-MIXIN)
+  :documentation "1-dimensional array with float values."
+  :public? TRUE
+  :synonyms (FLOAT-ARRAY)
+  :parameters ((any-value :type FLOAT)))
+
+(defclass 2D-ARRAY (ABSTRACT-DIMENSIONAL-ARRAY 2-DIMENSIONAL-ARRAY-MIXIN)
+  :documentation "2-dimensional array with object values."
+  :public? TRUE
+  :parameters ((any-value :type OBJECT)))
+
+(defclass 2D-FLOAT-ARRAY (ABSTRACT-DIMENSIONAL-ARRAY 2-DIMENSIONAL-ARRAY-MIXIN)
+  :documentation "2-dimensional array with float values."
+  :public? TRUE
+  :parameters ((any-value :type FLOAT)))
+
+#|
+(defun test-2d-float-array ()
+  :command? TRUE
+  (let ((array (new 2D-FLOAT-ARRAY :dim1 3 :dim2 4)))
+    (initialize-array array 0.0)
+    (foreach i in (interval 0 2)
+        do (foreach j in (interval 0 3)
+               do (setf (2d-aref array i j) (* (1+ i) (1+ j) -1))))
+    ;(fill-array array 1 2 3 4 5 6 7 8 9 10)
+    (foreach i in (interval 0 2)
+        do (foreach j in (interval 0 3)
+               as idx in (interval (2d-aref-address array i 0) NULL)
+               do (print (2d-aref array i j) " " (1d-aref array idx) EOL)))
+    ))
+|#

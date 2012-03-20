@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: descriptions.ste,v 1.95 2006/05/11 07:05:08 hans Exp
+;;; Version: descriptions.ste,v 1.99 2009/01/20 23:30:05 hans Exp
 
 ;;; Named and unnamed descriptions and related support.
 
@@ -845,9 +845,19 @@ heavy-weight) would be the better option.")
     ;; OPTIMIZATION: IF 'mapping' GETS TOO BIG (FROM TOO MANY NESTED DESCRIPTIONS)
     ;;    THEN 'POP' ENTRIES UPON RETURN FROM NESTED DESCRIPTION:
     (foreach v1 in (io-variables self)
-             as v2 in (io-variables other)
-             do (insert-at mapping v1 v2))
+        as v2 in (io-variables other)
+        do (insert-at mapping v1 v2)
+           ;; we also insert the inverse mapping to support the test below:
+           (insert-at mapping v2 v1))
+    ;; make sure the two descriptions have the same variable equivalences, so
+    ;; we don't equate (kappa (?a ?b ?c) ...) with (kappa (?x ?y ?x) ...):
+    (foreach v1 in (io-variables self)
+        as v2 in (io-variables other)
+        do (unless (and (eql? (lookup mapping v1) v2)
+                        (eql? (lookup mapping v2) v1))
+             (return FALSE)))
     ;; THIS IS NOT VERY GENERAL, BUT WITHOUT IT, WE MESS UP ON EXACT MATCHES:
+    ;; NOTE: we don't have to worry about repeated equivalenced variables here:
     (foreach v1 in (internal-variables self)
              as v2 in (internal-variables other)
              do (insert-at mapping v1 v2))
@@ -1314,27 +1324,48 @@ WARNING: Potentially problematic implication rule, consequent variable(s)
         ;; renormalize to remove empty EXISTS or FORALL and other odd cases:
         (normalize-proposition proposition)))))
 
-(defun equate-top-level-equivalences ((proposition PROPOSITION))
-  ;; Called by 'normalize-top-level-descriptive-proposition' to pre-evaluate
+(defun equate-top-level-equivalences ((proposition PROPOSITION)
+                                      (ioVariables VARIABLES-VECTOR)
+                                      (kind KEYWORD))
+  ;; Called by 'normalize-descriptive-proposition' to pre-evaluate
   ;;    top-level EQUIVALENT propositions within a description or FORALL.
+  ;; `kind' must be one of :TAIL, :HEAD or :TOP-LEVEL and indicates
+  ;;    whether `proposition' comes from a particular part of a rule or
+  ;;    from a top-level description.  Depending on that, equivalences
+  ;;    between `ioVariables' might be evaluated (e.g., in a rule tail or
+  ;;    for top-level propositions) or not (for rule heads).  See also
+  ;;    'normalize-descriptive-proposition', and the test suite section
+  ;;    entitled "COLLAPSING OF EQUIVALENCES IN RULES" for test cases.
   ;; Also tries to pre-evaluate functions.
   ;; NOTE: this is now called with an unfastened `proposition' which means
   ;;    that evaluations that depend on backlinks will fail - shouldn't
   ;;    be much of a problem for descriptive propositions.
   (let ((arguments (arguments proposition)))
-   (case (kind proposition)
-     (:EQUIVALENT
-      (safety 3 (description-mode?) "BUG: Not in description mode.")
-      (equate-values (innermost-of (first arguments))
-                     (innermost-of (second arguments))))
-     (:AND
+    (case (kind proposition)
+      (:EQUIVALENT
+       (safety 3 (description-mode?) "BUG: Not in description mode.")
+       (let ((arg1 (innermost-of (first arguments)))
+             (arg2 (innermost-of (second arguments))))
+         (if (member? ioVariables arg1)
+             (if (member? ioVariables arg2)
+                 ;; both args are io-vars, equate unless in the head of a rule:
+                 (unless (eql? kind :HEAD)
+                   (equate-values arg1 arg2))
+               ;; equivalence between an io-var and an internal var or other object;
+               ;; choose argument order so an internal variable will point to the
+               ;; io-variable, otherwise, bad things might happen during collapsing:
+               (equate-values arg2 arg1))
+           ;; otherwise, arg1 is an internal variable, etc., equate with proper
+           ;; argument order in case arg2 is an io-variable (see above comment):
+           (equate-values arg1 arg2))))
+      (:AND
        (foreach arg in arguments
-                do (equate-top-level-equivalences arg)))
+           do (equate-top-level-equivalences arg ioVariables kind)))
       (:EXISTS
-       (equate-top-level-equivalences (first arguments)))
+       (equate-top-level-equivalences (first arguments) ioVariables kind))
       (:FUNCTION
        (evaluate-FUNCTION-proposition proposition))
-     (otherwise NULL))))
+      (otherwise NULL))))
 
 
   ;;
@@ -1392,10 +1423,14 @@ are referenced.")
             (collect-external-variables arg))
            (otherwise NULL))) )
 
-(defun (finish-building-description DESCRIPTION)
-       ((description DESCRIPTION) (checkForDuplicate? BOOLEAN))
+(defun (finish-building-description DESCRIPTION) ((description DESCRIPTION)
+                                                  (checkForDuplicate? BOOLEAN)
+                                                  (kind KEYWORD))
   ;; Called by 'evaluate-DESCRIPTION-term' and 
   ;;    'construct-description-from-forall-proposition'.
+  ;; `kind' has to be one of :TOP-LEVEL, :TAIL or :HEAD to signal what role
+  ;;    this description will play, which in turn signals what normalizations
+  ;;    will be performed (see `normalize-descriptive-proposition').
   (let ((proposition (proposition description)))
     (normalize-proposition proposition)
     ;; eliminate top-level exists:
@@ -1406,7 +1441,7 @@ are referenced.")
     (resolve-unresolved-slot-references description)
     (update-skolem-type-from-isa-assertions proposition)
     ;; set variable-value links, evaluate functions and re-normalize:
-    (normalize-top-level-proposition proposition (io-variables description))
+    (normalize-descriptive-proposition proposition (io-variables description) kind)
     ;; we don't look for duplicate substructures here (just like for quantified
     ;; propositions), since we look for whole duplicate descriptions later:
     (recursively-fasten-down-propositions proposition TRUE)
@@ -1454,7 +1489,7 @@ are referenced.")
                  (copy-cons-list-to-variables-vector *externalVariables*)))))
       (setf (proposition description) 
             (choose (defined? proposition) proposition TRUE-PROPOSITION)))
-     (return (finish-building-description description checkForDuplicate?)))))
+     (return (finish-building-description description checkForDuplicate? :TOP-LEVEL)))))
 
 
   ;;
@@ -1512,7 +1547,7 @@ are referenced.")
                       (class-description? self))
                   (pushq declarations (skolem-name v))
                 (pushq declarations 
-                       (bquote (& (skolem-name v) & (surrogate-to-symbol type)))))
+                       (bquote (& (skolem-name v) & (type-to-symbol type)))))
             collect (skolem-name v) into variables)
         (setq declarations (reverse declarations))
         (setq clauses (bquote ((not (& (description-name self) && variables)))))

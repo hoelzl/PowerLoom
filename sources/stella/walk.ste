@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: walk.ste,v 1.290 2006/05/11 07:06:33 hans Exp
+;;; Version: walk.ste,v 1.298 2008/12/19 23:27:33 tar Exp
 
 ;;; Stella code walker.
 
@@ -450,9 +450,11 @@ generated during the translation of Stella declarations.")
 
 ;;; Translator selection
 
-(defspecial *translatorOutputLanguage* KEYWORD :common-lisp
+(defspecial *translatorOutputLanguage* KEYWORD
+            (running-in-language)
   :documentation "Specifies the current translator output language; either
-:common-lisp, :idl, :java, :cpp, or :cpp-standalone.")
+:common-lisp, :idl, :java, :cpp, or :cpp-standalone.  The initial value
+points to the native implementation language of this STELLA instance.")
 
 (defun (translator-output-language KEYWORD) ()
   ;; Return :common-lisp or :java or :cpp :idl, indicating the output language.
@@ -816,7 +818,8 @@ return NIL instead."
               (*translationVerbosityLevel* 0)
               (*translationPhase* NULL)
               (*translationErrors* 0)
-              (*translationWarnings* 0))
+              (*translationWarnings* 0)
+              (*translationNotes* 0))
       ;; Walking:
       (cond 
        (declaration?
@@ -920,11 +923,14 @@ to its own gensym counter and/or to related gensyms.")
   :public? TRUE)
 (defspecial *translationWarnings* INTEGER 0
   :public? TRUE)
+(defspecial *translationNotes* INTEGER 0
+  :public? TRUE)
 
 (defun reset-translation-errors ()
   ;; Reset the global translation error indicators.
   (setq *translationErrors* 0)
-  (setq *translationWarnings* 0))
+  (setq *translationWarnings* 0)
+  (setq *translationNotes* 0))
 
 (defun signal-translation-error ()
   :public? TRUE
@@ -935,6 +941,11 @@ to its own gensym counter and/or to related gensyms.")
   :public? TRUE
   ;; Signal a translation warning.  Called by 'walk-warn'.
   (++ *translationWarnings*))
+
+(defun signal-translation-note ()
+  :public? TRUE
+  ;; Signal a translation warning.  Called by 'walk-inform'.
+  (++ *translationNotes*))
 
 (defun (ignore-translation-errors? BOOLEAN) ()
   ;; Return `true' if translation errors should be ignored.
@@ -962,8 +973,16 @@ to its own gensym counter and/or to related gensyms.")
     (print *translationWarnings* " warning")
     (when (> *translationWarnings* 1)
       (print "s")))
+  (when (> *translationNotes* 0)
+    (when (or (> *translationErrors* 0)
+	      (> *translationWarnings* 0))
+      (print ", "))
+    (print *translationNotes* " note")
+    (when (> *translationNotes* 1)
+      (print "s")))
   (when (or (> *translationErrors* 0)
-            (> *translationWarnings* 0))
+            (> *translationWarnings* 0)
+	    (> *translationNotes* 0))
     (print "." EOL)))
 
 (defun print-error-context ((prefix STRING) (stream OUTPUT-STREAM))
@@ -1562,6 +1581,7 @@ confirmation with the user."
 (defglobal *wrapped-type-table* (CONS OF CONS)
   (bquote
    ((@INTEGER-WRAPPER             @INTEGER)
+    (@LONG-INTEGER-WRAPPER        @LONG-INTEGER)
     (@FLOAT-WRAPPER               @FLOAT)
     ;; This entry is needed by propositions.ste:
     (@NUMBER-WRAPPER              @NUMBER)
@@ -1626,6 +1646,7 @@ or 'self' if it is not a bare literal type."
   (bquote
    ((@BOOLEAN           @BOOLEAN-WRAPPER   inline-wrap-boolean)
     (@INTEGER           @INTEGER-WRAPPER   wrap-literal)      ; order dependent
+    (@LONG-INTEGER      @LONG-INTEGER-WRAPPER  wrap-literal)  ; order dependent
     (@INTEGER           @BOOLEAN-WRAPPER   integer-to-boolean-wrapper) ; order dependent
     (@INTEGER           @BOOLEAN           integer-to-boolean)
     (@FLOAT             @FLOAT-WRAPPER     wrap-literal)
@@ -1641,6 +1662,8 @@ or 'self' if it is not a bare literal type."
     (@SYMBOL            @STRING            symbol-name)
     (@BOOLEAN-WRAPPER   @BOOLEAN           inline-unwrap-boolean)
     (@INTEGER-WRAPPER   @INTEGER           wrapper-value)
+    (@INTEGER-WRAPPER   @LONG-INTEGER      wrapper-value)
+    (@LONG-INTEGER-WRAPPER  @LONG-INTEGER  wrapper-value)
     (@FLOAT-WRAPPER     @FLOAT             wrapper-value)
     (@NUMBER-WRAPPER    @FLOAT             number-wrapper-to-float)
     (@STRING-WRAPPER    @STRING            wrapper-value)
@@ -1653,9 +1676,13 @@ or 'self' if it is not a bare literal type."
     (@INPUT-STREAM      @NATIVE-INPUT-STREAM  native-stream)
     (@OUTPUT-STREAM     @NATIVE-OUTPUT-STREAM native-stream)
     (@NUMBER            @INTEGER           (cast <X> @INTEGER))
+    (@NUMBER            @LONG-INTEGER      (cast <X> @LONG-INTEGER))
     (@NUMBER            @FLOAT             (cast <X> @FLOAT))
     (@INTEGER           @FLOAT             (cast <X> @FLOAT))
     (@INTEGER           @SINGLE-FLOAT      (cast <X> @SINGLE-FLOAT))
+    ;(@LONG-INTEGER      @INTEGER           (cast <X> @INTEGER)) ;; require explicit cast
+    (@LONG-INTEGER      @FLOAT             (cast <X> @FLOAT))
+    (@LONG-INTEGER      @SINGLE-FLOAT      (cast <X> @SINGLE-FLOAT))
     ;; For these types rely on automatic coercion in the target language:
     (@FLOAT             @SINGLE-FLOAT      identity)
     (@FLOAT             @DOUBLE-FLOAT      identity)
@@ -2044,6 +2071,19 @@ locate a coersion method.")
      (return (wrapped-type-to-type (primary-type tree))))
     (otherwise NULL))
   (return @UNKNOWN))
+
+(defun (walked-expression-expression OBJECT) ((tree OBJECT))
+  ;; Assume 'tree' is the result of walking an expression.
+  ;; Return the actual walked expression which unwraps it from any
+  ;;    SYS-TREE or TYPED-SYS wrappers.
+  (typecase tree
+    (CONS
+     (case (first tree)
+       ((VOID-SYS TYPED-SYS)
+        (return (second tree)))
+       (otherwise NULL)))
+    (otherwise NULL))
+  (return tree))
 
 ;;; If we are translating to C++, virtual methods in the class
 ;;;   hierarchy must have identical signatures.  Hence, the return
@@ -4631,16 +4671,18 @@ to a LOOP/WHILE/FOREACH construct.")
   (return (walk-case-tree tree)) )
 
 (defglobal *type-predicate-table* (CONS OF CONS)
-  ;; Type                  isa?-Predicate     subtype-of?-Predicate
+  ;; Type                  isa?-Predicate       subtype-of?-Predicate
   (bquote
    ((@BOOLEAN                 boolean?          subtype-of-boolean?)
     (@INTEGER                 integer?          subtype-of-integer?)
+    (@LONG-INTEGER            long-integer?     subtype-of-long-integer?)
     (@FLOAT                   float?            subtype-of-float?)
     (@STRING                  string?           subtype-of-string?)
     (@CHARACTER               character?        subtype-of-character?)
     (@WRAPPER                 wrapper?          subtype-of-wrapper?)
     (@BOOLEAN-WRAPPER         boolean?          subtype-of-boolean?)
     (@INTEGER-WRAPPER         integer?          subtype-of-integer?)
+    (@LONG-INTEGER-WRAPPER    long-integer?     subtype-of-long-integer?)
     (@FLOAT-WRAPPER           float?            subtype-of-float?)
     (@STRING-WRAPPER          string?           subtype-of-string?)
     (@CHARACTER-WRAPPER       character?        subtype-of-character?)
@@ -4801,6 +4843,7 @@ during bootstrap when only some class objects are defined.")
       (STRING (setq caseConstantType @STRING))
       (CHARACTER (setq caseConstantType @CHARACTER))
       (INTEGER (setq caseConstantType @INTEGER))
+      (LONG-INTEGER (setq caseConstantType @LONG-INTEGER))
       (FLOAT (setq caseConstantType @FLOAT))
       (otherwise
        (walk-error "`case' statement contains illegal constant of type "
@@ -4819,6 +4862,7 @@ during bootstrap when only some class objects are defined.")
     ;; convert to a 'cond' statement if the test is not
     ;;    of type INTEGER or CHARACTER:
     (unless (or (eql? caseConstantType @INTEGER)
+                (eql? caseConstantType @LONG-INTEGER)
                 (eql? caseConstantType @CHARACTER))
       (return (walk-non-built-in-case-tree
                tree
@@ -5151,6 +5195,7 @@ during bootstrap when only some class objects are defined.")
   (case type2
     (@BOOLEAN (setf (first tree) (quote EQL-TO-BOOLEAN?)))
     (@INTEGER (setf (first tree) (quote EQL-TO-INTEGER?)))
+    (@LONG-INTEGER (setf (first tree) (quote EQL-TO-LONG-INTEGER?)))
     (@FLOAT (setf (first tree) (quote EQL-TO-FLOAT?)))
     (@STRING (setf (first tree) (quote EQL-TO-STRING?))))
   (return (walk-without-type-tree tree) @BOOLEAN) )
@@ -5187,6 +5232,9 @@ during bootstrap when only some class objects are defined.")
                 (eql? type2 @UNKNOWN)
                 (subtype-of? type1 type2)
                 (subtype-of? type2 type1)
+                ;; CL:= and C++/Java's == transparently compare numbers of different types:
+                (and (subtype-of? type1 @NUMBER)
+                     (subtype-of? type2 @NUMBER))
                 ;; these are comparable via the `EQL-TO-X' functions:
                 (subtype-of? (type-to-wrapped-type (cast type1 TYPE)) type2)
                 (subtype-of? (type-to-wrapped-type (cast type2 TYPE)) type1))
@@ -5209,7 +5257,7 @@ during bootstrap when only some class objects are defined.")
   ;;
 
 (defglobal *numeric-type-hierarchy* (LIST OF TYPE)
-  (list @INTEGER @FLOAT @NUMBER))
+  (list @INTEGER @LONG-INTEGER @FLOAT @NUMBER))
 
 (defun (more-general-numeric-type TYPE) ((type1 TYPE) (type2 TYPE))
   ;; Return the more general of 'type1' and 'type2' according to
@@ -5244,7 +5292,16 @@ during bootstrap when only some class objects are defined.")
                (yield-arithmetic-operator-call-tree
                 operator (cons-list parenthesizedTree (nth operands i)))))
     (return parenthesizedTree)))
-  
+
+(defun (coerce-to-float FLOAT) ((number NUMBER-WRAPPER))
+  :documentation "Coerce `number' to a float value."
+  :public? TRUE
+  (typecase number
+    ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER)
+     (return (* (wrapper-value number) 1.0)))
+    (FLOAT-WRAPPER
+     (return (wrapper-value number)))))
+
 (defun (walk-arithmetic-tree OBJECT TYPE) ((tree CONS))
   ;; Walk an arithmetic tree of the form '(+|-|*|/ <arg>*)'.
   ;; All operators behave exactly like their Common-Lisp analogues, with
@@ -5278,16 +5335,16 @@ during bootstrap when only some class objects are defined.")
       (otherwise NULL))
     ;; Walk the operands:
     (foreach it on operands
-             do
-             (mv-setq (operand operandType)
-               (walk-expression-tree (value it) @NUMBER operator FALSE))
-             (setq returnType
-               (more-general-numeric-type
-                returnType (type-spec-to-base-type operandType)))
-             (setf (value it) operand))
+        do (mv-setq (operand operandType)
+             (walk-expression-tree (value it) @NUMBER operator FALSE))
+           (setq returnType
+             (more-general-numeric-type
+              returnType (type-spec-to-base-type operandType)))
+           (setf (value it) operand))
     ;; Enforce floating-point division:
     (when (and (eql? operator (quote /))
-               (eql? returnType @INTEGER))
+               (or (eql? returnType @INTEGER)
+                   (eql? returnType @LONG-INTEGER)))
       ;; Force a uniform behavior by always performing a floating-point
       ;; division (without that Common-Lisp would use ratios and C++ or
       ;; Java would perform truncating integer division).  This means
@@ -5295,13 +5352,9 @@ during bootstrap when only some class objects are defined.")
       ;; division.
       (cond
        ((wrapper? (first operands))
-        (setf (first operands)
-          (wrap-literal
-           (* (wrapper-value (cast (first operands) INTEGER-WRAPPER)) 1.0))))
+        (setf (first operands) (coerce-to-float (first operands))))
        ((wrapper? (second operands))
-        (setf (second operands)
-          (wrap-literal
-           (* (wrapper-value (cast (second operands) INTEGER-WRAPPER)) 1.0))))
+        (setf (second operands) (coerce-to-float (second operands))))
        (otherwise
 	(setq operands (bquote ((cast & (first operands) @FLOAT) && (rest operands))))
         (++ nofOperands)))
@@ -5447,7 +5500,7 @@ during bootstrap when only some class objects are defined.")
                ;;    strings can usually be printed more efficiently:
                (typecase oTree
                  (STRING NULL)
-                 ((INTEGER FLOAT)
+                 ((INTEGER LONG-INTEGER FLOAT)
                   (setf (value it) (wrap-literal (stringify oTree))))
                  (CHARACTER
                   (setf (value it)
@@ -5802,16 +5855,22 @@ during bootstrap when only some class objects are defined.")
         (otherwise
          (return (finish-walking-call-slot-tree self tree firstArgType)))))
 
-(defun (walk-variable-arguments CONS) ((arguments CONS) (method METHOD-SLOT))
+(defun (walk-variable-arguments CONS) ((arguments CONS)
+                                       (method METHOD-SLOT)
+                                       (firstArgType TYPE-SPEC))
   ;; Helping function for 'METHOD-SLOT.finish-walking-call-slot-tree'.
   ;; 'method' takes variable arguments; 'arguments' points to ones that
   ;;    haven't been walked.
   (let ((targetType (variable-arguments-type method))
         (listifyArgs? (pass-variable-arguments-as-list? method))
-        (wrapArgs?
-         (and listifyArgs?
-              (sub-type-spec-of? targetType @LITERAL)))
+        (wrapArgs? FALSE)
         (cursor arguments))
+    (when (and (not (type? targetType))
+               (defined? firstArgType))
+      (setq targetType (compute-relative-type-spec targetType firstArgType)))
+    (setq wrapArgs?
+      (and listifyArgs?
+           (sub-type-spec-of? targetType @LITERAL)))
     (while (non-empty? cursor)
       (setf (value cursor)
         (walk-expression-tree
@@ -5849,7 +5908,7 @@ during bootstrap when only some class objects are defined.")
        (when (and (eq? pIndex nofParameters)
                   (method-variable-arguments? self))
          (setf (nth-rest tree pIndex)
-           (walk-variable-arguments cursor self))
+           (walk-variable-arguments cursor self firstArgType))
          (break))
        (setf (value cursor)
          (walk-expression-tree (value cursor) targetTS methodName TRUE))
@@ -5859,7 +5918,7 @@ during bootstrap when only some class objects are defined.")
            where (vrlet-expression? arg)
            do (return (percolate-out-vrlet-expression tree arg oTypeSpec)))
     (when (inline-method-call? self)
-      (setq oTree (walk-inline-method-call self (rest tree)))
+      (setq oTree (walk-inline-method-call self (rest tree) firstArgType))
       (when (defined? oTree)
         (return (sys-tree oTree oTypeSpec))))
     (if (method-function? self)
@@ -5914,7 +5973,7 @@ during bootstrap when only some class objects are defined.")
                (eq? (length pTypeSpecs) 1))
       ;; TRICKY: we walk ALL arguments now, since '(method-ptype-specs fnSlot)'
       ;; has only length one, so later processing thinks there is only one arg:
-      (setf (rest tree) (walk-variable-arguments (rest tree) fnSlot))
+      (setf (rest tree) (walk-variable-arguments (rest tree) fnSlot NULL))
       (return @UNKNOWN))                ; we don't care about the arg type
     (when (or (empty? (rest tree))
               (empty? (method-parameter-type-specifiers fnSlot)))
@@ -6130,7 +6189,7 @@ during bootstrap when only some class objects are defined.")
 (defspecial *inliningMethodCall?* BOOLEAN FALSE)
 
 (defun (walk-inline-method-call OBJECT)
-    ((method METHOD-SLOT) (walkedArgs CONS))
+    ((method METHOD-SLOT) (walkedArgs CONS) (firstArgType TYPE-SPEC))
   ;; Try to inline a call to `method' applied to `walkedArgs'.
   ;; If successful, return the resulting tree; otherwise, return `null'.
   ;; Here's how it works:
@@ -6163,7 +6222,13 @@ during bootstrap when only some class objects are defined.")
       (foreach var in (method-parameter-names method)
           as tSpec in (method-parameter-type-specifiers method)
           as arg in walkedArgs
-          do (walk-a-declaration var tSpec NULL TRUE)
+          as i in (interval 0 NULL)
+          do (if (and (= i 0)
+                      (mixin-method? method)
+                      (translate-to-single-inheritance-language?))
+                 (setq tSpec firstArgType)
+               (setq tSpec (compute-relative-type-spec tSpec firstArgType)))
+             (walk-a-declaration var tSpec NULL TRUE)
              (set-local-variable-info var :inline-argument arg)
              (set-local-variable-info var :inline-references 0))
       (setq body
@@ -6401,8 +6466,14 @@ Used to flag functions and methods that were declared but not defined.")
 	  (evaluatorWrapperMethod METHOD-SLOT NULL))
       (when (and (mixin-method? method)
                  (translate-to-single-inheritance-language?))
-        ;; Ignore it, since it gets inherited down to individual classes:
+        ;; Ignore it, since it gets inherited down to individual classes,
+        ;; but do generate startup code, otherwise, we'll have trouble
+        ;; translating anything later that references this method:
         (clear-translation-unit unit)
+        (walk-auxiliary-tree
+         (bquote
+          (startup-time-progn :methods
+            & (yield-define-stella-method-object method NULL NULL))))
         (return))
       (when (forward-declaration? method)
         ;; Reset this in case we now walk the actual definition of
@@ -6904,13 +6975,17 @@ accessors and catch-all methods are needed.")
               TRUE))
             slot)))
    (otherwise
-    (let ((mixinMethods (new (LIST OF METHOD-SLOT))))
+    (let ((mixinMethods (new (LIST OF METHOD-SLOT)))
+          (superMethods (new (LIST OF METHOD-SLOT))))
       (foreach super in (class-direct-supers class)
           where (mixin? (type-class super))
           do (foreach slot in (class-slots (type-class super))
                  where (and (method-slot? slot)
                             (eql? (native-slot-home slot class) class))
-                 do (insert-new mixinMethods slot)))
+                 do (when (defined? (slot-direct-equivalent slot))
+                      (insert-new superMethods (slot-direct-equivalent slot)))
+                    (unless (member? superMethods slot)
+                      (insert-new mixinMethods slot))))
       (foreach method in (reverse mixinMethods)
           do (register-auxiliary-method
               (the-object
@@ -7213,8 +7288,14 @@ holding its expander function."
                  (sys-set-default & (variable-name global) & initialValueTree))))
              (setq initialValueTree :UNBOUND-SPECIAL-VARIABLE))
 	    ((or (wrapper? initialValueTree)
+                 ;; NOTE: we only directly initialize variables that have native-language
+                 ;; constants as their initializers (NULL, TRUE & FALSE); all others are
+                 ;; initialized via startup code to insure proper sequencing:
                  (and (symbol? initialValueTree)
-                      (constant-symbol? initialValueTree))
+                      (constant-symbol? initialValueTree)
+                      (or (not (eql? initialValueTree (quote NULL)))
+                          ;; fail in case NULL gets mapped onto NULL-INTEGER, etc:
+                          (eql? (type-to-null-value-tree (variable-type global)) (quote NULL))))
 		 ;; Treat 'verbatim' initialization code as constant
 		 ;;    (if it relies on other stuff, it needs to go
 		 ;;    inside of a 'startup-time-progn'):
@@ -7225,7 +7306,7 @@ holding its expander function."
              (setq initialValueTree
                (walk-expression-tree
                 initialValueTree
-                (variable-type global)
+		(global-variable-type-spec global)
                 (variable-name global)
                 TRUE)))
             (otherwise
@@ -7238,7 +7319,7 @@ holding its expander function."
 	     ;; cl-array-null
              (setq initialValueTree
                (type-to-walked-null-value-tree
-		(variable-type global)
+		(global-variable-type-spec global)
                 (type-spec-to-base-type (variable-type global)))))))
     (setf (code-register unit) initialValueTree)
     ;; Don't create variable objects for system-defined variables,
@@ -8050,6 +8131,19 @@ functions that would cause too much stress for some wimpy compilers).")
         into otherAssignments)
     (return requiredValues otherAssignments) ))
 
+(defun (get-current-self-type TYPE) ()
+  ;; Try to determine what a `self' reference in an anchored type
+  ;; refers to in the current translation context.
+  (let ((method *methodBeingWalked*)
+        (owner @UNKNOWN))
+    (when (defined? method)
+      (setq owner (owner method))
+      (when (null? owner)
+        (if (method-constructor? method)
+            (setq owner (slot-base-type method))
+          (setq owner @UNKNOWN))))
+    (return owner)))
+
 (defun (walk-new-tree CONS TYPE-SPEC) ((tree CONS))
   ;; Expand a 'new' or 'allocate' expression.
   ;; Return a form that
@@ -8074,6 +8168,9 @@ functions that would cause too much stress for some wimpy compilers).")
       (walk-error "Undefined class supplied to " operator " operator: "
                   baseClassName)
       (return (walk-dont-call-me-tree tree @UNKNOWN)))
+    (unless (type? classType)
+      ;; instantiate any anchored types such as `(new (CONS OF (LIKE (any-value self))))':
+      (setq classType (compute-relative-type-spec classType (get-current-self-type))))
     (when (abstract? (type-spec-to-class classType))
       (walk-error "Trying to create an instance of the ABSTRACT class "
                   baseClassName)
@@ -8195,16 +8292,16 @@ functions that would cause too much stress for some wimpy compilers).")
          (case (translator-output-language)
            ((:cpp :cpp-standalone)
 	    (when (subtype-of? type @LITERAL)
-              (walk-warn "Cannot have methods on literals in "
-                         (translator-output-language-name)
-                         ", hence, cannot generate" EOL
-                         " a method-code pointer for "
-                         (third tree) "." (fourth tree))
+              (walk-inform "Cannot have methods on literals in "
+			   (translator-output-language-name)
+			   ", hence, cannot generate" EOL
+			   " a method-code pointer for "
+			   (third tree) "." (fourth tree))
               (return (walk-a-tree (bquote (CAST NULL METHOD-CODE)))))
             (when (not (subtype-of? type @OBJECT))
-              (walk-warn "Cannot store a method-code pointer for " EOL
-                         " " (third tree) "." (fourth tree) EOL
-                         " since it is not defined on a subtype of @OBJECT")
+              (walk-inform "Cannot store a method-code pointer for " EOL
+			   " " (third tree) "." (fourth tree) EOL
+			   " since it is not defined on a subtype of @OBJECT")
               (return (walk-a-tree (bquote (CAST NULL METHOD-CODE))))))
 ;;;	   (:java
 ;;;	    (when (subtype-of? type @LITERAL)
@@ -8765,7 +8862,13 @@ evaluation strategies."
         (when (or (< nofArgs minArgs)
                   (and (defined? maxArgs)
                        (> nofArgs maxArgs)))
-          (evaluation-error "Wrong number of arguments"))
+          (let ((minString (integer-to-string minArgs))
+                (maxString ""))
+            (cond ((null? maxArgs)
+                   (setq maxString "+"))
+                  ((> maxArgs minArgs)
+                   (setq maxString (string-concatenate "-" (integer-to-string maxArgs)))))
+            (evaluation-error "Wrong number of arguments.  Expected " minString maxString " but got " nofArgs)))
         ;; Loop "by-hand" so we avoid the creation of an ON-iterator:
         (while (non-empty? unevaluatedArgs)
           (mv-setq (evaluatedArg evaluatedArgType)
@@ -8854,6 +8957,7 @@ evaluation strategies."
       (when (eql? tree (quote NULL))
         (case targetType
           (@INTEGER (return NULL-INTEGER-WRAPPER targetType))
+          (@LONG-INTEGER (return NULL-LONG-INTEGER-WRAPPER targetType))
           (@FLOAT (return NULL-FLOAT-WRAPPER targetType))
           (@STRING (return NULL-STRING-WRAPPER targetType))
           (@BOOLEAN (return FALSE-WRAPPER targetType))

@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: load-stella.lisp,v 1.14 2006/05/21 07:11:23 hans Exp
+;;; Version: load-stella.lisp,v 1.17 2008/08/01 00:13:24 hans Exp
 
 ;;; Load Stella.
 
@@ -51,6 +51,18 @@
 ;; of STELLA classes.  Structs are significantly faster but can cause problems
 ;; when classes are redefined.  Use for production versions only.
 (defvar *load-cl-struct-stella?* nil)
+
+;; In CMUCL and derivatives, use low optimization levels to more
+;; easily uncover issues due to imprecise type declarations (or too
+;; agressive CMUCL type inference); however, to achieve reasonable
+;; speed, we need speed=3; also turn down verbosity levels so we can
+;; actually see what's going on during compilation:
+#+(or cmu sbcl)
+(progn (setq *stella-compiler-optimization*
+         '(optimize (speed 3) (safety 1) (space 1) (debug 1)))
+       (setq *compile-verbose* nil
+             *compile-print* nil
+             *gc-verbose* nil))
 
 (load (merge-pathnames "translations" *load-pathname*))
 (load "PL:native;lisp;stella;load-stella.lisp")

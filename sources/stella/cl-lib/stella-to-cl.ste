@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: stella-to-cl.ste,v 1.68 2006/05/11 07:06:38 hans Exp
+;;; Version: stella-to-cl.ste,v 1.70 2008/09/10 22:03:05 hans Exp
 
 ;;; Common Lisp macros that expand Stella declarations into Common Lisp.
 
@@ -97,6 +97,36 @@ due to the head of the result matching the head of 'form'."
     \"Translate and evaluate a STELLA statement or expression.\"
     (CL:list
      'CL:eval (CL:list 'bi-modal-translate (CL:list 'CL:quote statement))))")
+
+(defmacro clv ((code OBJECT))
+  :documentation
+  "Convenience macro to splice Lisp expressions into STELLA expressions
+without upsetting the translator during interactive sessions.
+If `code' is a currently bound Lisp variable, this tries to infer the
+type of the resulting expression from the object `code' is bound to
+and generates an appropriate cast.  `clv' stands for Common-Lisp Value
+or Verbatim."
+  :public? TRUE
+  (let ((type @UNKNOWN)
+        (lispCode STRING NULL))
+    (when (symbol? code)
+      (verbatim :common-lisp
+        "(CL:let ((lispSymbol (lispify code)))
+           ;; if the symbol is unbound and we are in a module with a Lisp pkg
+           ;; different from the current pkg, also look in the current pkg:
+           (CL:when (CL:and (CL:not (CL:boundp lispSymbol))
+                            (CL:find-symbol (CL:symbol-name lispSymbol)))
+             (CL:setq lispSymbol (CL:find-symbol (CL:symbol-name lispSymbol))))
+           (CL:when (CL:boundp lispSymbol)
+             (CL:setq type (safe-primary-type (CL:eval lispSymbol)))
+             ;; this qualifies the symbol with a package:
+             (CL:let ((CL:*package* (cl:find-package \"KEYWORD\")))
+               (CL:setq lispCode (CL:prin1-to-string lispSymbol)))))"
+        :otherwise NULL))
+    (when (unknown-type? type)
+      (return (bquote (verbatim :common-lisp & code))))
+    (setq code (new VERBATIM-STRING-WRAPPER :wrapper-value lispCode))
+    (return (bquote (cast (verbatim :common-lisp & code) & type)))))
 
 
   ;;
@@ -255,7 +285,8 @@ Unsupported types are left unchanged."
                            :otherwise NULL))))
       (VERBATIM-STRING-WRAPPER
        (return (cons-tree-to-lisp-code thing)))
-      ((INTEGER-WRAPPER FLOAT-WRAPPER STRING-WRAPPER CHARACTER-WRAPPER)
+      ((INTEGER-WRAPPER LONG-INTEGER-WRAPPER FLOAT-WRAPPER
+        STRING-WRAPPER CHARACTER-WRAPPER)
        (return (safe-cast (wrapper-value thing) LISP-CODE)))
       (otherwise (return thing)))))
 

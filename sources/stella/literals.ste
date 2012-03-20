@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1996-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2008      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: literals.ste,v 1.57 2006/05/11 07:06:13 hans Exp
+;;; Version: literals.ste,v 1.61 2009/04/09 00:15:57 tar Exp
 
 ;;; Procedures that manipulate wrapped literals, and that
 ;;;    wrap and unwrap literals.
@@ -70,6 +70,7 @@
 ;;; Null wrappers:
 
 (defglobal NULL-INTEGER-WRAPPER INTEGER-WRAPPER NULL :public? TRUE)
+(defglobal NULL-LONG-INTEGER-WRAPPER LONG-INTEGER-WRAPPER NULL :public? TRUE)
 (defglobal NULL-FLOAT-WRAPPER FLOAT-WRAPPER NULL :public? TRUE)
 (defglobal NULL-STRING-WRAPPER STRING-WRAPPER NULL :public? TRUE)
 (defglobal NULL-MUTABLE-STRING-WRAPPER MUTABLE-STRING-WRAPPER
@@ -80,6 +81,8 @@
 (startup-time-progn :early-inits
   (setq NULL-INTEGER-WRAPPER
     (new INTEGER-WRAPPER :wrapper-value NULL))
+  (setq NULL-LONG-INTEGER-WRAPPER
+    (new LONG-INTEGER-WRAPPER :wrapper-value NULL))
   (setq NULL-FLOAT-WRAPPER
     (new FLOAT-WRAPPER :wrapper-value NULL))
   (setq NULL-STRING-WRAPPER
@@ -98,7 +101,8 @@
 (defmethod (terminate-wrapper? BOOLEAN) ((self WRAPPER))
   :public? TRUE
   ;; Make sure special wrappers never get freed.
-  (if (or (eq? self NULL-FLOAT-WRAPPER)
+  (if (or (eq? self NULL-LONG-INTEGER-WRAPPER)
+          (eq? self NULL-FLOAT-WRAPPER)
           (eq? self NULL-STRING-WRAPPER)
 	  (eq? self NULL-MUTABLE-STRING-WRAPPER)
           (eq? self NULL-CHARACTER-WRAPPER)
@@ -155,6 +159,8 @@ Maintained for iteration purposes.")
   (set-literal-type-info
    @INTEGER :null-wrapper (quote NULL-INTEGER-WRAPPER))
   (set-literal-type-info
+   @LONG-INTEGER :null-wrapper (quote NULL-LONG-INTEGER-WRAPPER))
+  (set-literal-type-info
    @FLOAT :null-wrapper (quote NULL-FLOAT-WRAPPER))
   (set-literal-type-info
    @STRING :null-wrapper (quote NULL-STRING-WRAPPER))
@@ -190,6 +196,35 @@ Return NULL if `wrapper' is NULL."
   (if (null? wrapper)
       (return NULL)
     (return (wrapper-value wrapper))))
+
+(defun (wrap-long-integer LONG-INTEGER-WRAPPER) ((value LONG-INTEGER))
+  :documentation
+  "Return a literal object whose value is the LONG-INTEGER 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-LONG-INTEGER-WRAPPER)
+    (return (new LONG-INTEGER-WRAPPER :wrapper-value value))))
+
+(defun (unwrap-long-integer LONG-INTEGER) ((wrapper LONG-INTEGER-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-integer-value NUMBER-WRAPPER) ((value LONG-INTEGER))
+  :documentation
+  "Return a literal object whose value is 'value'.  Choose a regular integer
+wrapper unless `value' is too large and needs to be stored in a long wrapper."
+  :public? TRUE
+  (if (regular-integer-valued? value)
+      (let ((intWrapper (make INTEGER-WRAPPER)))
+        (setf (wrapper-value intWrapper) value)
+        (return intWrapper))
+    (let ((longWrapper (make LONG-INTEGER-WRAPPER)))
+      (setf (wrapper-value longWrapper) value)
+      (return longWrapper))))
 
 (defun (wrap-float FLOAT-WRAPPER) ((value FLOAT))
   :documentation "Return a literal object whose value is the FLOAT 'value'."
@@ -308,27 +343,31 @@ Map NULL onto FALSE."
 
 (defmacro inline-wrap-boolean ((expression OBJECT))
   ;; Coercion macro used by the walker that is smart about constant conversions.
-  (cond ((eql? expression (quote TRUE))
-         (return (quote TRUE-WRAPPER)))
-        ((eql? expression (quote FALSE))
-         (return (quote FALSE-WRAPPER)))
-        (otherwise
-         (return (bquote (wrap-boolean & expression))))))
+  (let ((walkedExp (walked-expression-expression expression)))
+    (cond ((eql? walkedExp (quote TRUE))
+           (return (quote TRUE-WRAPPER)))
+          ((eql? walkedExp (quote FALSE))
+           (return (quote FALSE-WRAPPER)))
+          (otherwise
+           (return (bquote (wrap-boolean & expression)))))))
 
 (defmacro inline-unwrap-boolean ((expression OBJECT))
   ;; Coercion macro used by the walker that is smart about constant conversions.
-  (cond ((eql? expression (quote TRUE-WRAPPER))
-         (return (quote TRUE)))
-        ((eql? expression (quote FALSE-WRAPPER))
-         (return (quote FALSE)))
-        (otherwise
-         (return (bquote (coerce-wrapped-boolean-to-boolean & expression))))))
+  (let ((walkedExp (walked-expression-expression expression)))
+    (cond ((eql? walkedExp (quote TRUE-WRAPPER))
+           (return (quote TRUE)))
+          ((eql? walkedExp (quote FALSE-WRAPPER))
+           (return (quote FALSE)))
+          (otherwise
+           (return (bquote (coerce-wrapped-boolean-to-boolean & expression)))))))
 
 (startup-time-progn :globals
   (set-literal-type-info
    @BOOLEAN :wrap-function (quote wrap-boolean))
   (set-literal-type-info
    @INTEGER :wrap-function (quote wrap-integer))
+  (set-literal-type-info
+   @LONG-INTEGER :wrap-function (quote wrap-long-integer))
   (set-literal-type-info
    @FLOAT :wrap-function (quote wrap-float))
   (set-literal-type-info
@@ -353,6 +392,12 @@ Map NULL onto FALSE."
   :globally-inline? TRUE
   :public? TRUE
   (return (wrap-integer value)))
+
+(defmethod (wrap-literal LONG-INTEGER-WRAPPER) ((value LONG-INTEGER))
+  ;; Return a literal object whose value is the LONG-INTEGER 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-long-integer value)))
 
 (defmethod (wrap-literal FLOAT-WRAPPER) ((value FLOAT))
   ;; Return a literal object whose value is the FLOAT 'value'.
@@ -403,6 +448,8 @@ Map NULL onto FALSE."
   (return self))
 (defmethod (copy-wrapped-literal OBJECT) ((self INTEGER-WRAPPER))
   (return (wrap-literal (wrapper-value self))))
+(defmethod (copy-wrapped-literal OBJECT) ((self LONG-INTEGER-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
 (defmethod (copy-wrapped-literal OBJECT) ((self FLOAT-WRAPPER))
   (return (wrap-literal (wrapper-value self))))
 (defmethod (copy-wrapped-literal OBJECT) ((self STRING-WRAPPER))
@@ -436,6 +483,12 @@ Map NULL onto FALSE."
 ;;; methods that assume that bare literals won't appear as arguments
 ;;; (otherwise they will break).
 
+;;; The type-specific wrapper tests assume that most of the time where
+;;; runtime is important, we will be comparing wrappers of exactly the
+;;; type indicated.  That allows us to short-circuit the more
+;;; expensive tests which are used for subtypes, such as PowerLoom's
+;;; logic-X-wrapper classes.
+
 (defmethod (object-eql? BOOLEAN) ((x OBJECT) (y OBJECT))
   ;; SHOULD THIS BE WARN?  - tar
   (error "object-eql?: Don't know how to compare " x " with " y)
@@ -447,40 +500,57 @@ Map NULL onto FALSE."
 
 (defmethod (object-eql? BOOLEAN) ((x INTEGER-WRAPPER) (y OBJECT))
   (return (and (defined? y)
-               (eql? (primary-type y) @INTEGER-WRAPPER) ;; treat as final
+               (or (eql? (primary-type y) @INTEGER-WRAPPER)
+		   (isa? y @INTEGER-WRAPPER))
                (= (wrapper-value x)
                   (wrapper-value (cast y INTEGER-WRAPPER))))))
 
+(defmethod (object-eql? BOOLEAN) ((x LONG-INTEGER-WRAPPER) (y OBJECT))
+  (return (and (defined? y)
+               (or (eql? (primary-type y) @LONG-INTEGER-WRAPPER)
+		   (isa? y @LONG-INTEGER-WRAPPER))
+               (= (wrapper-value x)
+                  (wrapper-value (cast y LONG-INTEGER-WRAPPER))))))
+
 (defmethod (object-eql? BOOLEAN) ((x FLOAT-WRAPPER) (y OBJECT))
   (return (and (defined? y)
-               (eql? (primary-type y) @FLOAT-WRAPPER)   ;; treat as final
+               (or (eql? (primary-type y) @FLOAT-WRAPPER)
+		   (isa? y @FLOAT-WRAPPER))
                (= (wrapper-value x)
                   (wrapper-value (cast y FLOAT-WRAPPER))))))
 
 (defmethod (object-eql? BOOLEAN) ((x BOOLEAN-WRAPPER) (y OBJECT))
-  (return (eq? x y)) )
+  (return (or (eq? x y)
+	      (and (defined? y)
+		   (or (eql? (primary-type y) @BOOLEAN-WRAPPER)
+		       (isa? y @BOOLEAN-WRAPPER))
+		   (eql? (wrapper-value x)
+			 (wrapper-value (cast y BOOLEAN-WRAPPER)))))) )
   
 (defmethod (object-eql? BOOLEAN) ((x STRING-WRAPPER) (y OBJECT))
   (when (defined? y)
     (let ((yType (primary-type y)))
-      (when (or (eql? yType @STRING-WRAPPER)            ;; treat as final
+      (when (or (eql? yType @STRING-WRAPPER)            
                 (eql? yType @VERBATIM-STRING-WRAPPER)
                 ;; if we use STELLA hash tables, we need to make this work
                 ;;    before symbols (such as type names) become available:
                 (and (not *class-hierarchy-booted?*)
                      (or (null? yType)
                          (null? @STRING-WRAPPER)
-                         (null? @VERBATIM-STRING-WRAPPER))))
+                         (null? @VERBATIM-STRING-WRAPPER)))
+		(isa? y @STRING-WRAPPER))
         (return (eql? (wrapper-value x)
                       (wrapper-value (cast y STRING-WRAPPER)))))))
   (return FALSE))
 
 (defmethod (object-eql? BOOLEAN) ((x MUTABLE-STRING-WRAPPER) (y OBJECT))
+  ;; Doesn't need extension.
   (return (eq? x y)))
 
 (defmethod (object-eql? BOOLEAN) ((x CHARACTER-WRAPPER) (y OBJECT))
   (return (and (defined? y)
-               (eql? (primary-type y) @CHARACTER-WRAPPER)  ;; treat as final
+               (or (eql? (primary-type y) @CHARACTER-WRAPPER)
+		   (isa? y @CHARACTER-WRAPPER))
                (eq? (wrapper-value x)
                     (wrapper-value (cast y CHARACTER-WRAPPER))))))
 
@@ -495,6 +565,10 @@ Map NULL onto FALSE."
 (defun (eql-to-integer? BOOLEAN) ((y OBJECT) (x INTEGER))
   (return (and (integer? y)
                (eq? (wrapper-value (cast y INTEGER-WRAPPER)) x))) )
+
+(defun (eql-to-long-integer? BOOLEAN) ((y OBJECT) (x LONG-INTEGER))
+  (return (and (long-integer? y)
+               (eq? (wrapper-value (cast y LONG-INTEGER-WRAPPER)) x))) )
 
 (defun (eql-to-float? BOOLEAN) ((y OBJECT) (x FLOAT))
   (return (and (float? y)
@@ -536,6 +610,9 @@ Map NULL onto FALSE."
 
 (defmethod (equal-to-integer? BOOLEAN) ((y INTEGER-WRAPPER) (x INTEGER))
   (return (eq? x (wrapper-value y))) )
+
+(defmethod (equal-to-integer? BOOLEAN) ((y LONG-INTEGER-WRAPPER) (x INTEGER))
+  (return (= x (wrapper-value y))) )
 
 (defmethod (equal-to-integer? BOOLEAN) ((y FLOAT-WRAPPER) (x INTEGER))
   ;; USE THIS IF C++ DOESN'T AUTOMATICALLY CAST:
@@ -591,7 +668,7 @@ Map NULL onto FALSE."
        (return (cons-list (quote CONS)
                           (help-bquotify (value tree))
                           (help-bquotify (rest tree))))))
-   ((INTEGER STRING FLOAT CHARACTER)
+   ((INTEGER LONG-INTEGER STRING FLOAT CHARACTER)
     ;; allocate storage for literal encapsulation:
     (return (cons-list (quote WRAP-LITERAL) tree)))
    (KEYWORD
@@ -941,21 +1018,19 @@ otherwise, return 'char' unmodified."
   ;; Assumes string isn't null!
   (verbatim
       ;; In Lisp this is more efficient:
-      :common-lisp (CL:progn
-                       (CL:prin1 string stream)
-                       (CL:return-from print-string-readably))
-      :otherwise NULL)
-  (if (null? string)
-    (print-native-stream stream (quote null-string))
-    (progn
-      (print-native-stream stream "\"")
-      (foreach i in (interval 0 (- (length string) 1))
-        do (let ((char (nth string i)))
-             (if (or (eq? char #\")
-                     (eq? char #\\))
-               (print-native-stream stream "\\" char)
-               (print-native-stream stream char))))
-      (print-native-stream stream "\""))))
+      :common-lisp (CL:prin1 string stream)
+      :otherwise
+      (if (null? string)
+          (print-native-stream stream (quote null-string))
+        (progn
+          (print-native-stream stream "\"")
+          (foreach i in (interval 0 (- (length string) 1))
+              do (let ((char (nth string i)))
+                   (if (or (eq? char #\")
+                           (eq? char #\\))
+                       (print-native-stream stream "\\" char)
+                     (print-native-stream stream char))))
+          (print-native-stream stream "\"")))))
 
 
   ;;
@@ -987,6 +1062,11 @@ In Lisp and C++ this is a no-op."
 (defmethod (number-wrapper-to-float FLOAT) ((self INTEGER-WRAPPER))
   :public? TRUE
   ;; Return a floating point representation of the integer 'self'.
+  (return (cast (wrapper-value self) FLOAT)))
+
+(defmethod (number-wrapper-to-float FLOAT) ((self LONG-INTEGER-WRAPPER))
+  :public? TRUE
+  ;; Return a floating point representation of the long integer 'self'.
   (return (cast (wrapper-value self) FLOAT)))
 
 (defmethod (number-wrapper-to-float FLOAT) ((self FLOAT-WRAPPER))

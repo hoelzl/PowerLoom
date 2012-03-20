@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: optimize.ste,v 1.79 2006/05/11 07:05:25 hans Exp
+;;; Version: optimize.ste,v 1.82 2009/02/07 06:06:24 hans Exp
 
 ;;; PowerLoom Query Optimizer
 
@@ -1643,6 +1643,7 @@ should be performed.")
                   NULL))
     (when (null? estimate)
       ;; this is VERY CRUDE, since it doesn't take subrelations into account:
+      ;; and it also picks up unknown propositions:
       (setq estimate
         (estimated-length (get-description-extension description TRUE))))
     (return estimate)))
@@ -2195,7 +2196,7 @@ of order-dependent optimizations.")
     (return equivalentProp) ))
 
 (defun (inherit-FUNCTION-proposition PROPOSITION)
-       ((self PROPOSITION) (mapping ENTITY-MAPPING))
+       ((self PROPOSITION) (mapping ENTITY-MAPPING) (createSkolem? BOOLEAN))
   ;; Called by 'map-functional-value' and 'inherit-proposition'.
   ;; No equivalent of the inheriting :FUNCTION proposition 'self'
   ;;     exists.  Create one, with an unbound output skolem.
@@ -2211,12 +2212,15 @@ of order-dependent optimizations.")
     (foreach arg in (arguments self)
         as i in (interval 1 NULL)
         where (<= i nofInputArgs)
-        do (setq argMapsTo (mapped-value-of arg mapping FALSE))
-           ;; exit if an input argument isn't mapped (yet):
+        do (setq argMapsTo (mapped-value-of arg mapping createSkolem?))
+           ;; exit if an input argument isn't mapped (yet) - can only
+           ;; happen if `createSkolem?' is FALSE:
            (when (null? argMapsTo)
              (return NULL))
         collect argMapsTo into inputArgs)
-    (setq copy (create-function-proposition (relationRef self) inputArgs))
+    ;; Actually, `find-similar-proposition' can miss some which is why we call
+    ;; `find-or-create-...' here instead of just `create-':
+    (setq copy (find-or-create-function-proposition (relationRef self) inputArgs))
     (return copy) ))
 
 (defun (equal-up-to-skolem-identity? BOOLEAN) 
@@ -2401,7 +2405,7 @@ of order-dependent optimizations.")
          (return NULL))
        (setq copy (find-similar-proposition self mapping))
        (when (null? copy)
-         (setq copy (inherit-FUNCTION-proposition self mapping))
+         (setq copy (inherit-FUNCTION-proposition self mapping TRUE))
          (setq copy (eradicate-holds-proposition copy)))
        ;; tricky: we don't inherit a :FUNCTION proposition. Instead,
        ;;    we inherit an :EQUIVALENT proposition between the local
@@ -2465,7 +2469,10 @@ of order-dependent optimizations.")
   ;; 'variable' is unbound and (probably) unmapped (it is explicitly or
   ;;     implicitly existentially-quantified).
   ;; Create a new skolem, and map 'variable' to it.
-  (let ((skolem (lookup mapping variable)))
+  ;; Also record the skolem under the :CREATED-SKOLEMS key for the
+  ;; benefit of `filter-implied-skolem-propositions'.
+  (let ((skolem (lookup mapping variable))
+        (createdSkolems LIST (lookup mapping :CREATED-SKOLEMS)))
     (when (defined? skolem)
       (return skolem))
     (safety 3 (null? (variable-value variable))
@@ -2473,6 +2480,10 @@ of order-dependent optimizations.")
     (setq skolem (create-variable-or-skolem 
                   (skolem-type variable) NULL))
     (insert-at mapping variable skolem)
+    (when (null? createdSkolems)
+      (setq createdSkolems (list))
+      (insert-at mapping :CREATED-SKOLEMS createdSkolems))
+    (insert createdSkolems skolem)
     (return skolem) ))
 
 (defun (inherit-as-top-level-proposition (CONS OF PROPOSITION))
@@ -2499,10 +2510,65 @@ of order-dependent optimizations.")
               (inherit-proposition (first (arguments proposition)) mapping)))
       (otherwise
        (pushq resultList (inherit-proposition proposition mapping))))
-    (free mapping)
     (foreach p in resultList
-        do (normalize-top-level-proposition p NULL))
-    (return resultList)) )
+        do (normalize-top-level-proposition p))
+    (return (reverse resultList))))
+
+
+(defun (filter-implied-skolem-propositions (CONS OF PROPOSITION))
+    ((inheritedProps (CONS OF PROPOSITION))
+     (description DESCRIPTION)
+     (arguments VECTOR)
+     (mapping ENTITY-MAPPING))
+  ;; Given a set of inherited propositions `inheritedProps' derived from
+  ;; instantiating `description' on `arguments', check whether any skolems
+  ;; were created from existential variables, and if so, whether the
+  ;; resulting propositions are redundant and implied by some already
+  ;; existing propositions.  For example, `(father-of fred joe)' would
+  ;; imply `(exists ?x (father-of fred ?x))' or `(father-of fred sk123)'.
+  ;; Giving that forward skolemization can quickly lead to lots and lots
+  ;; of garbage and unwanted recursion, filtering out such redundant skolem
+  ;; propositions is important for performance and inferential completeness.
+  ;; `mapping' is the mapping created during the instantiation of `description'.
+  ;; When redundant skolem propositions are detected, the subset of
+  ;; `inheritedProps' that is not redundant will be returned (currently,
+  ;; we simply return NIL in this case).
+  ;; TO DO: - special-case single propositions to not use a query but a lookup
+  ;;        - maybe handle independent skolem clusters, since one might fail
+  ;;          even though the other might succeed
+  (let ((createdSkolems (LIST OF SKOLEM)
+                        (choose (defined? mapping)
+                                (lookup mapping :CREATED-SKOLEMS)
+                                NULL))
+        (filteredProps inheritedProps)
+        (query QUERY-ITERATOR NULL))
+    (when (defined? createdSkolems)
+      (setq query
+        (memoize (description)
+                 ;; this remains valid as long as the description stays alive,
+                 ;; so, flushing it only with module clearing should be ok:
+                 :timestamps :MODULE-UPDATE ; :META-KB-UPDATE
+                 :max-values 500
+                 (initialize-query-iterator
+                  (allocate-query-iterator)
+                  description
+                  ;; this initializes the `initial-bindings' slot:
+                  (new ARGUMENTS-VECTOR :array-size (arity description)))))
+      ;; initialize external arguments; note, since we always bind the
+      ;; same variables, there is never the need for reoptimization as
+      ;; with general cached queries:
+      (foreach arg in arguments
+          as i in (interval 0 NULL)
+          do (setf (nth (initial-bindings query) i) arg))
+      (reset query)
+      (special ((*queryIterator* query)
+                (*reversePolarity?* FALSE)
+                (*inferenceLevel* SUBSUMPTION-INFERENCE)
+                (*generate-all-proofs?* FALSE))
+        (when (next? query)
+          ;; something implies the skolem props, don't assert any of them:
+          (setq filteredProps NIL))))
+    (return filteredProps)))
 
 
   ;;
@@ -2589,7 +2655,7 @@ of order-dependent optimizations.")
   (let ((copy (find-similar-proposition proposition mapping)))
     (when (and (null? copy)
                (eql? (kind proposition) :FUNCTION))
-      (setq copy (inherit-FUNCTION-proposition proposition mapping)))
+      (setq copy (inherit-FUNCTION-proposition proposition mapping FALSE)))
     (when (defined? copy)
       (let ((localFunctionalValue (value-of (last-argument copy))))
         ;; map the range of 'proposition' to the range of the matching
@@ -2599,11 +2665,13 @@ of order-dependent optimizations.")
            (last-argument proposition) localFunctionalValue mapping queue))))
     (return TRUE)))
   
-(defun (inherit-description-propositions (CONS OF PROPOSITION))
+(defun (inherit-description-propositions (CONS OF PROPOSITION) ENTITY-MAPPING)
     ((arguments VECTOR) (description DESCRIPTION))
   ;; Inherit the structure within 'description' onto the objects
   ;;    in 'arguments' and return a list of fastened-down, top-level
   ;;    propositions.
+  ;; Return the created `mapping' as a second value for the benefit of
+  ;;    `filter-implied-skolem-propositions'.
   ;; NOTE: This does not automatically assert any of the propositions
   ;;    it instantiated.
   (let ((mapping (new ENTITY-MAPPING))
@@ -2613,7 +2681,7 @@ of order-dependent optimizations.")
     (foreach v in (io-variables description)
         as arg in arguments
         do (unless (map-and-enqueue-variable? v arg mapping variableQueue)
-             (return NIL)))
+             (return NIL NULL)))
     (foreach v in (internal-variables description)
         collect v into variableQueue)
     ;; For each variable in 'variableQueue', extend the mapping in 'mapping'
@@ -2628,7 +2696,7 @@ of order-dependent optimizations.")
         (foreach p in (unfiltered-dependent-propositions variable NULL)
             where (member? structuralFunctions p)
             do (unless (map-functional-value? p mapping variableQueue)
-                 (return NIL)))))
+                 (return NIL NULL)))))
     ;; Done mapping variables; inherit the top-level proposition within
     ;;    'description' onto the instances mapped to within 'mapping':
     (let ((propositions (inherit-as-top-level-proposition
@@ -2636,7 +2704,7 @@ of order-dependent optimizations.")
       (foreach it on propositions
           do (setf (value it)
                (recursively-fasten-down-propositions (value it) FALSE)))
-      (return propositions))))
+      (return propositions mapping))))
 
 (defun inherit-unnamed-description 
            ((self OBJECT) (description DESCRIPTION) (defaultTrue? BOOLEAN))
@@ -2653,15 +2721,21 @@ of order-dependent optimizations.")
   ;; Fasten down each inherited proposition.
   ;; Assumes that the length of 'arguments' equals the number of
   ;;    io-variables in 'description'.
-  (foreach prop in (inherit-description-propositions arguments description)
-      where (not (true? prop))
-      do (assign-truth-value 
-          prop
-          ;; QUESTION: DOES THIS INCORRECTLY CLIP STRICT TRUE?:
-          (choose defaultTrue? DEFAULT-TRUE-TRUTH-VALUE TRUE-TRUTH-VALUE))
-         (unless (defined? *collectForwardPropositions*)
-           (continue))
-      collect prop into *collectForwardPropositions*))
+  (mv-bind (propositions mapping)
+      (inherit-description-propositions arguments description)
+    (foreach prop in (filter-implied-skolem-propositions
+                      propositions
+                      description
+                      arguments
+                      mapping)
+        where (not (true? prop))
+        do (assign-truth-value
+            prop
+            ;; QUESTION: DOES THIS INCORRECTLY CLIP STRICT TRUE?:
+            (choose defaultTrue? DEFAULT-TRUE-TRUTH-VALUE TRUE-TRUTH-VALUE))
+           (unless (defined? *collectForwardPropositions*)
+             (continue))
+        collect prop into *collectForwardPropositions*)))
 
 (defun LOGIC-OBJECT.inherit-unnamed-description
            ((instance LOGIC-OBJECT) (description DESCRIPTION) (defaultTrue? BOOLEAN))

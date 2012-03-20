@@ -8,8 +8,8 @@
 
 MANUAL-MAKEFILE = ../../stella/doc/Makefile
 
-all:
-	$(MAKE) -f $(MANUAL-MAKEFILE) $(MFLAGS) all
+manual.pdf manual.html manual.info manual.dvi all:
+	$(MAKE) -f $(MANUAL-MAKEFILE) $(MFLAGS) $@
 
 #
 # Cleaning up

@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2009      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: propositions.ste,v 1.189 2006/05/14 07:34:02 hans Exp
+;;; Version: propositions.ste,v 1.203 2009/02/07 05:53:34 hans Exp
 
 ;;; Parsing and constructing propositions.
 
@@ -140,6 +140,11 @@ Potentially unifiable with any other object."
           (input-bindings :type CONS)
           (cache-id :type SYMBOL)
           (consequent :type DESCRIPTION)))
+
+(defmethod (deleted? BOOLEAN) ((self FORWARD-CHAINING-INDEX))
+  ;; Return TRUE if 'self' has been deleted.
+  (return (or (null? (master-rule self))
+              (deleted-proposition? (master-rule self)))))
 
 (defclass DESCRIPTION (LOGIC-OBJECT)
   :public-slots
@@ -260,9 +265,11 @@ this proposition.")
    (dont-optimize? :type BOOLEAN :allocation :dynamic
                    :option-keyword :dont-optimize?)
    (forward-only? :type BOOLEAN :allocation :dynamic
-                  :option-keyword :forward-only?)
+                  :option-keyword :forward-only?
+                  :option-handler forward-backward-option-handler)
    (backward-only? :type BOOLEAN :allocation :dynamic
-                   :option-keyword :backward-only?)
+                   :option-keyword :backward-only?
+                   :option-handler forward-backward-option-handler)
    (proposition-stringified-source :type STRING :allocation :dynamic
      ;; use accessors for uniform access with LOGIC-OBJECT's:
      :reader stringified-source :writer stringified-source-setter)
@@ -389,6 +396,7 @@ this proposition.")
     (setf (unfastened? proposition) TRUE)
     (return proposition) ))
 
+
 (defun enforce-code-only ()
   ;; Signal a proposition error if an attempt is made to perform
   ;;    a logic action in a code-only? module.
@@ -397,6 +405,25 @@ this proposition.")
      "Can't create a relation, instance or proposition in module:" EOL
      "       " (module-name *module*) EOL
      "    because it is marked as 'code-only?'" EOL)) )
+
+(defun (get-proposition-base-operator SURROGATE) ((prop PROPOSITION))
+  ;; Returns the base operator of the proposition `prop'.
+  ;; For an equivalence proposition, the base operator is the
+  ;; operator of the defining proposition for a skolem equivalence,
+  ;; if there is one, or else the `relationRef'.
+  ;; For other propositions, it is just the `relationRef'
+  :public? TRUE
+  (when (eq? (kind prop) :EQUIVALENT)
+    (let ((term1 (nth (arguments prop) 0))
+          (term2 (nth (arguments prop) 1)))
+      (cond ((function-output-skolem? term1)
+             (return (relationRef (defining-proposition (cast term1 SKOLEM)))))
+            ((function-output-skolem? term2)
+             (return (relationRef (defining-proposition (cast term2 SKOLEM)))))
+            (otherwise
+             (return (relationRef prop))
+             ))))
+    (return (relationRef prop)))
 
 
 ;;; Logic slots on Stella classes:
@@ -752,7 +779,11 @@ the overhead of the context mechanism." )
   ;; 'proposition' has become true, and its relation is single valued.
   ;; Look for propositions with clashing output values.
   ;; If clipping is enabled, retract these propositions;
-  ;; Otherwise, signal a clash.
+  ;; Otherwise, try to equate the values which will give us two separate
+  ;; propositions whose output values are linked to each other or a clash.
+  ;; FIGURE OUT: should we create an equivalence proposition for this case?
+  ;;    also, should we try to reduce this to a single proposition somewhat
+  ;;    similar to what we do for function terms?
   ;; Note: We are a bit lazy here.  We call 'all-true-dependent-propositions',
   ;;    assuming that the first argument has backlinks.  If not, we might
   ;;    miss a clip or clash.
@@ -760,21 +791,19 @@ the overhead of the context mechanism." )
         (countMinusTwo (- (length arguments) 2)))
     (foreach p in (all-true-dependent-propositions
                    (first arguments) (relationRef proposition) FALSE)
-             do
-             (when (forall i in (interval 1 countMinusTwo)
-                           always (eql? (value-of (nth arguments i))
-                                        (value-of (nth (arguments p) i))))
-               ;; found true proposition that matches on all but the
-               ;;    last argument:
-               (cond
-                ((eql? (value-of (last-argument p)) (value-of (last arguments)))
-                 NULL)
-                ((and *clippingEnabled?*
-                      (world-state? *context*))
-                 (deassign-truth-value p :RETRACT-TRUE))
-                (otherwise
-                 (signal-unification-clash
-                  (value-of (last-argument p)) (value-of (last arguments))))))) ))
+        do (when (forall i in (interval 1 countMinusTwo)
+                     always (eql? (value-of (nth arguments i))
+                                  (value-of (nth (arguments p) i))))
+             ;; found true proposition that matches on all but the
+             ;;    last argument:
+             (cond ((eql? (value-of (last-argument p)) (value-of (last arguments)))
+                    NULL)
+                   ((and *clippingEnabled?*
+                         (world-state? *context*))
+                    (deassign-truth-value p :RETRACT-TRUE))
+                   (otherwise
+                    (equate-values (value-of (last-argument p))
+                                   (value-of (last arguments)))))))))
 
 (defun run-update-equivalence-proposition-demon 
        ((proposition PROPOSITION) (updateMode KEYWORD))
@@ -990,7 +1019,7 @@ the overhead of the context mechanism." )
        ((eql? newTruthValue DEFAULT-TRUE-TRUTH-VALUE)
         (cond
          (*deferingDefaultForwardInferences?*
-	  (pushf (deferred-default-propositions *context*) self)
+          (defer-default-proposition (get-propagation-environment *context*) self)
           (return))
          ((or (eql? oldTruthValue TRUE-TRUTH-VALUE)
               (eql? oldTruthValue FALSE-TRUTH-VALUE))
@@ -1000,7 +1029,7 @@ the overhead of the context mechanism." )
        ((eql? newTruthValue DEFAULT-FALSE-TRUTH-VALUE)
         (cond
          (*deferingDefaultForwardInferences?*
-	  (pushf (deferred-default-propositions *context*) self)
+          (defer-default-proposition (get-propagation-environment *context*) self)
           (return))
          ((or (eql? oldTruthValue FALSE-TRUTH-VALUE)
               (eql? oldTruthValue TRUE-TRUTH-VALUE))
@@ -2632,7 +2661,10 @@ without signalling an error if none exists.")
   ;; TO DO: FLESH OUT THE MISSING CASES ONCE WE FIGURE OUT WHAT
   ;;    THEY SHOULD EVALUATE TO (SEE ALSO `inherit-proposition-argument').
   (typecase self
-    (PATTERN-VARIABLE NULL)
+    (PATTERN-VARIABLE
+     (when (defined? (lookup-logic-variable-binding (skolem-name self)))
+       ;; we must be re-evaluating a variable that was stuck into a parse tree:
+       (return self)))
     (SKOLEM
      ;; Always return this, since they are legal and can arise in queries.
      ;; Was previously allowed except in (description-mode?).
@@ -3332,26 +3364,35 @@ structure hash code which might be shared by different objects.")
       (insert-at *structured-objects-index* index (list self))
       (return NULL))
     (remove-deleted-members bucket)
-    (foreach p in bucket
-        do (typecase p
-             (PROPOSITION
-              (if function?
-                  (let ((operator (operator self))
-                        (arguments (arguments self))
-                        (arity (length arguments)))
-                    ;; special-purpose equality test that ignores the last argument:
-                    (when (and (eql? operator (operator p))
-                               (forall arg1 in arguments
-                                   as arg2 in (arguments p)
-                                   as i in (interval 2 arity) ;; only compare n-1 args
-                                   always (eql? (value-of arg1) (value-of arg2)))
-                               (eql? arity (length (arguments p)))
-                               (subcontext? homeModule (base-module (home-context p))))
-                      (return p)))
-                (when (and (equivalent-propositions? self p NULL)
-                           (subcontext? homeModule (base-module (home-context p))))
-                  (return p))))
-             (otherwise NULL)))
+    (let ((operator (operator self))
+          (arguments (arguments self))
+          (arity (length arguments))
+          (rewrapped? FALSE))
+      (foreach p in bucket
+          do (typecase p
+               (PROPOSITION
+                (when (and (eql? operator (operator p))
+                           (= arity (length (arguments p))))
+                  (loop ;; since we might have to try again after rewrapping - kludge
+                    (when (or (and function?
+                                   ;; special equality test that ignores the last argument:
+                                   (forall arg1 in arguments
+                                       as arg2 in (arguments p)
+                                       as i in (interval 2 arity) ;; only compare n-1 args
+                                       always (eql? (value-of arg1) (value-of arg2))))
+                              (and (not function?)
+                                   (equivalent-propositions? self p NULL)))
+                      (if (subcontext? homeModule (base-module (home-context p)))
+                          (return p)
+                        (break)))
+                    ;; we failed due to an argument mismatch, see whether we need to rewrap:
+                    (cond (rewrapped?
+                           (break))
+                          (otherwise
+                           (rewrap-proposition-arguments self)
+                           (setq rewrapped? TRUE)
+                           (continue))))))
+             (otherwise NULL))))
     (push bucket self)
     (return NULL) ))
 
@@ -3542,7 +3583,7 @@ propositions when building a new proposition.")
               (*termUnderConstruction* tree))
      (setq proposition (build-proposition tree))
      (when (defined? proposition)
-       (normalize-top-level-proposition proposition NULL)
+       (normalize-top-level-proposition proposition)
        (verify-forall-propositions proposition)
        (when (not (empty? (collect-unresolved-slot-references proposition)))
          ;; a bit of a kludge: figure out types of constants BEFORE they
@@ -3843,6 +3884,15 @@ propositions when building a new proposition.")
                 (setf (weight proposition) NULL))
                (otherwise
                 (run-option-handler? proposition option NULL)))))))
+
+(defun forward-backward-option-handler ((self PROPOSITION) (slot STORAGE-SLOT) (tree OBJECT))
+  ;; Handler for :forward-only? and :backward-only? options.
+  ;; If we are setting one of these options to TRUE, make sure the competing
+  ;; option is unset.
+  (when (eql? tree (quote TRUE))
+    (when (forward-only? self) (setf (forward-only? self) NULL))
+    (when (backward-only? self) (setf (backward-only? self) NULL)))
+  (default-option-handler self slot tree))
 
 #|
 
@@ -4227,7 +4277,7 @@ doesn't indicate that."
    ((or (eql? type @PROPOSITION)
         (and *auto-coerce-propositional-arguments?*
              (propositional-argument? argument)))
-    (return (build-proposition argument)))
+    (return (evaluate-proposition-term argument)))
    ((defined? type)
     ;; signal 'type' so that, if its a native type, that a native
     ;;    instance will be created:
@@ -4235,6 +4285,56 @@ doesn't indicate that."
       (return (evaluate-term argument))))
    (otherwise
     (return (evaluate-term argument)))) )
+
+(defun (evaluate-proposition-term OBJECT) ((tree OBJECT))
+  ;; Evaluate the term `tree' under the assumption that it is to
+  ;; result in a proposition object.
+  (typecase tree
+    (PROPOSITION
+     (return tree))
+    (CONS
+     ;; Tricky: need to check for a function term returning a
+     ;; proposition as opposed to a function value proposition
+     ;; such as (age fred 40) or another regular proposition:
+     (mv-bind (predicate firstArgument)
+         (evaluate-predicate-and-first-argument tree)
+       (when (defined? firstArgument)
+         ;; avoid re-evaluation:
+         (setf (second tree) firstArgument))
+       (if (and (function? predicate)
+                (= (arity (cast predicate NAMED-DESCRIPTION)) (length tree)))
+           ;; we have a term without a value assertion:
+           (return (evaluate-function-term tree))
+         (return (build-proposition tree)))))
+    (otherwise
+     (return (build-proposition tree)))))
+
+(defun (evaluate-predicate-and-first-argument LOGIC-OBJECT OBJECT) ((tree CONS))
+  ;; Evaluate the predicate and first argument of `tree' and return them as two values.
+  ;; NOTE: we don't check for 0-arity anymore, since that is taken care of
+  ;;       by the argument check logic later.
+  (let ((predicate (first tree))
+        (firstArgument (second tree)))
+    (typecase predicate
+      (GENERALIZED-SYMBOL
+       (case predicate
+         ((PL-KERNEL/EXISTS PL-KERNEL/FORALL)
+          ;; we don't evaluate anything here - for now:
+          (setq firstArgument NULL)
+          (setq predicate NULL))
+         ((PL-KERNEL/AND PL-KERNEL/OR PL-KERNEL/NOT)
+          ;; same thing:
+          (setq firstArgument NULL)
+          (setq predicate NULL))
+         (otherwise NULL)))
+      (otherwise
+       ;; TO DO: FIGURE OUT HOW TO HANDLE PREDICATE-VALUED TERMS HERE
+       (setq predicate NULL)))
+    (when (defined? predicate)
+      (when (defined? firstArgument)
+        (setq firstArgument (evaluate-first-argument (second tree) predicate)))
+      (setq predicate (evaluate-predicate predicate firstArgument)))
+    (return predicate firstArgument)))
 
 (defun (evaluate-first-argument OBJECT) ((argument OBJECT) (relationName SYMBOL))
   ;; Called by 'build-predicate-proposition'.
@@ -4332,17 +4432,15 @@ doesn't indicate that."
          (create-proposition (quote PREDICATE) (length (rest tree))))
         (firstArgument OBJECT NULL)
         (predicateValue LOGIC-OBJECT NULL))
-    (cond
-     ((nil? (rest tree))                ; no arguments
-      (if (eql? predicateName (quote PL-KERNEL/CUT))
-        NULL                            ; zero arity is OK
-        ;; TO DO: FIGURE OUT HOW TO TEST FOR VARIABLE ARITY HERE, AND
-        ;;    FLAG AS ERROR ONLY FOR FIXED ARITY:
-        (inform "Predicate " predicateName " applied to zero arguments.")))
-     (otherwise
-      (setq firstArgument (evaluate-first-argument (second tree) predicateName))
-      (setf (nth (arguments proposition) 0) firstArgument)))
-    (setq predicateValue (evaluate-predicate predicateName firstArgument))
+    (mv-setq (predicateValue firstArgument)
+      (evaluate-predicate-and-first-argument tree))
+    (when (defined? firstArgument)
+      ;; Tricky: insert the evaluated argument into the tree (evaluates to itself) to
+      ;; avoid re-evaluation in case we have a function-proposition as the first argument
+      ;; to a function that takes a proposition as its first arg, since the evaluation of
+      ;; the argument term will destructively modify the tree:
+      (setf (second tree) firstArgument)
+      (setf (nth (arguments proposition) 0) firstArgument))
     (when (and (defined? predicateValue )
                (function? predicateValue))
       ;; tricky: we mandate that asserted functions have a SKOLEM for
@@ -4354,7 +4452,13 @@ doesn't indicate that."
         (setf (kind proposition) :FUNCTION)
         ;; convert from predicate to function form:
         (let ((lastArgIndex (1- (length tree)))
-              (resultArgument (nth tree lastArgIndex)))
+              (resultArgument
+               ;; we evaluate the last argument here, so we get proper typed evaluation
+               ;; and coercion to proposition type if necessary; `build-equivalence-prop'
+               ;; can't handle that, since it already lost all the necessary context:
+               (evaluate-typed-argument
+                (nth tree lastArgIndex)
+                (last (io-variable-types (cast predicateValue NAMED-DESCRIPTION))))))
           (setf (nth tree lastArgIndex) NULL)
           (setq tree (remove tree NULL))
           (return (build-proposition
@@ -4392,6 +4496,12 @@ doesn't indicate that."
             (null? self)
             (eql? type STELLA/@THING))
     (return TRUE))
+  ;; Special case for boolean values, since they are implemented as
+  ;;   PowerLoom constant propositions.
+  (when (and (eql? type STELLA/@BOOLEAN)
+             (or (eql? self TRUE-PROPOSITION)
+                 (eql? self FALSE-PROPOSITION)))
+    (return TRUE))
   (typecase self
     (PATTERN-VARIABLE
      (return TRUE))
@@ -4399,6 +4509,12 @@ doesn't indicate that."
      (when (and (isa? (surrogate-value type) STELLA/@CLASS)
                 (subtype-of? (logical-type self) type))
        (return TRUE)))
+    (QUANTITY-LOGIC-WRAPPER
+     ;; (when ????
+     ;;   (return TRUE))
+     ;; KLUDGE: Need to figure out what to really do to test this!
+     (return TRUE)
+     )
     (otherwise NULL))
   ;; otherwise, look for type assertion:
   (return
@@ -4648,12 +4764,13 @@ routines in the event that a type-check fails.  Options are:
       "   Expected " requiredArity " argument(s)."))))
 
 (defclass CHECK-TYPES-RECORD (STANDARD-OBJECT)
-  :slots ((parent-proposition :type OBJECT)
+  :slots ((proposition :type PROPOSITION)
+          (parent-proposition :type OBJECT)
           (parent-description :type DESCRIPTION)
           (module :type MODULE)) )
 
-(defglobal *check-types-agenda* (KEY-VALUE-LIST OF PROPOSITION CHECK-TYPES-RECORD)
-  (new KEY-VALUE-LIST)
+(defglobal *check-types-agenda* (VECTOR-SEQUENCE OF CHECK-TYPES-RECORD)
+  (new VECTOR-SEQUENCE :array-size 4)
   :documentation "List of propositions that have failed a type check,
 but might pass once finalization is complete.")
 
@@ -4662,16 +4779,27 @@ but might pass once finalization is complete.")
   ;;     and recheck it after everything has been finalized.
   (safety 3 (world-state? (home-context self))
           "INTERNAL ERROR: Checking types in non-world-state")
-  (insert-at *check-types-agenda* self
-             (new CHECK-TYPES-RECORD
-                  :parent-proposition *termUnderConstruction*
-                  :parent-description *descriptionUnderConstruction*
-                  :module *module*)) )
+  ;; we don't worry about duplicate records for the same proposition
+  ;; here, in general, if that happens the number should be smalle
+  ;; compared to the extra effort and storage required for a hash map:
+  (let ((length (length *check-types-agenda*)))
+    (when (or (= length 0)
+              ;; eliminate simple duplicates that come from multiple
+              ;; violations on the same proposition:
+              (not (eql? self (proposition (nth *check-types-agenda* (1- length))))))
+      (insert *check-types-agenda*
+              (new CHECK-TYPES-RECORD
+                   :proposition self
+                   :parent-proposition *termUnderConstruction*
+                   :parent-description *descriptionUnderConstruction*
+                   :module *module*))
+      (++ length))
+    (when (= (mod length 100000) 0) ;; queue of this size takes up about 3MB
+      (signal-proposition-warning "Queued " length " type violations, consider running `(process-definitions)'"))))
 
 (defun process-check-types-agenda ()
   ;; Called at the end of 'process-definitions'.
-  ;; TO DO: PUT BAD GUYS ON A LIST OF BADDIES, OR ASSERT THEM TO A BAD GUYS
-  ;;    CLASS.
+  ;; TO DO: PUT BAD GUYS ON A LIST OF BADDIES, OR ASSERT THEM TO A BAD GUYS CLASS.
   (when (or (empty? *check-types-agenda*)
             *inhibitObjectFinalization?*)
     (return))
@@ -4682,33 +4810,34 @@ but might pass once finalization is complete.")
           "INTERNAL ERROR: Called 'process-check-types-agenda' "
           "when not in a world state")
   (pl-log :medium "Processing check-types agenda...")
-  (let ((agenda (reverse *check-types-agenda*)))
+  (let ((agenda *check-types-agenda*)
+        (proposition PROPOSITION NULL))
     ;; Reset the agenda here to avoid infinite recursion (some type-checking
     ;;    involves proposition lookup which in turn accesses inference caches
     ;;    which in turn call `process-check-types-agenda'...):
-    (setq *check-types-agenda* (new KEY-VALUE-LIST))
-    (foreach (proposition record) in agenda
-        where (not (deleted? proposition))
-        do (special ((*typeCheckMode*
-                      (choose
-                       (and (descriptive? proposition)
-                            (not (eql? *type-check-policy*
-                                       :IGNORE-TYPE-VIOLATIONS)))
-                       :REPORT-TYPE-VIOLATIONS
-                       *type-check-policy*))
-                     (*termUnderConstruction* (parent-proposition record))
-                     (*descriptionUnderConstruction* (parent-description record)))
-             (when (or (deleted? proposition)
-                       (and (defined? *termUnderConstruction*)
-                            (deleted? *termUnderConstruction*))
-                       (and (defined? *descriptionUnderConstruction*)
-                            (deleted? *descriptionUnderConstruction*)))
-               (continue))
-             (exception-case
-                 (within-module (module record)
-                   (verify-argument-types-and-count proposition))
-               (LOGIC-EXCEPTION (e)
-                 (print-stream STANDARD-ERROR (exception-message e))))))))
+    (setq *check-types-agenda* (new VECTOR-SEQUENCE :array-size 4))
+    (foreach record in agenda
+        do (setq proposition (proposition record))
+           (when (not (deleted? proposition))
+             (special ((*typeCheckMode*
+                        (choose
+                         (and (descriptive? proposition)
+                              (not (eql? *type-check-policy*
+                                         :IGNORE-TYPE-VIOLATIONS)))
+                         :REPORT-TYPE-VIOLATIONS
+                         *type-check-policy*))
+                       (*termUnderConstruction* (parent-proposition record))
+                       (*descriptionUnderConstruction* (parent-description record)))
+               (when (or (and (defined? *termUnderConstruction*)
+                              (deleted? *termUnderConstruction*))
+                         (and (defined? *descriptionUnderConstruction*)
+                              (deleted? *descriptionUnderConstruction*)))
+                 (continue))
+               (exception-case
+                   (within-module (module record)
+                     (verify-argument-types-and-count proposition))
+                 (LOGIC-EXCEPTION (e)
+                   (print-stream STANDARD-ERROR (exception-message e)))))))))
 
 (defun process-definitions ()
   :public? TRUE :command? TRUE
@@ -4960,7 +5089,13 @@ the processing and validation."
       (setq proposition (normalize-VALUE-function proposition)))
     (verify-argument-types-and-count proposition)
     (when (isa? (operator proposition) @SURROGATE)
-      (fasten-down-one-proposition proposition TRUE))
+      (fasten-down-one-proposition proposition TRUE)
+      ;;; Tricky: now fasten down the arguments (which might be nested props)
+      ;;; AFTER we fastened down the new function term proposition, otherwise,
+      ;;; due to the logic in `help-fasten-down-propositions' that handles
+      ;;; defining propositions of skolem arguments, we would lose and not
+      ;;; get this new proposition fastened:
+      (help-fasten-down-propositions proposition FALSE))
     (return proposition) ))
 
 (defun (find-or-create-function-proposition PROPOSITION)
@@ -4993,9 +5128,18 @@ the processing and validation."
        ((predicate GENERALIZED-SYMBOL) (inputArguments CONS))
   ;; Return a newly-created function term that applies 'predicate' to
   ;;    'inputArguments'.
-  ;; Called by 'inherit-proposition'.
+  ;; Called by 'inherit-proposition' where we know we are creating a
+  ;; new proposition.  Nevertheless, we have to add it to the object
+  ;; index so future duplicates will be found.
   (let ((proposition
-         (begin-creating-function-proposition predicate inputArguments)))
+         (begin-creating-function-proposition predicate inputArguments))
+        (duplicate
+         (only-if (not (description-mode?))
+           ;; we don't expect to find a duplicate here, but this will insert
+           ;; `proposition' into the structured object index:
+           (find-duplicate-function-proposition proposition))))
+    (safety 1 (null? duplicate) "INTERNAL ERROR: encountered unexpected duplicate"
+            " function proposition: " duplicate)
     (return (finish-creating-function-proposition proposition)) ))
 
 ;;; Main entry to building a function term:
@@ -5080,7 +5224,8 @@ the processing and validation."
       ;; this is a good time to explicitly infer the type of the skolem:
       (typecase lastArgument
         (SKOLEM
-         (when (defined? (skolem-type lastArgument))
+         (when (and (defined? (skolem-type lastArgument))
+                    (not (eql? (skolem-type lastArgument) @THING)))
            (special ((*evaluationMode* :EXTENSIONAL-ASSERTION)
                      (*invisibleAssertion?* TRUE))
              (assert-isa-proposition lastArgument (skolem-type lastArgument)))))
@@ -5123,6 +5268,15 @@ the processing and validation."
                     (collectionOf-proposition? definingProposition)))))
     (otherwise (return FALSE))))
 
+(defun (function-output-skolem? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' is a SKOLEM representing the
+  ;;    output of a function.
+  :public? TRUE
+  (typecase self
+    (SKOLEM
+     (return (defined? (defining-proposition self))))
+    (otherwise (return FALSE))) )
+
 (defun (skolem-defined-by-operator? BOOLEAN) ((self OBJECT) (operator SURROGATE))
   ;; Return TRUE if `self' is a skolem defined by a proposition headed by `operator'
   :globally-inline? TRUE
@@ -5132,7 +5286,21 @@ the processing and validation."
        (return (and (defined? definingProposition)
                     (eql? (operator definingProposition) operator)))))
     (otherwise (return FALSE))))
-    
+
+(defun (get-skolem-and-value-terms SKOLEM OBJECT) ((proposition PROPOSITION))
+  ;; Returns the SKOLEM and VALUE terms from `proposition', which should
+  ;; be an equivalence proposition.  If this equivalence doesn't have a
+  ;; function-output-skolem in one of the positions, NULL, NULL is returned.
+  :public? TRUE
+  (safety 3 (eql? (kind proposition) :EQUIVALENT))
+  (let ((term1 (nth (arguments proposition) 0))
+	(term2 (nth (arguments proposition) 1)))
+    (cond ((function-output-skolem? term1)
+	   (return term1 term2))
+	  ((function-output-skolem? term2)
+	   (return term2 term1))
+	  (otherwise
+           (return null null)))) )
 
 (defun (enumerated-set? BOOLEAN) ((self OBJECT))
   ;; Return TRUE if 'self' is a skolem representing an enumerated set.
@@ -5159,17 +5327,6 @@ the processing and validation."
   ;;
 ;;;;;; Updating propositions
   ;;
-
-(defun erase-proposition ((proposition PROPOSITION))
-  ;; Called by 'help-update-top-level-proposition'
-  ;; Delete all backpointers pointers to 'proposition' and mark
-  ;;    it :DELETED.
-  (foreach arg in (arguments proposition)
-           where (defined? arg)
-           do (remove-dependent-proposition-link arg proposition))
-  (free (arguments proposition))
-  (setf (arguments proposition) NULL)
-  (setf (deleted? proposition) TRUE) )
 
 (defun (update-equivalence-proposition PROPOSITION)
        ((proposition PROPOSITION) (updateMode KEYWORD))
@@ -5238,7 +5395,7 @@ the processing and validation."
       (recursively-fasten-down-propositions
        (inherit-proposition (first (arguments existsProposition)) mapping)
        FALSE))
-    (erase-proposition existsProposition)
+    (destroy-redundant-proposition existsProposition)
     (return skolemizedProposition)))
 
 (defun (help-update-top-level-proposition (CONS OF PROPOSITION))
@@ -5269,7 +5426,7 @@ the processing and validation."
             do (foreach p in (help-update-top-level-proposition arg updateMode)
 		   where (and (defined? p) (not (deleted? p)))
                    collect p into propositions))
-        (erase-proposition proposition)
+        (destroy-redundant-proposition proposition)
         (return propositions)))
      (:EQUIVALENT
       (setq proposition (update-equivalence-proposition proposition updateMode))
@@ -5283,7 +5440,7 @@ the processing and validation."
             :RETRACT-TRUE :RETRACT-FALSE)
            (update-proposition-truth-value
             argument (invert-update-mode updateMode))
-           (erase-proposition proposition)
+           (destroy-redundant-proposition proposition)
            ;; THIS IS PROBLEMATIC, SINCE WE ARE RETURNING THE WRONG
            ;;    PROPOSITION.  CONSIDER ADDING A PARAMETER THAT ASKS
            ;;    FOR A LIST BACK, AND OVERRIDES :NOT ELIMINATION:
@@ -5441,7 +5598,7 @@ newly-conceived) term representing the internalized representation of that term.
     (SYMBOL
      (return (conceive-term tree)))
     (SURROGATE
-     (return (conceive-term (surrogate-to-symbol tree))))
+     (return (conceive-term (type-to-symbol tree))))
     (otherwise
      ;; PROBABLY COULD BE A BIT SMARTER HERE: -rmm
      (return (conceive-sentence tree)))) )
@@ -5658,6 +5815,13 @@ Also, destroy all satellite propositions of 'proposition'."
   (setf (slot-value proposition truth-value :context-sensitive? FALSE) NULL)
   (setf (dynamic-slots proposition) NULL)
   (return proposition) )
+
+(defun destroy-redundant-proposition ((proposition PROPOSITION))
+  ;; Called by 'help-update-top-level-proposition' and others to eliminate
+  ;; top-level ANDs, etc.
+  ;; Just like `destroy-proposition' but avoids inference cache deletion.
+  (setf (home-context proposition) NULL)
+  (destroy-proposition proposition))
 
 (defun destroy-logic-instance ((self OBJECT))
   ;; Helping function for 'destroy-term'.  Destroy all propositions
@@ -6039,18 +6203,24 @@ for lists, collections and propositions.  Numbers precede all other values,
   ;;       A PROPOSITION THAT HAS THE FUNCTION OUTPUT SKOLEM IN IT (AS IN
   ;;       SET DEFINITIONS, BUT THEN EITHER SOME ARGUMENT MUST BE DIFFERENT
   ;;       OR THE SKOLEM TERMS SHOULD BE THE SAME.  - tar 3-Jan-2006
+  ;; BUG FIX:  Infinite recursion bug broken by using name of skolems that
+  ;;       have no value and are not function output skolems. - tar 12-Jul-2006
   (when (isa? o1 @SKOLEM)
     (let ((value (variable-value (cast o1 @SKOLEM))))
-      (if (and (null? value)
-               (function-output-skolem? o1))
-          (setq o1 (defining-proposition (cast o1 @SKOLEM)))
-        (setq o1 value))))
+      (cond ((defined? value)
+             (setq o1 value))
+            ((function-output-skolem? o1)
+             (setq o1 (defining-proposition (cast o1 @SKOLEM))))
+            (otherwise
+             (setq o1 (skolem-name (cast o1 @SKOLEM)))))))
   (when (isa? o2 @SKOLEM)
     (let ((value (variable-value (cast o2 @SKOLEM))))
-      (if (and (null? value)
-               (function-output-skolem? o2))
-          (setq o2 (defining-proposition (cast o2 @SKOLEM)))
-        (setq o2 value))))
+      (cond ((defined? value)
+             (setq o2 value))
+            ((function-output-skolem? o2)
+             (setq o2 (defining-proposition (cast o2 @SKOLEM))))
+            (otherwise
+             (setq o2 (skolem-name (cast o2 @SKOLEM)))))))
 
   ;; Handle Nulls
   (when (null? o1)

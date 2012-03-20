@@ -20,7 +20,7 @@
 | UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          |
 | 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               |
 |                                                                            |
-| Portions created by the Initial Developer are Copyright (C) 1996-2006      |
+| Portions created by the Initial Developer are Copyright (C) 1996-2008      |
 | the Initial Developer. All Rights Reserved.                                |
 |                                                                            |
 | Contributor(s):                                                            |
@@ -39,7 +39,7 @@
 |                                                                            |
 +---------------------------- END LICENSE BLOCK ----------------------------*/
 
-// Version: cpp-primal.cc,v 1.64 2006/05/10 02:33:14 hans Exp
+// Version: cpp-primal.cc,v 1.66 2008/09/09 00:53:37 hans Exp
 
 // Native C++ support for STELLA
 
@@ -131,41 +131,7 @@ int truncate(double n) {
   return (int) n;
 }
 
-
 // `double exp(double x)' already available in math.h.
-
-
-int integerLength (int x) {
-  // Implements a search for the leftmost bit of "X"
-  //   using a binary search method.
-  int ilength = 0;
-  if (x < 0) {
-    x = -x;
-    ilength++;
-  }
-  if ((x ^ 0xFFFF0000L)  != 0) {
-     x >>= 16;
-     ilength += 16;
-  }
-  if ((x ^ 0xFF00)  != 0) {
-     x >>= 8;
-     ilength += 8;
-  }
-  if ((x ^ 0xF0)  != 0) {
-     x >>= 4;
-     ilength += 4;
-  }
-  if ((x ^ 0xC)  != 0) {
-     x >>= 2;
-     ilength += 2;
-  }
-  switch (x) {
-    case 0: return ilength;
-    case 1: return ilength + 1;
-    case 2:
-    case 3: return ilength + 2;
-  }
-}
 
 
   //
@@ -177,7 +143,7 @@ int integerLength (int x) {
  //
 
 char* makeString(int size, char initialElement) {
-  char* newstring = new (GC) char[size+1];
+  char* newstring = new (PointerFreeGC) char[size+1];
   for (int i = 0; i< size; i++) {
     newstring[i] = initialElement;
   }
@@ -186,7 +152,7 @@ char* makeString(int size, char initialElement) {
 }
 
 char* stringConcatenate(char* string1, char* string2) {
-  char* newstring = new (GC) char[strlen(string1) + strlen(string2) + 1];
+  char* newstring = new (PointerFreeGC) char[strlen(string1) + strlen(string2) + 1];
   strcpy(newstring, string1);
   strcat(newstring, string2);
   return newstring;
@@ -194,7 +160,7 @@ char* stringConcatenate(char* string1, char* string2) {
 
 char* stringUpcase(char* string) {
   // Return an upper-case copy of 'string'.
-  char* newstring = new (GC) char[strlen(string) + 1];
+  char* newstring = new (PointerFreeGC) char[strlen(string) + 1];
   strcpy(newstring, string);
   int offset = ('a' - 'A');
   for (char* p = newstring; *p != '\0'; p++)
@@ -205,7 +171,7 @@ char* stringUpcase(char* string) {
 
 char* stringDowncase(char* string) {
   // Return a lower-case copy of 'string'.
-  char* newstring = new (GC) char[strlen(string) + 1];
+  char* newstring = new (PointerFreeGC) char[strlen(string) + 1];
   strcpy(newstring, string);
   int offset = ('A' - 'a');
   for (char* p = newstring; *p != '\0'; p++)
@@ -234,7 +200,7 @@ char* stringCapitalize(char* string) {
 }
 
 char* stringCopy(char* string) {
-  char* newstring = new (GC) char[strlen(string) + 1];
+  char* newstring = new (PointerFreeGC) char[strlen(string) + 1];
   strcpy(newstring, string);
   return newstring;
 }
@@ -252,7 +218,7 @@ char* stringRemove(char* string, char character) {
   if (matches == 0) {
       return string;
   } else {
-      char* newstring = new (GC) char[end-matches];
+      char* newstring = new (PointerFreeGC) char[end-matches];
       int j = 0;
       for(i = 0; i < end; i++) {
 	  if (string[i] != character) {
@@ -352,7 +318,7 @@ char* stringSubsequence(char* string, int start, int end) {
   int i, j;
   if (end == NULL_INTEGER) 
     end = strlen(string);
-  char* newstring = new (GC) char[end-start + 1];
+  char* newstring = new (PointerFreeGC) char[end-start + 1];
   for(i = 0, j = start; j < end; i++, j++)
     newstring[i] = string[j];
   newstring[i] = '\0';
@@ -378,7 +344,7 @@ char* ostringstream_to_c_string(std::ostringstream* stream) {
   // we could avoid that by copying from the std::string character by
   // character, the question is whether that's too slow or not.
   std::string result = stream->str();
-  return strcpy(new (GC) char[result.length() + 1], result.c_str());
+  return strcpy(new (PointerFreeGC) char[result.length() + 1], result.c_str());
 }
 
 char* stringify(Object* expression) {
@@ -389,19 +355,19 @@ char* stringify(Object* expression) {
   return(ostringstream_to_c_string(&s));
 }
 
-char* integerToString(int i) {
+char* integerToString(long long int i) {
   std::ostringstream s;
   s << i;
   return(ostringstream_to_c_string(&s));
 }
 
-char* integerToHexString(int i) {
+char* integerToHexString(long long int i) {
   std::ostringstream s;
   s << std::hex << i;
   return(ostringstream_to_c_string(&s));
 }
 
-char* integerToStringInBase(int i, int base) {
+char* integerToStringInBase(long long int i, int base) {
   // BUG:  Only supports base 8, 10, 16:
   // SHOULD ADD IN THE GENERAL CODE FROM THE LISP VERSION
   // AND USE IT IF base IS NOT 8, 10 OR 16.
@@ -425,10 +391,10 @@ char* formatFloat (double v, int n) {
   return(ostringstream_to_c_string(&s));
 }
 
-int stringToInteger(char* string) {
-  // TO DO: Consider using std::atoi(string)  instead.
+long long int stringToInteger(char* string) {
+  // TO DO: Consider using std::atoll(string) or strtoll instead.!!!
   std::istringstream s(string);
-  int result;
+  long long int result;
   s >> result;
   return result;
 }
@@ -479,7 +445,7 @@ char* native_read_line(std::istream* stream) {
 
   std::string line;
   std::getline(*stream, line);
-  char* result = new (GC) char[line.length() + 1];
+  char* result = new (PointerFreeGC) char[line.length() + 1];
   strcpy(result, line.c_str());
   return result;
 }
@@ -526,7 +492,7 @@ CalendarDate* fileWriteDate(char* filename) {
   return (NULL);
 }
 
-int fileLength(char* filename) {
+long long int fileLength(char* filename) {
   // NOTE: Using 'int' to store sizes might not be sufficient!!
   if (!probeFileP(filename)) {
    //// WE SHOULD THROW AN EXCEPTION HERE!!
