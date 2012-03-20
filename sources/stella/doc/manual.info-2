@@ -1,0 +1,1082 @@
+This is manual.info, produced by makeinfo version 4.2 from manual.texi.
+
+   This file documents the STELLA programming language.
+
+   Copyright (C) 2003 University of Southern California, Information
+Sciences Institute 4676 Admiralty Way Marina Del Rey, CA 90292
+
+   Permission is granted to make and distribute verbatim copies of this
+manual provided the copyright notice and this permission notice are
+preserved on all copies.
+
+
+File: manual.info,  Node: Incrementally Developing STELLA Code,  Next: Performance Hints,  Prev: Hello World in STELLA,  Up: Programming in STELLA
+
+Incrementally Developing STELLA Code
+====================================
+
+   The preferred method of STELLA code development is to use a
+Lisp-based version of STELLA for all the prototyping and testing, since
+that allows you to exploit most (or all) of the rapid-prototyping
+advantages of Lisp.  Once a system has reached a certain point of
+stability, it can be translated into C++ or Java for delivery or to
+interface it with other C++ or Java code.
+
+   In the following, we assume an X/Emacs-based Lisp development
+environment such as the Allegro CL Emacs interface, where Lisp is run in
+an Emacs subprocess, and Lisp source can be compiled and evaluated
+directly from the source buffers.  By "Lisp buffer" we mean the listener
+buffer in which Lisp is actually running, and by "source buffer" we mean
+a buffer that is used to edit a file that contains STELLA source.
+
+   Included in the distribution is the Hello World system comprised of
+the files
+
+     sources/systems/hello-world-system.ste
+     sources/hello-world/file-a.ste
+     sources/hello-world/file-b.ste
+
+   To get started, simply add your code to either `file-a.ste' or
+`file-b.ste', since all the necessary definitions and directories for
+these files are already set up properly.  See section ??? on how to
+setup your own system.
+
+   Make sure the Hello World system is loaded into Lisp by doing the
+following:
+
+     (make-system "hello-world" :common-lisp)
+
+   This will make sure that the system definition is loaded and the
+necessary module definition is evaluated.
+
+   Now suppose you add the following function to `file-a.ste':
+
+     (defun (factorial INTEGER) ((n INTEGER))
+       (if (eql? n 0)
+           (return 1)
+         (return (* n (factorial (1- n))))))
+
+   There are various options for translating and evaluating this
+definition.  For example, you can simply remake the complete system
+similar to what you would do for a C++ or Java program:
+
+     (make-system "hello-world" :common-lisp)
+
+   This will retranslate the modified files, recompile them and reload
+them into your Lisp image.
+
+   Instead of retranslating and recompiling everything, you can
+incrementally evaluate the definition of `factorial' from your
+Emacs-to-Lisp interface.  Simply put your cursor somewhere inside the
+definition in the source buffer and evaluate it by typing `M-C-x'.
+This translates the STELLA code into Lisp and compiles (or evaluates)
+the resulting Lisp code.  Now you can actually try it out in the Lisp
+buffer, for example:
+
+     STELLA(4): (factorial 6)
+     720
+
+   Finally, instead of evaluating the definition in the source buffer,
+you can also enter it directly at the Lisp prompt with the same effect.
+
+   The way this works is that the Lisp symbol `stella::defun' is
+actually bound to a Lisp macro that calls all the necessary translation
+machinery to convert the STELLA `defun' into Lisp code.  Look at the
+file `sources/stella/cl-lib/stella-to-cl.ste' for the complete set of
+such macros.  This might be a bit confusing, since there are now three
+different bindings (or meanings) of `defun':
+
+  1. The STELLA operator `defun' used to define STELLA functions.
+
+  2. The Lisp macro `stella::defun' that resides in the `STELLA' Lisp
+     package and is only available for convenience in Lisp versions of
+     STELLA.
+
+  3. The Lisp macro `CL:defun' which is the standard Common Lisp macro
+     used to define Lisp functions.
+
+   We'll try to explicitly qualify which meaning is used wherever there
+might be some doubt which one is meant.  In general, every unqualified
+symbol mentioned below is either part of the STELLA language or resides
+in the STELLA Lisp package.
+
+   Since a newly-written STELLA function might have errors, it is
+prudent to first only translate it without actually executing the
+result of the translation.  In the source buffer you can do that by
+macro-expanding the `defun'.  For example, if you use the Allegro CL
+interface you would position the cursor on the opening parenthesis of
+the `defun' and then type `M-M'.  Any errors discovered by the STELLA
+translator are reported in the Lisp buffer window.  The expansion will
+be a `CL:progn' that contains the translated definition as the first
+element plus various startup-time (initialization) code following it.
+
+   In the Lisp buffer you can achieve a similar effect with the
+`lptrans' macro.  For example, executing
+
+     (lptrans
+      (defun (factorial INTEGER) ((n INTEGER))
+        (if (eql? n 0)
+            (return 1)
+          (return (* n (factorial (1- n)))))))
+
+   in the Lisp buffer first Lisp-translates the definition, and then
+prints the translation.  To see the C++ translation you can use
+`cpptrans', calling `jptrans' will generate the Java translation.
+
+   You can also use `lptrans'/`cpptrans'/`jptrans' to translate code
+fragments that are not top-level definitions such as `defun' and its
+friends.  For example:
+
+     STELLA(8): (lptrans
+                 (foreach element in (list 1 2 3)
+                     do (print element EOL)))
+     
+     (CL:LET* ((ELEMENT NULL)
+               (ITER-003
+                (%THE-CONS-LIST (LIST (WRAP-INTEGER 1) (WRAP-INTEGER 2)
+                                      (WRAP-INTEGER 3)))))
+       (CL:LOOP WHILE (CL:NOT (CL:EQ ITER-003 NIL)) DO
+                (CL:PROGN (SETQ ELEMENT (%%VALUE ITER-003))
+                          (SETQ ITER-003 (%%REST ITER-003)))
+                (%%PRINT-STREAM (%NATIVE-STREAM STANDARD-OUTPUT)
+                                ELEMENT EOL)))
+     ()
+     STELLA(9): (cpptrans
+                 (foreach element in (list 1 2 3)
+                     do (print element EOL)))
+     { Object* element = NULL;
+       Cons* iter004 = list(3, wrapInteger(1), wrapInteger(2),
+                               wrapInteger(3))-> theConsList;
+     
+       while (!(iter004 == NIL)) {
+         element = iter004->value;
+         iter004 = iter004->rest;
+         cout << element << endl;
+       }
+     }
+     :VOID
+     STELLA(10): (jptrans
+                  (foreach element in (list 1 2 3)
+                      do (print element EOL)))
+     { Stella_Object element = null;
+       Cons iter005 = Stella.list
+                       (Stella_Object.cons
+                         (Stella.wrapInteger(1),
+                          Stella_Object.cons
+                           (Stella.wrapInteger(2),
+                            Stella_Object.cons
+                             (Stella.wrapInteger(3),
+                              Stella.NIL)))).theConsList;
+     
+       while (!(iter005 == Stella.NIL)) {
+         {
+           element = iter005.value;
+           iter005 = iter005.rest;
+         }
+         java.lang.System.out.println(element);
+       }
+     }
+     :VOID
+
+   The use of `lptrans' is really necessary here, since there is no
+Lisp macro `foreach' that knows how to translate STELLA `foreach' loops
+(those Lisp macros only exist for top-level definition commands such as
+`defun').  In order to translate such code fragments without error
+messages, they need to be self-contained, i.e., all referenced
+variables have to be either bound by a surrounding `let', or they must
+be globally defined variables.  Otherwise, the STELLA translator will
+generate various "undefined variable" error messages.
+
+   You can use the STELLA Lisp macro `eval' (i.e., `stella::eval' not
+`CL:eval') to actually execute such a code fragment.  For example:
+
+     STELLA(11): (eval
+                  (foreach element in (list 1 2 3)
+                      do (print element EOL)))
+     |L|1
+     |L|2
+     |L|3
+     ()
+
+   This translates the loop and executes the result, which prints the
+wrapped numbers (hence, the `|L|' prefix) to standard output.  The `()'
+at the end is the resulting Lisp value returned by the loop (in Lisp
+everything returns a value, even though for STELLA `foreach' is a
+statement, not an expression).
+
+   Make it a habit to wrap `eval' around any STELLA code you
+incrementally evaluate in the Lips buffer.  This makes sure that all the
+arguments to a function, etc., are translated into the appropriate
+STELLA objects.  For example, evaluating
+
+     (eval (list :a :b :c))
+
+   in the Lisp buffer generates a STELLA list that points to the STELLA
+keywords `:a', `:b' and `:c'.  If you don't use `eval', for example,
+
+     (list :a :b :c)
+
+   a STELLA list containing the Lisp keywords `:a', `:b' and `:c' will
+be created.  Lisp keywords are a completely different data structure
+than STELLA keywords, and any STELLA code expecting a STELLA keyword but
+finding a Lisp keyword will break, since Lisp keywords are not a legal
+STELLA data structure.  Unfortunately, such cases can be very confusing,
+since Lisp and STELLA keywords look/print exactly alike.
+
+   `eval' is also necessary to access STELLA symbols and surrogates in
+the Lisp buffer.  For example, to access a STELLA symbol, you can use
+`quote' (again, this is the STELLA `quote' not `CL:quote'):
+
+     (eval (quote foo))
+
+   This returns the STELLA symbol `foo'.  We explicitly used `quote'
+here, since code typed at the Lisp prompt is first passed through the
+Lisp reader before the STELLA translator sees it, and the default Lisp
+reader interprets the `'' character differently than the STELLA reader.
+Within a STELLA file you can use the syntax `'foo', since it will be
+read directly by the STELLA reader that knows how to interpret it
+correctly.
+
+   `lptrans', `cpptrans' and `jptrans' are evaluable STELLA commands
+that can also be evaluated by the C++ and Java version of STELLA.  For
+example, to generate a Java translation of a little STELLA code
+fragment you could run the `stella' script in the STELLA directory like
+this (the output below has been additionally indented by hand for
+clarity):
+
+     % ./stella -e '(jptrans\
+                      (foreach element in (list 1 2 3)\
+                         do (print element EOL)))'
+     Welcome to STELLA 3.3.0
+     { Stella_Object element = null;
+       Cons iter001 = Stella.list
+                       (Stella_Object.cons
+                         (Stella.wrapInteger(1),
+                          Stella_Object.cons
+                           (Stella.wrapInteger(2),
+                            Stella_Object.cons
+                             (Stella.wrapInteger(3),
+                              Stella.NIL)))).theConsList;
+     
+       while (!(iter001 == Stella.NIL)) {
+         {
+           element = iter001.value;
+           iter001 = iter001.rest;
+         }
+         java.lang.System.out.println(element);
+       }
+     }
+
+
+File: manual.info,  Node: Performance Hints,  Prev: Incrementally Developing STELLA Code,  Up: Programming in STELLA
+
+Performance Hints
+=================
+
+   Here are a few things to watch out for once you get serious about the
+performance of your translated STELLA programs:
+
+   *Safety checks:* The STELLA variable `*safety*' controls whether
+certain safety code is added to your translated STELLA program.  For
+Lisp translations it also controls whether `cast''s will be translated
+into run-time type checks or not.  There is no run-time type checking
+performed in C++.  In Java native casts will always perform runtime
+type tests.  The default `*safety*' level is 3 which enables the
+translation of all `safety' clauses with level 3 or lower.  A safety
+level of 1 or lower disables the generation of calls to the `cast'
+function in Lisp.  `cast' performs run-time type checks which are
+somewhat expensive.  However, you should not disable run-time type
+checking in Lisp until you have fully debugged your program.  Once you
+are confident that your program works correctly, you can set `*safety*'
+to 0 before you translate it.  That way you will avoid the generation
+and execution of any safety code at all.  All of the core STELLA system
+was translated with `*safety*' set to 1.
+
+   *Quoted cons trees:* Access to quoted constants that are not symbols
+is somewhat slow, since it currently uses hashing to find them in a
+table.  Hence, access to quoted constants such as `(quote (foo bar
+fum))' should be avoided in inner loops.  Access to quoted symbols such
+as `(quote foo)' is fast and does not cause any performance problems.
+The use of `quote' for constant cons trees is rare in STELLA (and
+somewhat deprecated), which is the reason why this mechanism is not all
+that well supported.  Future versions of STELLA might re-implement the
+handling of constants and alleviate this performance problem.
+
+   *Equality tests:* The standard equality test in STELLA is `eql?',
+which the translator will translate into the most efficient equality
+test for the particular types of operands (`eql?' is somewhat similar
+to the Lisp function `CL:eql' with the exception of comparing strings).
+If the translator can determine that at least one of the operands is a
+subtype of `STANDARD-OBJECT', it will translate the test into a fast
+pointer comparison with the Lisp function `CL:eq' or the C++/Java `=='
+operator.  However, if both operands are of type `OBJECT', they might
+be wrapped literals such as wrapped integers or strings.  In that case
+the equality test translates into a call to the function `eql?' which
+in turn uses method calls to handle comparison of different types of
+wrapped literals (two wrapped literals are equal if their wrapped
+content is equal).  This is of course a lot less efficient than a
+simple pointer comparison.  It also means that if you can restrict the
+type of a variable that will be tested with `eql?' to
+`STANDARD-OBJECT', you probably should do so for performance reasons.
+
+   *Type tests:* Run-time type tests as used implicitly within a
+`typecase' or explicitly with functions such as `cons?' have to use a
+call to the method `primary-type'.  Hence, in performance-critical
+portions of your code you should try to keep the number of such tests
+as small as possible.
+
+   *Wrapping and unwrapping literals:* The STELLA translator
+automatically wraps (or objectifies) literals such as numbers or strings
+when they are stored in a variable or slot of type `OBJECT'.
+Similarly, it unwraps wrapped literals automatically to operate on the
+literal directly.  This is very convenient, since it relieves the
+programmer from having to perform these conversions by hand and makes
+the code less cluttered.  For example, consider the following code
+fragment:
+
+     (let ((l (cons "foo" nil))
+           (x (concatenate "bar" (first l))))
+       (print x EOL)))
+   Here is its C++ translation:
+     { Cons* l = cons(stringWrapLiteral("foo"), NIL);
+       char* x = stringConcatenate
+                  ("bar", ((StringWrapper*) (l->first()))->wrapperValue, 0);
+     
+       cout << x << endl;
+     }
+
+   Notice how the string literal `"foo"' is first wrapped so it can be
+inserted into the `CONS' list `l' and then automatically unwrapped in
+the call to `concatenate'.  While this is very convenient, it does
+cause a certain overhead that should be avoided in performance critical
+loops, etc.  In such situations, it often helps to use auxiliary
+variables of the appropriate literal type to avoid unnecessary
+wrap/unwrap operations.
+
+   *Lisp-style property lists:* Lisp programs often use property lists
+for fast retrieval of information that is linked to symbols.  To
+support the easy translation of existing Lisp programs that use this
+paradigm into STELLA, a similar mechanism implemented by the functions
+`symbol-value', `symbol-plist', and `symbol-property' is available that
+preserves the performance benefits of this storage scheme (see the file
+`sources/stella/symbols.ste').  However, property lists do not fit the
+object-oriented programming paradigm supported by STELLA, and, hence,
+are frowned upon.
+
+   *Compiler optimization:* The optimization settings used with the
+native Lisp or C++ compiler can greatly influence performance results.
+In particular, using high optimization settings with the Lisp compiler
+can greatly improve slot access time on STELLA objects.
+
+* Menu:
+
+* Lisp Performance Hints::
+
+
+File: manual.info,  Node: Lisp Performance Hints,  Prev: Performance Hints,  Up: Performance Hints
+
+Lisp Performance Hints
+----------------------
+
+   The standard Lisp implementation for STELLA objects are CLOS objects,
+since CLOS provides the most natural Lisp implementation for the STELLA
+object system.  However, there is a price to pay, since in Lisp slot
+access on CLOS objects is a lot slower than slot access on structs.  For
+example, in Allegro CL 4.3, the access to the `value' slot of a STELLA
+CONS cell takes about 4 times longer on a CLOS object implementation of
+`CONS' than on a struct implementation.  Unfortunately, the struct
+implementation itself takes about 3 times longer than calling `CL:car'
+on a Lisp cons, which is why we are actually using Lisp conses as the
+Lisp implementation for STELLA `CONS'es.  Note, that in the C++ and
+Java translation these slot-access performance problems are nonexistent.
+
+   In order to get the maximum performance out of the Lisp version of
+STELLA, you can tell the translator to use structs as the implementation
+for STELLA objects.  It does so by using `CL:defstruct' instead of
+`CL:defclass' and dispatches methods directly on the structure object.
+
+   To use the struct translation scheme evaluate
+
+     (set-stella-feature :use-common-lisp-structs)
+
+   before you translate a STELLA system.  This will generate translated
+files with a `.slisp' extension.  Make sure that after you translated
+all the files you are interested in, you disable the above feature with
+
+     (unset-stella-feature :use-common-lisp-structs)
+
+   Otherwise, subsequent incremental translations in that Lisp image
+might fail, since different translation schemes cannot be mixed.  If you
+already are using the struct version of STELLA, all systems will be
+translated in struct mode by default.
+
+   To use the struct translation of your system you have to use the
+struct version of STELLA.  To do so do the following:
+
+     (CL:setq cl-user::*load-cl-struct-stella?* CL:t)
+     (CL:load "load-stella.lisp")
+
+   Alternatively, you can edit the initial value of the variable
+`*load-cl-struct-stella?*' in the file `load-stella.lisp' (see also
+*Note Lisp Installation::).
+
+   The reasons why the struct translation scheme is not enabled by
+default are the following:
+
+   * Incremental redefinition of STELLA classes does not redefine any
+     objects created with the old definition, and, hence, slot
+     accessors might simply break or retrieve the value of a different
+     slot when applied to such an old object.  The programmer therefore
+     has to be very careful when redefining a STELLA class while in
+     struct mode.  This means, that you should view the usage of the
+     struct-translation scheme for Lisp as a kind of delivery option,
+     similar to translating into C++.  Part of the reason why slot
+     access on CLOS object is expensive is the indirection machinery
+     that allows redefinition of classes and their associated instances.
+     This is great for code development, but the flexibility and
+     expense is usually not needed or warranted for delivered code.
+
+   * The performance trade-offs between CLOS and struct versions might
+     be different in different versions of Lisp.  For example, in older
+     version of Allegro CL slot access on structs was fast, but method
+     dispatch was significantly slower than for CLOS objects which
+     eliminated some/all of the performance gains.
+
+
+File: manual.info,  Node: Library Classes,  Next: Library Functions,  Prev: Programming in STELLA,  Up: Top
+
+Library Classes (tbw)
+*********************
+
+   To be written.
+
+
+File: manual.info,  Node: Library Functions,  Next: Function Index,  Prev: Library Classes,  Up: Top
+
+Library Functions
+*****************
+
+* Menu:
+
+* Basic Constants and Predicates::
+* Numbers::
+* Characters::
+* Strings::
+* CONS Lists and Trees::
+* Lists::
+* Property and Key-Value Lists::
+* Vectors::
+* Hash Tables::
+* Key Value Maps::
+* Hash Sets::
+* Iterators::
+* Symbols::
+* Contexts and Modules::
+* Input and Output::
+* Files::
+* Dates and Times::
+* XML Support::
+* Miscellaneous::
+
+
+File: manual.info,  Node: Basic Constants and Predicates,  Next: Numbers,  Prev: Library Functions,  Up: Library Functions
+
+Basic Constants and Predicates
+==============================
+
+ - Constant: true : BOOLEAN
+     Represents the boolean true truth value.
+
+ - Constant: false : BOOLEAN
+     Represents the boolean false truth value.
+
+ - Method: null? ((x OBJECT)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x SECOND-CLASS-OBJECT)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x NATIVE-VECTOR)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x STRING)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x MUTABLE-STRING)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x CHARACTER)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x CODE)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x INTEGER)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: null? ((x FLOAT)) : BOOLEAN
+     Return true if X is undefined (handled specially by all
+     translators).
+
+ - Method: defined? ((x OBJECT)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x SECOND-CLASS-OBJECT)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x NATIVE-VECTOR)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x STRING)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x MUTABLE-STRING)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x CHARACTER)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x CODE)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x INTEGER)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Method: defined? ((x FLOAT)) : BOOLEAN
+     Return true if X is defined (handled specially by all translators).
+
+ - Function: eq? ((x UNKNOWN) (y UNKNOWN)) : BOOLEAN
+     Return true if X and Y are literally the same object (or simple
+     number).  Analogue to the Common Lisp EQL and C++ and Java's ==.
+
+ - Function: eql? ((x OBJECT) (y OBJECT)) : BOOLEAN
+     Return true if X and Y are `eq?' or equivalent literals such as
+     strings that also might be wrapped in non-identical wrappers.  For
+     the case where X or Y are plain literals such as strings or
+     integers, the STELLA translator substitutes the equality test
+     appropriate for the particular target language and does not
+     actually call this function.  For cases where X or Y are known to
+     be of type STANDARD-OBJECT, the STELLA translator substitutes the
+     faster `eq?' test inline.
+
+ - Function: equal? ((x OBJECT) (y OBJECT)) : BOOLEAN
+     Return true if X and Y are `eql?' or considered equal by a
+     user-defined `object-equal?' method.  This implements a fully
+     extensible equality test similar to Java's `equals' method.  Note
+     that writers of custom `object-equal?' methods must also implement
+     a corresponding `equal-hash-code' method.
+
+ - Method: object-equal? ((x OBJECT) (y OBJECT)) : BOOLEAN
+     Return true if X and Y are `eq?'.
+
+ - Method: object-equal? ((x WRAPPER) (y OBJECT)) : BOOLEAN
+     Return true if X and Y are literal wrappers whose literals are
+     considered `eql?'.
+
+ - Function: object-hash-code ((self OBJECT)) : INTEGER
+     Return a hash code for SELF (can be negative).  Two objects that
+     are `eq?' are guaranteed to generate the same hash code.  Two
+     objects that are not `eq?' do not necessarily generate different
+     hash codes.  Similar to `hash-code' but always hashes on the
+     address of SELF even if it is a wrapper.
+
+ - Method: hash-code ((self OBJECT)) : INTEGER
+     Return a hash code for SELF (can be negative).  Two objects that
+     are `eql?' are guaranteed to generate the same hash code.  Two
+     objects that are not `eql?' do not necessarily generate different
+     hash codes.
+
+ - Method: hash-code ((self STANDARD-OBJECT)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self STRING-WRAPPER)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self INTEGER-WRAPPER)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self FLOAT-WRAPPER)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self CHARACTER-WRAPPER)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self BOOLEAN-WRAPPER)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self STRING)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self INTEGER)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self FLOAT)) : INTEGER
+     Not documented.
+
+ - Method: hash-code ((self CHARACTER)) : INTEGER
+     Not documented.
+
+ - Method: equal-hash-code ((self OBJECT)) : INTEGER
+     Return a hash code for SELF (can be negative).  Two objects that
+     are `equal?' are guaranteed to generate the same hash code
+     (provided, that writers of `object-equal?' methods also
+     implemented the appropriate `equal-hash-code' method).  Two
+     objects that are not `equal?'do not necessarily generate different
+     hash codes.
+
+
+File: manual.info,  Node: Numbers,  Next: Characters,  Prev: Basic Constants and Predicates,  Up: Library Functions
+
+Numbers
+=======
+
+ - Constant: pi : FLOAT
+     A float approximation of the mathematical constant pi.
+
+ - Function: + (&rest (arguments NUMBER)) : NUMBER
+     Return the sum of all ARGUMENTS.
+
+ - Function: - ((x NUMBER) &rest (arguments NUMBER)) : NUMBER
+     If only X was supplied return the result of 0 - X.  Otherwise,
+     return the result of (...((X - arg1) - arg2) - ... - argN).
+
+ - Function: * (&rest (arguments NUMBER)) : NUMBER
+     Return the product of all ARGUMENTS.
+
+ - Function: / ((x NUMBER) &rest (arguments NUMBER)) : NUMBER
+     If only X was supplied return the result of 1 / X.  Otherwise,
+     return the result of (...((X / arg1) / arg2 ) / ... / argN).
+
+ - Macro: 1+ ((expression OBJECT)) : OBJECT
+     Add 1 to EXPRESSION and return the result.
+
+ - Macro: 1- ((expression OBJECT)) : OBJECT
+     Subtract 1 from EXPRESSION and return the result.
+
+ - Macro: ++ ((place OBJECT) &body (increment CONS)) : OBJECT
+     Increment the value of PLACE and return the result.  PLACE can be
+     either a variable name or a slot reference.  Increment by the
+     optional INCREMENT (which can be a float) or 1 otherwise.
+
+ - Macro: - ((place OBJECT) &body (decrement CONS)) : OBJECT
+     Decrement the value of PLACE and return the result.  PLACE can be
+     either a variable name or a slot reference.  Decrement by the
+     optional DECREMENT (which can be a float) or 1 otherwise.
+
+ - Function: = ((x NUMBER) (y NUMBER)) : BOOLEAN
+     Return true if X and Y are numbers of exactly the same magnitude.
+
+ - Function: < ((x NUMBER) (y NUMBER)) : BOOLEAN
+     Return true if X is less than Y.
+
+ - Function: <= ((x NUMBER) (y NUMBER)) : BOOLEAN
+     Return true if X is less than or equal to Y.
+
+ - Function: >= ((x NUMBER) (y NUMBER)) : BOOLEAN
+     Return true if X is greater than or equal to Y.
+
+ - Function: > ((x NUMBER) (y NUMBER)) : BOOLEAN
+     Return true if X is greater than Y.
+
+ - Function: zero? ((x INTEGER)) : BOOLEAN
+     Return true if X is 0.
+
+ - Function: plus? ((x INTEGER)) : BOOLEAN
+     Return true if X is greater than 0.
+
+ - Function: even? ((x INTEGER)) : BOOLEAN
+     Return true if X is an even number.
+
+ - Function: odd? ((x INTEGER)) : BOOLEAN
+     Return true if X is an odd number.
+
+ - Function: mod ((x INTEGER) (modulus INTEGER)) : INTEGER
+     True modulus.  Return the result of X mod `modulo'.  Note: In C++
+     and Java, `mod' has more overhead than the similar function `rem'.
+     The  answers returned by `mod' and `rem' are only different when
+     the signs of X and `modulo' are different.
+
+ - Function: ceiling ((n NUMBER)) : INTEGER
+     Return the smallest integer >= N.
+
+ - Function: floor ((n NUMBER)) : INTEGER
+     Return the biggest integer <= N.
+
+ - Function: round ((n NUMBER)) : INTEGER
+     Round N to the closest integer and return the result.
+
+ - Method: abs ((x INTEGER)) : INTEGER
+     Return the absolute value of X.
+
+ - Method: abs ((x FLOAT)) : FLOAT
+     Return the absolute value of X.
+
+ - Function: min ((x INTEGER) (y INTEGER)) : INTEGER
+     Return the minimum of X and Y.  If either is NULL, return the
+     other.
+
+ - Function: max ((x INTEGER) (y INTEGER)) : INTEGER
+     Return the maximum of X and Y.  If either is NULL, return the
+     other.
+
+ - Function: sqrt ((n FLOAT)) : FLOAT
+     Return the square root of N.
+
+ - Function: exp ((n FLOAT)) : FLOAT
+     Return the e to the power N.
+
+ - Function: log ((n FLOAT)) : FLOAT
+     Return the natural logarithm (base e) of N.
+
+ - Function: sin ((n FLOAT)) : FLOAT
+     Return the sine of N radians.
+
+ - Function: cos ((n FLOAT)) : FLOAT
+     Return the cosine of N radians.
+
+ - Function: tan ((n FLOAT)) : FLOAT
+     Return the tangent of N radians.
+
+ - Function: random ((n INTEGER)) : INTEGER
+     Generate a random integer in the interval [0..n-1].  N must be <=
+     2^15.
+
+ - Function: integer-to-string ((i INTEGER)) : STRING
+     Print I to a string and return the result.  This is more efficient
+     than using a string stream.
+
+ - Function: string-to-integer ((string STRING)) : INTEGER
+     Convert a STRING representation of an integer into an integer.
+
+ - Function: float-to-string ((f FLOAT)) : STRING
+     Print F to a string and return the result.  This is more efficient
+     than using a string stream.
+
+ - Function: string-to-float ((string STRING)) : FLOAT
+     Convert a STRING representation of a float into a float.
+
+ - Function: format-float ((f FLOAT) (nDecimals INTEGER)) : STRING
+     Print F in fixed-point format with NDECIMALS behind the decimal
+     point and return the result as a string.
+
+ - Function: wrap-integer ((value INTEGER)) : INTEGER-WRAPPER
+     Return a literal object whose value is the INTEGER VALUE.
+
+ - Function: unwrap-integer ((wrapper INTEGER-WRAPPER)) : INTEGER
+     Unwrap WRAPPER and return the result.  Return NULL if WRAPPER is
+     NULL.
+
+ - Function: wrap-float ((value FLOAT)) : FLOAT-WRAPPER
+     Return a literal object whose value is the FLOAT VALUE.
+
+ - Function: unwrap-float ((wrapper FLOAT-WRAPPER)) : FLOAT
+     Unwrap WRAPPER and return the result.  Return NULL if WRAPPER is
+     NULL.
+
+
+File: manual.info,  Node: Characters,  Next: Strings,  Prev: Numbers,  Up: Library Functions
+
+Characters
+==========
+
+ - Function: character-code ((ch CHARACTER)) : INTEGER
+     Return the 8-bit ASCII code of CH as an integer.
+
+ - Function: code-character ((code INTEGER)) : CHARACTER
+     Return the character encoded by CODE (0 <= CODE <= 255).
+
+ - Function: digit-character? ((ch CHARACTER)) : BOOLEAN
+     Return TRUE if CH represents a digit.
+
+ - Function: letter-character? ((ch CHARACTER)) : BOOLEAN
+     Return TRUE if CH represents a letter.
+
+ - Function: upper-case-character? ((ch CHARACTER)) : BOOLEAN
+     Return TRUE if CH represents an upper-case character.
+
+ - Function: lower-case-character? ((ch CHARACTER)) : BOOLEAN
+     Return TRUE if CH represents a lower-case character.
+
+ - Function: white-space-character? ((ch CHARACTER)) : BOOLEAN
+     Return TRUE if CH is a white space character.
+
+ - Function: character-downcase ((ch CHARACTER)) : CHARACTER
+     If CH is lowercase, return its uppercase version, otherwise,
+     return CH unmodified.
+
+ - Function: character-upcase ((ch CHARACTER)) : CHARACTER
+     If CH is uppercase, return its lowercase version, otherwise,
+     return CH unmodified.  If only the first character of a sequence
+     of characters is to be capitalized, `character-capitalize' should
+     be used instead.
+
+ - Function: character-capitalize ((ch CHARACTER)) : CHARACTER
+     Return the capitalized character for CH.  This is generally the
+     same as the uppercase character, except for obscure non-English
+     characters in Java.  It should be used if only the first character
+     of a sequence of characters is to be capitalized.
+
+ - Function: character-to-string ((c CHARACTER)) : STRING
+     Convert C into a one-element string and return the result.
+
+ - Function: wrap-character ((value CHARACTER)) : CHARACTER-WRAPPER
+     Return a literal object whose value is the CHARACTER VALUE.
+
+ - Function: unwrap-character ((wrapper CHARACTER-WRAPPER)) : CHARACTER
+     Unwrap WRAPPER and return the result.  Return NULL if WRAPPER is
+     NULL.
+
+
+File: manual.info,  Node: Strings,  Next: CONS Lists and Trees,  Prev: Characters,  Up: Library Functions
+
+Strings
+=======
+
+ - Function: string-eql? ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X and Y are equal strings or are both undefined.
+     This test is substituted automatically by the STELLA translator if
+     `eql?' is applied to strings.
+
+ - Function: string-equal? ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X and Y are equal strings ignoring character case or
+     are both undefined.
+
+ - Method: empty? ((x STRING)) : BOOLEAN
+     Return true if X is the empty string ""
+
+ - Method: non-empty? ((x STRING)) : BOOLEAN
+     Return true if X is not the empty string ""
+
+ - Function: string-compare ((x STRING) (y STRING)
+          (case-sensitive? BOOLEAN)) : INTEGER
+     Compare X and Y lexicographically, and return -1, 0, or 1,
+     depending on whether X is less than, equal, or greater than Y.  If
+     CASE-SENSITIVE? is true, then case does matter for the comparison
+
+ - Function: string< ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically < Y, considering case.
+
+ - Function: string<= ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically <= Y, considering case.
+
+ - Function: string>= ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically >= Y, considering case.
+
+ - Function: string> ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically > Y, considering case.
+
+ - Function: string-less? ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically < Y, ignoring case.
+
+ - Function: string-less-equal? ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically <= Y, ignoring case.
+
+ - Function: string-greater-equal? ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically >= Y, ignoring case.
+
+ - Function: string-greater? ((x STRING) (y STRING)) : BOOLEAN
+     Return true if X is lexicographically > Y, ignoring case.
+
+ - Function: all-upper-case-string? ((s STRING)) : BOOLEAN
+     Return TRUE if all letters in S are upper case.
+
+ - Function: all-lower-case-string? ((s STRING)) : BOOLEAN
+     Return TRUE if all letters in S are lower case.
+
+ - Function: make-string ((size INTEGER) (initchar CHARACTER)) : STRING
+     Return a new string filled with SIZE INITCHARs.
+
+ - Function: make-mutable-string ((size INTEGER) (initchar CHARACTER))
+          : MUTABLE-STRING
+     Return a new mutable string filled with SIZE INITCHARs.
+
+ - Function: make-raw-mutable-string ((size INTEGER)) : MUTABLE-STRING
+     Return a new uninitialized mutable string of SIZE.
+
+ - Method: first ((self STRING)) : CHARACTER
+     Return the first character of SELF.
+
+ - Method: first ((self MUTABLE-STRING)) : CHARACTER
+     Return the first character of SELF (settable via `setf').
+
+ - Method: second ((self STRING)) : CHARACTER
+     Return the second character of SELF.
+
+ - Method: second ((self MUTABLE-STRING)) : CHARACTER
+     Return the second character of SELF (settable via `setf').
+
+ - Method: third ((self STRING)) : CHARACTER
+     Return the third character of SELF.
+
+ - Method: third ((self MUTABLE-STRING)) : CHARACTER
+     Return the third character of SELF (settable via `setf').
+
+ - Method: fourth ((self STRING)) : CHARACTER
+     Return the fourth character of SELF.
+
+ - Method: fourth ((self MUTABLE-STRING)) : CHARACTER
+     Return the fourth character of SELF (settable via `setf').
+
+ - Method: fifth ((self STRING)) : CHARACTER
+     Return the fifth character of SELF.
+
+ - Method: fifth ((self MUTABLE-STRING)) : CHARACTER
+     Return the fifth character of SELF (settable via `setf').
+
+ - Method: nth ((self STRING) (position INTEGER)) : CHARACTER
+     Return the character in SELF at POSITION.
+
+ - Method: nth ((self MUTABLE-STRING) (position INTEGER)) : CHARACTER
+     Return the character in SELF at POSITION.
+
+ - Method: rest ((self STRING)) : STRING
+     Not documented.
+
+ - Method: length ((self STRING)) : INTEGER
+     Return the length of the string SELF.
+
+ - Method: length ((self MUTABLE-STRING)) : INTEGER
+     Return the length of the string SELF.
+
+ - Method: member? ((self STRING) (char CHARACTER)) : BOOLEAN
+     Not documented.
+
+ - Method: position ((string STRING) (character CHARACTER)
+          (start INTEGER)) : INTEGER
+     Return the position of CHARACTER within STRING (counting from
+     zero); or return NULL if CHARACTER does not occur within STRING.
+     If START was supplied as non-NULL, only consider the substring
+     starting at START, however, the returned position will always be
+     relative to the entire string.
+
+ - Function: string-search ((string STRING) (substring STRING)
+          (start INTEGER)) : INTEGER
+     Return start position of the left-most occurrence of SUBSTRING in
+     STRING, beginning from START.  Return NULL if it is not a
+     substring.
+
+ - Method: copy ((string STRING)) : STRING
+     Return a copy of STRING.
+
+ - Function: string-upcase ((string STRING)) : STRING
+     Return an upper-case copy of STRING.
+
+ - Function: string-downcase ((string STRING)) : STRING
+     Return a lower-case copy of STRING.
+
+ - Function: string-capitalize ((string STRING)) : STRING
+     Return a capitalized version of STRING.
+
+ - Method: concatenate ((string1 STRING) (string2 STRING)
+          &rest (otherStrings STRING)) : STRING
+     Return a new string representing the concatenation of STRING1,
+     STRING2, and OTHERSTRINGS.  The two mandatory parameters allow us
+     to optimize the common binary case by not relying on the somewhat
+     less efficient variable arguments mechanism.
+
+ - Method: subsequence ((string STRING) (start INTEGER) (end INTEGER))
+          : STRING
+     Return a substring of STRING beginning at position START and
+     ending up to but not including position END, counting from zero.
+     An END value of NULL stands for the rest of the string.
+
+ - Method: remove ((string STRING) (char CHARACTER)) : STRING
+     Remove all occurences of CHAR from STRING.
+
+ - Method: substitute ((self STRING) (new-char CHARACTER)
+          (old-char CHARACTER)) : STRING
+     Substitute all occurences of OLD-CHAR with NEW-CHAR in the string
+     SELF.
+
+ - Method: substitute ((self MUTABLE-STRING) (new-char CHARACTER)
+          (old-char CHARACTER)) : MUTABLE-STRING
+     Substitute all occurences of OLD-CHAR with NEW-CHAR in the string
+     SELF.
+
+ - Function: replace-substrings ((string STRING) (new STRING)
+          (old STRING)) : STRING
+     Replace all occurrences of OLD in STRING with NEW.
+
+ - Function: insert-string ((source STRING) (start INTEGER)
+          (end INTEGER) (target MUTABLE-STRING) (target-index INTEGER)
+          (case-conversion KEYWORD)) : INTEGER
+     Inserts characters from SOURCE begining at START and ending at END
+     into TARGET starting at TARGET-INDEX.  If END is `null', then the
+     entire length of the string is used. The copy of characters is
+     affected by the CASE-CONVERSION keyword which should be one of
+     :UPCASE :DOWNCASE :CAPITALIZE :PRESERVE.
+
+     The final value of target-index is returned.
+
+ - Function: wrap-string ((value STRING)) : STRING-WRAPPER
+     Return a literal object whose value is the STRING VALUE.
+
+ - Function: wrap-mutable-string ((value MUTABLE-STRING)) :
+          MUTABLE-STRING-WRAPPER
+     Return a literal object whose value is the MUTABLE-STRING VALUE.
+
+ - Function: unwrap-string ((wrapper STRING-WRAPPER)) : STRING
+     Unwrap WRAPPER and return the result.  Return NULL if WRAPPER is
+     NULL.
+
+ - Function: unwrap-mutable-string ((wrapper MUTABLE-STRING-WRAPPER)) :
+          MUTABLE-STRING
+     Unwrap WRAPPER and return the result.  Return NULL if WRAPPER is
+     NULL.
+
+ - Function: string-to-mutable-string ((s STRING)) : MUTABLE-STRING
+     Copy S into a mutable string with the same content.  In Lisp and
+     C++ this simply copies S.
+
+ - Function: mutable-string-to-string ((s MUTABLE-STRING)) : STRING
+     Convert S into a regular string with the same content.  In Lisp
+     and C++ this is a no-op.
+
+ - Function: integer-to-string ((i INTEGER)) : STRING
+     Print I to a string and return the result.  This is more efficient
+     than using a string stream.
+
+ - Function: string-to-integer ((string STRING)) : INTEGER
+     Convert a STRING representation of an integer into an integer.
+
+ - Function: float-to-string ((f FLOAT)) : STRING
+     Print F to a string and return the result.  This is more efficient
+     than using a string stream.
+
+ - Function: string-to-float ((string STRING)) : FLOAT
+     Convert a STRING representation of a float into a float.
+
+ - Function: format-float ((f FLOAT) (nDecimals INTEGER)) : STRING
+     Print F in fixed-point format with NDECIMALS behind the decimal
+     point and return the result as a string.
+
+ - Function: character-to-string ((c CHARACTER)) : STRING
+     Convert C into a one-element string and return the result.
+
+ - Function: stringify ((expression OBJECT)) : STRING
+     Print EXPRESSION onto a string and return the result.  Printing is
+     done with `*printReadably?*' set to true and with `*printPretty?*'
+     set to false.
+
+ - Function: stringify-in-module ((tree OBJECT) (module MODULE)) :
+          STRING
+     Stringify a parse TREE relative to MODULE, or `*module*' if no
+     module is specified.
+
+ - Function: unstringify ((string STRING)) : OBJECT
+     Read a STELLA expression from STRING and return the result.  This
+     is identical to `read-s-expression-from-string'.
+
+ - Function: unstringify-in-module ((string STRING) (module MODULE)) :
+          OBJECT
+     Unstringify relative to MODULE, or `*MODULE*' if no module is
+     specified.
+

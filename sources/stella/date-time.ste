@@ -1,0 +1,1002 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: date-time.ste,v 1.21 2003/09/05 00:45:08 tar Exp
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+;;;;
+;;;;  Support Functions
+;;;;
+
+(defun (compute-julian-day integer) ((yyyy INTEGER) (mm INTEGER) (dd INTEGER))
+  :public? TRUE
+  :documentation "Returns the Julian day that starts at noon on yyyy-mm-dd.
+`yyyy' is the year.  `mm' is the month.  `dd' is the day of month.
+Negative years are B.C.  Remember there is no year zero."
+  ;; Algorithm converted from "Numeric Recipes in C", p. 10.
+  (let ((jul 0)
+	(ja 0)
+	(jy 0)
+	(jm 0))
+
+    ;; Optional error checking:
+    (when (= yyyy 0)
+      (error "There is no year zero."))
+    (when (> mm 12)
+      (error "Month " mm " must be <= 12"))
+    (when (< mm 0)
+      (error "Month " mm " must be > zero."))
+    (when (> dd 31)
+      (error "Day " dd " must be <= 31"))
+    (when (< dd 0)
+      (error "Day " dd " must be > zero."))
+
+    (when (< yyyy 0)
+      (++ yyyy))
+    (if (> mm 2)
+      (progn
+	(setq jy yyyy)
+	(setq jm (+ mm 1)))
+      (progn
+	(setq jy (- yyyy 1))
+	(setq jm (+ mm 13))))
+    (setq jul (+ (floor (* 365.25 jy))
+		 (floor (* 30.6001 jm))
+		 dd
+		 1720995))
+    ;; Test for change to Gregorian Calendar on Oct. 15, 1582
+    (when (>= (+ dd (* 31 (+ mm (* 12 yyyy))))
+	      (+ 15 (* 31 (+ 10 (* 12 1582)))))
+      (setq ja (* 0.01 jy))
+      (++ jul (+ (- 2 ja) (cast (* 0.25 ja) INTEGER))))
+    (return jul) ))
+
+(defun (julian-day-to-modified-julian-day INTEGER) ((julian-day INTEGER))
+  :public? TRUE
+  :documentation
+  "Returns the modified Julian day during which `julian-day'starts at noon."
+  ;; Technical this should subtract 2400000.5 to account for the half-day
+  ;; shift, but since we are only dealing with whole days, we ignore that.
+  (return (- julian-day 2400000)))
+
+(defun (modified-julian-day-to-julian-day INTEGER) ((modified-julian-day INTEGER))
+  :public? TRUE
+  :documentation
+  "Returns the modified Julian day during which `julian-day'starts at noon."
+  ;; Technical this should add 2400000.5 to account for the half-day
+  ;; shift, but since we are only dealing with whole days, we ignore that.
+  (return (+ modified-julian-day 2400000)))
+
+(defun (compute-day-of-week-julian KEYWORD) ((julian-day INTEGER))
+  :public? TRUE
+  :documentation "Returns the day of the week for julian-day"
+  (case (rem julian-day 7)
+    (0 (return :monday))
+    (1 (return :tuesday))
+    (2 (return :wednesday))
+    (3 (return :thursday))
+    (4 (return :friday))
+    (5 (return :saturday))
+    (6 (return :sunday))))
+
+(defun (compute-day-of-week KEYWORD) ((yyyy INTEGER) (mm INTEGER) (dd INTEGER))
+  :public? TRUE
+  :documentation "Returns the day of the week for yyyy-mm-dd."
+  (return (compute-day-of-week-julian (compute-julian-day yyyy mm dd))))
+
+(defun (compute-next-moon-phase INTEGER FLOAT) ((N INTEGER) (PHASE KEYWORD))
+  :public? TRUE
+  :documentation "Returns the Julian Day and fraction of day of the Nth occurence
+since January 1, 1900 of moon PHASE.  PHASE is one of :NEW-MOON, :FIRST-QUARTER,
+:FULL-MOON, :LAST-QUARTER"
+  ;; Algorithm converted from "Numeric Recipes in C", p. 1-2.
+  (let ((i 0)
+	(am 0.0)
+	(as 0.0)
+	(c 0.0)
+	(x 0.0)
+	(x2 0.0)
+	(extra 0.0)
+	(rad (/ PI 180.0))
+	(julian-day 0))
+    (case phase
+      (:new-moon
+       (setq c n)
+       (setq julian-day 0))
+      (:first-quarter
+       (setq c (+ n 0.25))
+       (setq julian-day 7))
+      (:full-moon
+       (setq c (+ n 0.5))
+       (setq julian-day 14))
+      (:last-quarter
+       (setq c (+ n 0.75))
+       (setq julian-day 21)))
+    (setq x (/ c 1236.85))
+    (setq x2 (* x x))
+    (setq as (+ 359.2242 (* 29.105356 c)))
+    (setq am (+ 306.0253 (* 385.816918 c) (* 0.010730 x2)))
+    (setq julian-day (+ 2415020 (* 28 n) julian-day))
+    (setq extra (+ 0.75933 (* 1.53058868 c) (* (- 1.178e-4 (* 1.55e-7 x)) x2)))
+    (case phase
+      ((:new-moon :full-moon)
+       (++ extra (- (* (- 0.1734 (* 3.93e-4 x)) (sin (* as rad)))
+		    (* 0.4068 (sin (* am rad))))))
+      ((:first-quarter :last-quarter)
+       (++ extra (- (* (- 0.1721 (* 4.0e-4 x)) (sin (* as rad)))
+		    (* 0.6280 (sin (* am rad)))))))
+    (setq i (choose (>= extra 0.0) (floor extra) (ceiling (- extra 1.0))))
+    (return (+ julian-day i) (- extra i))))
+  
+(defun (compute-calendar-date INTEGER INTEGER INTEGER KEYWORD) ((julian-day INTEGER))
+  :public? TRUE
+  :documentation "Returns the YEAR, MONTH, DAY, DAY-OF-WEEK on which the given
+`julian-day' begins at noon."
+  ;; Algorithm converted from "Numeric Recipes in C", p. 11-12.
+  (let ((ja julian-day)
+	(jalpha 0)
+	(jb 0)
+	(jc 0)
+	(jd 0)
+	(je 0)
+	(igreg 2299161)			; Start of Gregorian calendar.
+	(yyyy 0)
+	(mm 0)
+	(dd 0))
+    (when (>= julian-day igreg)		; Gregorian calendar correction
+      (setq jalpha (/ (- julian-day 1867216 0.25) 36524.25))
+      (setq ja (+ julian-day 1 jalpha (cast (* -0.25 jalpha) INTEGER))))
+    (setq jb (+ ja 1524))
+    (setq jc (+ 6680.0 (/ (- jb 2439870 122.1) 365.25)))
+    (setq jd (+ (* 365 jc) (* 0.25 jc)))
+    (setq je (/ (- jb jd) 30.6001))
+    (setq dd (- jb jd (cast (* 30.6001 je) INTEGER)))
+    (setq mm (- je 1))
+    (when (> mm 12) (-- mm 12))
+    (setq yyyy (- jc 4715))
+    (when (> mm 2) (-- yyyy))
+    (when (<= yyyy 0) (-- yyyy))
+    (return yyyy mm dd (compute-day-of-week-julian julian-day))))
+
+
+;;;
+;;; Current Time
+;;;
+
+(verbatim
+    :cpp "# include <time.h>
+"
+    :otherwise NULL)
+
+(defun (get-current-date-time INTEGER INTEGER INTEGER KEYWORD
+			      INTEGER INTEGER INTEGER INTEGER) ()
+  :public? TRUE
+  :documentation "Returns the current time in UTC as multiple values of
+year month day day-of-week hour minute second millisecond.  Currently
+millisecond will always be zero (even in Java where it is technically available)."
+  ()
+  (let ((year 0)
+	(month 0)
+	(day 0)
+	(hour 0)
+	(minute 0)
+	(second 0)
+	(millisecond 0))
+    (verbatim
+	:common-lisp (cl:multiple-value-setq (second minute hour day month year)
+		       (cl:decode-universal-time (cl:get-universal-time) 0))
+	:java "java.util.Calendar gc = new java.util.GregorianCalendar(java.util.TimeZone.getTimeZone(\"UTC\"));
+      year = gc.get(java.util.Calendar.YEAR);
+      month = gc.get(java.util.Calendar.MONTH) + 1 - java.util.Calendar.JANUARY;
+      day = gc.get(java.util.Calendar.DAY_OF_MONTH);
+      hour = gc.get(java.util.Calendar.HOUR_OF_DAY);
+      minute = gc.get(java.util.Calendar.MINUTE);
+      second = gc.get(java.util.Calendar.SECOND);"
+	;; Include files: <time.h> <sys/types.h>
+	:cpp "time_t now = time(0);
+      if (now > 0) {
+        struct tm* time = gmtime(&now);
+        year  = time->tm_year + 1900;
+        month = time->tm_mon + 1;
+        day   = time->tm_mday;
+        hour  = time->tm_hour;
+        minute = time->tm_min;
+        second = time->tm_sec;
+      }"
+	)
+    (return year month day (compute-day-of-week year month day)
+	    hour minute second millisecond)))
+
+(defun (get-local-time-zone FLOAT) ()
+  :public? TRUE
+  :documentation "Returns the current time zone offset from UTC as a float,
+considering the effects of daylight savings time."
+  (let ((offset 0.0))
+    (verbatim
+	:common-lisp 
+      "(cl:multiple-value-bind 
+	  (s m h dd mm yy dow daylight-savings-p zone)
+	  (cl:get-decoded-time)
+	(cl:declare (cl:ignore s m h dd mm yy dow))
+	(cl:if daylight-savings-p
+	  (cl:setq offset (cl:- (cl:float (- zone 1) 0.0d0)))
+          (cl:setq offset (cl:- (cl:float zone 0.0d0)))))"
+      :java "java.util.Calendar gc = java.util.Calendar.getInstance();
+    offset = (gc.get(java.util.Calendar.ZONE_OFFSET) + 
+              gc.get(java.util.Calendar.DST_OFFSET)) / (1000.0 * 60.0 * 60.0);"
+      :cpp "tzset();
+#ifdef __CYGWIN__
+    offset = - _timezone / (60.0 * 60.0);
+#else
+    offset = - timezone / (60.0 * 60.0);
+#endif
+    // `altzone' not available under Linux, so assume 1-hour offset:
+    if (daylight > 0) offset += 1.0;")
+    (return offset) ))
+
+(defun (get-local-standard-time-zone FLOAT) ()
+  :public? TRUE
+  :documentation "Returns the standard time zone offset from UTC as a float,
+without considering the effects of daylight savings time."
+  (let ((offset 0.0))
+    (verbatim
+	:common-lisp 
+      "(cl:multiple-value-bind 
+	  (s m h dd mm yy dow daylight-savings-p zone)
+	  (cl:get-decoded-time)
+	(cl:declare (cl:ignore s m h dd mm yy dow daylight-savings-p))
+        (cl:setq offset (cl:- (cl:float zone 0.0d0))))"
+      :java "java.util.Calendar gc = java.util.Calendar.getInstance();
+    offset = gc.get(java.util.Calendar.ZONE_OFFSET) / (1000.0 * 60.0 * 60.0);"
+      :cpp "tzset();
+#ifdef __CYGWIN__
+    offset = - _timezone / (60.0 * 60.0);
+#else
+    offset = - timezone / (60.0 * 60.0);
+#endif
+")
+    (return offset) ))
+
+(defun (get-local-time-zone-for-date FLOAT)
+    ((year INTEGER) (month INTEGER) (day INTEGER)
+     (hour INTEGER) (minute INTEGER) (second INTEGER))
+  :public? TRUE
+  :documentation "Returns the time zone offset from UTC (as a float)
+that is applicable to the given date.  Assumes that the date is one
+that is valid for the underlying programming language.  If not, then
+returns 0.0"
+  (let ((offset 0.0))
+    (verbatim
+	:common-lisp 
+      "(cl:when (cl:>= year 1900)
+         (cl:multiple-value-bind 
+	  (s m h dd mm yy dow daylight-savings-p zone)
+	    (cl:decode-universal-time
+              (cl:encode-universal-time second minute hour day month year))
+	  (cl:declare (cl:ignore s m h dd mm yy dow))
+	  (cl:if daylight-savings-p
+	    (cl:setq offset (cl:- (cl:float (- zone 1) 0.0d0)))
+            (cl:setq offset (cl:- (cl:float zone 0.0d0))))))"
+      :java "java.util.Calendar gc;
+    if (year > 0) {
+      gc = new java.util.GregorianCalendar (year,month-1,day,hour,minute,second);
+    } else {
+      gc = new java.util.GregorianCalendar (-year,month-1,day,hour,minute,second);
+      gc.set(java.util.Calendar.ERA, java.util.GregorianCalendar.BC);
+    }
+    offset = (gc.get(java.util.Calendar.ZONE_OFFSET) + 
+              gc.get(java.util.Calendar.DST_OFFSET)) / (1000.0 * 60.0 * 60.0);"
+      :cpp "if ((year > 1970) && (year < 2038)) {
+        struct tm time;
+        time.tm_year = year - 1900;
+        time.tm_mon = month - 1;
+        time.tm_mday = day;
+        time.tm_hour = hour;
+        time.tm_min = minute;
+        time.tm_sec = second;
+        time.tm_isdst = -1;    // Flag to have mktime determine DST
+
+        mktime(&time);  // Executed for normalization effect only!
+
+        tzset();
+#ifdef __CYGWIN__
+        offset = - _timezone / (60.0 * 60.0);
+#else
+        offset = - timezone / (60.0 * 60.0);
+#endif
+    // `altzone' not available under Linux, so assume 1-hour offset:
+    if (time.tm_isdst > 0) offset += 1.0;
+  }")
+    (return offset) ))
+
+
+;;;;
+;;;;  Date and Time Objects
+;;;;
+
+(defconstant MILLIS-PER-DAY INTEGER (* 1000 60 60 24)
+  :public? FALSE)
+(defconstant MILLIS-PER-HOUR INTEGER (* 1000 60 60)
+  :public? FALSE)
+
+(defglobal *month-abbreviation-vector* (VECTOR OF STRING-WRAPPER) NULL
+  :documentation "A vector of month abbreviations for printing dates")
+
+(startup-time-progn :globals
+  (setq *month-abbreviation-vector*
+    (new (VECTOR OF STRING-WRAPPER)
+         :array-size 13))
+  (foreach i in (interval 0 12)
+      as abbreviation in (quote ("NUL" "JAN" "FEB" "MAR" "APR" "MAY" "JUN"
+				       "JUL" "AUG" "SEP" "OCT" "NOV" "DEC"))
+      do (setf (nth *month-abbreviation-vector* i) abbreviation)))
+
+
+(defclass native-date-time ()
+  :public? true
+  :documentation "A data type that is used to hold the native date and time
+information.   It is opaque to the Stella users.  It is provided so that
+Stella `calendar-date' objects can be translated into and out of native format.
+Note that there is no way to initialize a variable holding a `native-date-time'
+except by such a translation."
+  :cpp-native-type "time_t"
+  :cl-native-type "INTEGER"
+  :java-native-type "long")
+
+;;; The decoded-date-time structure holds the time/date values 
+;;; Note: Currently nothing is done with the day of the week.  It might
+;;; be appropriate to add a function to see if it matches the date.
+
+(defclass decoded-date-time (STANDARD-OBJECT)
+  :public? TRUE
+  :documentation "A data structure for holding decoded time values with fields
+for easy access of the components."
+  :public-slots
+  ((date-time-millis :initially 0.0  :type float)    ; Value < 1000.0
+   (date-time-second :initially 0    :type integer)  ; Value between 0 and 59.
+   (date-time-minute :initially 0    :type integer)	; Value between 0 and 59.
+   (date-time-hour   :initially 0    :type integer)	; Value between 0 and 23.
+   (date-time-day    :initially 1    :type integer)	; Value between 1 and 31.
+   (date-time-month  :initially 1    :type integer)	; Value between 1 and 12.
+   (date-time-year   :initially 1900 :type integer)	; 
+   (date-time-zone   :initially 0.0  :type float)    ; Value between -12.0 and 14.0
+   (date-time-dow    :initially :SUNDAY :type keyword)) ; Day of week.
+  )
+
+(defmethod (hash-code INTEGER) ((self DECODED-DATE-TIME))
+  :public? TRUE :globally-inline? TRUE
+  (return (logxor (logor (logor (shift-left (date-time-year self) 9)
+				(shift-left (date-time-month self) 5))
+			 (date-time-day self))
+		  (logor (logor (shift-left (date-time-hour self) 12)
+				(shift-left (date-time-minute self) 6))
+			 (date-time-second self)))))
+
+(defun set-current-time ((values-structure DECODED-DATE-TIME))
+  (mv-bind (year mon day dow hour min sec millis)
+      (get-current-date-time)
+    (ignore year mon day dow)
+    (setf (date-time-millis values-structure) millis)
+    (setf (date-time-second values-structure) sec)
+    (setf (date-time-minute values-structure) min)
+    (setf (date-time-hour values-structure) hour)))
+
+(defun set-current-date ((values-structure DECODED-DATE-TIME))
+  (mv-bind (year mon day dow hour min sec millis)
+      (get-current-date-time)
+    (ignore hour min sec millis)
+    (setf (date-time-dow values-structure) dow)
+    (setf (date-time-day values-structure) day)
+    (setf (date-time-month values-structure) mon)
+    (setf (date-time-year values-structure) year)))
+
+(defun set-current-date-time ((values-structure DECODED-DATE-TIME))
+  (mv-bind (year mon day dow hour min sec millis)
+      (get-current-date-time)
+    (setf (date-time-millis values-structure) millis)
+    (setf (date-time-second values-structure) sec)
+    (setf (date-time-minute values-structure) min)
+    (setf (date-time-hour values-structure) hour)
+    (setf (date-time-dow values-structure) dow)
+    (setf (date-time-day values-structure) day)
+    (setf (date-time-month values-structure) mon)
+    (setf (date-time-year values-structure) year)))
+
+;;
+;;  Decoded Time Duration
+;;
+
+(defclass decoded-time-duration (STANDARD-OBJECT)
+  :public? TRUE
+  :documentation "A data structure for holding decoded time duration values with
+fields for easy access of the components.  Note that all non-zero values
+should have the same sign."
+  :public-slots
+  ((duration-millis  :initially 0.0  :type float)    ; Value > -1000.0 and < 1000.0
+   (duration-seconds :initially 0    :type integer)  ; Value between -59 and 59.
+   (duration-minutes :initially 0    :type integer)	; Value between -59 and 59.
+   (duration-hours   :initially 0    :type integer)	; Value between -23 and 23.
+   (duration-days    :initially 0    :type integer)	; Any value.
+  ))
+
+(defmethod (hash-code INTEGER) ((self DECODED-TIME-DURATION))
+  :public? TRUE :globally-inline? TRUE
+  (return (logxor (duration-days self)
+		  (logor (logor (shift-left (duration-hours self) 12)
+				(shift-left (duration-minutes self) 6))
+			 (duration-seconds self)))))
+
+;;;;
+;;;;  DATE-TIME objects
+;;;;
+
+(defclass date-time-object (STANDARD-OBJECT)
+  :abstract? TRUE)
+
+(defclass calendar-date (date-time-object)
+  :public? TRUE
+  :documentation "Representation of Date and Time with the date represented
+as a modified Julian day (starting at midnight instead of noon) and the
+time as the offset in milliseconds from midnight, UTC"
+  :public-slots
+  ((modified-julian-day :type integer)
+   (time-millis :type integer))
+  :print-form (print-calendar-date self stream)
+  )
+
+(defmethod (hash-code INTEGER) ((self CALENDAR-DATE))
+  :public? TRUE :globally-inline? TRUE
+  (return (logxor (modified-julian-day self) (time-millis self))))
+
+
+(defun (calendar-date-to-string STRING) ((date CALENDAR-DATE) 
+					 (timezone FLOAT)
+					 (include-timezone? BOOLEAN))
+  :public? TRUE
+  :documentation "Returns a string representation of `date' adjusted for `timezone'"
+  (mv-bind (year month day dow)
+      (get-calendar-date date timezone)
+    (ignore dow)
+    (mv-bind (hours minutes seconds milli)
+	(get-time date timezone)
+      (let ((year-string (choose (< year 0)
+				 (concatenate (integer-to-string (- year)) "BC")
+				 (integer-to-string year)))
+	    (timezone-string (choose include-timezone?
+				     (choose (= timezone 0.0)
+					     " UTC"
+					     (concatenate " " (float-to-string timezone)))
+				     "")))
+      (return (concatenate
+		year-string
+		"-"
+		(nth *month-abbreviation-vector* month)
+		"-"
+		(format-with-padding (integer-to-string day)
+				     2 #\0 :right false)
+		" "
+		(integer-to-string hours) ":"
+		(format-with-padding (integer-to-string minutes)
+				     2 #\0 :right false)
+		":"
+		(format-with-padding (integer-to-string seconds)
+				     2 #\0 :right false)
+		"."
+		(format-with-padding (integer-to-string milli)
+				     3 #\0 :right false)
+		timezone-string)) ))))
+
+(defun (calendar-date-to-native-date-time NATIVE-DATE-TIME) ((date CALENDAR-DATE))
+  ;; (a) MJD 15021 is January 1, 1900
+  ;; (b) MJD 40588 is January 1, 1970
+  ;; Common Lisp Universal Time is seconds since (a)
+  ;; Java Time is milliseconds since (b)
+  ;; C time is seconds since (b)
+  (let ((mjd (modified-julian-day date))
+	(millis (time-millis date)))
+    (return
+      (verbatim 
+	  :common-lisp "(CL:+ (CL:* (CL:- mjd 15021) 86400) (CL:TRUNCATE millis 1000))"
+	  :java "(((long)mjd - 40588L) * 86400000L) + (long)millis"
+	  :cpp "(((time_t)mjd - 40588) * 86400) + ((time_t)millis / 1000)"))))
+  
+(defun (native-date-time-to-calendar-date CALENDAR-DATE) ((date NATIVE-DATE-TIME))
+  :constructor? TRUE
+  ;; (a) MJD 15021 is January 1, 1900
+  ;; (b) MJD 40588 is January 1, 1970
+  ;; Common Lisp Universal Time is seconds since (a)
+  ;; Java Time is milliseconds since (b)
+  ;; C time is seconds since (b)
+  (let ((mjd 0)
+	(millis 0))
+    (verbatim 
+	:common-lisp "
+    (CL:PROGN
+      (CL:MULTIPLE-VALUE-SETQ (mjd millis) (CL:TRUNCATE date 86400))
+      (CL:INCF mjd 15021)
+      (CL:SETQ millis (CL:* millis 1000)))
+"
+	:java "mjd = (int) ((date / 86400000) + 40588);
+      millis = (int) (date % 86400000)"
+	:cpp "mjd =  (int) ((date / 86400) + 40588);
+      millis = (int) ((date % 86400) * 1000)")
+    (return (make-calendar-date mjd millis))))
+
+(defun print-calendar-date ((date CALENDAR-DATE) (stream NATIVE-OUTPUT-STREAM))
+  (if *printreadably?*
+    (print-native-stream stream "\"")
+    (print-native-stream stream "<" (modified-julian-day date) " "))
+  (print-native-stream stream (calendar-date-to-string date 0.0 FALSE))
+  (if *printreadably?*
+    (print-native-stream stream " UTC\"")
+    (print-native-stream stream " UTC>")) )
+
+(defclass time-duration (date-time-object)
+  :public? TRUE
+  :documentation "Representation of Relative Days and Time with the date represented
+as a number of days and the time in milliseconds."
+  :public-slots
+  ((days :type integer)
+   (millis :type integer))
+  :print-form (print-time-duration self stream))
+
+(defmethod (hash-code INTEGER) ((self TIME-DURATION))
+  :public? TRUE :globally-inline? TRUE
+  (return (logxor (days self) (millis self))))
+
+(defun (time-duration-to-string STRING) ((date TIME-DURATION))
+  :public? TRUE
+  :documentation "Returns a string representation of `date'"
+  ;; NOTE: This can be simplified if we are sure that relative dates are
+  ;;       always normalized.
+  (let ((n-days (days date))
+	(n-millis (millis date)))
+    (if (< n-days 0)
+      (if (<= n-millis 0)
+	(return
+	  (concatenate "minus " 
+		       (integer-to-string (- n-days)) " days; "
+		       (integer-to-string (- n-millis)) " ms"))
+	(return
+	  (concatenate "minus " 
+		       (integer-to-string (- (+ n-days 1))) " days; "
+		       (integer-to-string (- MILLIS-PER-DAY n-millis)) " ms")))
+      (if (< n-millis 0)
+	(if (> n-days 0)
+	  (return
+	    (concatenate "plus "
+			 (integer-to-string (- n-days 1)) " days; "
+			 (integer-to-string (+ MILLIS-PER-DAY n-millis)) " ms"))
+	  (return
+	    (concatenate "minus 0 days; "
+			 (integer-to-string (- n-millis)) " ms")))
+	(return
+	  (concatenate "plus " 
+		       (integer-to-string n-days) " days; "
+		       (integer-to-string n-millis) " ms"))))))
+
+
+(defun (string-to-time-duration TIME-DURATION) ((duration STRING))
+  :public? TRUE
+  :documentation "Parses and returns an time-duration object corresponding to `duration'.
+The syntax for time duration strings is \"{plus|minus} N days[; M ms]\" where N and M are
+integer values for days and milliseconds.  If no valid parse is found, `null' is returned."
+  ;; NOTE: This can be simplified if we are sure that relative dates are
+  ;;       always normalized.
+  (let ((n-days 0)
+        (n-millis 0)
+        (negative? (defined? (string-search duration "minus" 0)))
+        (day-start-position 0)
+        (day-end-position 0)
+        (ms-start-position 0)
+        (ms-end-position 0))
+    (cond (negative?
+	 (setq day-start-position 6))
+	((defined? (string-search duration "plus" 0))
+	 (setq day-start-position 5))
+	(otherwise
+	 (setq day-start-position 0)))
+    (setq day-end-position (string-search duration "days" day-start-position))
+    (if (null? day-end-position)
+        (return null)
+      (setq n-days (string-to-integer (subsequence duration 
+					 day-start-position
+					 (- day-end-position 1)))))
+    (setq ms-start-position (position duration #\Space day-end-position))
+    (when (defined? ms-start-position)  ;; ms entry is optional.
+      (setq ms-end-position (string-search duration "ms" ms-start-position))
+      (when (defined? ms-end-position)
+        (setq n-millis (string-to-integer (subsequence duration 
+					     ms-start-position
+					     (- ms-end-position 1))))))
+    (return (make-time-duration n-days n-millis))))
+
+
+(defun print-time-duration ((date TIME-DURATION) (stream NATIVE-OUTPUT-STREAM))
+  (print-native-stream stream "<" (time-duration-to-string date) ">"))
+
+
+(defun (make-date-time CALENDAR-DATE) ((year INTEGER) (month INTEGER) (day INTEGER)
+				       (hour INTEGER) (minute INTEGER) (second INTEGER)
+				       (millis INTEGER) (timezone FLOAT))
+  :public? TRUE
+  :constructor? TRUE
+  :documentation "Create a calendar date with the specified components.  `year' must be
+the complete year (i.e., a year of 98 is 98 A.D in the 1st century).
+`timezone' is a real number in the range -12.0 to +14.0 where UTC is zone 0.0;  The number
+is the number of hours to add to UTC to arrive at local time."
+  (let ((time INTEGER (+ (* hour MILLIS-PER-HOUR)
+			 (* minute 60000)
+			 (* second  1000)
+			 millis)))
+    (setq time (- time (* timezone MILLIS-PER-HOUR)))
+    (return (make-calendar-date (julian-day-to-modified-julian-day
+				 (compute-julian-day year month day))
+				time)) ))
+
+(defun (make-current-date-time CALENDAR-DATE) ()
+  :public? TRUE
+  :constructor? TRUE
+  :documentation "Create a calendar date with current time and date."
+  (mv-bind (year month day dow hour minute second millisecond)
+      (get-current-date-time)
+    (ignore dow)
+    (return 
+      (make-date-time year month day hour minute second millisecond 0.0)) ))
+
+(defun (make-calendar-date CALENDAR-DATE) ((day INTEGER) (time INTEGER))
+  :constructor? TRUE
+  (while (< time 0)
+    (++ time MILLIS-PER-DAY)
+    (-- day))
+  (while (> time MILLIS-PER-DAY)
+    (-- time MILLIS-PER-DAY)
+    (++ day))
+  (return (new CALENDAR-DATE :modified-julian-day day :time-millis time)))
+
+(defun (make-time-duration TIME-DURATION) ((days INTEGER) (millis INTEGER))
+  :constructor? TRUE
+  (while (< millis (- MILLIS-PER-DAY))
+    (++ millis MILLIS-PER-DAY)
+    (-- days))
+  (while (> millis MILLIS-PER-DAY)
+    (-- millis MILLIS-PER-DAY)
+    (++ days))
+  (cond ((< days 0)
+	 (unless (<= millis 0)
+	   (++ days)
+	   (-- millis MILLIS-PER-DAY)))
+	((> days 0)
+	 (unless (>= millis 0)
+	   (-- days)
+	   (++ millis MILLIS-PER-DAY)))
+	(otherwise NULL))
+  (return (new TIME-DURATION :days days :millis millis)))
+
+(defun (decode-time-in-millis INTEGER INTEGER INTEGER INTEGER) ((time INTEGER))
+  :public? TRUE
+  :documentation "Returns multiple values of hours, minutes, seconds, milliseconds for
+`time' specified in milliseconds."
+  (let ((millis (rem time 1000))
+	(secs (rem (div time 1000) 60))
+	(mins (rem (div time 60000) 60))
+	(hours (div time MILLIS-PER-HOUR)))
+    (return (values hours mins secs millis)) ))
+
+(defmethod (get-calendar-date INTEGER INTEGER INTEGER KEYWORD) 
+    ((date CALENDAR-DATE) (timezone FLOAT))
+  :public? TRUE
+  :documentation "Returns multiple values of year, month, day and day of week for `date'
+in `timezone'.  `timezone' is the number of hours added to UTC to get local time.  It
+is in the range -12.0 to +14.0 where UTC is zone 0.0"
+  (when (null? timezone)
+    (warn "Timezone not specified in GET-CALENDAR-DATE  Using local zone.")
+    (mv-bind (year month day dow)
+	(compute-calendar-date 
+	 (modified-julian-day-to-julian-day (modified-julian-day date)))
+      (ignore dow)
+      (setq timezone (get-local-time-zone-for-date year month day 12 0 0))))
+  (let ((time (time-millis date))
+	(timezone-adjusted-time INTEGER (+ time (* timezone MILLIS-PER-HOUR)))
+	(day-offset 0))
+    (cond ((< timezone-adjusted-time 0)
+	   (setq day-offset -1))
+	  ((> timezone-adjusted-time MILLIS-PER-DAY)
+	   (setq day-offset 1))
+	  (otherwise NULL))
+    (return (compute-calendar-date (modified-julian-day-to-julian-day
+				    (+ (modified-julian-day date) day-offset))))))
+
+(defmethod (get-time INTEGER INTEGER INTEGER INTEGER)
+    ((date CALENDAR-DATE) (timezone FLOAT))
+  :public? TRUE
+  :documentation "Returns multiple values of hours, minutes, seconds, milliseconds for
+the calendar date `date' in `timezone'.  `timezone' is the number of hours added to UTC
+to get local time.  It is in the range -12.0 to +14.0 where UTC is zone 0.0"
+  (when (null? timezone)
+    (warn "Timezone not specified in GET-TIME.  Using local zone.")
+    (mv-bind (year month day dow)
+	(compute-calendar-date 
+	 (modified-julian-day-to-julian-day (modified-julian-day date)))
+      (ignore dow)
+      (setq timezone (get-local-time-zone-for-date year month day 12 0 0))))
+  (cond ((= timezone 0.0)
+	 (return (decode-time-in-millis (time-millis date))))
+	((< timezone 0.0)
+	 (return (decode-time-in-millis 
+		  (rem (+ (time-millis date) MILLIS-PER-DAY (* timezone MILLIS-PER-HOUR))
+		       MILLIS-PER-DAY))))
+	(otherwise
+	 (return (decode-time-in-millis 
+		  (rem (+ (time-millis date) (* timezone MILLIS-PER-HOUR))
+		       MILLIS-PER-DAY))))) )
+
+
+(defmethod (decode-calendar-date DECODED-DATE-TIME)
+    ((date CALENDAR-DATE) (timezone FLOAT))
+  :public? TRUE
+  :documentation "Returns a decoded time object for `date' interpreted in `timezone'
+`timezone' is the number of hours added to UTC to get local time.  It is 
+in the range -12.0 to +14.0 where UTC is zone 0.0"
+  (mv-bind (hour min sec millis)
+      (get-time date timezone)
+    (mv-bind (year month day dow)
+	(get-calendar-date date timezone)
+      (return (new DECODED-DATE-TIME
+		   :date-time-millis millis
+		   :date-time-second sec
+		   :date-time-minute min
+		   :date-time-hour   hour
+		   :date-time-day    day
+		   :date-time-month  month
+		   :date-time-year   year
+		   :date-time-zone   timezone
+		   :date-time-dow    dow)) )))
+
+(defmethod (encode-calendar-date CALENDAR-DATE) ((time-structure DECODED-DATE-TIME))
+  :public? TRUE
+  :documentation "Returns a calendar date object for `time-structure'."
+  (return (make-date-time (date-time-year   time-structure)
+			  (date-time-month  time-structure)
+			  (date-time-day    time-structure)
+			  (date-time-hour   time-structure)
+			  (date-time-minute time-structure)
+			  (date-time-second time-structure)
+			  (round (date-time-millis time-structure))
+			  (date-time-zone   time-structure))))
+
+(defmethod (decode-time-duration DECODED-TIME-DURATION) ((duration TIME-DURATION))
+  (if (> (millis duration) 0)
+    (return (new DECODED-TIME-DURATION
+		 :duration-days (days duration)
+		 :duration-hours (div (millis duration) MILLIS-PER-HOUR)
+		 :duration-minutes (div (rem (millis duration) MILLIS-PER-HOUR) 60000)
+		 :duration-seconds (div (rem (millis duration) 60000) 1000)
+		 :duration-millis (rem (millis duration) 1000)))
+    (return (new DECODED-TIME-DURATION
+		 :duration-days (days duration)
+		 :duration-hours (- (div (- (millis duration)) MILLIS-PER-HOUR))
+		 :duration-minutes (- (div (rem (- (millis duration)) MILLIS-PER-HOUR) 60000))
+		 :duration-seconds (-  (div (rem (- (millis duration)) 60000) 1000))
+		 :duration-millis (- (rem (- (millis duration)) 1000))))))
+
+(defmethod (encode-time-duration TIME-DURATION) ((time-structure DECODED-TIME-DURATION))
+  (return 
+    (make-time-duration (duration-days time-structure)
+			(+ (* (duration-hours time-structure) MILLIS-PER-HOUR)
+			   (* (duration-minutes time-structure) 60000)
+			   (* (duration-seconds time-structure) 1000)
+			   (duration-millis time-structure)))))
+
+;;;
+;;;  Time Arithmetic and Comparisons
+;;;
+
+(defun (time-add DATE-TIME-OBJECT) ((t1 DATE-TIME-OBJECT) (t2 DATE-TIME-OBJECT))
+  :public? TRUE
+  :documentation "Add `t1' to `t2'.
+If one of `t1' or `t2' is a calendar date, then the result is a calendar date.
+If both `t1' and `t2' are relative dates, then the result is a relative date.
+`t1' and `t2' cannot both be calendar dates."
+  (typecase t1
+    (CALENDAR-DATE
+     (typecase t2
+       (CALENDAR-DATE
+	(error "You can't add two calendar dates: " t1 "  " t2))
+       (TIME-DURATION
+	(return (make-calendar-date (+ (modified-julian-day t1) (days t2))
+				    (+ (time-millis t1) (millis t2)))))))
+    (TIME-DURATION
+     (typecase t2
+       (CALENDAR-DATE
+	(return (make-calendar-date (+ (days t1) (modified-julian-day t2))
+				    (+ (millis t1) (time-millis t2)))))
+       (TIME-DURATION
+	(return (make-time-duration (+ (days t1) (days t2))
+				    (+ (millis t1) (millis t2)))))))))
+
+(defun (time-subtract DATE-TIME-OBJECT) ((t1 DATE-TIME-OBJECT) (t2 DATE-TIME-OBJECT))
+  :public? TRUE
+  :documentation "Subtract `t2' from `t1'.  If `t1' is a calendar date, then `t2' can
+be either a calendar date (in which case the return value is a relative date) or it
+can be a relative date (in which case the return value is a calendar date).  If `t1'
+is a relative date, then `t2' must also be a relative date and a relative date is returned."
+  (typecase t1
+    (CALENDAR-DATE
+     (typecase t2
+       (CALENDAR-DATE
+	(return (make-time-duration (- (modified-julian-day t1) (modified-julian-day t2))
+				    (- (time-millis t1) (time-millis t2)))))
+       (TIME-DURATION
+	(return (make-calendar-date (- (modified-julian-day t1) (days t2))
+				    (- (time-millis t1) (millis t2)))))))
+    (TIME-DURATION
+     (typecase t2
+       (CALENDAR-DATE
+	(error "You can't subtract a calendar date from a relative date: " t1 "  " t2))
+       (TIME-DURATION
+	(return (make-time-duration (- (days t1) (days t2))
+				    (- (millis t1) (millis t2)))))))))
+
+(defun (time-multiply TIME-DURATION) ((t1 OBJECT) (t2 OBJECT))
+  :public? TRUE
+  :documentation "Multiplies a relative date by a wrapped number.  One of `t1' or `t2'
+must be a relative date and the other a wrapped number."
+  (typecase t1
+    (CALENDAR-DATE
+     (error "Calendar dates cannot be involved in multiplication:  " t1 "  " t2))
+    (TIME-DURATION
+     (typecase t2
+       (CALENDAR-DATE
+	(error "Calendar dates cannot be involved in multiplication:  " t1 "  " t2))
+       (TIME-DURATION
+	(error "You can't multiply two relative dates: " t1 "  " t2))
+       (INTEGER-WRAPPER
+	(return (make-time-duration (* (days t1) (wrapper-value t2))
+				    (* (millis t1) (wrapper-value t2)))))
+       (FLOAT-WRAPPER
+	(return (make-time-duration (round (* (days t1) (wrapper-value t2)))
+				    (round (* (millis t1) (wrapper-value t2))))))))
+    (INTEGER-WRAPPER
+     (typecase t2
+       (CALENDAR-DATE
+	(error "Calendar dates cannot be involved in multiplication:  " t1 "  " t2))
+       (TIME-DURATION
+	(return (make-time-duration (* (wrapper-value t1) (days t2))
+				    (* (wrapper-value t1) (millis t2)))))
+       (NUMBER-WRAPPER
+	(error "One argument must be a relative date:  " t1 "  " t2))))
+    (FLOAT-WRAPPER
+     (typecase t2
+       (CALENDAR-DATE
+	(error "Calendar dates cannot be involved in multiplication:  " t1 "  " t2))
+       (TIME-DURATION
+	(return (make-time-duration (round (* (wrapper-value t1) (days t2)))
+				    (round (* (wrapper-value t1) (millis t2))))))
+       (NUMBER-WRAPPER
+	(error "One argument must be a relative date:  " t1 "  " t2))))))
+
+(defun (time-divide OBJECT) ((t1 TIME-DURATION) (t2 OBJECT))
+  :public? TRUE
+  :documentation "Divides the relative date `t1' by `t2'.  `t2' must be
+either a relative date or a wrapped number.  If `t2' is a relative date,
+then the return value will be a wrapped float.  If `t2' is a wrapped number,
+then the reutrn value will be a relative date."
+  (typecase t2
+    (CALENDAR-DATE
+     (error "Calendar dates cannot be involved in division:  " t1 "  " t2))
+    (TIME-DURATION
+     (return (wrap-literal (/ (+ (days t1) (/ (millis t1) MILLIS-PER-DAY))
+			      (+ (days t2) (/ (millis t2) MILLIS-PER-DAY))))))
+    (INTEGER-WRAPPER
+     (return (make-time-duration (round (/ (days t1) (wrapper-value t2)))
+				 (round (/ (millis t1) (wrapper-value t2))))))
+    (FLOAT-WRAPPER
+     (return (make-time-duration (round (/ (days t1) (wrapper-value t2)))
+				 (round (/ (millis t1) (wrapper-value t2))))))))
+
+(defmacro define-time-comparison ((name SYMBOL) (operator SYMBOL))
+  :public? FALSE
+  (return
+    (bquote
+     (defun (& name BOOLEAN) ((t1 DATE-TIME-OBJECT) (t2 DATE-TIME-OBJECT))
+       (typecase t1
+	 (CALENDAR-DATE
+	  (typecase t2
+	    (CALENDAR-DATE
+	     (if (= (modified-julian-day t1) (modified-julian-day t2))
+	       (return (& operator (time-millis t1) (time-millis t2)))
+	       (return (& operator (modified-julian-day t1) (modified-julian-day t2)))))
+	    (TIME-DURATION
+	     (error "Can't compare calendar and relative dates: " t1 "  " t2))))
+	 (TIME-DURATION
+	  (typecase t2
+	    (CALENDAR-DATE
+	     (error "Can't compare relative and calendar dates: " t1 "  " t2))
+	    (TIME-DURATION
+	     (if (= (days t1) (days t2))
+	       (return (& operator (millis t1) (millis t2)))
+	       (return (& operator (days t1) (days t2))))))))))))
+
+(define-time-comparison time-eql? =)
+(define-time-comparison time-less? <)
+(define-time-comparison time-greater? >)
+(define-time-comparison time-less-equal? <=)
+(define-time-comparison time-greater-equal? >=)
+
+(defmethod (object-eql? BOOLEAN) ((self CALENDAR-DATE) (x OBJECT))
+  (return (and (isa? x @CALENDAR-DATE)
+	       (time-eql? self x))))
+
+(defmethod (object-eql? BOOLEAN) ((self TIME-DURATION) (x OBJECT))
+  (return (and (isa? x @TIME-DURATION)
+	       (time-eql? self x))))
+
+
+;;;
+;;;  Random Time Utility Functions
+;;;
+
+
+  ;;
+;;;;;; with-date-substitution
+  ;;
+
+(defun fill-in-date-substitution ((substitution-list (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+  :documentation "Fill in `substitution-list' with template variable substitions
+for the names YEAR and DATE which correspond to the current year and date.
+These substitutions can then be used with `substitute-template-variables-in-string'"
+  :public? TRUE
+  (mv-bind (year month day dow)
+      (get-calendar-date (make-current-date-time) (get-local-time-zone))
+    (ignore dow)
+    (insert-at substitution-list "YEAR" (integer-to-string year))
+    (insert-at substitution-list "DATE" 
+	       (concatenate (format-with-padding (integer-to-string day)
+						 2 #\0 :right false)
+			    "-"
+			    (nth *month-abbreviation-vector* month)
+			    "-"
+			    (integer-to-string year))) ))

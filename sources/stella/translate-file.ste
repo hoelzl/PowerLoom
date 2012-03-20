@@ -1,0 +1,1208 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: translate-file.ste,v 1.92 2003/04/18 21:15:39 hans Exp
+
+;;; Generic translator for Stella files.
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+
+  ;;
+;;;;;; Global variables used by Stella translators
+  ;;
+
+(defglobal *record-signatures?* BOOLEAN FALSE
+  :documentation "If `true', record object signatures into a persistent table.")
+
+(defglobal *walk-with-recorded-signatures?* BOOLEAN FALSE
+  :documentation "If `true', the walker will try to find previously recorded
+signatures for referenced but undefined functions, methods, etc.")
+
+(defspecial *useRecordedSignatures?* BOOLEAN FALSE
+  :documentation "If `true', `safe-lookup-slot' and `lookup-function' will
+try to retrieve a previously recorded signature if normal lookup fails.")
+
+(defspecial *rootSourceDirectory* STRING "PL:sources;")
+(defspecial *rootNativeDirectory* STRING "PL:native;")
+(defspecial *rootBinaryDirectory* STRING "PL:bin;")
+(defspecial *systemDefinitionsDirectory* STRING NULL
+  :documentation "Points to the directory containing the SYSTEMS file.")
+
+(defun (root-source-directory FILE-NAME) ()
+  (return (unlogicalize-pathname *rootSourceDirectory*)) )
+
+(defun (root-native-directory FILE-NAME) ()
+  (return (unlogicalize-pathname *rootNativeDirectory*)) )
+
+(defun (root-binary-directory FILE-NAME) ()
+  (return (unlogicalize-pathname *rootBinaryDirectory*)) )
+
+(defun (system-definitions-directory FILE-NAME) ()
+  ;; Return the name of the SYSTEMS directory.
+  (if (defined? *systemDefinitionsDirectory*)
+    (return (unlogicalize-pathname *systemDefinitionsDirectory*))
+    (return (concatenate (root-source-directory) "systems"))) )
+
+(defspecial *currentSystemDefinition* SYSTEM-DEFINITION NULL
+  :documentation "Points to the current system.")
+
+(defspecial *currentSystemDefinitionSubdirectory* STRING ""
+  :documentation "Points to a path from the root directory down
+to a local directory containing sources, natives, or binaries.")
+
+
+  ;;
+;;;;;;
+  ;;
+
+(defun (handle-in-module-tree BOOLEAN BOOLEAN)
+    ((tree CONS) (seenInModule? BOOLEAN))
+  :public? TRUE
+  ;; Handle 'tree' in case it is an 'IN-MODULE' declaration.
+  ;; 'seenInModule?' indicates that an 'IN-MODULE' declaration has already
+  ;;    been seen, in which case another one triggers an error message.
+  ;; The first return value is TRUE if 'tree' has actually been handled
+  ;;    by this function; the second return value is TRUE if 'tree' was an
+  ;;    'IN-MODULE' declaration.
+  (let ((operator (first tree))
+        (firstArg OBJECT NULL))
+    (typecase operator
+      (SYMBOL
+       (case (choose (case-sensitive? *module*)
+                     (string-upcase (symbol-name operator))
+                     (symbol-name operator))
+         ("IN-PACKAGE"
+          (return TRUE seenInModule?))
+         ("IN-MODULE"
+          (when seenInModule?
+            (walk-warn "Ignoring duplicate IN-MODULE declaration: " tree)
+            (return TRUE seenInModule?))
+          (setq firstArg (second tree))
+          (typecase firstArg
+            (STRING (change-module (wrapper-value firstArg))
+                    (setq seenInModule? TRUE))
+            (otherwise
+             (walk-warn "Ignoring illegal IN-MODULE declaration: " tree)))
+          (return TRUE seenInModule?))
+         ;; Allowed before IN-MODULE:
+         (("DEFMODULE" "VERBATIM") NULL)
+         (otherwise
+          (unless seenInModule?
+            (walk-warn "Missing IN-MODULE declaration, translating "
+                       "into module STELLA")
+            (change-module "STELLA")
+            (setq seenInModule? TRUE)))))
+      (otherwise NULL))
+    (return FALSE seenInModule?)))
+
+(defun translate-and-output-units-to-file ((file FILE-NAME)
+                                           (targetLanguage STRING))
+  ;; Helping function for file translation.  Since this is called at
+  ;;    a different point in the Java translation of systems, it has
+  ;;    been broken out as a separate function.
+  (setq *translationPhase* :TRANSLATE)
+  (case (translator-output-language)
+    (:java NULL)
+    (otherwise
+     (when (>= *translationVerbosityLevel* 1)
+       (inform "Translating " file " to " targetLanguage "..."))
+     (translate-all-units)))
+  (output-all-units-to-file file))
+
+(defun operate-on-file ((file FILE-NAME) (operation KEYWORD))
+  ;; Translates a complete Stella 'file' into a translation file or files.
+  ;;    The name of the translation file(s) depends on the target language.
+  ;; 'operation' can either be :define (which means only define the
+  ;;    objects in the file), :finalize (which means define the objects
+  ;;    and finalize them at the end), :walk (which means define, finalize,
+  ;;    and walk all objects), or :translate (which means perform a full
+  ;;    translation).
+  (let ((targetLanguage (symbol-name (translator-output-language)))
+        ;; Need extra vars, since we can't do a '(*module* *module*)':
+        (currentModule *module*)
+        (currentContext *context*)
+        (seenInModule? FALSE)
+        (skip? FALSE))
+    (setq file (unlogicalize-pathname file))
+    (when (null? operation)
+      (setq operation :translate))
+    (special ((*translationPhase* NULL)
+              (*translationErrors* 0)
+              (*translationWarnings* 0)
+	      (*currentFile* (file-base-name file))
+              (*module* currentModule)
+              (*context* currentContext))
+      (case (translator-output-language)
+        (:common-lisp (setq targetLanguage "Common Lisp"))
+        ((:cpp :cpp-standalone) (setq targetLanguage "C++"))
+	(:idl (setq targetLanguage "IDL"))
+	(:java (setq targetLanguage "Java"))
+        (otherwise NULL))
+      (when (>= *translationVerbosityLevel* 1)
+        (inform "Processing " file ":")
+        (inform "*** Pass 1, generating objects..."))
+      ;; Read STELLA source code as transient objects - maybe have a
+      ;;    separate iterator for that:
+      (with-transient-objects
+        (foreach
+            tree in (s-expressions (new INPUT-FILE-STREAM :filename file))
+            do (with-permanent-objects
+                 (typecase tree
+                   (CONS
+                    (mv-setq (skip? seenInModule?)
+                      (handle-in-module-tree tree seenInModule?))
+                    (unless skip?
+                      (special ((*translationPhase* :DEFINE))
+                        (walk-top-level-tree tree TRUE))))
+                   ;; ignore atomic expressions:
+                   (otherwise NULL)))))
+      (reverse *translationUnits*)
+      (unless (eql? operation :define)
+        (when (>= *translationVerbosityLevel* 1)
+          (inform "*** Pass 2, finalizing objects..."))
+        (setq *translationPhase* :FINALIZE)
+        (finalize-classes-and-slots)
+        (unless (eql? operation :finalize)
+          (when (>= *translationVerbosityLevel* 1)
+            (inform "*** Pass 3, walking objects..."))
+          (setq *translationPhase* :WALK)
+	  (unless (or (use-hardcoded-symbols?)
+		      (eq? (translator-output-language) :java))
+	    (clear-symbol-registry))
+          (special ((*useRecordedSignatures?*
+                     *walk-with-recorded-signatures?*))
+            (walk-all-phase-one-units))
+          (unless (eql? operation :walk)
+	    (translate-and-output-units-to-file file targetLanguage))
+          (when *record-signatures?*
+            (inform "Recording object signatures...")
+            (record-signatures-of-all-units file))))
+      ;; If we toggled, toggle back:
+      (summarize-translation-errors))))
+
+(defun clean-up-translation-units-special ()
+  ;; Performs standard clean up to free up the items in the externally
+  ;;   bound *translationUnits* variable;
+  (foreach unit in *translationUnits* do (free unit))
+  (clear *translationUnits*)
+  (sweep-transients))
+
+(defun translate-file ((file FILE-NAME) (outputLanguage KEYWORD) (asPartOfSystem? BOOLEAN))
+  ;; Translates a complete Stella 'file' into a translation file or files.
+  ;;    The name of the translation file(s) depends on the target language.
+  ;; If 'walkOnly?' is TRUE, no translation or output is performed after
+  ;;    the code walking pass.
+  ;; Java translation relies on being able to do a :walk only.
+  (let ((mode :translate))
+    (special ((*java-indent-chars* 0)
+	      (*idl-indent-chars* 0)
+	      (*cpp-indent-chars* 0))
+      (case outputLanguage
+	(:java
+	 (when asPartOfSystem?
+	   (setq mode :walk)))
+	(otherwise NULL))
+      (if asPartOfSystem?
+	(operate-on-file file mode)
+	(special ((*translatorOutputLanguage* *translatorOutputLanguage*)
+		  (*translationUnits* (new LIST)))
+	  (set-translator-output-language outputLanguage)
+	  (operate-on-file file mode)
+	  (case outputLanguage
+	    (:cpp-standalone NULL)
+	    (otherwise
+	     (clean-up-translation-units-special))))) )))
+
+(defun output-all-units-to-file ((sourceFile FILE-NAME))
+  ;; Generate native file(s) for the code translated from 'sourceFile'.
+  ;; 'sourceFile' is an absolute file name.
+  (case (translator-output-language)
+    (:common-lisp
+     (cl-output-all-units-to-file sourceFile))
+    (:java
+    (special ((*java-indent-chars* 0))
+      (java-output-all-units-to-file)))
+    (:idl
+     (special ((*idl-indent-chars* 0))
+       (idl-output-all-units-to-file sourceFile)))
+    ((:cpp :cpp-standalone)
+     (special ((*cpp-indent-chars* 0))
+       (cpp-output-all-units-to-file sourceFile)))) )
+
+(defun record-signatures-of-all-units ((sourceFile FILE-NAME))
+  ;; Dummy that gets redefined by an optional persistent signature package.
+  (ignore sourceFile)
+  NULL)
+
+(defun (translate-with-copyright-header? BOOLEAN) ()
+  ;; Return TRUE if the feature :translate-with-copyright-header is enabled.
+  (return (enabled-stella-feature? :translate-with-copyright-header)))
+
+(defun output-copyright-header ((stream OUTPUT-STREAM))
+  ;; Output system banner onto 'stream'.
+  ;; The STELLA system banner is a USC/ISI copyright.
+  (when (or (not (translate-with-copyright-header?))
+	    (null? *currentSystemDefinition*)  ; Called from SAVE-MODULE
+            (null? (banner *currentSystemDefinition*)))
+    (return))
+  (case (translator-output-language)
+    (:common-lisp (print-stream stream "#|"))
+    ((:java :cpp :cpp-standalone) (print-stream stream "/*")))
+  (let ((substitution-list (new (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER))))
+    (fill-in-date-substitution substitution-list)
+    (print-stream stream (substitute-template-variables-in-string
+			    (banner *currentSystemDefinition*) 
+			    substitution-list)) )
+  (case (translator-output-language)
+    (:common-lisp (print-stream stream "|#"))
+    ((:java :cpp :cpp-standalone) (print-stream stream "*/")))
+  (print-stream stream EOL EOL))
+
+(defun output-file-header ((stream OUTPUT-STREAM) (file FILE-NAME))
+  ;; Write a standard header for `file' to `stream'.
+  (case (translator-output-language)
+    (:common-lisp
+     (cl-output-file-header stream file TRUE))
+    (:java
+     (java-output-file-header stream file))
+    (:cpp
+     (cpp-output-file-header stream file))
+    (otherwise
+     (cl-output-file-header stream file FALSE))))
+
+  ;;
+;;;;;; Some primitive file name support until we have a proper FILE-NAME class
+;;;;;; (currently it is assumed that FILE-NAME is an alias for STRING):
+  ;;
+
+(defglobal *OS* KEYWORD (operating-system)
+  :documentation "The operating system we are running on.  Currently,
+either :UNIX, :WINDOWS, or :MAC.")
+
+(defun (operating-system KEYWORD) ()
+  ;; Try to figure out what operating system we are running on.
+  ;; This needs improvement:
+  ;; - we can use `(CL:software-version)' in Lisp
+  ;; - we can use `System.getProperty("os.name")' or
+  ;;   `System.getProperty("file.separator")' in Java.
+  (cond ((or (probe-file? "C:\\AUTOEXEC.BAT")
+             (probe-file? "C:\\IO.SYS")
+             (probe-file? "C:\\BOOT.INI"))
+         ;; problem: these files might reside on different drives
+         (return :WINDOWS))
+        ((or (probe-file? "/usr")
+             (probe-file? "/etc"))
+         (return :UNIX))
+        (otherwise
+         (return :MAC))))
+
+(defun (directory-separator CHARACTER) ()
+  ;; Return the physical directory-separator character conditional on
+  ;;    the operating system we are running on.
+  (let ((separator CHARACTER #\?))
+    (verbatim 
+        :java "separator = java.io.File.separatorChar;"
+        :otherwise
+        (when (defined? *OS*) ;; guard against bootstrap failure
+          (case *OS*
+            (:unix (setq separator #\/))
+            (:mac (setq separator #\:))
+            (:windows (setq separator #\\)))))
+    (return separator)))
+
+(defun (directory-separator-string STRING) ()
+  ;; Return a string version of '(directory-separator)'.
+  (return (make-string 1 (directory-separator))) )
+
+(defun (directory-separator-for-file CHARACTER) ((file FILE-NAME))
+  ;; If `file' is a logical pathname, return `;', otherwise return
+  ;;    the physical directory separator of the current OS.
+  (if (logical-pathname? file)
+      (return LOGICAL-DIRECTORY-SEPARATOR)
+    (return (directory-separator))))
+
+(defconstant TYPE-SEPARATOR CHARACTER #\.)
+
+(defun (file-name-directory FILE-NAME) ((file FILE-NAME))
+  :documentation "Return the directory component of `file' including the final
+directory separator or the empty string if `file' does not include a directory.
+Note that for purposes of this function, a logical host is considered part of
+the directory portion of `file'"
+  :public? TRUE
+  (let ((start 0)
+        (length (length file))
+        (separator (directory-separator-for-file file)))
+    (when (logical-pathname? file)
+      (setq start (1+ (position file LOGICAL-HOST-SEPARATOR 0))))
+    (while (and (< start length)
+                (defined? (position file separator start)))
+      (setq start (+ (position file separator start) 1)))
+    (return (subsequence file 0 start))))
+
+(defun (directory-file-name FILE-NAME) ((directory FILE-NAME))
+  :documentation "Return `directory' as a file name, i.e., without a terminating
+directory separator."
+  :public? TRUE
+  (let ((separator (directory-separator-for-file directory))
+        (last (1- (length directory))))
+    (if (and (>= last 0)
+             (eql? (nth directory last) separator))
+        (return (subsequence directory 0 last))
+      (return directory))))
+
+(defun (file-name-as-directory FILE-NAME) ((file FILE-NAME))
+  :documentation "Return `file' interpreted as a directory, i.e., with a
+terminating directory separator.  If `file' is the empty string simply
+return the empty string, i.e., interpret it as the current directory instead
+of the root directory."
+  :public? TRUE
+  (let ((separator (directory-separator-for-file file))
+        (last (1- (length file))))
+    (if (or (< last 0)
+            (eql? (nth file last) separator))
+        (return file)
+      (return (concatenate file (make-string 1 separator))))))
+
+(defun (directory-parent-directory FILE-NAME)
+    ((directory FILE-NAME) (level INTEGER))
+  :documentation "Return the `level'-th parent directory component of `directory'
+including the final directory separator, or the empty string if `directory' does
+not have that many parents."
+  :public? TRUE
+  (foreach i in (interval 1 level)
+      do (ignore i)
+	 (setq directory (file-name-directory (directory-file-name directory))))
+  (return directory))
+
+(defun (file-name-without-directory FILE-NAME) ((file FILE-NAME))
+  :documentation "Return the file name portion of `file' by removing any
+directory and logical host components."
+  :public? TRUE
+  (let ((start 0)
+        (separator (directory-separator-for-file file)))
+    (setq file (logical-pathname-without-host file))
+    (while (defined? (position file separator start))
+      (setq start (+ (position file separator start) 1)))
+    (return (subsequence file start NULL-INTEGER))))
+
+(defun (file-name-without-extension FILE-NAME) ((file FILE-NAME))
+  :documentation "Remove `file's extension (or type) if there is any and
+return the result."
+  :public? TRUE
+  (let ((start 0)
+        (end NULL-INTEGER))
+    (while (defined? (position file TYPE-SEPARATOR start))
+      (setq end (position file TYPE-SEPARATOR start))
+      (setq start (+ end 1)))
+    (return (subsequence file 0 end))))
+
+(defun (file-extension STRING) ((file FILE-NAME))
+  :documentation "Return `file's extension (or type) if it has any including
+the separator character."
+  :public? TRUE
+  (let ((start 0)
+        (end NULL-INTEGER))
+    (while (defined? (position file TYPE-SEPARATOR start))
+      (setq end (position file TYPE-SEPARATOR start))
+      (setq start (+ end 1)))
+    (if (null? end)
+      (return NULL)
+      (return (subsequence file end NULL))) ))
+
+(defun (file-base-name FILE-NAME) ((file FILE-NAME))
+  :documentation "Remove `file's directory (including logical host) and
+extension components and return the result."
+  :public? TRUE
+  (return (file-name-without-extension (file-name-without-directory file))))
+
+(defconstant LOGICAL-DIRECTORY-SEPARATOR CHARACTER #\;)
+(defconstant LOGICAL-HOST-SEPARATOR CHARACTER #\:)
+
+(defglobal *logical-host-table* (STRING-HASH-TABLE OF STRING KEY-VALUE-LIST) NULL)
+(startup-time-progn :early-inits
+  (setq *logical-host-table*
+    (new (STRING-HASH-TABLE OF STRING KEY-VALUE-LIST)))
+  (define-logical-host-property "PL" NULL NULL))
+
+(defun define-logical-host-property
+    ((host STRING) (property KEYWORD) (value OBJECT))
+  :documentation "Define `property' with `value' for the logical host `host'.
+As a side-effect, this also defines `host' as a logical host (both
+`property' and `value' can be supplied as NULL).  If :ROOT-DIRECTORY
+is specified, all pathnames with `host' are assumed to be relative to
+that directory (even if they are absolute) and will be rerooted upon
+translation.  :ROOT-DIRECTORY can be a logical or physical pathname.
+If :LISP-TRANSLATIONS is specified, those will be used verbatimely as
+the value of `(CL:logical-pathname-translations host)' if we are
+running in Lisp, which allows us to depend on the native
+`CL:translate-logical-pathname' for more complex translation operations."
+  :public? TRUE
+  (setq host (string-upcase host))
+  (let ((properties (lookup *logical-host-table* host)))
+    (when (null? properties)
+      (setq properties (new KEY-VALUE-LIST))
+      (insert-at *logical-host-table* host properties))
+    (when (defined? property)
+      (case property
+        (:ROOT-DIRECTORY
+         (insert-at properties property NULL) ;; avoid infinite recursion
+         (when (defined? value)
+           (insert-at properties property
+                      (translate-logical-pathname
+                       (file-name-as-directory value)))))
+        (:LISP-TRANSLATIONS
+         (insert-at properties property value))
+        (otherwise
+         (warn "Illegal host property: " property))))))
+
+(defun (lookup-logical-host-property OBJECT) ((host STRING) (property KEYWORD))
+  ;; Lookup the value of `property' for the logical host `host'.
+  (setq host (string-upcase host))
+  (let ((properties (lookup *logical-host-table* host)))
+    (if (null? properties)
+        (return NULL)
+      (return (lookup properties property)))))
+
+(defun (logical-host? BOOLEAN) ((host STRING))
+  ;; Return TRUE if `host' is a logical host.
+  (return (defined? (lookup *logical-host-table* (string-upcase host)))))
+
+(defun (logical-pathname? BOOLEAN) ((pathName STRING))
+  ;; Return TRUE if `pathName' is a logical pathname.
+  ;; For now, just key in on special logical-pathname syntax.  What we
+  ;;    should do is to also have and look for logical host definitions.
+  (let ((host (get-logical-host-name pathName)))
+    (return (and (defined? host)
+                 (logical-host? host)))))
+
+(defun (absolute-pathname? BOOLEAN) ((pathName STRING))
+  ;; Return TRUE if `pathname' is an absolute pathname.
+  (let ((separator (directory-separator)))
+    (when (logical-pathname? pathName)
+      (setq separator LOGICAL-DIRECTORY-SEPARATOR))
+    ;; KLUDGE: This also removes physical device names such as `C:':
+    (setq pathName (logical-pathname-without-host pathName))
+    (return (and (> (length pathName) 0)
+                 (eql? (nth pathName 0) separator)))))
+
+(defun (get-logical-host-name STRING) ((pathName STRING))
+  ;; If `pathName' is a logical pathname containing a non-empty host portion,
+  ;;    return it; return NULL otherwise.
+  (let ((separatorPos (position pathName LOGICAL-HOST-SEPARATOR 0)))
+    (if (and (defined? separatorPos)
+             (>= separatorPos 1))
+        (return (subsequence pathName 0 separatorPos))
+      (return NULL))))
+
+(defun (logical-pathname-without-host STRING) ((pathName STRING))
+  ;; If `pathName' is a logical pathname, remove its host portion; otherwise
+  ;;    return `pathName' unmodified.
+  (let ((hostName (get-logical-host-name pathName)))
+    (if (null? hostName)
+        (return pathName)
+      (return (subsequence pathName (1+ (length hostName)) NULL)))))
+
+(defun (translate-logical-pathname STRING) ((pathName STRING))
+  ;; If `pathName' is a logical pathname, translate it into a physical
+  ;;    pathname appropriate for the current operating system.
+  ;; Otherwise, return `pathName' unmodified.
+  ;; For now, only Common-Lisp can do complex directory and name translations.
+  ;;    C++ and Java only support rerooting to a physical directory.
+  (unless (logical-pathname? pathName)
+    (return pathName))
+  (let ((host (get-logical-host-name pathName))
+        (translatedPathname pathName))
+    (if-output-language
+     :common-lisp
+     (let ((translations
+            (lookup-logical-host-property host :LISP-TRANSLATIONS))
+           (ltranslations CONS
+            (verbatim :common-lisp
+              (CL:ignore-errors (CL:logical-pathname-translations host)))))
+       (when (or (defined? translations)
+                 (non-empty? ltranslations))
+         (verbatim
+           :common-lisp
+           "(CL:progn
+              (CL:unless ltranslations
+                (CL:setf (CL:logical-pathname-translations host)
+                  (lispify translations)))
+              (setq translatedPathname
+                (CL:namestring (%%translate-logical-pathname pathName))))"
+           :otherwise NULL)
+         (return translatedPathname)))
+     NULL)
+    ;; We are not in Lisp or didn't have Lisp translations available:
+    (setq translatedPathname
+      (substitute (logical-pathname-without-host pathName)
+                  (directory-separator)
+                  LOGICAL-DIRECTORY-SEPARATOR))
+    ;; Reroot pathname if we have a :ROOT-DIRECTORY specification:
+    (let ((rootDirectory STRING-WRAPPER
+            (lookup-logical-host-property host :ROOT-DIRECTORY)))
+      (when (defined? rootDirectory)
+        (when (absolute-pathname? translatedPathname)
+          (setq translatedPathname (subsequence translatedPathname 1 NULL)))
+        (setq translatedPathname
+          (concatenate (wrapper-value rootDirectory) translatedPathname))))
+    (return translatedPathname)))
+
+(defun (unlogicalize-pathname STRING) ((pathName STRING))
+  :globally-inline? TRUE
+  (return (translate-logical-pathname pathName)))
+
+
+(defun (merge-file-names FILE-NAME) ((baseFile FILE-NAME) (defaults FILE-NAME))
+  :documentation "Parse `baseFile', supply any missing components from
+`defaults' if supplied and return the result."
+  :public? TRUE
+  (let ((baseSeparator (directory-separator-for-file baseFile))
+        (baseHost (get-logical-host-name baseFile))
+        (baseDirectory
+         (logical-pathname-without-host (file-name-directory baseFile)))
+        (baseName (file-base-name baseFile))
+        (baseExtension (file-extension baseFile))
+        (defaultsSeparator (directory-separator-for-file defaults))
+        (merged? FALSE)
+        (result STRING-OUTPUT-STREAM NULL))
+    (when (and (not (eql? baseSeparator defaultsSeparator))
+               (member? baseFile baseSeparator)
+               (member? defaults defaultsSeparator))
+      (error "merge-file-names: base file and defaults use different syntax"))
+    (when (null? baseHost)
+      (setq baseHost (get-logical-host-name defaults))
+      (setq merged? (or merged? (defined? baseHost))))
+    (when (empty? baseDirectory)
+      (setq baseDirectory
+        (logical-pathname-without-host (file-name-directory defaults)))
+      (setq merged? (or merged? (not (empty? baseDirectory)))))
+    (when (null? baseName)
+      (setq baseName (file-base-name defaults))
+      (setq merged? (or merged? (defined? baseName))))
+    (when (null? baseExtension)
+      (setq baseExtension (file-extension defaults))
+      (setq merged? (or merged? (defined? baseExtension))))
+    (when (not merged?)
+      (return baseFile))
+    (setq result (new STRING-OUTPUT-STREAM))
+    (when (defined? baseHost)
+      (print-stream result baseHost LOGICAL-HOST-SEPARATOR))
+    (print-stream result baseDirectory)
+    (when (defined? baseName)
+      (print-stream result baseName))
+    (when (defined? baseExtension)
+      (print-stream result baseExtension))
+    (return (the-string result))))
+
+
+  ;;
+;;;;;; File name constructor 'make-file-name'
+  ;;
+
+;;; TO DO:
+;;; - the current filename translation scheme that translates filenames purely
+;;;   based on their (canonical) types as opposed to their actual usage in a
+;;;   system definition is somewhat strange and needs to be replaced by something
+;;;   else.  For example, we might need to copy some C++ files as part of a Lisp
+;;;   system which currently would make them wind up in the wrong place.
+;;; - also it seems `make-file-name' is the wrong place to do the translation.
+
+(defglobal *type-to-file-extension-table* (CONS OF CONS)
+  (bquote ((:stella ".ste")
+           (:kb ".kb")
+           (:cpp ".cc")
+           (:cpp-code ".cc")
+           (:cpp-header ".hh")
+           (:c-code ".c")
+           (:c-header ".h")
+           (:java ".java")
+           (:idl ".idl")
+           (:none "")))
+  :documentation "Used by `select-file-extension'.")
+
+(defun (compute-common-lisp-file-extension STRING) ((type KEYWORD))
+  ;; Return an appropriate Common Lisp extension.
+  ;; The only legal values of "type" are :LISP and :LISP-BINARY.
+  ;; This only works when running as lisp.
+  ;; QUESTION: IS THERE A SIMPLER WAY TO DO THE SAME THING?  -rmm
+  (unless (running-as-lisp?)
+    (error "Shouldn't call COMPUTE-COMMON-LISP-FILE-EXTENSION unless running in Lisp"))
+  (let ((suffix STRING NULL)
+        (dummyPathName STRING NULL))
+    (cond ((use-cl-structs?)
+	   (setq suffix ".slisp"))
+	  ((use-vector-structs?)
+	   (setq suffix ".vslisp"))
+	  (otherwise 
+	   (setq suffix ".lisp")))
+
+    ;; This is used to map ".lisp" into ".lsp" for lisp systems where it is
+    ;; appropriate.
+    (verbatim
+     :common-lisp
+     "(cl:let* ((lispType 
+                  (CL:pathname-type (CL:concatenate 'CL:string \"dummy\" suffix)))
+                 (dummyPath
+                  (CL:make-pathname :name \"f\" :type lispType)))
+         (cl:setq dummyPathName (CL:namestring dummyPath)))"
+     :otherwise NULL)
+    
+    (when (eq? type :lisp-binary)
+      (cond ((use-cl-structs?)
+             (setq dummyPathName "f.sfasl"))
+            ((use-vector-structs?)
+             (setq dummyPathName "f.vsfasl"))
+            (otherwise
+             ;; let the compiler tell us what to use:
+             (verbatim
+               :common-lisp
+               " (cl:setq dummyPathName 
+                    (CL:namestring (cl:compile-file-pathname dummyPathName)))"
+               :otherwise NULL))))
+
+    ;; Extract just the extension.  The filename was set to "f" in the
+    ;; first verbatim clause.
+    (return (subsequence dummyPathName 1 NULL)) ))
+
+(defun (default-common-lisp-file-extension STRING) ((type KEYWORD))
+  ;; Return an appropriate Common Lisp extension.
+  ;; The only legal values of "type" are :LISP and :LISP-BINARY.
+  (case type
+    (:lisp 
+     (case *OS*
+       (:windows
+	(return ".lsp"))
+       (otherwise
+	(return ".lisp"))))
+    (:lisp-binary
+     (case *OS*
+       (:mac
+	(return ".pfsl"))
+       (:windows
+	(return ".fas"))
+       (otherwise
+	(return ".fasl"))))))
+
+(defun (select-file-extension STRING) ((type KEYWORD))
+  ;; Return a surface representation of the canonical file extension `type'.
+  (let ((extension STRING NULL))
+    (foreach entry in *type-to-file-extension-table*
+             where (eql? (first entry) type)
+             do (setq extension (second entry)))
+    (case type
+      (:directory (return (directory-separator-string)))
+      ((:lisp :lisp-binary) 
+       (if (running-as-lisp?)
+	   (return (compute-common-lisp-file-extension type))
+	 (return (default-common-lisp-file-extension type))))
+      (otherwise NULL))
+    (safety 3 (defined? extension) "Bad type: " type)
+    (return extension) ))
+
+(defun (classify-file-extension KEYWORD) ((file FILE-NAME))
+  ;; Return a canonical representation of the extension of `file'.
+  ;; Return :NONE if it has no extension or :OTHER if its type is unknown.
+  (let ((extension (file-extension file)))
+    (when (null? extension)
+      (return :NONE))
+    (foreach entry in *type-to-file-extension-table*
+        where (eql? (second entry) extension)
+        do (return (first entry)))
+    (when (running-as-lisp?)
+      (when (eql? (compute-common-lisp-file-extension :lisp) extension)
+        (return :lisp))
+      (when (eql? (compute-common-lisp-file-extension :lisp-binary) extension)
+        (return :lisp-binary)))
+    (when (eql? (default-common-lisp-file-extension :lisp) extension)
+      (return :lisp))
+    (when (eql? (default-common-lisp-file-extension :lisp-binary) extension)
+      (return :lisp-binary))
+    (return :OTHER)))
+
+(defun (select-root-directory STRING) ((type KEYWORD))
+  (let ((root STRING NULL))
+    (case type
+      ((:stella :kb)
+       (setq root (root-source-directory)))
+      ((:lisp-binary :directory)
+       (setq root (root-binary-directory)))
+      (otherwise
+       (setq root (root-native-directory))))
+    (return root) ))
+
+(defglobal *lisp-splitter-path* STRING "lisp")
+(defglobal *java-splitter-path* STRING "java")
+(defglobal *cpp-splitter-path* STRING "cpp")
+
+(defun (select-splitter-path STRING) ((type KEYWORD))
+  ;; Called by 'make-file-name'.
+  ;; Compute a directory name (or NULL) used to separate different
+  ;;    native code directories.
+  (let ((splitterPath ""))
+    (case type
+      ((:lisp :common-lisp)
+       (setq splitterPath *lisp-splitter-path*))
+      (:java
+       (setq splitterPath *java-splitter-path*))
+      ((:cpp :cpp-header :cpp-code :c-header :c-code)
+       (setq splitterPath *cpp-splitter-path*))
+      ((:none :other)
+       (return (select-splitter-path (translator-output-language))))
+      (otherwise NULL))
+    (when (not (eql? splitterPath ""))
+      (setq splitterPath (concatenate splitterPath (directory-separator-string))))
+    (return splitterPath) ))
+
+(defun (make-file-name-from-relative-path FILE-NAME) ((filePath OBJECT) (type KEYWORD))
+  ;; Make an absolute file-name string from 'filePath' with directory location
+  ;;     and file extension determined by 'type' and 'relative?'.
+  ;; 'filePath' is a string or list of strings ending in an extensionless file-name.
+  (return (make-file-name (implode-pathname filePath) type TRUE)) )
+
+(defun (root-directory-prefix FILE-NAME) ((file FILE-NAME))
+  ;; Helping function for 'make-file-name'.
+  ;; Return a root directory based on the extension of 'file'.
+  (let ((extension (file-extension file)))
+    (case extension
+      (".ste"
+       (return (root-source-directory)))
+      ((".lisp" ".java" ".cc" ".hh")
+       (return (root-native-directory)))
+      (otherwise
+       (return (root-native-directory))))))
+
+(defun (make-file-name FILE-NAME) ((filePath STRING) (type KEYWORD) (relative? BOOLEAN))
+  ;; Make an absolute file-name string from 'filePath' with directory location
+  ;;     and file extension determined by 'type' and 'relative?'.
+  ;; If 'relative?', then a prefix is appended:
+  ;;    If '(root-source-directory)' is a prefix of 'filePath', then if
+  ;;    :stella or :kb, the prefix stays; if
+  ;;    :lisp-binary, the prefix is replaced by '(root-binary-directory)';
+  ;;    else the prefix is replaced by '(root-native-directory)'.
+  (let ((extension (select-file-extension type))
+        (rootPath "")
+        (splitterPath "")
+        (subDirectory ""))
+    (cond
+     (relative?
+      (setq rootPath (select-root-directory type))
+      (setq splitterPath (select-splitter-path type))
+      (setq filePath (file-name-without-extension filePath))
+      (case type
+        (:java
+         (setq subDirectory (java-package-prefix *module* (directory-separator-string))))
+        (otherwise
+         (when (not (eql? *currentSystemDefinitionSubdirectory* ""))
+           (setq subDirectory
+                 (concatenate *currentSystemDefinitionSubdirectory* (directory-separator-string)))))))
+     (otherwise
+      ;; Convert an absolute path name by substituting a different prefix
+      ;;    and/or extension for the ones on 'filePath':
+      (let ((rootPrefix (root-directory-prefix filePath)))
+        (setq filePath (file-name-without-extension filePath))
+        (when (not (member? (quote (:stella :kb)) type))
+          ;; switch prefix from source to native or binary:
+          (let ((relativePath (relativize-file-name filePath rootPrefix)))
+            (when (not (eql? filePath relativePath))
+              ;; 'rootPrefix' must be a prefix of 'filePath'.  That means that
+              ;;    we know how to redirect the path:
+              (setq rootPath (select-root-directory type))
+              (setq splitterPath (select-splitter-path type))
+              (setq filePath relativePath)))))))
+    (return (concatenate rootPath splitterPath subDirectory filePath extension)) ))
+
+(defun (relativize-file-name FILE-NAME) ((file FILE-NAME) (rootPath FILE-NAME))
+  ;; If 'rootPath' is a prefix of 'file', remove it.
+  ;; This turns absolute path names into relative ones for the case that
+  ;;    we guessed 'rootPath' correctly.
+  (let ((absolute? (eq? (string-search file rootPath 0) 0)))
+    (if absolute?
+      (return (subsequence file (length rootPath) NULL))
+      (return file)) ))
+
+(defun (help-implode-pathname FILE-NAME) ((fileName FILE-NAME))
+  ;; Helping function for 'implode-pathname'.
+  ;; If necessary, strip file extension before calling 'maybe-truncate-filename';
+  ;;    then put the extension back on.
+  (let ((extension (file-extension fileName)))
+    (if (null? extension)
+      (return (maybe-truncate-filename fileName))
+      (return (concatenate (maybe-truncate-filename (file-base-name fileName)) extension))) ))
+
+(defun (implode-pathname FILE-NAME) ((filePath OBJECT))
+  ;; Convert 'filePath' from a list into a string with embedded directory
+  ;;    separators.
+  (let ((file STRING NULL))
+    (typecase filePath
+      (CONS
+       (let ((path-length (length filePath)))
+         (setq file "")
+         (foreach name in (cast filePath (CONS OF STRING-WRAPPER))
+                  as n in (interval 1 path-length)
+                  do (if (= n path-length)  ;; Last item, namely the file name
+                       (setq file (concatenate file (help-implode-pathname name)))
+                       (setq file
+                             (concatenate file 
+                                          (wrapper-value name)
+                                          (directory-separator-string))))) ))
+      (otherwise
+       (setq file 
+             (help-implode-pathname 
+              (wrapper-value (cast filePath STRING-WRAPPER))))))
+    (return file) ))
+
+(defspecial *dontTruncateFilenames?* BOOLEAN FALSE
+  :documentation "When TRUE, overrides normal truncation of file names.")
+
+(defun (maybe-truncate-filename FILE-NAME) ((bareFileName FILE-NAME))
+  ;; If <fileName.suffix> is too long, shorten it and print a warning.
+  (safety 3 (string-eql? bareFileName (file-name-without-extension bareFileName))
+          "File name with extension passed to 'maybe-...':" bareFileName)
+  (when *dontTruncateFilenames?*
+    (return bareFileName))
+  (let ((maximumLength 999))
+    (case *OS*
+      ;; some OS's can't handle arbitrarily long path names:
+      (:mac (setq maximumLength (- 31 5)))      ; 31 minus (length ".java")
+      (otherwise NULL))
+    (when (> (length bareFileName) maximumLength)
+      (let ((originalFileName bareFileName))
+        (setq bareFileName (subsequence bareFileName 0 (1- maximumLength)))
+        (warn "Truncating name of file." EOL
+              "   Original: " originalFileName "    Truncated: " bareFileName EOL)))
+    (return bareFileName) )) 
+
+
+  ;;
+;;;;;; Simple system functions
+  ;;
+
+;; These functions were defined BEFORE the SYSTEM class was invented.
+;; They should be generalized. 
+
+(defun (language-to-file-type KEYWORD) ((language KEYWORD))
+  ;; Handle the mapping from language keywords to file type keywords.
+  (case language
+    (:common-lisp (return :lisp))
+    (:cpp (return :cpp-code))
+    (otherwise (return language))))
+
+(defun (reroot-file-name FILE-NAME)
+    ((file FILE-NAME) (fromRoot FILE-NAME) (toRoot FILE-NAME))
+  ;; If 'file' has 'fromRoot' as a prefix replace it with 'toRoot'.
+  ;; Otherwise, append 'toRoot' and 'file'.
+  (let ((absolute? (eq? (string-search file fromRoot 0) 0)))
+    (if absolute?
+        (if (string-eql? fromRoot toRoot)
+            (return file)
+          (return
+            (concatenate toRoot (subsequence file (length fromRoot) NULL))))
+      (return (concatenate toRoot file)))))
+
+(defun (file-younger-than? THREE-VALUED-BOOLEAN) ((file1 STRING) (file2 STRING))
+  ;; Return TRUE if `file1' is younger than `file2', or FALSE if not.
+  ;; Return NULL if the relationship cannot be determined.
+  (if (or (not (probe-file? file1))
+          (not (probe-file? file2)))
+    (return NULL)
+    (let ((file1-date (file-write-date file1))
+	  (file2-date (file-write-date file2)))
+      (if (or (null? file1-date)
+	      (null? file2-date))
+	(return NULL)
+	(return (time-greater? file1-date file2-date))))))
+
+(defun (stella-need-to-translate? BOOLEAN) ((file OBJECT) (language KEYWORD))
+  ;; TRUE if 'sourceFile' needs to be translated.
+  ;; For Java, the files always need to be translated since there isn't
+  ;;   a one-to-one correspondence between source and translated files.
+  (when (eq? language :java)
+    (return TRUE))
+  (let ((sourceFile  (make-file-name file :stella TRUE))
+	(translatedFile (make-file-name file 
+					(language-to-file-type language)
+					TRUE)))
+    (return
+      (and (probe-file? sourceFile)
+           (not (eql? (file-younger-than? translatedFile sourceFile)
+                      TRUE-WRAPPER))))))
+
+(defun (stella-need-to-compile? BOOLEAN) ((file OBJECT))
+  ;; TRUE if 'sourceFile' needs to be compiled.
+  ;; Should only be called from Lisp versions.
+  (let ((sourceFile (make-file-name file :lisp TRUE))
+	(compiledFile (make-file-name file :lisp-binary TRUE)))
+    (return (not (eql? (file-younger-than? compiledFile sourceFile)
+                       TRUE-WRAPPER)))))
+
+(defun (system-needs-translation? BOOLEAN) ((systemName STRING) (language KEYWORD))
+  ;; Return TRUE if the `language' version of `systemName' has one or more
+  ;;    files that need to be translated.
+  ;; Assumes the preprocessed files are a subset of the source files.
+  (with-system-definition systemName
+    (return (exists file in (files-plus-system-startup
+                             (system-definition-source-files
+                              *currentSystemDefinition*))
+                where (stella-need-to-translate? file language))))
+  ;; make Java happy:
+  (return FALSE))
+
+(deftype SYSTEM-UNITS-ALIST
+    (KEY-VALUE-LIST OF STRING-WRAPPER (LIST OF TRANSLATION-UNIT)))
+
+(defun (compute-file-units-module MODULE) ((fileUnits (LIST OF TRANSLATION-UNIT)))
+  ;; Take `fileUnits' to be the translation units resulting from the translation
+  ;;    of a single file, and derive the file's `in-module' by retrieving the
+  ;;    home module of one of its translated objects.
+  ;; Alternatively, we could store this module information in the units list.
+  (foreach unit in fileUnits
+      where (defined? (the-object unit))
+      do (case (category unit)
+           ((STARTUP-TIME-PROGN VERBATIM) NULL)
+           (otherwise
+            (return (home-module (the-object unit))))))
+  (return *module*))
+
+(defun (concatenate-system-units (LIST OF TRANSLATION-UNIT))
+    ((systemUnits SYSTEM-UNITS-ALIST))
+  ;; Concatenate all translation units collected in the `systemUnits' alist
+  ;;    and return the result.
+  (let ((head (cons NULL NIL))
+        (cursor head))
+    ;; concatenate all translation units:
+    (foreach (file units) in systemUnits
+        do (ignore file)
+	   (when (non-empty? units)
+             (concatenate cursor (the-cons-list units))
+             (setq cursor (the-cons-list units))))
+    (return (new LIST :the-cons-list (rest head)))))
+
+(defun (translate-system BOOLEAN) ((systemName STRING)
+                                   (outputLanguage KEYWORD)
+                                   &rest (options OBJECT))
+  :documentation
+  "Translate all of the STELLA source files in system `systemName' into
+`outputLanguage'.  The following keyword/value `options' are recognized:
+
+`:two-pass?' (default false): if true, all files will be scanned twice, once
+to load the signatures of objects defined in them, and once to actually
+translate the definitions.
+
+`:force-translation?' (default false): if true, files will be translated
+whether or not their translations are up-to-date.
+
+`:development-settings?' (default false): if true translation will favor
+safe, readable and debuggable code over efficiency (according to the value
+of `:development-settings' on the system definition).  If false, efficiency
+will be favored instead (according to the value of `:production-settings'
+on the system definition).
+
+`:production-settings?' (default true): inverse to `:development-settings?'."
+  :public? TRUE
+  (let ((plist (new PROPERTY-LIST :the-plist (coerce-&rest-to-cons options)))
+        (twoPass? FALSE)
+        (forceTranslation? FALSE)
+        (productionMode? TRUE))
+    (setq outputLanguage (stellify outputLanguage))
+    (vet-options plist
+                 (quote (:two-pass?
+                         :force-translation?
+                         :production-settings?
+                         :development-settings?)))
+    (foreach (key value) in plist
+        do (case key
+             (:two-pass?
+              (setq twoPass? (eql? value TRUE-WRAPPER)))
+             (:force-translation?
+              (setq forceTranslation? (eql? value TRUE-WRAPPER)))
+             (:production-settings?
+              (setq productionMode? (eql? value TRUE-WRAPPER)))
+             (:development-settings?
+              (setq productionMode? (not (eql? value TRUE-WRAPPER))))))
+    (when (null? (lookup-function-or-stella-function
+                  (system-startup-function-symbol
+                   (get-system-definition systemName))))
+      ;; This relies on the fact that "system-startup.ste" gets translated last:
+      (setq twoPass? TRUE))
+    (special ((*translatorOutputLanguage* *translatorOutputLanguage*)
+              (*translationPhase* NULL)
+              (*safety* *safety*)       ; preserve old value
+              ;; Java breaks with recycling.
+              (*recycling-enabled?* (not (eql? outputLanguage :java)))
+              (*current-stella-features* (copy *current-stella-features*)))
+      (setq *gensym-counter* -1)
+      (set-stella-feature
+       :TRANSLATE-WITH-COPYRIGHT-HEADER
+       :WARN-ABOUT-MISSING-METHODS
+       :WARN-ABOUT-UNDEFINED-METHODS)
+      (unset-stella-feature :USE-HARDCODED-SYMBOLS)
+      (set-translator-output-language outputLanguage)
+      (with-system-definition systemName
+        (compute-optimization-levels *currentSystemDefinition* productionMode?)
+        (let ((files (files-plus-system-startup
+                      (system-definition-source-files
+                       *currentSystemDefinition*)))
+              (translatedSomething? FALSE))
+          (when (or forceTranslation?
+                    (system-needs-translation? systemName outputLanguage))
+            ;; create startup-system file; it is translated with source files:
+            (create-system-startup-file *currentSystemDefinition*)
+            (setq translatedSomething?
+              (help-translate-system files twoPass? forceTranslation?)))
+          (transfer-native-system-files outputLanguage)
+          (return translatedSomething?)))
+      ;; Return required in case the WITH-SYSTEM-DEFINITION code doesn't execute
+      ;; its body!
+      (return FALSE) )))
+
+(defun (help-translate-system BOOLEAN) ((files (CONS OF STRING-WRAPPER))
+                                        (twoPass? BOOLEAN) 
+                                        (forceTranslation? BOOLEAN))
+  ;; Translate a system of 'files'.
+  ;; If 'twoPass?' is true, all files will be scanned twice, once to define
+  ;;    all objects defined in them, and once to actually translate them.
+  ;; Return TRUE if at least one file was translated
+  (special ((*translationUnits* (new LIST)))
+    (let ((outputLanguage (translator-output-language))
+          (fileName FILE-NAME NULL)
+	  (translatedFile? FALSE)
+	  (walkedUnits SYSTEM-UNITS-ALIST (new KEY-VALUE-LIST)))
+      (clear-symbol-registry)
+      (when twoPass?
+	(foreach file in files
+            do (when (or forceTranslation? 
+                         (stella-need-to-translate? file outputLanguage)
+                         (not (loaded? *currentSystemDefinition*)))
+                 (setq fileName (make-file-name file :stella TRUE))
+                 (unless (probe-file? fileName)
+                   (inform "Warning: File " fileName " does not exist.")
+                   (continue))
+                 (operate-on-file fileName :define)
+                 (clean-up-translation-units-special)
+                 (setq translatedFile? TRUE)))
+	(when translatedFile?
+	  (when (>= *translationVerbosityLevel* 1)
+	    (inform "*** Pass 2, finalizing objects..."))
+	  (finalize-classes-and-slots)))
+      ;; ready for collecting startup names:
+      (foreach file in files
+          do (when (or forceTranslation?
+                       (stella-need-to-translate? file outputLanguage))
+               (setq fileName (make-file-name file :stella TRUE))
+               (unless (probe-file? fileName)
+                 (inform "Warning: File " fileName " does not exist.")
+                 (continue))
+               (operate-on-file fileName :walk)
+               (insert-at walkedUnits fileName *translationUnits*)
+               (setq *translationUnits* (new LIST))))
+      (reverse walkedUnits) ;; reestablish file order
+      (when (>= *translationVerbosityLevel* 1)
+        (inform "    =============================="))
+      (case outputLanguage
+        (:common-lisp (cl-translate-walked-system-units walkedUnits))
+        (:cpp (cpp-translate-walked-system-units walkedUnits))
+        (:java (java-translate-walked-system-units walkedUnits)))
+      (clear-symbol-registry)
+      (return translatedFile?))))
+
+(defun transfer-native-system-files ((outputLanguage KEYWORD))
+  ;; Helping function for 'translate-system'.
+  ;; Copy any native files in  *currentSystemDefinition* from their position
+  ;;    within the root source directory into an equivalent position in the
+  ;;    native source directory.
+  ;; Most of the complexity originates because we need to interpret
+  ;;    native file extensions as indicators of file types, but can't
+  ;;    assume that they represent legal extensions (e.g., ".lisp" may
+  ;;    translate to ".lsp" for some Lisps).
+  (let ((nativeFiles (CONS OF STRING-WRAPPER) NULL)
+        (systemSubDirectory
+         (choose (eql? *currentSystemDefinitionSubdirectory* "")
+                 ""
+                 (concatenate *currentSystemDefinitionSubdirectory*
+                              (directory-separator-string))))
+	(flotsamFileName STRING ""))
+    (case outputLanguage
+      (:common-lisp 
+       (setq nativeFiles (lisp-only-files *currentSystemDefinition*)))
+      (:java 
+       (setq nativeFiles (java-only-files *currentSystemDefinition*))
+       (setq flotsamFileName
+	 (java-yield-flotsam-class-name 
+	  (get-cardinal-module *currentSystemDefinition*))))
+      (:cpp
+       (setq nativeFiles (cpp-only-files *currentSystemDefinition*))))
+    (when (null? nativeFiles)
+      (return))
+    (when (eql? (root-source-directory) (root-native-directory))
+      (return))
+    ;; subtract any language-specific STELLA files (such as `cl-primal.ste')
+    ;;    whose translation has already been copied during the translation step
+    ;;    (we now need to do this since we copy extensionless files):
+    (setq nativeFiles
+      (difference nativeFiles
+                  (system-definition-source-files *currentSystemDefinition*)))
+    (within-module (get-cardinal-module *currentSystemDefinition*)
+      (foreach f in nativeFiles
+	  do (let ((fileName STRING f)
+                   (type (classify-file-extension fileName))
+                   (relativeFileName
+                    (relativize-file-name fileName (root-source-directory)))
+                   (fromFileName FILE-NAME NULL)
+                   (toFileName FILE-NAME NULL))
+               (case type
+                 (:JAVA
+                  (when (eql? (file-base-name fileName) flotsamFileName)
+                    (warn "Native Java filename " flotsamFileName EOL 
+                          " conflicts with the Java catchall class' filename")))
+                 (otherwise NULL))
+               (setq fromFileName
+                 (concatenate
+                   (root-source-directory) systemSubDirectory fileName))
+               (setq toFileName (make-file-name relativeFileName type TRUE))
+               (when (not (eql? (file-younger-than? toFileName fromFileName)
+                                TRUE-WRAPPER))
+                 (when (>= *translationVerbosityLevel* 1)
+                   (inform "Copying " fromFilename EOL " to " toFileName " ..."))
+                 (copy-file fromFileName toFileName)))))))

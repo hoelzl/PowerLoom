@@ -1,0 +1,795 @@
+;;;  -*- Mode: Lisp; Syntax: Common-Lisp ; Package: STELLA -*-
+
+;;; **********************************************************************
+;;; This code was written as part of the CMU Common Lisp project at
+;;; Carnegie Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of CMU Common Lisp, please contact
+;;; Scott Fahlman or slisp-group@cs.cmu.edu.
+;;;
+;;;
+;;; **********************************************************************
+
+;;; Parsing routines for time and date strings. parse-date-time returns the
+;;; universal time integer for the time and/or date given in the string.
+
+;;; Written by Jim Healy, June 1987.
+
+;;;
+;;;       CHANGES FROM THE CMU VERSION:
+;;;
+;;; Modified for Stella by Tom Russ, August 2001
+;;;   Modifications include renaming the main entry function to 
+;;;   parse-date-time and having it return a Stella decoded-date-time 
+;;;   object and renaming the file.
+;;;
+
+;;; **********************************************************************
+
+;;; Version: date-time-parser.ste,v 1.13 2003/09/05 00:45:08 tar Exp
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+(defconstant whitespace-chars CONS (bquote (#\space #\tab #\linefeed #\return #\Page #\, #\' #\`)))
+(defconstant time-dividers CONS (bquote (#\: #\.)))
+(defconstant date-dividers CONS (bquote (#\\ #\/ #\-)))
+(defconstant date-time-dividers CONS (bquote (#\T)))
+
+(defspecial *error-on-mismatch* BOOLEAN FALSE
+  :public? TRUE
+  :documentation
+  "If TRUE, an error will be signalled if parse-date-time is unable
+   to determine the time/date format of the string.")
+
+;;; Set up hash tables for month, weekday, zone, and special strings.
+;;; Provides quick, easy access to associated information for these items.
+
+;;; Hashlist takes an association list and hashes each pair into the
+;;; specified tables using the car of the pair as the key and the cdr as
+;;; the data object.
+
+(defmacro hashlist ((list OBJECT) (table OBJECT))
+  (return 
+    (bquote (foreach item in (cast & list (CONS OF CONS))
+		do (insert-at & table (first item) (second item))) )))
+
+(defspecial *weekday-strings* (STRING-HASH-TABLE OF STRING KEYWORD)
+	   (new (STRING-HASH-TABLE OF STRING KEYWORD)))
+
+(defspecial *month-strings* STRING-TO-INTEGER-HASH-TABLE
+	   (new STRING-TO-INTEGER-HASH-TABLE))
+
+(defspecial *zone-strings* (STRING-HASH-TABLE OF STRING FLOAT-WRAPPER)
+	   (new (STRING-HASH-TABLE OF STRING FLOAT-WRAPPER)))
+
+(defspecial *special-strings* STRING-HASH-TABLE
+	   (new STRING-HASH-TABLE))
+
+(defspecial *special-symbols* (CONS OF SYMBOL)  
+	   (bquote (yesterday today tomorrow now)))
+
+;;; Load-time creation of the hash tables.
+
+(startup-time-progn :globals
+  (hashlist (bquote (("monday" :monday)    ("mon" :monday)
+		     ("tuesday" :tuesday)   ("tues" :tuesday)   ("tue" :tuesday)
+		     ("wednesday" :wednesday) ("wednes" :wednesday) ("wed" :wednesday)
+		     ("thursday" :thursday)  ("thurs" :thursday)  ("thu" :thursday)
+		     ("friday" :friday)    ("fri" :friday)
+		     ("saturday" :saturday)  ("sat" :saturday)
+		     ("sunday" :sunday)    ("sun" :sunday)))
+	    *weekday-strings*)
+
+  (hashlist (bquote (("january" 1)   ("jan" 1)
+		     ("february" 2)  ("feb" 2)
+		     ("march" 3)     ("mar" 3)
+		     ("april" 4)     ("apr" 4)
+		     ("may" 5)
+                     ("june" 6)      ("jun" 6)
+                     ("july" 7)      ("jul" 7)
+	             ("august" 8)    ("aug" 8)
+                     ("september" 9) ("sept" 9)  ("sep" 9)
+		     ("october" 10)  ("oct" 10)
+		     ("november" 11) ("nov" 11)
+		     ("december" 12) ("dec" 12)))
+	    *month-strings*)
+
+  (hashlist (bquote (("gmt" 0.0) ("utc" 0.0) ("zulu" 0.0)
+		     ("est" -5.0) ("edt" -4.0)
+		     ("cst" -6.0) ("cdt" -5.0)
+		     ("mst" -7.0) ("mdt" -6.0)
+		     ("pst" -8.0) ("pdt" -7.0)
+
+		     ("a" 1.0) ("b" 2.0) ("c" 3.0) ("c*" 3.5)
+		     ("d" 4.0) ("d*" 4.5) ("e" 5.0) ("e*" 4.5)
+		     ("f" 6.0) ("f*" 6.5) ("g" 7.0) ("h" 7.0)
+		     ("i" 9.0) ("i*" 9.5) ("k" 10.0) ("k*" 10.5)
+		     ("l" 11.0) ("l*" 11.5) ("m" 12.0) ("m*" 13.0) ("m%" 14.0)
+		     ("n" -1.0) ("o" -2.0) ("p" -3.0) ("p*" -3.5)
+		     ("q" -4.0) ("r" -5.0) ("s" -6.0) ("t" -7.0)
+		     ("u" -8.0) ("u*" -8.5) ("v" -9.0) ("v*" -9.5)
+		     ("w" -10.0) ("x" -11.0) ("y" -12.0)
+		     ("z" 0.0)
+		     ))
+	    *zone-strings*)
+
+  (foreach symbol in *special-symbols*
+      do (insert-at *special-strings*
+		    (string-downcase (symbol-name symbol))
+		    symbol))
+  )
+
+
+;;; Time/date format patterns are specified as lists of symbols repre-
+;;; senting the elements.  Optional elements can be specified by
+;;; enclosing them in parentheses.  Note that the order in which the
+;;; patterns are specified below determines the order of search.
+
+;;; Choices of pattern symbols are: second, minute, hour, day, month,
+;;; year, time-divider, date-divider, am-pm, zone, weekday, noon-midn,
+;;; and any special symbol.
+
+(defspecial *date-time-patterns* CONS
+  (bquote ( 
+     ;; Date formats.
+    (year (date-divider) month (date-divider) day (noon-midn))
+    ((weekday) month (date-divider) day (date-divider) year 
+	       (noon-midn) (date-divider) (zone) (time-divider) (zone-minute))
+    ((weekday) day (date-divider) month (date-divider) year
+	       (noon-midn) (date-divider) (zone) (time-divider) (zone-minute))
+    ((weekday) month (date-divider) day (noon-midn) (date-divider) 
+	       (zone) (time-divider) (zone-minute))
+    (month (date-divider) year (noon-midn) (date-divider) (zone) (time-divider) (zone-minute))
+    (year (date-divider) month (noon-midn) (date-divider) (zone) (time-divider) (zone-minute))
+
+    ((noon-midn) (weekday) month (date-divider) day (date-divider) year)
+    ((noon-midn) (weekday) day (date-divider) month (date-divider) year)
+    ((noon-midn) (weekday) month (date-divider) day)
+    ((noon-midn) year (date-divider) month (date-divider) day)
+    ((noon-midn) month (date-divider) year)
+    ((noon-midn) year (date-divider) month)
+
+     ;; Time formats.
+    (hour (time-divider) (minute) (time-divider) (secondp) (am-pm) 
+	  (date-divider) (zone) (time-divider) (zone-minute))
+    (noon-midn (date-divider) (zone) (time-divider) (zone-minute))
+    (hour (noon-midn))
+
+     ;; Time/date combined formats.
+    (year (date-divider) month (date-divider) day (date-time-divider)
+	  hour (time-divider) (minute) (time-divider) (secondp)
+	  (am-pm) (date-divider) (zone) (time-divider) (zone-minute))
+    (year (date-divider) month (date-divider) day
+	  noon-midn (date-divider) (zone) (time-divider) (zone-minute))
+    (year (date-divider) month (date-divider) day now)
+    ((weekday) month (date-divider) day (date-divider) year (date-time-divider)
+	   hour (time-divider) (minute) (time-divider) (secondp)
+	   (am-pm) (date-divider) (zone) (time-divider) (zone-minute))
+    ((weekday) day (date-divider) month (date-divider) year  (date-time-divider)
+	 hour (time-divider) (minute) (time-divider) (secondp)
+	 (am-pm) (date-divider) (zone) (time-divider) (zone-minute))
+    ((weekday) month (date-divider) day  (date-time-divider)
+	   hour (time-divider) (minute) (time-divider) (secondp)
+	   (am-pm) (date-divider) (zone) (time-divider) (zone-minute))
+    (month (date-divider) year (date-time-divider)
+	   hour (time-divider) (minute) (time-divider) (secondp)
+	   (am-pm) (date-divider) (zone) (time-divider) (zone-minute))
+    (year (date-divider) month (date-time-divider)
+	  hour (time-divider) (minute) (time-divider) (secondp)
+	  (am-pm) (date-divider) (zone) (time-divider) (zone-minute))
+
+    (hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	  (date-divider) (zone) (time-divider) (zone-minute)
+	  (weekday) month (date-divider) day (date-divider) year)
+    (hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	  (date-divider) (zone) (time-divider) (zone-minute)
+	  (weekday) day (date-divider) month (date-divider) year)
+    (hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	  (date-divider) (zone) (time-divider) (zone-minute)
+	  (weekday) month (date-divider) day)
+    (hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	  (date-divider) (zone) (time-divider) (zone-minute)
+	  year (date-divider) month (date-divider) day)
+    (hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	  (date-divider) (zone) (time-divider) (zone-minute)
+	  month (date-divider) year)
+    (hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	  (date-divider) (zone) (time-divider) (zone-minute)
+	  year (date-divider) month)
+
+     ;; Weird, non-standard formats.
+    (weekday month day hour (time-divider) minute (time-divider)
+	     secondp (am-pm)
+	     (zone) (time-divider) (zone-minute) year)
+    ((weekday) day (date-divider) month (date-divider) year hour
+     (time-divider) minute (time-divider) (secondp) (am-pm)
+     (date-divider) (zone) (time-divider) (zone-minute))
+    ((weekday) month (date-divider) day (date-divider) year hour
+     (time-divider) minute (time-divider) (secondp) (am-pm)
+     (date-divider) (zone) (time-divider) (zone-minute))
+    (year (date-divider) (month))
+    (month (date-divider) (year))
+    ;; ANSI C:
+    ((weekday) month day
+	       hour time-divider minute (time-divider) (secondp) year)
+
+    ;; Special-string formats.
+    (now (yesterday))
+    ((yesterday) now)
+    (now (today))
+    ((today) now)
+    (now (tomorrow))
+    ((tomorrow) now)
+    (yesterday (noon-midn))
+    ((noon-midn) yesterday)
+    (today (noon-midn))
+    ((noon-midn) today)
+    (tomorrow (noon-midn))
+    ((noon-midn) tomorrow)
+    (yesterday hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	       (date-divider) (zone) (time-divider) (zone-minute))
+    (tomorrow hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	      (date-divider) (zone) (time-divider) (zone-minute))
+    (today hour (time-divider) (minute) (time-divider) (secondp) (am-pm)
+	   (date-divider) (zone) (time-divider) (zone-minute))
+    )))
+
+
+;;; Special function definitions.  To define a special substring, add
+;;; a dotted pair consisting of the substring and a symbol in the
+;;; *special-strings* hashlist statement above.  Then define a function
+;;; here which takes one argument- the decoded time structure- and
+;;; sets the values of the structure to whatever is necessary.  Also,
+;;; add a some patterns to the patterns list using whatever combinations
+;;; of special and pre-existing symbols desired.
+
+
+(defun yesterday ((parsed-values DECODED-DATE-TIME))
+  ;; Computes yesterday by the round-about procedure of encoding
+  ;; today as a julian day, decrementing and converting back.  The
+  ;; alternative is to do the arithmetic directly on the day field
+  ;; and then having to handle end of month, leap years and end of
+  ;; year issues.
+  (today parsed-values)
+  (let ((jd (compute-julian-day (date-time-year parsed-values)
+				(date-time-month parsed-values)
+				(date-time-day parsed-values))))
+    (mv-bind (year month day dow)
+	(compute-calendar-date (1- jd))
+      (setf (date-time-day parsed-values) day)
+      (setf (date-time-month parsed-values) month)
+      (setf (date-time-year parsed-values) year)
+      (setf (date-time-dow parsed-values) dow))))
+
+(defun today ((parsed-values DECODED-DATE-TIME))
+  (let ((time-zone (date-time-zone parsed-values)))
+    (when (null? time-zone)
+      (setq time-zone (get-local-time-zone)))
+    (mv-bind (year month day dow) 
+	(get-calendar-date (make-current-date-time) time-zone)
+      (setf (date-time-day parsed-values) day)
+      (setf (date-time-month parsed-values) month)
+      (setf (date-time-year parsed-values) year)
+      (setf (date-time-dow parsed-values) dow))))
+
+(defun tomorrow ((parsed-values DECODED-DATE-TIME))
+  ;; Computes tomorrow by the round-about procedure of encoding
+  ;; today as a julian day, incrementing and converting back.  The
+  ;; alternative is to do the arithmetic directly on the day field
+  ;; and then having to handle beginning of month, leap years and 
+  ;; beginning of year issues.
+  (today parsed-values)
+  (let ((jd (compute-julian-day (date-time-year parsed-values)
+				(date-time-month parsed-values)
+				(date-time-day parsed-values))))
+    (mv-bind (year month day dow)
+	(compute-calendar-date (1+ jd))
+      (setf (date-time-day parsed-values) day)
+      (setf (date-time-month parsed-values) month)
+      (setf (date-time-year parsed-values) year)
+      (setf (date-time-dow parsed-values) dow))))
+
+(defun now ((parsed-values DECODED-DATE-TIME))
+  (let ((time-zone (date-time-zone parsed-values)))
+    (when (null? time-zone)
+      (setq time-zone (get-local-time-zone)))
+    (mv-bind (hour minute second millis) 
+	(get-time (make-current-date-time) time-zone)
+      (setf (date-time-millis parsed-values) millis)
+      (setf (date-time-second parsed-values) second)
+      (setf (date-time-minute parsed-values) minute)
+      (setf (date-time-hour parsed-values) hour))))
+
+
+
+;;; Predicates for symbols.  Each symbol has a corresponding function
+;;; defined here which is applied to a part of the datum to see if
+;;; it matches the qualifications.
+
+(defun (am-pm SYMBOL) ((string OBJECT))
+  (typecase string
+    (STRING-WRAPPER
+     (cond ((string-eql? string "am") (return (bquote am)))
+	   ((string-eql? string "pm") (return (bquote pm)))
+	   (otherwise (return NULL))))
+    (otherwise (return NULL))))
+
+(defun (noon-midn SYMBOL) ((string OBJECT))
+  (typecase string
+    (STRING-WRAPPER
+     (cond ((string-eql? string "noon") (return (bquote noon)))
+	   ((string-eql? string "midnight") (return (bquote midn)))
+	   (otherwise (return NULL))))
+    (otherwise (return NULL))))
+
+(defun (weekday KEYWORD) ((thing OBJECT))
+  (typecase thing
+    (STRING-WRAPPER
+     (return (lookup *weekday-strings* thing)))
+    (otherwise (return NULL))))
+
+(defun (month INTEGER-WRAPPER) ((thing OBJECT))
+  (typecase thing
+    (STRING-WRAPPER
+     (let ((month-number (lookup *month-strings* thing)))
+       (if (defined? month-number)
+	 (return month-number)
+	 (return NULL))))
+    (INTEGER-WRAPPER 
+     (if (and (<= 1 (wrapper-value thing))
+	      (<= (wrapper-value thing) 12))
+       (return thing)
+       (return NULL)))
+    (otherwise (return NULL))))
+
+(defun (zone FLOAT-WRAPPER) ((thing OBJECT))
+  ;; Accepts strings defined in the *zone-strings*
+  ;; as well as floating point numbers
+  ;; and integers either as direct integral offset
+  ;; or incoded in the form of a hhmm value.
+  (typecase thing
+    (STRING-WRAPPER
+     (when (string-equal? (wrapper-value thing) "local")
+       (return NULL-FLOAT))
+     (let ((zone-number (lookup *zone-strings* thing)))
+       (if (defined? zone-number)
+	 (return zone-number)
+	 (return NULL))))
+    (FLOAT-WRAPPER 
+     (if (and (<= -12.0 (wrapper-value thing))
+	      (<= (wrapper-value thing) 14.0))
+       (return thing)
+       (return NULL)))
+    (INTEGER-WRAPPER 
+     (let ((offset (wrapper-value thing)))
+       (cond ((and (<= -12 offset) (<= offset 14))
+	      (return (wrap-literal (cast offset float))))
+	     ;; RFC1123, in hours and minutes
+	     ((and (<= -1200 offset) (<= offset 1400))
+	      (return (wrap-literal (+ (div offset 100)
+				       (/ (rem offset 100) 60.0)))))
+	     (otherwise
+              (return NULL)))))
+    (otherwise (return NULL))))
+
+(defun (specialp SYMBOL) ((string OBJECT))
+  (typecase string
+    (STRING-WRAPPER
+     (return (lookup *special-strings* string)))
+    (otherwise (return NULL))))
+
+(defun (secondp BOOLEAN-WRAPPER) ((number OBJECT))
+  (typecase number
+    (INTEGER-WRAPPER (return (and (<= 0 number) (<= number 59))))
+    (FLOAT-WRAPPER (return (and (<= 0.0 number) (< number 60.0))))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (minute BOOLEAN-WRAPPER) ((number OBJECT))
+  (typecase number
+    (INTEGER-WRAPPER (return (and (<= 0 number) (<= number 59))))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (zone-minute BOOLEAN-WRAPPER) ((number OBJECT))
+  (typecase number
+    (INTEGER-WRAPPER (return (and (<= 0 number) (<= number 59))))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (hour BOOLEAN-WRAPPER) ((number OBJECT))
+  (typecase number
+    (INTEGER-WRAPPER (return (and (<= 0 number) (<= number 23))))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (day BOOLEAN-WRAPPER) ((number OBJECT))
+  (typecase number
+    (INTEGER-WRAPPER (return (and (<= 1 number) (<= number 31))))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (year BOOLEAN-WRAPPER) ((number OBJECT))
+  (typecase number
+    (INTEGER-WRAPPER (return (or (<= -4713 number)
+				 (<= number 5000))))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (time-divider BOOLEAN-WRAPPER) ((theCharacter OBJECT))
+  (typecase theCharacter
+    (CHARACTER-WRAPPER (return (member? time-dividers theCharacter)))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (date-divider BOOLEAN-WRAPPER) ((theCharacter OBJECT))
+  (typecase theCharacter
+    (CHARACTER-WRAPPER (return (member? date-dividers theCharacter)))
+    (otherwise (return FALSE-WRAPPER))))
+
+(defun (date-time-divider BOOLEAN-WRAPPER) ((theCharacter OBJECT))
+  (typecase theCharacter
+    (CHARACTER-WRAPPER (return (member? date-time-dividers theCharacter)))
+    (otherwise (return FALSE-WRAPPER))))
+
+
+;;; Match-substring takes a string argument and tries to match it with
+;;; the strings in one of the four hash tables: *weekday-strings*, *month-
+;;; strings*, *zone-strings*, *special-strings*.  It returns a specific
+;;; keyword and/or the object it finds in the hash table.  If no match
+;;; is made then it immediately signals an error.
+
+(defun (match-substring CONS) ((substring STRING) (parsing-time? BOOLEAN))
+  (let ((teststring (string-downcase substring))
+	(test-value OBJECT NULL))
+    (when (and (not parsing-time?)
+	       (eql? (length substring) 1)
+	       (setq test-value (date-time-divider (nth substring 0))))
+      (return (cons-list (bquote date-time-divider) test-value)))
+    (when (defined? (setq test-value (month teststring)))
+      (return (cons-list (bquote month) test-value)))
+    (when (defined? (setq test-value (weekday teststring)))
+      (return (cons-list (bquote weekday) test-value)))
+    (when (defined? (setq test-value (am-pm teststring)))
+      (return (cons-list (bquote am-pm) test-value)))
+    (when (defined? (setq test-value (noon-midn teststring)))
+      (return (cons-list (bquote noon-midn) test-value)))
+    (when (defined? (setq test-value (zone teststring)))
+      (return (cons-list (bquote zone) test-value)))
+    (when (defined? (setq test-value (specialp teststring)))
+      (return  (cons-list (bquote special) test-value)))
+    (if *error-on-mismatch*
+      (error "\"~A\" is not a recognized word or abbreviation."
+	     substring)
+      (return NIL))))
+
+;;; Decompose-string takes the time/date string and decomposes it into a
+;;; list of alphabetic substrings, numbers, and special divider characters.
+;;; It matches whatever strings it can and replaces them with a dotted pair
+;;; containing a symbol and value.
+
+(defun (digit-value INTEGER) ((char CHARACTER))
+  (return (- (character-code char) (character-code #\0))))
+
+(defun (decompose-date-time-string CONS) ((string STRING) (start INTEGER) (end INTEGER))
+  (let ((string-index start)
+	(next-negative? FALSE)
+	(parsing-time? FALSE)
+	(parts-list NIL)
+	(next-char CHARACTER NULL)
+	(prev-char CHARACTER NULL))
+    (when (null? end)
+      (setq end (length string)))
+    (while (< string-index end)
+      (setq next-char (nth string string-index))
+      (setq prev-char (choose (= string-index start) 
+			      NULL
+			      (nth string (1- string-index))))
+      (cond ((letter-character? next-char)
+	     (setq parsing-time? FALSE)
+	     ;; Alphabetic character - scan to the end of the substring.
+	     (foreach scan-index in (interval (1+ string-index) NULL)
+		 do (when (or (= scan-index end)
+			      (not (letter-character? (nth string scan-index))))
+		      (let ((match-symbol
+			     (match-substring
+			      (subsequence string string-index scan-index)
+			      parsing-time?)))
+			(if (empty? match-symbol)
+			  (return nil)
+			  (pushq parts-list match-symbol)))
+		      (setq string-index scan-index)
+		      (break))))
+	    ((digit-character? next-char)
+	     ;; Numeric digit - convert digit-string to a decimal value.
+	     (let ((numeric-value (digit-value next-char))
+		   (fractional-value 0)
+		   (fractional-divisor 1.0)
+		   (in-fraction? false))
+	       (foreach scan-index in (interval (1+ string-index) NULL)
+		   do (when (or (= scan-index end)
+				(not (or (digit-character? (nth string scan-index))
+					 (and (not in-fraction?)
+					      (eq? (nth string scan-index) #\.)))))
+			(when next-negative?
+			  (setq next-negative? FALSE)
+			  (setq numeric-value (- numeric-value))
+			  (setq fractional-value (- fractional-value)))
+			(if in-fraction?
+			  (pushq parts-list (+ numeric-value
+					       (/ fractional-value fractional-divisor)))
+			  (pushq parts-list numeric-value))
+			(setq string-index scan-index)
+			(break))
+		      (cond (in-fraction?
+			     (setq fractional-value
+			       (+ (* fractional-value 10)
+				  (digit-value (nth string scan-index))))
+			     (setq fractional-divisor
+			       (* fractional-divisor 10.0)))
+			    ((eq? (nth string scan-index) #\.)
+			     (setq in-fraction? true))
+			    (otherwise
+			     (setq numeric-value
+			       (+ (* numeric-value 10)
+				  (digit-value (nth string scan-index)))))))))
+	    ((and (eql? next-char #\-)
+		  (or (null? prev-char)
+		      (member? whitespace-chars prev-char)
+		      (member? date-dividers prev-char)
+		      (and parsing-time? (digit-character? prev-char))))
+	     ;; If we see a minus sign before a number, but not after one,
+	     ;; it is not a date divider, but a negative offset from GMT, so
+	     ;; set next-negative? to true and continue.
+	     (setq next-negative? TRUE)
+	     ; (setq parsing-time? FALSE)
+	     (++ string-index))
+	    ((member? time-dividers next-char)
+	     ;; Time-divider - add it to the parts-list with symbol.
+	     (pushq parts-list (cons-list (bquote time-divider) next-char))
+	     (setq parsing-time? TRUE)
+	     (++ string-index))
+	    ((member? date-dividers next-char)
+	     	     ;; Date-divider - add it to the parts-list with symbol.
+	     (pushq parts-list (cons-list (bquote date-divider) next-char))
+	     (setq parsing-time? FALSE)
+	     (++ string-index))
+	    ((member? date-time-dividers next-char)
+	     ;; Date-Time-divider - add it to the parts-list with symbol.
+	     (pushq parts-list (cons-list (bquote date-time-divider) next-char))
+	     (setq parsing-time? TRUE)
+	     (++ string-index))
+	    ((member? whitespace-chars next-char)
+	     ;; Whitespace character - ignore it completely.
+	     (setq parsing-time? FALSE)
+	     (++ string-index))
+	    ((eql? next-char #\+)
+	     ;; If we see a plus sign it might be a positive offset from GMT,
+	     ;; so treat just ignore it
+	     ; (pushq parts-list (cons-list (bquote date-divider) next-char))
+	     ; (setq parsing-time? FALSE)
+	     (++ string-index))
+	    ((eql? next-char #\()
+	     ;; Parenthesized string - scan to the end and ignore it.
+	     (while (and (not (= string-index end))
+			 (not (eql? (nth string string-index) #\))))
+	       (setq parsing-time? FALSE)
+	       (++ string-index)))
+	    (otherwise
+	     ;; Unrecognized character - barf voraciously.
+	     (if *error-on-mismatch*
+	       (error ">>> Bogus character at position " string-index " in \"" string "\"")
+	       (return NIL)))))
+  (return (reverse parts-list))))
+
+;;; Match-pattern-element tries to match a pattern element with a datum
+;;; element and returns the symbol associated with the datum element if
+;;; successful.  Otherwise nil is returned.
+
+(defun (match-pattern-element CONS) ((pattern-element SYMBOL) (datum-element OBJECT))
+  (cond ((isa? datum-element @CONS)  ;; Special Element
+	 (let ((datum-type (choose (eq? (first (cast datum-element CONS))
+					(bquote special))
+				   (second (cast datum-element CONS))
+				   (first  (cast datum-element CONS)))))
+	   (if (eq? datum-type pattern-element)
+	     (return datum-element)
+	     (return NIL))))
+	;; If this is a special pattern, but the datum element isn't a
+	;; special match then we fail the match:
+	((member? *special-symbols* pattern-element)
+	 (return NIL))
+	(otherwise 
+	 (let ((function (function-code (lookup-function pattern-element)))
+	       (match OBJECT (funcall function datum-element)))
+	   (typecase match
+	     (BOOLEAN-WRAPPER
+	      (if match
+		(return (cons-list pattern-element datum-element))
+		(return NIL)))
+	     (otherwise
+	      (if (defined? match)
+		(return (cons-list pattern-element match))
+		(return nil))))))))
+
+;;; Match-pattern matches a pattern against a datum, returning the
+;;; pattern if successful and nil otherwise.
+
+(defun (match-pattern CONS) ((pattern CONS) (datum CONS) (datum-length INTEGER))
+  (if (< (length pattern) datum-length)
+    (return NIL)
+    (let ((form-list nil)
+	  (pattern-cursor pattern)
+	  (datum-cursor datum)
+	  (pattern-element OBJECT NULL)
+	  (datum-element OBJECT NULL)
+	  (optional? FALSE)
+	  (matching NIL))
+      (while (not (or (empty? pattern-cursor) (empty? datum-cursor)))
+	(setq pattern-element (first pattern-cursor))
+	(setq datum-element (first datum-cursor))
+	(setq optional? (isa? pattern-element @CONS))
+	(setq matching (match-pattern-element 
+			(choose optional?
+				(cast (first (cast pattern-element CONS)) SYMBOL)
+				(cast pattern-element SYMBOL))
+			datum-element))
+	(cond ((not (empty? matching))
+	       (let ((form-type (first matching)))
+		 (unless (or (eq? form-type (bquote time-divider))
+			     (eq? form-type (bquote date-divider))
+			     (eq? form-type (bquote date-time-divider)))
+		   (pushq form-list matching))))
+	      (optional?
+	       (pushq datum-cursor datum-element))
+	      (otherwise
+	       (return nil)))
+	(setq pattern-cursor (rest pattern-cursor))
+	(setq datum-cursor (rest datum-cursor)))
+      (cond ((and (empty? pattern-cursor) (empty? datum-cursor))
+	     (return (reverse form-list)))
+	    ((empty? pattern-cursor) (return nil))
+	    ((empty? datum-cursor)
+	     (foreach element in pattern-cursor
+		 where (not (isa? element @CONS))
+		 do (return nil))
+	     (return (reverse form-list)))
+	    (otherwise
+	     (error "Shouldn't get here!"))) )))
+
+;;; Deal-with-noon-midn sets the decoded-date-time values to either noon
+;;; or midnight depending on the argument form-value.  Form-value
+;;; can be either 'noon or 'midn.
+
+(defun deal-with-noon-midn ((form-value OBJECT) (parsed-values DECODED-DATE-TIME))
+  (cond ((eq? form-value (bquote noon))
+	 (setf (date-time-hour parsed-values) 12))
+	((eq? form-value (bquote midn))
+	 (setf (date-time-hour parsed-values) 0))
+	(otherwise (error "Unrecognized symbol: ~A" form-value)))
+  (setf (date-time-minute parsed-values) 0)
+  (setf (date-time-second parsed-values) 0))
+
+;;; Deal-with-am-pm sets the decoded-date-time values to be in the am
+;;; or pm depending on the argument form-value.  Form-value can
+;;; be either 'am or 'pm.
+
+(defun deal-with-am-pm ((form-value OBJECT) (parsed-values DECODED-DATE-TIME))
+  (let ((hour (date-time-hour parsed-values)))
+    (cond ((eq? form-value (bquote am))
+	   (cond ((= hour 12)
+		  (setf (date-time-hour parsed-values) 0))
+		 ((not (and (<= 0 hour) (<= hour 12)))
+		  (when *error-on-mismatch*
+		    (error hour " is not an AM hour.")))))
+	  ((eq? form-value (bquote pm))
+	   (when (and (<= 0 hour) (<= hour 11))
+	     (setf (date-time-hour parsed-values) (+ hour 12))))
+	  (otherwise
+	   (error form-value "isn't AM/PM - this shouldn't happen.")))))
+
+;;; Set-time-values uses the association list of symbols and values
+;;; to set the time in the decoded-date-time structure.
+
+(defun set-time-values 
+    ((string-form (CONS OF CONS)) (parsed-values DECODED-DATE-TIME))
+  (let ((form-type OBJECT NULL)
+	(form-value OBJECT NULL))
+  (foreach form-part in string-form
+      do (setq form-type (first form-part))
+	 (setq form-value (second form-part))
+	 (case form-type
+	   (secondp 
+	    (typecase form-value
+	      (INTEGER-WRAPPER 
+	       (setf (date-time-second parsed-values) form-value))
+	      (FLOAT-WRAPPER
+	       (setf (date-time-second parsed-values)
+		 (floor form-value))
+	       (setf (date-time-millis parsed-values)
+		 (* 1000.0 (- form-value (floor form-value)))))))
+	   (minute (setf (date-time-minute parsed-values) form-value))
+	   (hour (setf (date-time-hour parsed-values) form-value))
+	   (day (setf (date-time-day parsed-values) form-value))
+	   (month (setf (date-time-month parsed-values) form-value))
+	   (year (setf (date-time-year parsed-values) form-value))
+	   (zone (setf (date-time-zone parsed-values) form-value))
+	   (zone-minute 
+	    (if (> (date-time-zone parsed-values) 0)
+	      (setf (date-time-zone parsed-values)
+		(+ (date-time-zone parsed-values)
+		   (/ form-value 60.0)))
+	      (setf (date-time-zone parsed-values)
+		(+ (date-time-zone parsed-values)
+		   (/ form-value -60.0)))))
+	   (weekday (setf (date-time-dow parsed-values) form-value))
+	   (am-pm (deal-with-am-pm form-value parsed-values))
+	   (noon-midn (deal-with-noon-midn form-value parsed-values))
+	   (special (funcall (function-code (lookup-function (cast form-value SYMBOL)))
+		     parsed-values))
+	   (otherwise (error "Unrecognized symbol in form list: ~A." form-type))))))
+
+
+(defun (parse-date-time-in-time-zone DECODED-DATE-TIME)
+    ((date-time-string STRING) (time-zone FLOAT) (start INTEGER) (end INTEGER)
+     (error-on-mismatch? BOOLEAN))
+  :public? TRUE
+  :documentation
+  "Tries very hard to make sense out of the argument `date-time-string' and
+returns a time structure if successful.  If not, it returns `null'.
+If `error-on-mismatch?' is true, parse-date-time will signal an error instead of
+returning `null'.  
+Default values are 00:00:00 in the given timezone on the current date.  If the
+given `time-zone' value is `null', then the local time zone for the given date
+and time will be used as determined by the operating system."
+  (special ((*error-on-mismatch* error-on-mismatch?))
+    (let ((string-parts (decompose-date-time-string date-time-string start end))
+	  (parts-length (length string-parts))
+	  (string-form NIL))
+      (foreach pattern in *date-time-patterns*
+	  do (setq string-form (match-pattern pattern string-parts
+					      parts-length))
+	     (unless (empty? string-form)
+	       (break)))
+      (if (empty? string-form)
+	(if *error-on-mismatch*
+	  (error "\"" date-time-string "\" is not a recognized time/date format.")
+	  (return NULL))
+	(let ((parsed-values (decode-calendar-date (make-current-date-time)
+						   (choose (null? time-zone)
+							   (get-local-time-zone)
+							   time-zone))))
+	  (setf (date-time-millis parsed-values) 0.0)
+	  (setf (date-time-second parsed-values) 0)
+	  (setf (date-time-minute parsed-values) 0)
+	  (setf (date-time-hour parsed-values) 0)
+	  (setf (date-time-zone parsed-values) time-zone)
+	  
+	  (set-time-values string-form parsed-values)
+	  
+	  (when (null? (date-time-zone parsed-values))
+	    (setf (date-time-zone parsed-values)
+	      (get-local-time-zone-for-date (date-time-year parsed-values)
+					    (date-time-month parsed-values)
+					    (date-time-day parsed-values)
+					    (date-time-hour parsed-values)
+					    (date-time-minute parsed-values)
+					    (date-time-second parsed-values))))
+	  (return parsed-values))))))
+
+(defun (parse-date-time DECODED-DATE-TIME)
+    ((date-time-string STRING)  (start INTEGER) (end INTEGER)
+     (error-on-mismatch? BOOLEAN))
+  :public? TRUE :globally-inline? TRUE
+  :documentation
+  "Tries very hard to make sense out of the argument `date-time-string' and
+returns a time structure if successful.  If not, it returns `null'.
+If `error-on-mismatch?' is true, parse-date-time will signal an error instead of
+returning `null'.  
+Default values are 00:00:00 local time on the current date"
+  (return (parse-date-time-in-time-zone 
+	   date-time-string NULL start end error-on-mismatch?)))
+
+(defun (string-to-calendar-date CALENDAR-DATE) ((input STRING))
+  :public? TRUE
+  :documentation "Returns a calendar date object representing the date and time
+parsed from the `input' string.  If no valid parse is found,
+`null' is returned."
+  (let ((do (parse-date-time input 0 NULL false)))
+    (if (null? do)
+      (return NULL)
+      (return (encode-calendar-date do)))))

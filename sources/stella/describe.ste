@@ -1,0 +1,792 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: describe.ste,v 1.34 2003/04/18 21:14:51 hans Exp
+
+;;; Support for describing objects of all kinds.
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+
+  ;;
+;;;;;; "get" and "get-object"
+  ;;
+
+(defun (get OBJECT) ((name NAME) &rest (type NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  (let ((typeSpec (coerce-&rest-to-cons type)))
+    (return (search-for-object name (first typeSpec)))))
+
+;;; "get-object" is one of the very few methods defined on the class OBJECT.
+;;;    This is done because it must be both overloaded (defined on STRING
+;;;    and INTEGER) and dynamically typed.
+
+(defmethod (get-object OBJECT) ((self OBJECT) (type OBJECT))
+  (return (search-for-object self type)) )
+
+(defmethod (get-object OBJECT) ((self STRING) (type OBJECT))
+  (let ((wrappedString STRING-WRAPPER self)
+        (object (search-for-object wrappedString type)))
+    (free wrappedString)
+    (return object) ))
+
+(defmethod (get-object OBJECT) ((self INTEGER) (type OBJECT))
+  (let ((wrappedInteger INTEGER-WRAPPER self)
+        (object (search-for-object wrappedInteger type)))
+    (free wrappedInteger)
+    (return object) ))
+
+
+  ;;
+;;;;;; "search-for-object"
+  ;;
+
+(defglobal *string-to-object-functions* (KEY-VALUE-LIST OF TYPE CODE-WRAPPER) 
+  (new KEY-VALUE-LIST)
+  :documentation "Table of functions (keyed by type of object returned) that can
+be called to search for an object identified by a string.")
+
+(defglobal *integer-to-object-functions* (LIST OF CODE-WRAPPER) (list)
+  :documentation "List of functions that can be called to search for
+an object identified by an integer.")
+
+(defun (string-search-for-object OBJECT) ((string STRING) (classType TYPE))
+  ;; Called by `search-for-object'.
+  (let ((object OBJECT NULL))
+    (foreach (type fn) in *string-to-object-functions*
+             where (or (null? classType)
+                       (subtype-of? type classType))
+             do
+             (typecase fn
+               ;; Problem: Can't dispatch a method on a literal in C++:
+               ;;(METHOD-CODE-WRAPPER (setq object (funcall fn string)))
+               (FUNCTION-CODE-WRAPPER (setq object (funcall fn string))))
+             (when (defined? object)
+               (return object)))
+    (return NULL) ))
+
+(defun (search-for-object OBJECT) ((self OBJECT) (typeRef OBJECT))
+  :documentation "If `self' is a string or a symbol, search for an object named
+`self' of type `type'.  Otherwise, if `self' is an object, return it."
+  ;; TO DO: ADD WILD CARD CAPABILITIES.
+  ;; TO DO: EXTEND SEARCH OVER ALL MODULES.
+  (let ((classType SURROGATE NULL))
+    (when (defined? typeRef)
+      (typecase typeRef
+        (SYMBOL (setq classType
+                  (lookup-surrogate-in-module
+                   (symbol-name typeRef)
+                   (interned-in typeRef)
+                   FALSE)))
+        (SURROGATE (setq classType typeRef))
+        (STRING (setq classType (lookup-surrogate typeRef)))
+        (CLASS (setq classType (class-type typeRef)))
+        (otherwise (inform "Invalid type reference: " typeRef)))
+      (when (and (defined? classType)
+                 (or (null? (surrogate-value classType))
+                     (not (isa? (surrogate-value classType) @CLASS))))
+        (inform "No class exists with name: " (symbol-name classType))
+        (setq classType NULL)))
+    ;; at this point, `classType' is a surrogate for an existant class
+    (typecase self
+      (STRING-WRAPPER
+       (let ((string (wrapper-value self))
+             (object (string-search-for-object string classType))
+             (module MODULE NULL))
+         (when (and (null? object)
+                    (qualified-name? string))
+           (mv-setq (module string) (compute-module-and-bare-name string))
+           ;; PROBLEM: THIS SEARCH ISN'T SENSITIVE TO THE MODULE, SO IT
+           ;;    COULD RETURN THE WRONG THING (HARD TO FIX BECAUSE MOST
+           ;;    OF THE `string-search' FUNCTIONS IGNORE *module*):
+           (setq object (string-search-for-object string classType)))
+         (when (null? object)
+           (setq string (string-upcase string))
+           (setq object (string-search-for-object string classType)))
+         (return object)))
+      (SYMBOL
+       ;; TO DO: TEMPORARILY?? SWITCH TO MODULE OF SYMBOL HERE
+       ;;    QUESTION: HOW DO WE SWITCH BACK??:
+       (return (search-for-object (symbol-name self) classType)))
+      (INTEGER-WRAPPER
+       (let ((integer (wrapper-value self))
+             (object OBJECT NULL))
+         (foreach fn in *integer-to-object-functions*
+                  do
+                  (typecase fn
+                    (FUNCTION-CODE-WRAPPER (setq object (funcall fn integer)))
+                    ;; Problem: Can't dispatch a method on a literal in C++:
+                    ;;(METHOD-CODE-WRAPPER (setq object (funcall fn integer)))
+                    )
+                  (when (defined? object)
+                    (return object)))
+         (return NULL)))           
+      (OBJECT (return self))
+      (otherwise (return NULL))) ))
+
+(defun (filter-string-to-class? BOOLEAN) ((self CLASS) (iterator ALL-PURPOSE-ITERATOR))
+  ;; Helping function for `string-to-classes'.
+  ;; Return TRUE if the class name for `self' matches the string in
+  ;;    `(iterator-object iterator)'.
+  (if (eql? (iterator-integer iterator) 1)      ; exact match?
+    (return (string-eql? (class-name self) (iterator-object iterator)))
+    (return (defined? (string-search (class-name self) (iterator-object iterator) 0)))) )
+
+;; CONSIDER ADDING "module" PARAMETER HERE:
+(defun (string-to-classes (ITERATOR OF CLASS)) ((string STRING) (exact? BOOLEAN))
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-nested-iterator iterator) (all-classes NULL FALSE))
+    (setf (iterator-filter-code iterator) (the-code :function filter-string-to-class?))
+    (setf (iterator-next-code iterator) 
+          (the-code :function filtered-nested-iterator-next?))
+    (setf (iterator-object iterator) string)    ; save wrapped string
+    (setf (iterator-integer iterator) (choose exact? 1 0))
+    (return iterator) ))
+
+
+(defun (string-to-class OBJECT) ((string STRING))
+  ;; TO DO: WIDEN SEARCH OVER ALL MODULES:
+  (return (get-stella-class string FALSE)) )
+
+(defun (string-to-context OBJECT) ((string STRING))
+  (exception-case 
+      (return (get-stella-context-slowly string))
+    (NO-SUCH-CONTEXT-EXCEPTION ()
+      (return NULL))))
+
+(defun (string-to-function OBJECT) ((string STRING))
+  (return (lookup-function-by-name string)) )
+
+(defun (dotted-string? BOOLEAN) ((string STRING))
+  :public? TRUE
+  ;; Return TRUE if `string' contains a DOT ('.').
+  (return (defined? (position string #\. 0))) )
+  
+(defun (yield-exploded-method-name STRING STRING) ((dottedString STRING))
+  ;; `dottedString' contains a DOT ('.').
+  ;; Return a pair of strings before and after the dot.
+  (let ((dotPosition (position dottedString #\. 0))
+        (firstString STRING NULL)
+        (secondString STRING NULL))
+    (when (defined? dotPosition)
+      (setq firstString (subsequence dottedString 0 dotPosition))
+      (setq secondString (subsequence dottedString (1+ dotPosition) NULL)))
+    (return firstString secondString) ))
+
+(defun (string-to-slot OBJECT) ((string STRING))
+  :public? TRUE
+  (if (dotted-string? string)
+    (mv-bind (classString slotString)
+             (yield-exploded-method-name string)
+       (let ((class (get-stella-class classString FALSE))
+             (slotName SYMBOL NULL))
+         (when (defined? class)
+           (setq slotName (lookup-symbol slotString))
+           (when (defined? slotName)
+             (return (safe-lookup-slot class slotName))))))
+    (let ((symbol (lookup-symbol string)))
+      (when (defined? symbol)
+        (return (lookup-function-or-stella-function symbol)))))
+  (return NULL) )
+
+(defun (string-to-surrogate-value OBJECT) ((string STRING))
+  (foreach sgt in (all-surrogates NULL FALSE)
+           where (eql? (symbol-name sgt) string)
+           do (return (surrogate-value sgt)))
+  (return NULL) )
+
+(defun (string-to-demon OBJECT) ((string STRING))
+  (return (lookup-demon string)) )
+
+(startup-time-progn
+  (clear *string-to-object-functions*)
+  (insert-at *string-to-object-functions* @CLASS
+             (the-code :function string-to-class))
+  (insert-at *string-to-object-functions* @CONTEXT
+             (the-code :function string-to-context))
+  (insert-at *string-to-object-functions* @METHOD-SLOT
+             (the-code :function string-to-function))
+  (insert-at *string-to-object-functions* @SLOT
+             (the-code :function string-to-slot))
+  (insert-at *string-to-object-functions* @OBJECT
+             (the-code :function string-to-surrogate-value))
+  (insert-at *string-to-object-functions* @DEMON
+             (the-code :function string-to-demon))
+  )
+
+(defun (integer-to-context OBJECT) ((integer INTEGER))
+  (return (get-stella-context-slowly integer)) )
+
+(startup-time-progn
+  (insert *integer-to-object-functions*
+          (wrap-literal (the-code :function integer-to-context))))
+
+
+  ;;
+;;;;;; "describe"
+  ;;
+
+(defglobal *default-describe-mode* KEYWORD :VERBOSE
+  :public? TRUE
+  :documentation "Specifies the print mode for `describe' when no second
+argument is given.")
+
+;; SHOULD THIS TAKE AN OPTIONAL `TYPE' ARGUMENT SIMILAR TO `GET'?
+
+(defun describe ((name OBJECT) &rest (mode OBJECT))
+  :documentation "Print a description of an object in :verbose, :terse,
+or :source modes."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (let ((object (choose (null? name) NULL (get-object name NULL)))
+        (modeSpec (first (coerce-&rest-to-cons mode)))
+        (validMode KEYWORD NULL))
+    (when (null? modeSpec)
+      (setq modeSpec *default-describe-mode*))
+    (typecase modeSpec
+      (GENERALIZED-SYMBOL
+       (case (symbol-name modeSpec)
+         (("VERBOSE" "TERSE" "SOURCE")
+          (setq validMode (intern-keyword (symbol-name modeSpec))))
+         (otherwise NULL)))
+      (otherwise NULL))
+    (when (null? validMode)
+      (inform "Valid modes (the second argument to 'describe') are " EOL
+              "   :VERBOSE, :TERSE, and :SOURCE")
+      (setq validMode *default-describe-mode*))
+    (if (null? object)
+        (print "NULL")
+      (describe-object object STANDARD-OUTPUT validMode))))
+
+(defun describe-tersely ((self OBJECT) (stream OUTPUT-STREAM))
+  ;; Call the standard print function, converting "stream" to a native stream.
+  (print-stream stream self))
+
+;; REINSTATE ONLY IF MORE LOGIC IS ADDED:
+;(defun pretty-print-stringified-source ((self STRING) (stream STREAM))
+;  ;; Convert `self' to a parse tree and then print it with
+;  ;;    pretty-printing enabled.
+;  (pretty-print-stella-tree (unstringify self) stream) )
+
+(defun pretty-print-stella-tree ((tree CONS) (stream OUTPUT-STREAM))
+  ;; Print `tree' nicely and then garbage collect it.
+  (setq tree (consify-lists-and-iterators tree))
+  (special ((*printPrettyCode?* TRUE))
+    (print-stella-code tree (native-output-stream stream))))
+
+(defun pretty-print-definition-tree ((tree CONS) (stream OUTPUT-STREAM))
+  ;; Print `tree' nicely and then garbage collect it.
+  (setq tree (consify-lists-and-iterators tree))
+  (special ((*printPrettyCode?* TRUE))
+    (print-stella-definition tree (native-output-stream stream))))
+
+(defglobal *pretty-print-list-cutoff* INTEGER 5
+  :public? TRUE
+  :documentation "Lists longer than the cutoff are truncated during
+pretty printing.")
+
+(defun (consify-lists-and-iterators OBJECT) ((tree OBJECT))
+  ;; Return `tree' with cons-lists substituted for lists
+  ;;    and iterators (destructive modification, except that
+  ;;    the newly-introduced conses are copied).
+  (when (null? tree)
+    (return tree))
+  (typecase tree
+    (CONS
+     (foreach cons on tree
+              do (setf (value cons) (consify-lists-and-iterators (value cons))))
+     (return tree))
+    ((LIST ITERATOR)
+     (let ((consList NIL))
+       (foreach item in tree 
+                as i in (interval 0 *pretty-print-list-cutoff*)
+                collect
+                (choose (eql? i *pretty-print-list-cutoff*)
+                        ELIPSIS
+                        item)
+                into consList)
+       (return consList)))
+    (otherwise (return tree))) )
+  
+(defmethod print-definition ((self MODULE) (stream OUTPUT-STREAM))
+  :public? TRUE
+  (let ((options CONS (unstringify (stringified-options self))))
+    (special ((*printReadably?* TRUE))
+      (print-stream stream "(DEFMODULE \"" (module-full-name self) "\"")
+      ;; Assume options come in key-value pairs:
+      (while (not (empty? options))
+        (print-stream stream EOL "  " (first options) " " (second options))
+        (setq options (nth-rest options 2)))
+      (print-stream stream ")" EOL))))
+
+(defun print-class-list ((self (ITERATOR OF CLASS)) (stream OUTPUT-STREAM))
+  ;; print a class list horizontally given an iterator
+  (print-stream stream "(")
+  (when (next? self)
+    (print-stream stream (symbol-name (class-type (value self)))))
+  (while (next? self)
+	 (print-stream stream " " (symbol-name (class-type (value self)))))
+  (print-stream stream ")"))
+
+(defmethod pretty-print-object ((self SLOT) (stream OUTPUT-STREAM))
+  ;; Abstract method
+  (ignore stream)
+  NULL)
+
+(defspecial *slotOptionSlots* (CONS OF STORAGE-SLOT) NULL 
+  :documentation "List of slots containing storage-slot options")
+
+(defspecial *classOptionSlots* (CONS OF STORAGE-SLOT) NULL 
+  :documentation "List of slots containing class options")
+
+(defspecial *classUnstringifiedOptions* PROPERTY-LIST NULL 
+  :documentation "Plist of unstringifed class options")
+
+(defun (get-class-options (CONS OF STORAGE-SLOT)) ()
+  ;; Return a list of slots on CLASS with options
+  ;; TODO: get also non-local slots
+  (let ((result NIL))
+    (foreach slot in (private-class-storage-slots (type-class @CLASS))
+	where (defined? (slot-option-keyword slot))
+	collect slot into result)
+    (foreach slot in (public-class-storage-slots (type-class @CLASS))
+	where (defined? (slot-option-keyword slot))
+	collect slot into result)
+    (foreach slot in (private-class-storage-slots (type-class @RELATION))
+	where (defined? (slot-option-keyword slot))
+	collect slot into result)
+    (foreach slot in (public-class-storage-slots (type-class @RELATION))
+	where (defined? (slot-option-keyword slot))
+	collect slot into result)
+    (return result)))
+
+(defun (get-unstringified-class-options PROPERTY-LIST) ((class CLASS))
+  ;; Return property list of `class''s options from its stringifed sources
+  (let ((theOptions (allocate PROPERTY-LIST)))
+    ;; place options into a property list:
+    (setf (the-plist theOptions) 
+      (rest (rest (rest (cast (unstringify (class-stringified-source class)) 
+			      CONS)))))
+    (return theOptions)))
+
+(defun (get-slot-options (CONS OF STORAGE-SLOT)) ()
+  ;; Return a list of slots on STORAGE-SLOT with options
+  (let ((result NIL))
+    (foreach slot in (private-class-storage-slots (type-class @STORAGE-SLOT))
+	where (defined? (slot-option-keyword slot))
+	collect slot into result)
+    (return result)))
+
+(defun pretty-print-literal ((literal OBJECT) (stream OUTPUT-STREAM))
+  ;; Print out a wrapped literal
+  (typecase literal
+    (BOOLEAN-WRAPPER
+     (if (eql? literal TRUE-WRAPPER)
+	 (print-stream stream "TRUE")
+       (print-stream stream "FALSE")))
+    (otherwise
+     (special ((*printReadably?* TRUE))
+       (print-stream stream literal)))))
+
+(defun (literal-eql? BOOLEAN) ((x OBJECT) (y OBJECT))
+  ;; Test if 2 literals are equal, special-casing booleans
+  ;; Assume types are compatible
+  (when (or (and (defined? x) 
+		 (isa? x @BOOLEAN-WRAPPER))
+	    (and (defined? y)
+		 (isa? y @BOOLEAN-WRAPPER)))
+    (return (or (and (null? (cast x BOOLEAN-WRAPPER))
+		     (not (cast y BOOLEAN-WRAPPER)))
+		(and (null? (cast y BOOLEAN-WRAPPER))
+		     (not (cast x BOOLEAN-WRAPPER)))
+		(eql? x y))))
+  (return (eql? x y)))
+
+(defun (convert-to-literal OBJECT) ((object OBJECT))
+  ;; "Evaluate" a parse tree to produce a value.
+  ;; NOTE: Currently only works on booleans
+  (when (null? object)
+    (return object))
+  (typecase object
+    (LITERAL-WRAPPER
+     (return object))
+    (SYMBOL
+     (when (eql? object (quote TRUE))
+       (return TRUE-WRAPPER))
+     (when (eql? object (quote FALSE))
+       (return FALSE-WRAPPER))
+     (return object))
+    ((KEYWORD SURROGATE)
+     (return object))
+    (otherwise
+     (warn "`convert-to-literal': Can't handle non-boolean literals")
+     (return NULL))))
+
+(defun pretty-print-class-options ((class CLASS) (stream OUTPUT-STREAM))
+  ;; Print out class options
+  ;; NOTE: We currently don't print out non-literal-valued
+  ;;   slots.  Alternatively, we could print them all out
+  (let ((optionValue OBJECT NULL))
+    (foreach optionSlot in *classOptionSlots*
+	do (setq optionValue 
+	     (read-slot-value class optionSlot))
+	   (when (null? optionValue) (continue))
+	   (typecase optionValue
+	     ((LITERAL-WRAPPER SYMBOL KEYWORD SURROGATE)
+	      (when (not (or 
+			  (literal-eql? (convert-to-literal
+					 (slot-initial-value optionSlot))
+					optionValue)
+			  (literal-eql? (convert-to-literal
+					 (default-form optionSlot))
+					optionValue)))
+		(print-stream stream EOL "  :" 
+			      (string-downcase 
+			       (symbol-name 
+				(slot-option-keyword optionSlot)))
+			      " " )
+		(pretty-print-literal optionValue stream)))
+	     (LIST
+	      (when (not (or
+			  (empty? optionValue)
+			  (eql? (slot-initial-value optionSlot)
+				optionValue)
+			  (eql? (default-form optionSlot)
+				optionValue)))
+		(special ((*printReadably?* TRUE)
+			  (*printPretty?* TRUE))
+		  (print-stream stream EOL "  :" 
+				(string-downcase 
+				 (symbol-name 
+				  (slot-option-keyword optionSlot)))
+				" " )
+		  (print-stream stream 
+				(lookup *classUnstringifiedOptions*
+					(slot-option-keyword optionSlot)))
+;		  (print-stream stream (the-cons-list optionValue))
+		  )))
+	     (CONS
+	      (when (not (or
+			  (empty? optionValue)
+			  (eql? (slot-initial-value optionSlot)
+				optionValue)
+			  (eql? (default-form optionSlot)
+				optionValue)))
+		(special ((*printReadably?* TRUE)
+			  (*printPretty?* TRUE))
+		  (print-stream stream EOL "  :" 
+				(string-downcase 
+				 (symbol-name 
+				  (slot-option-keyword optionSlot)))
+				" " )
+		  (print-stream stream optionValue))))
+	     (otherwise
+;	      (warn "`print-slot-options': can't handle non-literal " 
+;		    optionValue)
+	      )))))
+
+(defun pretty-print-slot-options ((slot STORAGE-SLOT) (stream OUTPUT-STREAM))
+  ;; Print out slot options
+  (let ((slotValue OBJECT NULL))
+    (foreach optionSlot in *slotOptionSlots*
+	do (setq slotValue (read-slot-value slot optionSlot))
+	   (when (null? slotValue) (continue))
+	   (typecase slotValue
+	     (LITERAL-WRAPPER
+	      (when (not (literal-eql? (slot-initial-value optionSlot) 
+				       slotValue))
+		(print-stream stream " :" 
+			      (string-downcase 
+			       (symbol-name 
+				(slot-option-keyword optionSlot)))
+			      " ")
+		(pretty-print-literal slotValue stream)))
+	   (otherwise
+;	    (warn "print-slot-options: can't handle non-literal " slotValue)
+	    )))))
+
+(defmethod pretty-print-object ((self STORAGE-SLOT) 
+				(stream OUTPUT-STREAM))
+  ;; Print a storage slot
+  ;; TODO: Add various options
+  (print-stream stream "(" (string-downcase (slot-name self)) " :type ")
+  ;; Q: Will this print-out parameterized and anchored types?- no
+  ;; TODO: print complex types
+  (print-stream 
+   stream
+   (choose (defined? (slot-type-specifier self))
+	   (stringify (yield-type-spec-tree (slot-type-specifier self)))
+	   (stringify (yield-type-spec-tree (slot-base-type self)))))
+  (pretty-print-slot-options self stream)
+  (print-native-stream stream ")"))
+
+(defun pretty-print-method-parameters ((stream OUTPUT-STREAM)
+				       (method METHOD-SLOT))
+  ;; Print out `method's parameter list.
+  (let ((lastArgIndex (choose (method-variable-arguments? method)
+                              (length (method-parameter-names method))
+                              -1)))
+    (special ((*printReadably?* TRUE))
+      (print-stream stream "(")
+      (foreach parameter in (method-parameter-names method)
+          as tSpec in (method-parameter-type-specifiers method)
+          as i in (interval 1 NULL)
+          do (when (> i 1)
+               (print-stream stream " "))
+             (when (= i lastArgIndex)
+               (print-stream stream "&rest ")
+               (setq tSpec (variable-arguments-type method)))
+             (print-stream
+              stream
+              "(" (string-downcase (symbol-name parameter))
+              " " (yield-type-spec-tree tSpec) ")"))
+      (print-stream stream ")"))))
+
+(defmethod pretty-print-object ((self METHOD-SLOT) 
+				(stream OUTPUT-STREAM))
+  ;; Print representation of a method slot
+  (print-stream stream "(" (string-downcase (slot-name self)) " ")
+  (pretty-print-method-parameters stream self)
+  (print-stream stream " :type ")
+  (print-stream 
+   stream
+   (choose (defined? (slot-type-specifier self))
+	   (stringify (yield-type-spec-tree (slot-type-specifier self)))
+	   (stringify (yield-type-spec-tree (slot-base-type self)))))
+  (print-stream stream ")"))
+
+(defun pretty-print-slot-block ((stream OUTPUT-STREAM)
+				(iterator (ITERATOR OF SLOT))
+				(slotGroup STRING))
+  ;; Print out a group (e.g., :public-methods) of slots
+  ;; First one: don't do newline first 
+  (if (next? iterator)
+    (let ((slot (value iterator)))
+      (print-stream stream EOL "  " slotGroup EOL "  (")
+      (pretty-print-object slot stream))
+    (return))
+  (foreach slot in iterator
+      do (print-stream stream EOL "   ")
+	 (pretty-print-object slot stream))
+  (print-stream stream ")"))
+
+(defun pretty-print-slots ((self CLASS) (stream OUTPUT-STREAM))
+  ;; Print slots associated with `self'
+  (pretty-print-slot-block stream (public-class-storage-slots self)
+			 ":public-slots")
+  (pretty-print-slot-block stream (private-class-storage-slots self)
+			 ":slots")
+  (pretty-print-slot-block stream (public-class-methods self)
+			 ":public-methods")
+  (pretty-print-slot-block stream (private-class-methods self)
+			 ":methods"))
+
+(defmethod pretty-print-object ((self CLASS) (stream OUTPUT-STREAM))
+  ;; Print representation of `self' to `stream'
+  (special ((*slotOptionSlots* (get-slot-options))
+	    (*classOptionSlots* (get-class-options))
+	    (*classUnstringifiedOptions* 
+	     (get-unstringified-class-options self)))
+    (print-stream stream "(defclass " (symbol-name (class-type self)) " ")
+    (print-class-list
+     (new TYPES-TO-CLASSES-ITERATOR
+          :iterator-cursor (the-cons-list (class-direct-supers self)))
+     stream)
+    (pretty-print-class-options self stream)
+    (pretty-print-slots self stream)
+    (print-stream stream ")" EOL)
+    
+    (when (next? (class-tables self NIL))
+      (print-stream stream EOL)
+      (foreach table in (class-tables self NIL)
+	  do
+	  (pretty-print-object table stream)
+	  (print-stream stream EOL))
+      (print-stream stream EOL))))
+
+  ;;
+;;;;;; "describe-object" methods
+  ;;
+
+;;; "describe-object" is one of the few methods defined on the class OBJECT.
+;;; This is done to make it extensible by users.
+
+(defmethod describe-object ((self OBJECT) (stream OUTPUT-STREAM) (mode KEYWORD))
+  :public? TRUE
+  :documentation "Prints a description of 'self' to stream 'stream'.  'mode'
+can be :terse, :verbose, or :source.  The :terse mode is often equivalent
+to the standard print function."
+  ;; The top-level method ignores 'mode' and calls "print-object".
+  (ignore mode)
+  (describe-tersely self stream) )
+
+(defmethod describe-object ((self CLASS) (stream OUTPUT-STREAM) (mode KEYWORD))
+  :public? TRUE
+  (case mode
+    (:SOURCE
+     (pretty-print-definition-tree 
+      (unstringify (class-stringified-source self)) stream))
+    (:TERSE
+     (describe-tersely self stream))
+    (:VERBOSE
+     (print-stream stream "SOURCE mode:" EOL)
+     (describe-object self stream :SOURCE))) )
+
+(defmethod describe-object
+    ((self STORAGE-SLOT) (stream OUTPUT-STREAM) (mode KEYWORD))
+  :public? TRUE
+  (case mode
+    (:SOURCE
+     (print-stream stream "TERSE mode:" EOL)
+     (describe-object self stream :TERSE))
+    (:TERSE
+     (describe-tersely self stream))
+    (:VERBOSE
+     ;; QUICK AND DIRTY SLOT PRINTER:
+     (pretty-print-definition-tree 
+      (bquote (SLOT & (slot-name self) 
+                 :owner & (symbol-name (slot-owner self))
+                 :type & (slot-base-type self)
+                 :initially & (slot-initial-value self)))
+      stream))) )
+
+(defmethod describe-object ((self MODULE) (stream OUTPUT-STREAM) (mode KEYWORD))
+  :public? TRUE
+  (case mode
+    (:SOURCE
+     (pretty-print-stella-tree
+      (unstringify (xmodule-stringified-source self)) stream))
+    (:TERSE
+     (describe-tersely self stream))
+    (:VERBOSE
+     (pretty-print-definition-tree
+      (bquote (defmodule & (module-name self)
+                         :includes & (parent-modules self)
+                         :uses & (uses self)
+                         :shadows & (shadowed-surrogates self)
+                         >>_inferred_slots
+                         :children & (child-contexts self)
+                         :used-by & (used-by self)
+                         :cardinal-module & (cardinal-module self)
+                         ))
+      stream))) )
+
+;; TEMPORARY:
+(defun (xmodule-stringified-source STRING) ((self MODULE))
+  (return (concatenate
+           "(defmodule "
+           (concatenate
+            (module-name self)
+            (concatenate
+             " "
+             (concatenate
+              (stringified-options self)
+              ")"))))) )
+
+  ;;
+;;;;;; Documentation utilities
+  ;;
+
+(defun (short-documentation STRING) ((documentation STRING))
+  :public? TRUE
+  ;; Return a shortened version of 'documentation' that can be used
+  ;;    in an overview display.
+  ;; The result is either the full first line of 'documentation' if it
+  ;;    ended in a period, or the first sentence of 'documentation' if
+  ;;    it was not too long, otherwise, the full first line.
+  ;; This assumes that the first sentence of a documentation string
+  ;;    gives a crisp overall description of a documented item (similar
+  ;;    to the convention used in Emacs documentation).
+  (let ((lineEnd INTEGER NULL)
+        (sentenceEnd INTEGER NULL))
+    (when (null? documentation)
+      (setq documentation "Not documented."))
+    ;; To be safe, check for each of the two possible line end
+    ;; characters.  Check return first, since a combo will most
+    ;; likely be CR-LF
+    (setq lineEnd (position documentation #\Return 0))
+    (when (null? lineEnd)
+      (setq lineEnd (position documentation #\Linefeed 0)))
+    (when (null? lineEnd)
+      (return documentation))
+    (when (member? ".!" (nth documentation (1- lineEnd)))
+      (return (subsequence documentation 0 lineEnd)))
+    (setq sentenceEnd (position documentation #\. 0))
+    (if (and (defined? sentenceEnd)
+             (<= sentenceEnd 155))
+        (return (subsequence documentation 0 (1+ sentenceEnd)))
+      (return (subsequence documentation 0 lineEnd)))))
+
+(defun print-documentation-string
+    ((string STRING) (indent INTEGER) (stream OUTPUT-STREAM))
+  ;; Print a documentation 'string' indented by 'indent' spaces onto 'stream'.
+  (let ((freshLine? TRUE))
+    (when (null? indent)
+      (setq indent 0))
+    (foreach char in string
+        do (when freshLine?
+             (foreach i in (interval 1 indent)
+                 do (ignore i)
+                    (print-stream stream #\Space))
+             (setq freshLine? FALSE))
+           (print-stream stream char)
+           (when (eql? char #\Newline)
+             (setq freshLine? TRUE)))
+    (print-stream stream EOL)))
+
+(defmethod print-documentation
+    ((self METHOD-SLOT) (stream OUTPUT-STREAM) (short? BOOLEAN))
+  :public? TRUE
+  ;; Print the documentation of 'self' onto 'stream'.
+  ;; If 'short?' is TRUE, print a shortened documentation string.
+  (when (null? stream)
+    (setq stream STANDARD-OUTPUT))
+  (let ((documentation (documentation self)))
+    (print-stream stream (slot-name self))
+    (unless short?
+      (print-stream stream " ")
+      (pretty-print-method-parameters stream self))
+    (print-stream stream ":" EOL)
+    (print-documentation-string
+     (choose short? (short-documentation documentation) documentation)
+     2 stream)))

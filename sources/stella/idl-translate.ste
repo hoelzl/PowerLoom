@@ -1,0 +1,541 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: idl-translate.ste,v 1.12 2003/04/18 21:15:03 hans Exp
+
+;;; Routines for translating Stella parse trees into IDL trees.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+(defmodule "/IDL-THEORY"
+  :case-sensitive? TRUE
+  :uses ()
+  :lisp-package "IDL")
+
+(verbatim :common-lisp
+  (CL:unless (CL:find-package "IDL")
+    (CL:defpackage "IDL"))
+  :otherwise NULL)
+
+(defmodule "/IDL-THEORY/IDL-USER-THEORY"
+  :case-sensitive? TRUE
+  :uses ()
+  :lisp-package "IDL-USER")
+
+(verbatim :common-lisp
+  (CL:unless (CL:find-package "IDL-USER")
+    (CL:defpackage "IDL-USER"))
+  :otherwise NULL)
+
+
+(defun (idl-translate-a-tree OBJECT) ((tree OBJECT))
+  ;; Translate 'tree', converting Stella constructs into constructs
+  ;;    which can be consumed by the IDL outputter.
+  (typecase tree
+    (CONS
+     (if (nil? tree)
+	 (return (idl-translate-atomic-tree tree))
+       (return (idl-translate-null))))
+    (otherwise
+     ;; CAREFUL: THIS MAY NOT WORK...
+     (when (null? tree) 
+       (return (idl-translate-null)))
+     (return (idl-translate-atomic-tree tree)))) )
+
+  ;;
+;;;;;; IDL translation of translation units:
+  ;;
+
+(defun (idl-translate-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree representing an IDL definition of
+  ;;    the object stored in 'unit'.
+  (case (category unit)
+    (GLOBAL-VARIABLE
+     ;; ignore
+     (return NULL))
+    (TYPE
+     (return (idl-translate-deftype-unit unit)))
+    (CLASS
+     (return (idl-translate-define-native-class-unit unit)))
+    ((METHOD MACRO)
+     ;; ignore
+    (return NULL))
+    (PRINT-METHOD
+     ;; ignore
+     (return NULL))
+    ((STARTUP-TIME-PROGN VERBATIM)
+     ;; ignore
+     (return NULL))))
+
+(defun (idl-translate-deftype-unit CONS) ((unit TRANSLATION-UNIT))
+  (return (bquote 
+	   (IDL_TYPEDEF & (idl-translate-name 
+			   (cast (second (cast (code-register unit) CONS))
+				 SYMBOL))
+			& (idl-translate-type-spec 
+			   (surrogate-value (cast (the-object unit) 
+						  SURROGATE)))))))
+
+(defun (idl-translate-null CONS) ()
+  ;; Return a representation of NULL
+  (return (bquote (IDL_IDENT & (wrap-literal "NULL")))) )
+
+(defmethod (idl-translate-atomic-tree CONS) ((tree OBJECT))
+  ;; Return the value of the atom wrapped in a list.  
+  (return (bquote (IDL_LITERAL & tree))) )
+
+(defmethod (idl-translate-atomic-tree CONS) ((tree SYMBOL))
+  ;; Return the value of the atom wrapped in a list.  
+  ;; Special case known constants: upcase them
+  (return (bquote (IDL_IDENT 
+		   & (idl-translate-name tree)))))
+
+(defun (idl-translate-type-spec STRING-WRAPPER) ((typeSpec TYPE-SPEC))
+  ;; Translate a type specifier to a idl type.
+  (typecase typeSpec
+      (PARAMETRIC-TYPE-SPECIFIER
+       (return
+	 (wrap-literal
+	  (concatenate
+	      (wrapper-value
+	       (idl-translate-type-spec
+		(specifier-base-type typeSpec)))
+	    (concatenate "<"
+	      (concatenate 
+		  (wrapper-value
+		   (idl-translate-type-spec
+		    (first (specifier-parameter-types typespec))))
+		">"))))))
+    (TYPE
+     (cond
+      ((defined? (class-idl-native-type (type-class typeSpec)))
+       (return (wrap-literal (class-idl-native-type (type-class typeSpec)))))
+      (otherwise
+       ;; Do a double-dereference to get a class's true name
+       (return (idl-translate-class-name 
+		(symbolize (class-type (type-class typeSpec))))))))) )
+
+(defun (idl-translate-class-name STRING-WRAPPER) ((nameSymbol GENERALIZED-SYMBOL))
+  ;; Convert a lisp symbol representing a class name to a idl class name.
+  ;; Capitalize, and substitute forbidden characters.
+  (return
+    (wrap-literal
+     (idl-substitute-forbidden-characters
+      (idl-change-case
+       ;; This does the dereferencing of synonyms:
+       (class-type (type-class (surrogatify nameSymbol)))
+       :capitalized)
+      :capitalized))))
+
+;; Support for forbidden character substitution in idl names:
+
+(defun (idl-create-character-substitution-table STRING) ()
+  ;; Create a idl character substitution table that can be used
+  ;;    to map illegal idl characters onto legal replacements.
+  ;; Entry i in the table defines the substitution for the
+  ;;    character '(code-character i)'.
+  ;; Legal idl characters are mapped onto #\= (instead of themselves)
+  ;;    to indicate that no substitution is necessary.
+  (let ((table (make-mutable-string 256 #\_))) ;; default substitution is #\_
+    ;; Legal characters are indicated with an #\= sign:
+    (foreach code in (interval (character-code #\0) (character-code #\9))
+             do (setf (nth table code) #\=))
+    (foreach code in (interval (character-code #\A) (character-code #\Z))
+             do (setf (nth table code) #\=))
+    (foreach code in (interval (character-code #\a) (character-code #\z))
+             do (setf (nth table code) #\=))
+    (setf (nth table (character-code #\_)) #\=)
+    ;; Mapping for other printing characters:
+    (setf (nth table (character-code #\ )) #\_)
+    (setf (nth table (character-code #\!)) #\X) ;; eXclamation
+    (setf (nth table (character-code #\")) #\_)
+    (setf (nth table (character-code #\#)) #\H) ;; Hash
+    (setf (nth table (character-code #\$)) #\B) ;; Buck
+    (setf (nth table (character-code #\%)) #\R) ;; peRcent
+    (setf (nth table (character-code #\&)) #\A) ;; Ampersand
+    (setf (nth table (character-code #\')) #\Q) ;; Quote
+    (setf (nth table (character-code #\()) #\_)
+    (setf (nth table (character-code #\))) #\_)
+    (setf (nth table (character-code #\*)) #\O) ;; simply cute
+    (setf (nth table (character-code #\+)) #\I) ;; Increase
+    (setf (nth table (character-code #\,)) #\_)
+    (setf (nth table (character-code #\-)) #\_)
+    (setf (nth table (character-code #\.)) #\D) ;; Dot
+    (setf (nth table (character-code #\/)) #\S) ;; Slash
+    ;; Here go #\0 to #\9.
+    (setf (nth table (character-code #\:)) #\C) ;; Colon
+    (setf (nth table (character-code #\;)) #\_)
+    (setf (nth table (character-code #\<)) #\L) ;; Less than
+    (setf (nth table (character-code #\=)) #\E) ;; Equal
+    (setf (nth table (character-code #\>)) #\G) ;; Greater than
+    (setf (nth table (character-code #\?)) #\P) ;; Predicate
+    (setf (nth table (character-code #\@)) #\M) ;; Monkey tail
+    ;; Here go #\A to #\Z.
+    (setf (nth table (character-code #\[)) #\_)
+    (setf (nth table (character-code #\\)) #\_)
+    (setf (nth table (character-code #\])) #\_)
+    (setf (nth table (character-code #\^)) #\U) ;; Up arrow
+    ;; Here goes #\_.
+    (setf (nth table (character-code #\`)) #\_)
+    ;; Here go #\a to #\z.
+    (setf (nth table (character-code #\{)) #\_)
+    (setf (nth table (character-code #\|)) #\V) ;; Vertical bar
+    (setf (nth table (character-code #\})) #\_)
+    (setf (nth table (character-code #\~)) #\T) ;; Tilde
+    (return table)))
+
+(defglobal *idl-character-substitution-table* STRING
+  (idl-create-character-substitution-table))
+
+
+(defun (idl-substitute-forbidden-characters STRING)
+    ((name STRING) (caseConvention KEYWORD))
+  ;; Substitute all forbidden characters in 'name' (e.g., '-', '*', etc.),
+  ;;    with legal idl characters from *idl-character-substitution-table*.
+  ;; 'caseConvention' indicates the case for 'name' and has to be one of
+  ;;    :uppercase, :lowercase, or :capitalized.  Replacement characters
+  ;;    will be changed into the opposite case to avoid name clashes.
+  ;; If no substitutions were necessary, the unmodified and uncopied
+  ;;    'name' will be returned.
+  (let ((result MUTABLE-STRING NULL)
+        (substitution CHARACTER NULL))
+    (case (nth name 0)
+      ;; Handle leading digits:
+      (#\0 (setq result (replace-first-character-with-string name "zero")))
+      (#\1 (setq result (replace-first-character-with-string name "one")))
+      (#\2 (setq result (replace-first-character-with-string name "two")))
+      (#\3 (setq result (replace-first-character-with-string name "three")))
+      (#\4 (setq result (replace-first-character-with-string name "four")))
+      (#\5 (setq result (replace-first-character-with-string name "five")))
+      (#\6 (setq result (replace-first-character-with-string name "six")))
+      (#\7 (setq result (replace-first-character-with-string name "seven")))
+      (#\8 (setq result (replace-first-character-with-string name "eight")))
+      (#\9 (setq result (replace-first-character-with-string name "nine")))
+      (otherwise (setq result name)))
+    (foreach i in (interval 0 (- (length result) 1))
+	do (setq substitution
+	     (nth *idl-character-substitution-table*
+		  (character-code (nth result i))))
+	   (when (not (eq? substitution #\=))
+	     ;; We need a substitution.
+	     (case caseConvention
+	       (:uppercase (setf (nth result i) (downcase-character substitution)))
+	       (:lowercase (setf (nth result i) (upcase-character substitution)))
+	       (:capitalized
+		;; TO DO: This should do something different at word boundaries.
+		(setf (nth result i) (upcase-character substitution))))))
+    (return result)))
+
+(defun (idl-change-case STRING)
+    ((symbol GENERALIZED-SYMBOL) (caseConvention KEYWORD))
+  ;; Change the case of 'symbol' according to 'caseConvention' and return
+  ;;    a copy of the modified symbol name.
+  ;; Do not perform any case change if the home module of 'symbol' is
+  ;;    case-sensitive, but still return a copy of the symbol name.
+  ;; TO DO: Optimize to not allocate a new string when the case of
+  ;;    'symbol' is already correct.
+  (let ((module (interned-in symbol))
+        (name (symbol-name symbol)))
+    (when (null? module)
+      (setq module *module*))
+    (when (case-sensitive? module)
+      (return (copy name)))
+    (case caseConvention
+      (:uppercase (return (string-upcase name)))
+      (:lowercase (return (string-downcase name)))
+      (:capitalized (return (string-capitalize name))))))
+
+(defun (idl-yield-renamed-reserved-word STRING-WRAPPER) ((word SYMBOL))
+  ;; Yield a properly renamed replacement for the reserved IDL symbol 'word'.
+  (return
+    (wrap-literal
+     (concatenate "renamed_" (string-capitalize (symbol-name word))))))
+
+(defun (idl-create-reserved-word-table STRING-HASH-TABLE) ()
+  ;; Create a table of reserved IDL symbols and their associated replacements.
+  (let ((table (new STRING-HASH-TABLE)))
+    (foreach
+     word in (bquote
+              ;; NOTE: Can't add 'this' to the table, since first method
+              ;;       arguments get replaced with 'this' before translation.
+              ;; From B. Stroustrup, section r.2.4, page 479:
+              (asm auto break case catch char class const
+                   continue default delete do double else enum extern
+                   float for friend goto if inline int long
+                   new operator private protected public register return short
+                   signed sizeof static struct switch template #| this |# throw
+                   try typedef union unsigned virtual void volatile while
+                   ;; g++ needs this:
+                   typename))
+     do (insert-at
+         table
+         (symbol-name (cast word SYMBOL))
+         (idl-yield-renamed-reserved-word word)))
+    ;; The next two are not really reserved identifiers, but
+    ;; they are renamed for readability (is this still needed?):
+    (insert-at table "++" (wrap-literal "stella_Increment"))
+    (insert-at table "--" (wrap-literal "stella_Decrement"))
+    (return table)))
+
+(defglobal *idl-reserved-word-table*
+    (STRING-HASH-TABLE OF STRING STRING-WRAPPER)
+  (idl-create-reserved-word-table))
+
+(defun (idl-lookup-reserved-word-table STRING-WRAPPER) ((word SYMBOL))
+  ;; Check whether 'word' is a reserved IDL symbol, and if so, return
+  ;;    a properly renamed replacement.
+  ;; NOTE: We use the symbol name as the key instead of the symbol itself
+  ;;    to also make it work for symbols in different modules.  If at some
+  ;;    point the modules become part of identifier names this needs to
+  ;;    be fixed!
+  ;; TO DO: Maybe this should generate a warning.
+  (let ((entry (lookup *idl-reserved-word-table* (symbol-name word))))
+    (if (defined? entry)
+        ;; Make sure we copy the wrapper:
+	(return (wrap-literal (wrapper-value entry)))
+      (return NULL))))
+
+(defun (idl-translate-name STRING-WRAPPER) ((nameSymbol SYMBOL))
+  ;; Convert 'nameSymbol' representing an identifier to a idl identifier.
+  ;; Make lowercase, and substitute forbidden characters.
+  (let ((reservedName (idl-lookup-reserved-word-table nameSymbol)))
+    (when (null? nameSymbol)
+      (return (wrap-literal "NULL")))
+    (when (defined? reservedName)
+      (return reservedName))
+    (return
+      (wrap-literal
+       (idl-substitute-forbidden-characters 
+        (idl-change-case nameSymbol :lowercase) :lowercase)))))
+
+(defun (idl-translate-symbol-constant-name STRING-WRAPPER)
+    ((symbol GENERALIZED-SYMBOL))
+  ;; Convert 'symbol' representing a symbol/surrogate/keyword constant
+  ;;    into a IDL symbol/surrogate/keyword constant identifier.
+  (let ((prefix STRING NULL))
+    (typecase symbol
+      (SYMBOL
+       (setq prefix (concatenate "SYM_" (context-name (interned-in symbol)))))
+      (SURROGATE
+       (setq prefix (concatenate "SGT_" (context-name (interned-in symbol)))))
+      (KEYWORD
+       (setq prefix "KWD")))
+    (return
+      (wrap-literal
+       (idl-substitute-forbidden-characters
+        (concatenate prefix (concatenate "_" (symbol-name symbol)))
+        :uppercase)))))
+
+(defun (idl-translate-symbol-constant-id STRING-WRAPPER)
+    ((symbol GENERALIZED-SYMBOL))
+  ;; Convert a reference to the ID of 'symbol' into a IDL
+  ;;    symbol-id identifier.
+  (let ((translatedSymbol (idl-translate-symbol-constant-name symbol)))
+    (setf (wrapper-value translatedSymbol)
+      (concatenate (wrapper-value translatedSymbol) "_id"))
+    (return translatedSymbol)))
+
+(defun (idl-translate-symbol-name STRING-WRAPPER) ((symbol SYMBOL))
+  ;; Convert 'symbol' representing a symbol constant to a IDL
+  ;;    symbol constant identifier.
+  (return (idl-translate-symbol-constant-name symbol)))
+
+(defun (idl-translate-symbol-id STRING-WRAPPER) ((symbol SYMBOL))
+  ;; Convert a reference to the ID of 'symbol' into a IDL
+  ;;    symbol-id identifier.
+  (return (idl-translate-symbol-constant-id symbol)))
+
+(defun (idl-translate-surrogate-name STRING-WRAPPER) ((surrogate SURROGATE))
+  ;; Convert 'surrogate' representing a surrogate constant to a IDL
+  ;;    surrogate constant identifier.
+  (return (idl-translate-symbol-constant-name surrogate)))
+
+(defun (idl-translate-surrogate-id STRING-WRAPPER) ((surrogate SURROGATE))
+  ;; Convert a reference to the ID of 'surrogate' into a IDL
+  ;;    surrogate-id identifier.
+  (return (idl-translate-symbol-constant-id surrogate)))
+
+(defun (idl-translate-keyword-name STRING-WRAPPER) ((keyword KEYWORD))
+  ;; Convert 'keyword' representing a keyword constant to a IDL
+  ;;    keyword constant identifier.
+  (return (idl-translate-symbol-constant-name keyword)))
+
+(defun (idl-translate-keyword-id STRING-WRAPPER) ((keyword KEYWORD))
+  ;; Convert a reference to the ID of 'keyword' into a IDL
+  ;;    keyword-id identifier.
+  (return (idl-translate-symbol-constant-id keyword)))
+
+(defun (idl-translate-class-parameter-name STRING-WRAPPER) ((nameSymbol SYMBOL))
+  ;; Convert 'nameSymbol' representing a class parameter name to a IDL
+  ;;    class parameter name.
+  ;; Like 'idl-translate-global-name'.
+  (return
+    (wrap-literal
+     (idl-substitute-forbidden-characters 
+      (idl-change-case nameSymbol :uppercase) :uppercase))))
+
+(defun (idl-create-overloaded-function-name SYMBOL) ((functionName SYMBOL)
+						     (classType TYPE))
+  ;; Create a name for overloaded function based on the original name
+  ;;   and a method's type
+  (return
+    (intern-symbol
+     (concatenate 
+       (symbol-name classType)
+       (concatenate "-" (symbol-name functionName))))) )
+
+(defun (idl-method-object-is-overloaded-function? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return true if `method' is a method defined on a native (or literal) type.
+  (return
+    (and (not (method-function? method))
+         (defined? (class-idl-native-type (type-class (slot-owner method)))))))
+
+(defun (idl-translate-function-name STRING-WRAPPER) ((function METHOD-SLOT))
+  ;; Create a name for the IDL function defined by METHOD-SLOT.
+  ;; Do not prefix the name with the method's class.
+  (let ((functionName SYMBOL (slot-name function)) 
+	(translatedName STRING NULL))
+    (when (idl-method-object-is-overloaded-function? function)
+      (setq functionName (idl-create-overloaded-function-name 
+			  functionName (slot-owner function))))
+    (setq translatedName (wrapper-value (idl-translate-name functionName)))
+    ;; KLUDGE: we generate reader names and setter names in the translator.
+    ;;   The walker generates setter names.  Should it also generate reader
+    ;;   names?
+    (when (method-setter? function)
+      (setq translatedName (concatenate translatedName "_setter")))
+    (when (slot-reader? function)
+      (setq translatedName (concatenate translatedName "_reader")))
+    (return (wrap-literal translatedName)) ))
+
+;(defun (idl-translate-function-parameter OBJECT) ((parameterSpec OBJECT))
+;  ;; Translate a formal parameter specification, which consists of
+;  ;;   a name and a type.
+;  ;; NOTE: THIS VERSION IS NOT DESTRUCTIVE: I DON'T WANT TO DESTROY
+;  ;;   SHOULD IT BE?
+;  ;; CAREFUL ABOUT GARBAGE!
+;  (typecase parameterSpec
+;    (SYMBOL
+;     (when (eql? (cast parameterSpec SYMBOL) (quote &rest))
+;       (return (quote IDL_VAR_ARGS))))
+;    (CONS
+;     (let ((type (second parameterSpec))
+;	   (parameter (first parameterSpec)))
+;       (return
+;	 (bquote (& (idl-translate-type-spec type)
+;		    & (idl-translate-name parameter)))))) ))
+
+(defun (idl-translate-method-parameter OBJECT) 
+    ((name SYMBOL) (type TYPE-SPEC) (direction SYMBOL))
+  ;; Translate a formal parameter specification, which consists of
+  ;;   a name and a type.
+  (return
+    (bquote (& (idl-translate-name direction)
+	       & (idl-translate-type-spec type)
+	       & (idl-translate-name name)))))
+
+;(defun (idl-translate-function-parameters CONS)  ((parameters CONS))
+;  ;; Translate a list of formal parameters into IDL parameters
+;  ;; NOTE: CAREFUL ABOUT GARBAGE! CURRENTLY DON'T FREE PARAMETERS
+;  ;;   SINCE THIS IS CALLED MULTIPLE TIMES WITH THE SAME LIST.
+;  (let ((outputParameters NIL)
+;	(translatedParameter OBJECT NULL)
+;	(variableLengthParametersP FALSE)
+;	(gotDummyParameterP FALSE)
+;	(dummyParameter SYMBOL NULL))
+;    ;; NOTE: Logic is a bit tricky.  Can this be simplified?
+;    (foreach parameter in parameters
+;	     do
+;	     (unless gotDummyParameterP
+;	       (if variableLengthParametersP
+;		   (progn
+;		     (setq dummyParameter (first (cast parameter CONS)))
+;		     (setq gotDummyParameterP TRUE))
+;		   (progn
+;		     (setq translatedParameter 
+;		       (idl-translate-function-parameter parameter))
+;		     (if (and (symbol? translatedParameter)
+;			      (eql? translatedParameter (quote IDL_VAR_ARGS)))
+;			 (setq variableLengthParametersP TRUE)
+;		       (pushq outputParameters translatedParameter))))))
+;    (setq outputParameters (reverse outputParameters))
+;    (when variableLengthParametersP
+;      ;; NOTE: Don't use 'add-cons-to-end-of-cons-list' if 'outputParameters'
+;      ;;   is NIL!
+;      (if (empty? outputParameters)
+;	  (setq outputParameters 
+;	    (bquote ((IDL_VAR_ARGS & (idl-translate-name dummyParameter)))))
+;	  (add-cons-to-end-of-cons-list 
+;	   outputParameters 
+;	   (bquote ((IDL_VAR_ARGS & (idl-translate-name dummyParameter)))))))
+;    (return outputParameters) ))
+
+(defun (idl-translate-method-parameters CONS) ((method METHOD-SLOT))
+  ;; Translate all parameters of `method', excluding first (self)
+  ;; parameter
+  (let ((result NIL)
+	(directions NIL))
+    (if (empty? (method-parameter-directions method))
+	(foreach name in (rest (method-parameter-names method))
+	    do (ignore name)
+	    collect (quote IN)
+	    into directions)
+	(setq directions (rest (method-parameter-directions method))))
+    (foreach name in (rest (method-parameter-names method))
+	     as type in (rest (method-parameter-type-specifiers method))
+	     as direction in directions
+	     collect (idl-translate-method-parameter name type direction)
+	     into result)
+    (return result)))
+
+(defun (idl-translate-constructor-name STRING-WRAPPER) 
+    ((constructor METHOD-SLOT))
+  ;; Create a name for the IDL constructor defined by METHOD-SLOT.
+  (return (idl-translate-class-name (slot-name constructor))) )
+
+
+
+
+

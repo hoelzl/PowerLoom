@@ -1,0 +1,1444 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: collections.ste,v 1.34 2003/09/30 00:36:48 hans Exp
+
+;;; Procedures that implement sets, hash tables, arrays, etc.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Collections
+  ;;
+
+(defmethod (member? BOOLEAN) ((self COLLECTION) (object OBJECT))
+  :documentation
+  "Return true iff `object' is a member of the collection `self'."
+  :public? TRUE
+  (foreach i in self
+      where (eql? i object)
+      do (return TRUE))
+  (return FALSE) )
+
+(defmethod (remove-duplicates (LIKE self)) ((self COLLECTION))
+  :documentation "Return `self' with duplicates removed.  Preserves the
+original order of the remaining members."
+  :public? TRUE :abstract? TRUE)
+
+  ;;
+;;;;;; Collection predicates (properties)
+  ;;
+
+;;; RENAMED TO `stella-collection?' TO AVOID A SHADOWING PROBLEM WITH A SIMILAR
+;;; POWERLOOM FUNCTION.  ONCE WE FIX TRANSLATION OF SHADOWED NAMES (AND IF WE
+;;; EVER REALLY CARE ABOUT THESE STELLA PREDICATES) WE SHOULD RENAME IT BACK.
+
+(defun (stella-collection? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  :documentation "Return `true' if `self' is a native collection."
+  (return (isa? self @COLLECTION)) )
+
+(defmethod (no-duplicates? BOOLEAN) ((self COLLECTION))
+  :public? TRUE
+  :documentation
+  "Return `true' if the collection `self' forbids duplicate values."
+  (return FALSE) )
+
+(defmethod (no-duplicates? BOOLEAN) ((self SET))
+  :public? TRUE
+  (return TRUE) )
+
+(defmethod (ordered? BOOLEAN) ((self COLLECTION))
+  :public? TRUE
+  :documentation "Return `true' if the collection `self' is ordered."
+  (return FALSE) )
+
+(defmethod (ordered? BOOLEAN) ((self SEQUENCE))
+  :public? TRUE
+  (return TRUE) )
+
+(defmethod (ordered? BOOLEAN) ((self SET))
+  :public? TRUE
+  (return FALSE) )
+
+
+  ;;
+;;;;;; Simple Sets
+  ;;
+
+;;; These are just like regular LISTs but with a few methods overridden
+;;; to not allow insertion of duplicate elements.  Note, that elements
+;;; can still be set destructively (e.g., via `(setf (first set) ...)')
+;;; which would still potentially allow one to insert duplicates.
+
+(defmethod insert ((self SET) (value (LIKE (any-value self))))
+  :public? TRUE
+  :documentation "Add `value' to the set `self' unless it is already a member."
+  (when (not (member? self value))
+    (setf (the-cons-list self) (cons value (the-cons-list self)))))
+
+(defmethod push ((self SET) (value (LIKE (any-value self))))
+  :public? TRUE
+  :documentation
+  "Add `value' to the front of set `self' unless it is already a member."
+  (when (not (member? self value))
+    (setf (the-cons-list self) (cons value (the-cons-list self)))))
+
+(defmethod insert-last ((self SET) (value (LIKE (any-value self))))
+  :documentation
+  "Add `value' to the end of set `self' unless it is already a member."
+  :public? TRUE
+  (when (not (member? self value))
+    (let ((cursor (the-cons-list self))
+          (lastCons (cons value NIL)))
+      (if (empty? cursor)
+          (setf (the-cons-list self) lastCons)
+        (add-cons-to-end-of-cons-list cursor lastCons)))))
+
+(defmethod (remove-duplicates (LIKE self)) ((self SET))
+  (return self))
+
+(defmethod (substitute (LIKE self)) ((self SET) (new OBJECT) (old OBJECT))
+  :documentation "Destructively replace `old' with `new' in the set `self'
+unless `new' is already a member."
+  :public? TRUE
+  (when (not (member? self new))
+    (setf (the-cons-list self) (substitute (the-cons-list self) new old)))
+  (return self))
+
+(defmethod (concatenate SET) ((set1 SET) (set2 LIST) &rest (otherSets LIST))
+  :documentation "Union `set2' and all `otherSets' onto the end of `set1'.
+The operation is destructive wrt `set1', but leaves all other sets intact.
+The two mandatory parameters allow us to optimize the common binary case by
+not relying on the somewhat less efficient variable arguments mechanism."
+  :public? TRUE
+  (let ((resultSet (the-cons-list set1)))
+    (foreach elt in set2
+        where (not (member? resultSet elt))
+        collect elt into resultSet)
+    (when (> (length otherSets) 0)
+      (foreach oSet in otherSets
+          do (foreach elt in oSet
+                 where (not (member? resultSet elt))
+                 collect elt into resultSet)))
+    (setf (the-cons-list set1) resultSet)
+    (return set1)))
+
+(defmethod (object-equal? BOOLEAN) ((x SET) (y OBJECT))
+  :documentation "Return TRUE iff `x' and `y' are SET's with equivalent members.
+Uses `equal?' to test equality of elements.  This is more general than
+`equivalent-sets?', since that only uses an `eql?' test."
+  :public? TRUE
+  (typecase y
+    (SET
+     (return
+       (and (= (length x) (length y))
+            (forall eltX in x
+                always (exists eltY in y
+                           where (equal? eltX eltY))))))
+    (otherwise NULL))
+  (return FALSE))
+
+(defmethod (equal-hash-code INTEGER) ((self SET))
+  :documentation "Return an `equal?' hash code for `self'.  Note that this
+is O(N) in the number of elements of `self'."
+  :public? TRUE
+  (let ((cursor (the-cons-list self))
+        (code 95880665)) ;; result of (hash-string "SET" 0)
+    (loop
+      (when (empty? cursor)
+        (break))
+      ;; exploits the fact that `XOR' is commutative:
+      (setq code (logxor code (safe-equal-hash-code (value cursor))))
+      (setq cursor (rest cursor)))
+    (return code)))
+
+(defun (set SET) (&rest (values OBJECT))
+  :documentation "Return a set containing `values', in order."
+  :public? TRUE
+  (let ((set (new SET)))
+    (foreach v in values
+        where (not (member? set v))
+        collect v into set)
+    (return set) ))
+
+
+  ;;
+;;;;;; VECTORS, EXTENSIBLE-VECTORs, and VECTOR-SEQUENCEs
+  ;;
+
+(defmethod print-vector ((self VECTOR) (stream NATIVE-OUTPUT-STREAM))
+  (if (eq? (length self) 0)
+      (print-native-stream stream "|i|[]")
+    (let ((i 0)
+          (limit 9))
+      (print-native-stream stream "|i|[")
+      (foreach element in self
+               do
+               (print-native-stream stream element)
+               (++ i)
+               (when (> i limit) (break))
+               (when (< i (length self))
+                 (print-native-stream stream " ")))
+      (if (or (<= i limit)
+              (eq? i (length self)))
+          (print-native-stream stream "]")
+        (print-native-stream stream " ...]")))))
+
+(defmethod (empty? BOOLEAN) ((self VECTOR))
+  :documentation "Return `true' if `self' has length 0."
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (eql? (array-size self) 0)) )
+
+(defmethod (non-empty? BOOLEAN) ((self VECTOR))
+  :public? TRUE
+  :documentation "Return `true' if `self' has length > 0."
+  :globally-inline? TRUE
+  (return (> (array-size self) 0)) )
+
+(defmethod (first (LIKE (any-value self))) ((self VECTOR))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (nth self 0)))
+
+(defmethod (second (LIKE (any-value self))) ((self VECTOR))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (nth self 1)))
+
+(defmethod (third (LIKE (any-value self))) ((self VECTOR))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (nth self 2)))
+
+(defmethod (fourth (LIKE (any-value self))) ((self VECTOR))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (nth self 3)))
+
+(defmethod (fifth (LIKE (any-value self))) ((self VECTOR))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (nth self 4)))
+
+(defmethod (nth (LIKE (any-value self))) ((self VECTOR) (position INTEGER))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (nth (the-array self) position)))
+
+(defmethod (last (LIKE (any-value self))) ((self VECTOR))
+  :public? TRUE
+  :documentation "Return the last item in the vector `self'."
+  (return (nth self (1- (array-size self)))) )
+
+(defmethod (first-setter (LIKE (any-value self)))
+    ((self VECTOR) (value (LIKE (any-value self))))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (setf (nth self 0) value)))
+
+(defmethod (second-setter (LIKE (any-value self)))
+    ((self VECTOR) (value (LIKE (any-value self))))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (setf (nth self 1) value)))
+
+(defmethod (third-setter (LIKE (any-value self)))
+    ((self VECTOR) (value (LIKE (any-value self))))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (setf (nth self 2) value)))
+
+(defmethod (fourth-setter (LIKE (any-value self)))
+    ((self VECTOR) (value (LIKE (any-value self))))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (setf (nth self 3) value)))
+
+(defmethod (fifth-setter (LIKE (any-value self)))
+    ((self VECTOR) (value (LIKE (any-value self))))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (setf (nth self 4) value)))
+
+(defmethod (nth-setter (LIKE (any-value self)))
+    ((self VECTOR) (value (LIKE (any-value self))) (position INTEGER))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (setf (nth (the-array self) position) value)))
+
+(defmethod (last-setter (LIKE (any-value self)))
+    ((self VECTOR) (value (LIKE (any-value self))))
+  :public? TRUE
+  (return (setf (nth self (1- (array-size self))) value)))
+
+(defmethod (length INTEGER) ((self VECTOR))
+  :public? TRUE
+  ;;:globally-inline? `true' ;; can't inline, since VECTOR-SEQUENCE shadows it
+  (return (array-size self)))
+
+(defmethod (member? BOOLEAN) ((self VECTOR) (object OBJECT))
+  :public? TRUE
+  (let ((array (the-array self)))
+    (foreach i in (interval 0 (1- (length self)))
+             where (eql? (nth array i) object)
+             do (return TRUE))
+    (return FALSE) ))
+
+(defmethod (position INTEGER) ((self VECTOR) (object OBJECT) (start INTEGER))
+  :documentation "Return the position of `object' within the vector
+`self' (counting from zero); or return `null' if `object' does not occur within 
+`self' (uses an `eql?' test).  If `start' was supplied as non-`null', only 
+consider the portion starting at `start', however, the returned position 
+will always be relative to the entire vector."
+  :public? TRUE
+  (when (null? start)
+    (setq start 0))
+  (foreach i in (interval start (1- (length self)))
+           where (eql? (nth self i) object)
+           do (return i))
+  (return NULL))
+
+(defmethod insert-at ((self VECTOR) (offset INTEGER)
+                      (value (LIKE (any-value self))))
+  (when (>= offset (array-size self))
+    (error "Out-of-bounds array access"))
+  (setf (nth self offset) value))
+
+(defmethod (copy (VECTOR OF (LIKE (any-value self)))) ((self VECTOR))
+  :documentation "Return a copy of the vector `self'."
+  :public? TRUE
+  (let ((size (array-size self))
+        (sourceArray (the-array self))
+        (copy (new VECTOR :array-size size))
+        (copyArray (the-array copy)))
+    (foreach i in (interval 0 (1- size))
+        do (setf (nth copyArray i) (nth sourceArray i)))
+    (return copy)))
+
+(defmethod clear ((self VECTOR))
+  :public? TRUE
+  (let ((size (array-size self))
+        (array (the-array self)))
+    (foreach i in (interval 0 (1- size))
+        do (setf (nth array i) NULL))))
+
+(defun (vector VECTOR) (&rest (values OBJECT))
+  :documentation "Return a vector containing `values', in order."
+  :public? TRUE
+  (let ((vector (new VECTOR :array-size (length values))))
+    (foreach v in values
+        as i in (interval 0 NULL)
+        do (setf (nth vector i) v))
+    (return vector)))
+
+(startup-time-progn
+  ;; handle conflict with STL function:
+  (register-native-name (quote vector) :cpp :function))
+
+(defmethod (object-equal? BOOLEAN) ((x VECTOR) (y OBJECT))
+  :documentation "Return TRUE iff the vectors `x' and `y' are structurally
+equivalent.  Uses `equal?' to test equality of elements."
+  :public? TRUE
+  (typecase y
+    (VECTOR
+     (when (= (array-size x) (array-size y))
+       (foreach eltX in x
+           as eltY in y
+           where (not (equal? eltX eltY))
+           do (return FALSE))
+       (return TRUE)))
+    (otherwise NULL))
+  (return FALSE))
+
+(defmethod (equal-hash-code INTEGER) ((self VECTOR))
+  :documentation "Return an `equal?' hash code for `self'."
+  :public? TRUE
+  (let ((cursor (length self))
+        (code 66435053)) ;; result of (hash-string "VECTOR" 0)
+    (loop
+      (if (= cursor 0)
+          (break)
+        (-- cursor))
+      (setq code (logxor code (safe-equal-hash-code (nth self cursor))))
+      ;; rotate right to take element ordering into account:
+      (setq code (rotate-hash-code code)))
+    (return code)))
+
+(defmethod insert-at ((self EXTENSIBLE-VECTOR) (offset INTEGER)
+                      (value (LIKE (any-value self))))
+  :public? TRUE
+  (when (>= offset (array-size self))
+    (let ((size (array-size self)))
+      (while (>= offset size) (setq size (* 2 size)))
+      (resize-vector self size)))
+  (setf (nth self offset) value))
+
+(defmethod insert-at ((self EXTENSIBLE-SYMBOL-ARRAY) (offset INTEGER)
+                      (value (LIKE (any-value self))))
+  :public? TRUE
+  (when (>= offset (array-size self))
+    (let ((size (array-size self)))
+      (while (>= offset size) (setq size (* 2 size)))
+      (resize-vector self size)))
+  (setf (nth self offset) value)
+  (when (> offset (top-symbol-offset self))
+    (setf (top-symbol-offset self) offset)) )
+
+(defmethod insert ((self VECTOR-SEQUENCE) (value (LIKE (any-value self))))
+  :documentation "Append `value' to the END of the sequence `self'.  
+Resize the array if necessary."
+  :public? TRUE
+  (let ((oldLength (sequence-length self)))
+    (when (eq? oldLength (array-size self))
+      (resize-vector self (+ (array-size self) (resize-increment self))))
+    ;; offset of position of `value' is one less than the new length:
+    (setf (nth self oldLength) value)
+    (setf (sequence-length self) (1+ oldLength)) ))
+
+(defmethod (remove VECTOR-SEQUENCE)
+    ((self VECTOR-SEQUENCE) (value (LIKE (any-value self))))
+  :documentation "Remove `value' from the sequence `self', and left shift
+the values after it to close the gap."
+  :public? TRUE
+  (let ((array (the-array self))
+        (firstShiftOffset -1)           ; initialize to impossible value
+        (lastShiftOffset (- (sequence-length self) 1)))
+    (foreach i in (interval 0 lastShiftOffset)
+             do
+             (when (eql? (nth array i) value)
+               (setq firstShiftOffset (1+ i))
+               (break)))
+    (when (eq? firstShiftOffset -1)     ; exit if `value' not found
+      (return self))
+    (when (<= firstShiftOffset lastShiftOffset)
+      (foreach j in (interval firstShiftOffset lastShiftOffset)
+               do (setf (nth array (1- j)) (nth array j))))
+    (setf (nth array lastShiftOffset) NULL)        ; clear last offset
+    (setf (sequence-length self) lastShiftOffset)
+    (return self)))
+
+(defmethod (length INTEGER) ((self VECTOR-SEQUENCE))
+  :public? TRUE
+  (return (sequence-length self)) )
+
+  ;;
+;;;;;; Iteration over VECTORs
+  ;;
+
+(defmethod (allocate-iterator (ITERATOR OF (LIKE (any-value self))))
+    ((self VECTOR))
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-object iterator) self)
+    (setf (iterator-integer iterator) 0)
+    (setf (iterator-second-integer iterator) (array-size self))
+    (setf (iterator-next-code iterator)
+      (the-code :function vector-next?))
+    (return iterator)))
+
+(defun (vector-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Iterates over all elements of a vector stored within `self'.
+  (let ((cursor (iterator-integer self)))
+    (when (< cursor (iterator-second-integer self))
+      (setf (slot-value self value)
+        (nth (safe-cast (iterator-object self) VECTOR) cursor))
+      (setf (iterator-integer self) (+ cursor 1))
+      (return TRUE))
+    (return FALSE)))
+
+(defmethod (but-last (ITERATOR OF (LIKE (any-value self)))) ((self VECTOR))
+  :documentation "Generate all but the last element of the vector `self'."
+  :public? TRUE
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-object iterator) self)
+    (setf (iterator-integer iterator) 0)
+    (setf (iterator-second-integer iterator) (1- (array-size self)))
+    (setf (iterator-next-code iterator)
+      (the-code :function vector-next?))
+    (return iterator)))
+
+
+#|
+;;; Old stuff, but maybe we'll resurrect it some time:
+
+  ;;
+;;;;;; Tables with built-in caches
+  ;;
+
+(defclass TABLE-WITH-UNIT-CACHE (DICTIONARY)
+  :documentation "Implements a key-value table with a cache of the
+last key and value retrieved.  For the case when the same object
+may be repeatedly searched in the table."
+  :parameters ((any-value :type OBJECT))
+  :slots ((the-hash-table :type HASH-TABLE)
+          (the-cache-key :type ANYTHING)
+          (the-cache-value :type OBJECT))
+  :initializer initialize-table
+  )
+
+(defmethod initialize-table ((self TABLE-WITH-UNIT-CACHE))
+  ;; Create a hash table and store it in `self'.
+  (setf (the-hash-table (new HASH-TABLE))) )
+
+(defmethod (lookup (LIKE (any-value self)))
+           ((self TABLE-WITH-UNIT-CACHE) (key (LIKE (any-key self))))
+  ;; Use the unit cache to accelerate lookup.
+  (when (eql? key (the-cache-key self))
+    (return (the-cache-value self)))
+  (let ((value (lookup (the-hash-table self) key)))
+    (setf (the-cache-key self) key)
+    (setf (the-cache-value self) value)
+    (return value) ))
+
+(defmethod insert-at ((self TABLE-WITH-UNIT-CACHE) (key (LIKE (any-key self)))
+                      (value (LIKE (any-value self))))
+  ;; Insert <key, value> into a hash table and into the unit cache.
+  (insert-at (the-hash-table self) key value) )
+
+(defmethod remove-at ((self TABLE-WITH-UNIT-CACHE) (key (LIKE (any-key self))))
+  ;; Remove the entry at <key> from the hash table and the unit cache.
+  (remove-at (the-hash-table self) key)
+  (when (eql? key (the-cache-key self))
+    (setf (the-cache-key self) NULL)
+    (setf (the-cache-value self) NULL)) )
+|#
+
+  ;;
+;;;;;; STELLA implementation of hash tables
+  ;;
+
+;;; TO DO:
+;;; - optimize literal types (avoid wrapping if possible)
+;;; - optimize usage of `hash-code' vs. `object-hash-code'
+;;; - optimize usage of `eq?' vs. `eql?'
+;;; + implement iteration
+;;; - implement shrinking if we deleted lots of entries?
+
+;;; They are not yet used by default (see methods in `primal.ste'):
+(defglobal *use-stella-hash-tables?* BOOLEAN FALSE)
+
+(startup-time-progn :early-inits
+  (verbatim
+    :cpp "
+#ifndef HAVE_SGI_HASH_MAPS
+  oUSE_STELLA_HASH_TABLESpo = TRUE;
+#endif
+"
+    :otherwise NULL))
+
+;; need to do this again to make sure it is not undone by the startup
+;;    variable initialization:
+(startup-time-progn :globals
+  (verbatim
+    :cpp "
+#ifndef HAVE_SGI_HASH_MAPS
+  oUSE_STELLA_HASH_TABLESpo = TRUE;
+#endif
+"
+    :otherwise NULL))
+
+(defclass STELLA-HASH-TABLE (ABSTRACT-HASH-TABLE)
+  :parameters ((any-key :type OBJECT) (any-value :type OBJECT))
+  :slots ((the-table :type (ARRAY () OF KV-CONS))
+          (size :type INTEGER)
+          (initial-size :type INTEGER :initially 50 :public? TRUE
+                        :documentation "If supplied, the initial hash table
+will be sized to hold at least that many elements.")
+          (free-elements :type INTEGER)
+          (equal-test? :type BOOLEAN :initially FALSE :public? TRUE
+                       :documentation "If true use `equal?' as the
+equality test and `equal-hash-code' as the hash function, otherwise,
+use `eql?' and `hash-code' (the default).")))
+
+(defglobal *stella-hash-table-avg-bucket-length* FLOAT 1.0)
+
+(defun initialize-stella-hash-table ((self STELLA-HASH-TABLE))
+  ;; Initialize the (assumed to be) uninitialized hash table `self'.
+  (let ((size (pick-hash-table-size-prime
+               (floor (/ (initial-size self)
+                         *stella-hash-table-avg-bucket-length*))))
+        (table (new (ARRAY () OF KV-CONS) :size size)))
+    (foreach i in (interval 0 (1- size))
+        do (setf (aref table i) NULL))
+    (setf (the-table self) table)
+    (setf (size self) size)
+    (setf (free-elements self)
+      (floor (* size *stella-hash-table-avg-bucket-length*)))))
+
+(defmethod initialize-hash-table ((self STELLA-HASH-TABLE))
+  :documentation "Initialize the STELLA hash table `self'.  This is a
+no-op and primarily exists to shadow the standard initializer inherited
+from ABSTRACT-HASH-TABLE.  STELLA hash tables are initialized at the
+first insertion operation."
+  NULL)
+
+(defun rehash-stella-hash-table ((self STELLA-HASH-TABLE) (newSize INTEGER))
+  ;; Rehash `self' into a table of `newSize' and adjust `self's
+  ;;    `free-elements' accordingly.
+  ;; `newSize' can be smaller than the current size of `self' in which
+  ;;    case there should be sufficient `free-elements' available to
+  ;;    allow the size reduction without generating long collision chains.
+  (when (null? (the-table self))
+    (initialize-stella-hash-table self)
+    (return))
+  (let ((size (size self))
+        (table (the-table self))
+        (newTable (new (ARRAY () OF KV-CONS) :size newSize))
+        (newBucketIndex 0)
+        (newBucket KV-CONS NULL)
+        (cursor KV-CONS NULL)
+        (current KV-CONS NULL)
+        (equalTest? (equal-test? self)))
+    (foreach i in (interval 0 (1- newSize))
+        do (setf (aref newTable i) NULL))
+    (foreach i in (interval 0 (1- size))
+        do (setq cursor (aref table i))
+           (while (defined? cursor)
+             (if equalTest?
+                 (setq newBucketIndex
+                   (hashmod (equal-hash-code (key cursor)) newSize))
+               (setq newBucketIndex
+                 (hashmod (hash-code (key cursor)) newSize)))
+             (setq newBucket (aref newTable newBucketIndex))
+             (setq current cursor)
+             (setq cursor (rest cursor))
+             (cond ((defined? newBucket)
+                    ;; insert destructively to avoid another array access:
+                    (setf (rest current) (rest newBucket))
+                    (setf (rest newBucket) current))
+                   (otherwise
+                    (setf (aref newTable newBucketIndex) current)
+                    (setf (rest current) NULL)))))
+    (setf (the-table self) newTable)
+    (setf (size self) newSize)
+    (setf (free-elements self)
+      (max (+ (free-elements self)
+              ;; free elements we gain/lose from the size change:
+              (floor (* (- newSize size)
+                        *stella-hash-table-avg-bucket-length*)))
+           0))))
+
+(defun stella-hash-table-insert-at ((self STELLA-HASH-TABLE)
+                                    (key OBJECT)
+                                    (value OBJECT))
+  ;; Insert `value' at `key' into self.  If using an `eql?' test this
+  ;;    does the appropriate thing for wrappers by using `hash-code'.
+  (let ((table (the-table self))
+        (free (free-elements self))
+        (bucketIndex 0)
+        (bucket KV-CONS NULL)
+        (equalTest? (equal-test? self)))
+    (when (null? table)
+      (initialize-stella-hash-table self)
+      (setq table (the-table self))
+      (setq free (free-elements self)))
+    (when (= free 0)
+      (rehash-stella-hash-table
+       self (pick-hash-table-size-prime (1+ (size self)))) ;; pick next prime
+      (setq table (the-table self))
+      (setq free (free-elements self)))
+    (if equalTest?
+        (setq bucketIndex (hashmod (equal-hash-code key) (size self)))
+      (setq bucketIndex (hashmod (hash-code key) (size self))))
+    (setq bucket (aref table bucketIndex))
+    (cond ((null? bucket)
+           (setf (aref table bucketIndex)
+             (new KV-CONS :key key :value value))
+           (setf (free-elements self) (1- free)))
+          (otherwise
+           (let ((cursor bucket))
+             (cond (equalTest?
+                    (while (and (defined? cursor)
+                         (not (equal? (key cursor) key)))
+                      (setq cursor (rest cursor))))
+                   (otherwise
+                    (while (and (defined? cursor)
+                                (not (eql? (key cursor) key)))
+                      (setq cursor (rest cursor)))))
+             (cond ((defined? cursor)
+                    (setf (value cursor) value))
+                   (otherwise
+                    ;; insert destructively to avoid another array access:
+                    (setf (rest bucket)
+                      (new KV-CONS :key key :value value :rest (rest bucket)))
+                    (setf (free-elements self) (1- free)))))))))
+
+(defun stella-hash-table-remove-at ((self STELLA-HASH-TABLE) (key OBJECT))
+  ;; Remove the entry for `key' from self.  If using an `eql?' test this
+  ;;    does the appropriate thing for wrappers by using `hash-code'.
+  (let ((table (the-table self))
+        (bucketIndex 0)
+        (bucket KV-CONS NULL)
+        (equalTest? (equal-test? self)))
+    (when (null? table)
+      (return))
+    (if equalTest?
+        (setq bucketIndex (hashmod (equal-hash-code key) (size self)))
+      (setq bucketIndex (hashmod (hash-code key) (size self))))
+    (setq bucket (aref table bucketIndex))
+    (cond ((null? bucket)
+           (return))
+          ((and (not equalTest?)
+                (eql? (key bucket) key))
+           (setf (aref table bucketIndex) (rest bucket))
+           (++ (free-elements self))
+           (return))
+          ((and equalTest?
+                (equal? (key bucket) key))
+           (setf (aref table bucketIndex) (rest bucket))
+           (++ (free-elements self))
+           (return))
+          (otherwise
+           (let ((trailer bucket))
+             (setq bucket (rest bucket))
+             (while (defined? bucket)
+               (cond ((and (not equalTest?)
+                           (eql? (key bucket) key))
+                      (setf (rest trailer) (rest bucket))
+                      (++ (free-elements self))
+                      (return))
+                     ((and equalTest?
+                           (equal? (key bucket) key))
+                      (setf (rest trailer) (rest bucket))
+                      (++ (free-elements self))
+                      (return))
+                     (otherwise
+                      (setq trailer bucket)
+                      (setq bucket (rest bucket))))))))))
+
+(defun (stella-hash-table-lookup (LIKE (any-value self)))
+    ((self STELLA-HASH-TABLE) (key OBJECT))
+  ;; Lookup the value of `key' from self.  If using an `eql?' test this
+  ;;    does the appropriate thing for wrappers by using `hash-code'.
+  (let ((table (the-table self))
+        (bucket KV-CONS NULL))
+    (when (null? table)
+      (return NULL))
+    (cond ((equal-test? self)
+           (setq bucket (aref table (hashmod (equal-hash-code key) (size self))))
+           (while (defined? bucket)
+             (if (equal? (key bucket) key)
+                 (return (value bucket))
+               (setq bucket (rest bucket)))))
+          (otherwise
+           (setq bucket (aref table (hashmod (hash-code key) (size self))))
+           (while (defined? bucket)
+             (if (eql? (key bucket) key)
+                 (return (value bucket))
+               (setq bucket (rest bucket))))))
+    (return NULL)))
+
+(defun (stella-string-hash-table-lookup (LIKE (any-value self)))
+    ((self STELLA-HASH-TABLE) (key STRING))
+  ;; Lookup the value of `key' from the string hash table `self'.
+  ;; Assumes each key in `self' is a STRING-WRAPPER.
+  (let ((table (the-table self))
+        (bucket KV-CONS NULL))
+    (when (null? table)
+      (return NULL))
+    (setq bucket (aref table (hashmod (hash-code key) (size self))))
+    (while (defined? bucket)
+      (if (eql? (wrapper-value (cast (key bucket) STRING-WRAPPER)) key)
+          (return (value bucket))
+        (setq bucket (rest bucket))))
+    (return NULL)))
+
+;; Top-level method linkage:
+
+(defmethod (lookup (LIKE (any-value self)))
+    ((self STELLA-HASH-TABLE) (key (LIKE (any-key self))))
+  :documentation "Lookup the entry identified by `key' in `self' and
+return its value, or NULL if no such entry exists.    Uses an `eql?'
+test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (return (stella-hash-table-lookup self key)))
+
+(defmethod insert-at ((self STELLA-HASH-TABLE) (key (LIKE (any-key self)))
+                      (value (LIKE (any-value self))))
+  :documentation "Set the value of the entry identified by `key' in `self'
+to `value' or add a new entry if no entry with `key' exists yet.  Uses an
+`eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (stella-hash-table-insert-at self key value)
+  (return))
+
+(defmethod remove-at ((self STELLA-HASH-TABLE) (key (LIKE (any-key self))))
+  :documentation "Remove the entry identified by `key' from `self'.  Uses an
+`eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (stella-hash-table-remove-at self key)
+  (return))
+
+(defmethod (length INTEGER) ((self STELLA-HASH-TABLE))
+  :documentation "Return the number of entries in `self'."
+  :public? TRUE
+  (if (null? (the-table self))
+      (return 0)
+    (return (- (size self) (free-elements self)))))
+
+(defmethod (empty? BOOLEAN) ((self STELLA-HASH-TABLE))
+  :documentation "Return TRUE if `self' has zero entries."
+  :public? TRUE
+  (return (= (length self) 0)))
+
+(defmethod (non-empty? BOOLEAN) ((self STELLA-HASH-TABLE))
+  :documentation "Return TRUE if `self' has at least 1 entry."
+  :public? TRUE
+  (return (> (length self) 0)))
+
+(defmethod (copy (LIKE self)) ((self STELLA-HASH-TABLE))
+  :documentation "Return a copy of the hash table `self'.  The bucket table
+and buckets are freshly allocated, however, the keys and values of entries
+are not copied themselves (similar to what we do for lists, etc.)."
+  :public? TRUE
+  (let ((size (size self))
+        (copy (new STELLA-HASH-TABLE
+                   :size size
+                   :initial-size (initial-size self)
+                   :free-elements (free-elements self)
+                   :equal-test? (equal-test? self)))
+        (table (the-table self))
+        (tableCopy table)
+        (bucket KV-CONS NULL))
+    (when (defined? table)
+      (setq tableCopy (new (ARRAY () OF KV-CONS) :size size))
+      (setf (the-table copy) tableCopy)
+      (foreach i in (interval 0 (1- size))
+          do (setq bucket (aref table i))
+             (if (defined? bucket)
+                 (setf (aref tableCopy i) (copy-kv-cons-list bucket))
+               (setf (aref tableCopy i) NULL))))
+    (return copy)))
+
+(defmethod clear ((self STELLA-HASH-TABLE))
+  :documentation "Remove all entries from `self'.  This will result in a
+re-initialization of the table upon the first insertion into `self'."
+  :public? TRUE
+  (setf (the-table self) NULL)
+  (setf (size self) NULL)
+  (setf (free-elements self) NULL))
+
+(defmethod (consify (CONS OF CONS)) ((self STELLA-HASH-TABLE))
+  :documentation "Collect all entries of `self' into a cons list of
+`(<key> <value>)' pairs and return the result."
+  :public? TRUE
+  (let ((result NIL))
+    (foreach (key value) in self
+        collect (cons key (cons value NIL)) into result)
+    (return result)))
+
+(defmethod (object-equal? BOOLEAN) ((x STELLA-HASH-TABLE) (y OBJECT))
+  :documentation
+  "Return TRUE if `x' and `y' represent the same set of key/value pairs."
+  :public? TRUE
+  (typecase y
+    (STELLA-HASH-TABLE
+     (when (= (length x) (length y))
+       (foreach (key value) in x
+           where (not (equal? value (lookup y key)))
+           do (return FALSE))
+       (return TRUE)))
+    (otherwise NULL))
+  (return FALSE))
+
+(defmethod (equal-hash-code INTEGER) ((self STELLA-HASH-TABLE))
+  :documentation "Return an `equal?' hash code for `self'.  Note that this
+is O(N) in the number of entries of `self'."
+  :public? TRUE
+  (let ((code 36273463)) ;; result of (hash-string "STELLA-HASH-TABLE" 0)
+    (foreach (key value) in self
+        ;; exploits the fact that `XOR' is commutative
+        ;; (minor bug: doesn't distinguish between keys and values):
+        do (setq code (logxor code (equal-hash-code key)))
+           (setq code (logxor code (equal-hash-code value))))
+    (return code)))
+
+
+;; Iteration:
+
+(defclass STELLA-HASH-TABLE-ITERATOR (DICTIONARY-ITERATOR)
+  :documentation "Iterator class for STELLA-HASH-TABLE's.  The only modifying
+operations allowed during iteration are removal of the current element or
+changing its value.  All other removal or insertion operations might lead
+to corruption or undefined results."
+  :slots ((size :type INTEGER)
+          (bucket-table :type (ARRAY () OF KV-CONS))
+          (bucket-index :type INTEGER :initially 0)
+          (bucket-cursor :type KV-CONS)))
+
+(defmethod (allocate-iterator (STELLA-HASH-TABLE-ITERATOR OF
+                               (LIKE (any-key self))
+                               (LIKE (any-value self))))
+    ((self STELLA-HASH-TABLE))
+  :documentation "Allocate an iterator for `self'."
+  :public? TRUE
+  (return
+    (new STELLA-HASH-TABLE-ITERATOR
+         :size (size self)
+         :bucket-table (the-table self)
+         :bucket-index 0
+         :bucket-cursor NULL)))
+
+(defmethod (next? BOOLEAN) ((self STELLA-HASH-TABLE-ITERATOR))
+  (let ((cursor (bucket-cursor self)))
+    (cond ((first-iteration? self)
+           (setf (first-iteration? self) FALSE))
+          ((defined? cursor)
+           (setq cursor (rest cursor))))
+    (when (null? cursor)
+      (let ((table (bucket-table self))
+            (index (bucket-index self))
+            (size (size self)))
+        (when (null? table)
+          (return FALSE))
+        (while (and (null? cursor)
+                    (< index size))
+          (setq cursor (aref table index))
+          (++ index))
+        (setf (bucket-index self) index)
+        (setf (bucket-cursor self) cursor)))
+    (cond ((defined? cursor)
+           (setf (slot-value self key) (key cursor))
+           (setf (slot-value self value) (value cursor))
+           ;; point to current item so we can set its value:
+           (setf (bucket-cursor self) cursor)
+           (return TRUE))
+          (otherwise
+           (return FALSE)))))
+
+(defmethod (value-setter (LIKE (any-value self)))
+    ((self STELLA-HASH-TABLE-ITERATOR) (value (LIKE (any-value self))))
+  (let ((cursor (bucket-cursor self)))
+    (when (defined? cursor)
+      (setf (value cursor) value))
+    (setf (slot-value self value) value)
+    (return value)))
+
+(defmethod (key-setter (LIKE (any-key self)))
+    ((self STELLA-HASH-TABLE-ITERATOR) (key (LIKE (any-key self))))
+  (error "Cannot change the key of a STELLA-HASH-TABLE item"))
+
+
+(defglobal *key-value-map-crossover-point* INTEGER
+           *remove-duplicates-crossover-point*
+  :documentation "Point where we switch from using a KV-CONS table
+representation to a STELLA hash table to preserve O(1) access.")
+
+(defclass KEY-VALUE-MAP (DICTIONARY)
+  :documentation "Full-featured dictionary class that supports `eql?' or
+`equal?' equality tests, O(1) access operations even for large numbers
+of entries by using a hash table, light-weight KV-CONS representation for
+small tables and iteration even if the dictionary is represented by a
+hash table."
+  :public? TRUE
+  :slots ((the-map :type OBJECT) ;; either KV-CONS or STELLA-HASH-TABLE
+          (equal-test? :type BOOLEAN :initially FALSE :public? TRUE
+                       :documentation "If true use `equal?' as the
+equality test (and `equal-hash-code' as the hash function), otherwise,
+use `eql?' (and `hash-code') (the default).")
+          (initial-size :type INTEGER
+                        :initially *key-value-map-crossover-point*
+                        :public? TRUE
+                        :documentation "If supplied, the initial table
+will be sized to hold at least that many elements.")
+          (crossover-point :type INTEGER
+                           :initially *key-value-map-crossover-point*)))
+
+(defmethod (lookup (LIKE (any-value self))) ((self KEY-VALUE-MAP)
+                                             (key (LIKE (any-key self))))
+  :documentation "Lookup the entry identified by `key' in `self' and
+return its value, or NULL if no such entry exists.    Uses an `eql?'
+test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (let ((map (the-map self))
+        (crossover (crossover-point self)))
+    (cond ((= crossover 0)
+           ;; we are using a hash table already:
+           (return (stella-hash-table-lookup map key)))
+          (otherwise
+           (let ((cursor KV-CONS map))
+             (if (equal-test? self)
+                 (while (defined? cursor)
+                   (when (equal? (key cursor) key)
+                     (return (value cursor)))
+                   (setq cursor (rest cursor)))
+               (while (defined? cursor)
+                 (when (eql? (key cursor) key)
+                   (return (value cursor)))
+                 (setq cursor (rest cursor))))
+             (return NULL))))))
+
+(defmethod insert-at ((self KEY-VALUE-MAP) (key (LIKE (any-key self)))
+                      (value (LIKE (any-value self))))
+  :documentation "Set the value of the entry identified by `key' in `self'
+to `value' or add a new entry if no entry with `key' exists yet.  Uses an
+`eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (let ((map (the-map self))
+        (crossover (crossover-point self)))
+    (when (null? map)
+      (cond ((> (initial-size self) *key-value-map-crossover-point*)
+             (setq map
+               (new STELLA-HASH-TABLE
+                    :initial-size (initial-size self)
+                    :equal-test? (equal-test? self)))
+             (setf (the-map self) map)
+             (setq crossover 0))
+            (otherwise
+             (setq crossover *key-value-map-crossover-point*)))
+      (setf (crossover-point self) crossover))
+    (cond ((= crossover 0)
+           ;; we are using a hash table already:
+           (stella-hash-table-insert-at map key value))
+          (otherwise
+           (let ((cursor KV-CONS map))
+             (if (equal-test? self)
+                 (while (defined? cursor)
+                   (when (equal? (key cursor) key)
+                     (setf (value cursor) value)
+                     (return))
+                   (setq cursor (rest cursor)))
+               (while (defined? cursor)
+                 (when (eql? (key cursor) key)
+                   (setf (value cursor) value)
+                   (return))
+                 (setq cursor (rest cursor))))
+             (setq cursor (kv-cons key value map))
+             (setf (the-map self) cursor)
+             ;; we actually added an item:
+             (-- crossover)
+             (setf (crossover-point self) crossover)
+             (when (= crossover 0)
+               (setq map (new STELLA-HASH-TABLE
+                              :equal-test? (equal-test? self)))
+               (setf (the-map self) map)
+               (foreach (key value) in cursor
+                   do (stella-hash-table-insert-at map key value))))))))
+
+(defmethod remove-at ((self KEY-VALUE-MAP) (key (LIKE (any-key self))))
+  :documentation "Remove the entry identified by `key' from `self'.  Uses an
+`eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (let ((map (the-map self))
+        (crossover (crossover-point self)))
+    (cond ((= crossover 0)
+           ;; we are using a hash table already:
+           (stella-hash-table-remove-at map key))
+          (otherwise
+           (let ((cursor KV-CONS map)
+                 (trailer KV-CONS map))
+             (if (equal-test? self)
+                 (while (defined? cursor)
+                   (when (equal? (key cursor) key)
+                     (break))
+                   (setq trailer cursor)
+                   (setq cursor (rest cursor)))
+               (while (defined? cursor)
+                 (when (eql? (key cursor) key)
+                   (break))
+                 (setq trailer cursor)
+                 (setq cursor (rest cursor))))
+             (cond ((null? cursor)
+                    ;; no matching item:
+                    (return))                    
+                   ((eql? cursor trailer)
+                    ;; we removed the first element:
+                    (setf (the-map self) (rest cursor)))
+                   (otherwise
+                    (setf (rest trailer) (rest cursor))))
+             (setf (crossover-point self) (1+ crossover)))))))
+
+(defmethod (length INTEGER) ((self KEY-VALUE-MAP))
+  :documentation "Return the number of entries in `self'."
+  :public? TRUE
+  (let ((map (the-map self)))
+    (cond ((null? map)
+           (return 0))
+          ((= (crossover-point self) 0)
+           (return (length (cast map STELLA-HASH-TABLE))))
+          (otherwise
+           (return (length (cast map KV-CONS)))))))
+
+(defmethod (empty? BOOLEAN) ((self KEY-VALUE-MAP))
+  :documentation "Return TRUE if `self' has zero entries."
+  :public? TRUE
+  (let ((map (the-map self)))
+    (cond ((null? map)
+           (return TRUE))
+          ((= (crossover-point self) 0)
+           (return (= (length (cast map STELLA-HASH-TABLE)) 0)))
+          (otherwise
+           (return FALSE)))))
+
+(defmethod (non-empty? BOOLEAN) ((self KEY-VALUE-MAP))
+  :documentation "Return TRUE if `self' has at least 1 entry."
+  :public? TRUE
+  (let ((map (the-map self)))
+    (cond ((null? map)
+           (return FALSE))
+          ((= (crossover-point self) 0)
+           (return (> (length (cast map STELLA-HASH-TABLE)) 0)))
+          (otherwise
+           (return TRUE)))))
+
+(defmethod (copy (LIKE self)) ((self KEY-VALUE-MAP))
+  :documentation "Return a copy of the map `self'.  All entries are freshly
+allocated, however, the keys and values of entries are not copied themselves
+ (similar to what we do for lists, etc.)."
+  :public? TRUE
+  (let ((copy (new KEY-VALUE-MAP
+                   :equal-test? (equal-test? self)
+                   :initial-size (initial-size self)
+                   :crossover-point (crossover-point self)))
+        (map (the-map self)))
+    (if (= (crossover-point self) 0)
+        (setf (the-map copy) (copy (cast map STELLA-HASH-TABLE)))
+      (setf (the-map copy) (copy-kv-cons-list map)))
+    (return copy)))
+  
+(defmethod clear ((self KEY-VALUE-MAP))
+  :documentation "Reset `self' to have zero entries."
+  :public? TRUE
+  (setf (the-map self) NULL)
+  (setf (crossover-point self) *key-value-map-crossover-point*))
+
+(defmethod (allocate-iterator (DICTIONARY-ITERATOR OF
+                                (LIKE (any-key self))
+                                (LIKE (any-value self))))
+    ((self KEY-VALUE-MAP))
+  :documentation "Allocate an iterator for `self'.  The only modifying
+operations allowed during iteration are removal of the current element or
+changing its value.  All other removal or insertion operations might lead
+to corruption or undefined results."
+  :public? TRUE
+  (let ((map (the-map self)))
+    (cond ((= (crossover-point self) 0)
+           (return
+             (allocate-iterator (cast map STELLA-HASH-TABLE))))
+          (otherwise
+           (return
+             (allocate-iterator (new KEY-VALUE-LIST :the-kv-list map)))))))
+
+(defmethod (consify CONS) ((self KEY-VALUE-MAP))
+  :documentation "Collect all entries of `self' into a cons list of
+`(<key> <value>)' pairs and return the result."
+  :public? TRUE
+  ;; NOTE: we can't use (CONS OF CONS) as a return type here, since that
+  ;;    would be incompatible with the signature of `HASH-SET.consify'.
+  (let ((result NIL))
+    (foreach (key value) in self
+        collect (cons key (cons value NIL)) into result)
+    (return result)))
+
+(defmethod (object-equal? BOOLEAN) ((x KEY-VALUE-MAP) (y OBJECT))
+  :documentation
+  "Return TRUE if `x' and `y' represent the same set of key/value pairs."
+  :public? TRUE
+  (typecase y
+    (KEY-VALUE-MAP
+     (when (= (length x) (length y))
+       (foreach (key value) in x
+           where (not (equal? value (lookup y key)))
+           do (return FALSE))
+       (return TRUE)))
+    (otherwise NULL))
+  (return FALSE))
+
+(defmethod (equal-hash-code INTEGER) ((self KEY-VALUE-MAP))
+  :documentation "Return an `equal?' hash code for `self'.  Note that this
+is O(N) in the number of entries of `self'."
+  :public? TRUE
+  (let ((code 102137005)) ;; result of (hash-string "KEY-VALUE-MAP" 0)
+    (foreach (key value) in self
+        ;; exploits the fact that `XOR' is commutative
+        ;; (minor bug: doesn't distinguish between keys and values):
+        do (setq code (logxor code (equal-hash-code key)))
+           (setq code (logxor code (equal-hash-code value))))
+    (return code)))
+
+#|
+(defun (test-key-value-map KEY-VALUE-MAP) ((n INTEGER) (equal? BOOLEAN))
+  (let ((table (new KEY-VALUE-MAP
+                    :equal-test? equal?
+                    :initial-size n)))
+    (print "Printing empty table..." EOL)
+    (foreach (key value) in table
+        do (print key value EOL))
+    (foreach i in (interval 1 n)
+        do (insert-at table (vector i) i))
+    (print "Printing full table..." EOL)
+    (foreach (key value) in table
+        do (print key value EOL))
+    (foreach (key value) in table
+        where (odd? value)
+        do (remove-at table key))
+    (print "Printing odds removed table..." EOL)
+    (foreach (key value) in table
+        do (print key value EOL))
+    (foreach it on table
+        where (> (value it) (/ n 2))
+        do (setf (value it) (- (value it))))
+    (print "Printing value modified table..." EOL)
+    (foreach (key value) in table
+        do (print key value EOL))
+    (return table)))
+|#
+
+(defclass HASH-SET (KEY-VALUE-MAP SET-MIXIN)
+  :documentation "Full-featured set class that supports `eql?' or `equal?'
+equality tests, O(1) insert and `member?' operations & O(N) `intersection'
+etc. operations even for large numbers of entries by using a hash table,
+light-weight KV-CONS representation for small sets and iteration even if the
+set is represented by a hash table.  The only minor drawback right now is that
+this wastes a value slot per entry, since we piggy-back off KEY-VALUE-MAP's,
+however, that wastes at most 25% space."
+  :public? TRUE)
+
+(defun (hash-set HASH-SET) (&rest (values OBJECT))
+  :documentation "Return an `eql?' HASH-SET containing `values'."
+  :public? TRUE
+  (let ((set (new HASH-SET)))
+    (foreach v in values
+        do (insert-at set v v))
+    (return set)))
+
+(defmethod (member? BOOLEAN) ((self HASH-SET) (object OBJECT))
+  :documentation "Return TRUE iff `object' is a member of the set `self'.
+Uses an `eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (return (defined? (lookup self object))))
+
+(defmethod insert ((self HASH-SET) (value (LIKE (any-value self))))
+  :documentation "Add `value' to the set `self' unless it is already a member.
+Uses an `eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (insert-at self value value))
+
+(defmethod (remove (LIKE self)) ((self HASH-SET) (value (LIKE (any-value self))))
+  :documentation
+  "Destructively remove `value' from the set `self' if it is a member and
+return `self'.  Uses an `eql?' test by default or `equal?' if `equal-test?' of
+`self' is TRUE."
+  :public? TRUE
+  (remove-at self value)
+  (return self))
+
+(defmethod (remove-if (LIKE self)) ((self HASH-SET) (test? FUNCTION-CODE))
+  :documentation "Destructively remove all elements of the set `self' for which
+'test?' evaluates to TRUE.  `test?' takes a single argument of type OBJECT and
+returns TRUE or FALSE.  Returns `self'."
+  :public? TRUE
+  (foreach element in self
+      where (funcall test? element)
+      do (remove-at self element))
+  (return self))
+
+(defmethod (pop (LIKE (any-value self))) ((self HASH-SET))
+  :documentation "Remove and return an arbitrary element of the set `self'.
+Return NULL if the set is empty.  Performance note: for large sets implemented
+via hash tables it takes O(N) to empty out the set with repeated calls to `pop',
+since the emptier the table gets, the longer it takes to find an element.
+Therefore, it is usually better to use iteration with embedded removals for
+such cases."
+  :public? TRUE
+  (let ((element OBJECT NULL)
+        (setMap (the-map self)))
+    (when (defined? setMap)
+      (cond ((= (crossover-point self) 0)
+             (let ((map STELLA-HASH-TABLE setMap)
+                   (table (the-table map))
+                   (bucket KV-CONS NULL))
+               (when (defined? table)
+                 (foreach i in (interval 0 (1- (size map)))
+                     do (setq bucket (aref table i))
+                        (when (defined? bucket)
+                          (setq element (key bucket))
+                          (break))))))
+            (otherwise
+             (let ((map (cast (the-map self) KV-CONS)))
+               (when (defined? map)
+                 (setq element (key map)))))))
+    (when (defined? element)
+      (remove-at self element))
+    (return element)))
+
+(defmethod (substitute (LIKE self)) ((self HASH-SET) (new OBJECT) (old OBJECT))
+  :documentation "Destructively replace `old' with `new' in the set `self'
+unless `new' is already a member.  Uses an `eql?' test by default or `equal?'
+if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (when (not (member? self new))
+    (remove-at self old)
+    (insert-at self new new))
+  (return self))
+
+(defmethod (copy (LIKE self)) ((self HASH-SET))
+  :documentation "Return a copy of the set `self'.  All entries are freshly
+allocated, however, the values are not copied themselves (similar to what we
+do for lists, etc.)."
+  :public? TRUE
+  (let ((copy (new HASH-SET
+                   :equal-test? (equal-test? self)
+                   :initial-size (initial-size self)
+                   :crossover-point (crossover-point self)))
+        (map (the-map self)))
+    (if (= (crossover-point self) 0)
+        (setf (the-map copy) (copy (cast map STELLA-HASH-TABLE)))
+      (setf (the-map copy) (copy-kv-cons-list map)))
+    (return copy)))
+
+(defmethod (consify (CONS OF (LIKE (any-value self)))) ((self HASH-SET))
+  :documentation
+  "Collect all entries of `self' into a cons list and return the result."
+  :public? TRUE
+  (let ((result NIL))
+    (foreach value in self
+        collect value into result)
+    (return result)))
+
+(defmethod (subset? BOOLEAN) ((self HASH-SET) (otherSet HASH-SET))
+  :documentation
+  "Return true if every element of `self' also occurs in `otherSet'.
+Uses an `eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (return
+    (and (<= (length self) (length otherSet))
+         (forall elt in self
+             always (defined? (lookup otherSet elt)))))) ; hand-inline `member?'
+  
+(defmethod (equivalent-sets? BOOLEAN) ((self HASH-SET) (otherSet HASH-SET))
+  :documentation
+  "Return true if every element of `self' occurs in `otherSet' and vice versa.
+Uses an `eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (return
+    (and (= (length self) (length otherSet))
+         (forall elt in self
+             always (defined? (lookup otherSet elt)))))) ; hand-inline `member?'
+
+(defmethod (intersection HASH-SET) ((self HASH-SET) (otherSet HASH-SET))
+  :documentation
+  "Return the set intersection of `self' and `otherSet' as a new set.
+Uses an `eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (let ((result (new HASH-SET :equal-test? (equal-test? self)))
+        (aux self))
+    (when (> (length self) (length otherSet))
+      (setq self otherSet)
+      (setq otherSet aux))
+    (foreach elt in self
+        where (defined? (lookup otherSet elt)) ; hand-inline `member?'
+        do (insert-at result elt elt))
+    (return result)))
+
+(defmethod (union HASH-SET) ((self HASH-SET) (otherSet HASH-SET))
+  :documentation
+  "Return the set union of `self' and `otherSet' as a new set.
+Uses an `eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (let ((result HASH-SET NULL)
+        (aux self))
+    (when (< (length self) (length otherSet))
+      (setq self otherSet)
+      (setq otherSet aux))
+    (setq result (copy self))
+    (foreach elt in otherSet
+        do (insert-at result elt elt))
+    (return result)))
+
+(defmethod (difference HASH-SET) ((self HASH-SET) (otherSet HASH-SET))
+  :documentation
+  "Return the set difference of `self' and `otherSet' as a new set (i.e.,
+all elements that are in `self' but not in `otherSet').  Uses an `eql?' test
+by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (let ((result HASH-SET NULL))
+    (cond ((> (length self) (* (length otherSet) 2))
+           ;; optimization: at least half of `self' will survive; so do a
+           ;; quick copy and then remove any elements also found in `otherSet':
+           (setq result (copy self))
+           (foreach elt in otherSet
+               where (defined? (lookup result elt)) ; hand-inline `member?'
+               do (remove-at result elt)))
+          (otherwise
+           (setq result (new HASH-SET :equal-test? (equal-test? self)))
+           (foreach elt in self
+               where (not (defined? (lookup otherSet elt)))
+               do (insert-at result elt elt))))
+    (return result)))
+
+(defmethod (subtract HASH-SET) ((self HASH-SET) (otherSet HASH-SET))
+  :documentation
+  "Return the set difference of `self' and `otherSet' by destructively
+removing elements from `self' that also occur in `otherSet'.  Uses an `eql?'
+test by default or `equal?' if `equal-test?' of `self' is TRUE."
+  :public? TRUE
+  (foreach elt in self
+      where (defined? (lookup otherSet elt)) ; hand-inline `member?'
+      do (remove-at self elt))
+  (return self))
+
+(defmethod (object-equal? BOOLEAN) ((x HASH-SET) (y OBJECT))
+  :documentation
+  "Return TRUE iff sets `x' and `y' are HASH-SET's with equivalent members.
+Uses an `eql?' test by default or `equal?' if `equal-test?' of `self' is TRUE.
+This is equivalent to calling `equivalent-sets?'."
+  :public? TRUE
+  (typecase y
+    (HASH-SET
+     (return (equivalent-sets? x y)))
+    (otherwise NULL))
+  (return FALSE))
+
+(defmethod (equal-hash-code INTEGER) ((self HASH-SET))
+  :documentation "Return an `equal?' hash code for `self'.  Note that this
+is O(N) in the number of elements of `self'."
+  :public? TRUE
+  (let ((code 107971569)) ;; result of (hash-string "HASH-SET" 0)
+    (foreach elt in self
+        ;; exploits the fact that `XOR' is commutative:
+        do (setq code (logxor code (equal-hash-code elt))))
+    (return code)))

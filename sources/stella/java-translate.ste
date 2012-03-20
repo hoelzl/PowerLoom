@@ -1,0 +1,2900 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: java-translate.ste,v 1.58 2003/07/01 21:55:35 tar Exp
+
+;;; Routines for translating Stella parse trees into Java trees.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+(defun (java-yield-flotsam-class-name STRING) ((mod MODULE))
+  ;; Returns the name of the Java class for flotsam
+  ;; (functions and variables)
+  (let ((flotsamClassName (java-flotsam-class mod)))
+    (if (and (defined? flotsamClassName)
+	     (not (eq? flotsamClassName "")))
+      (return flotsamClassName)
+      (progn 
+	(setq flotsamClassName (java-translate-class-namestring (name mod)))
+	(setf (java-flotsam-class mod) flotsamClassName)
+	(return flotsamClassName)))))
+
+(defun (java-yield-native-class-name STRING) ()
+  ;; Returns the name of the Java class, with appropriate
+  ;; qualifications depending on the the current module.
+  (if (or (defined? (get-stella-class "NATIVE" FALSE))
+	  (inherited-class-name-conflicts? "NATIVE"))
+    (return (java-yield-full-native-class-name))
+    (return "Native")))
+
+(defun (java-yield-special-variable-class-name STRING) ()
+  ;; Returns the name of the Java class implementing special
+  ;; variables, with appropriate qualifications depending on
+  ;; the the current module.
+  (if (or (defined? (get-stella-class "STELLA-SPECIAL-VARIABLE" FALSE))
+	  (inherited-class-name-conflicts? "STELLA-SPECIAL-VARIABLE"))
+    (return (concatenate (java-stella-package) ".javalib.StellaSpecialVariable"))
+    (return "StellaSpecialVariable")))
+
+(defun (java-yield-full-native-class-name STRING) ()
+  ;; Returns the name of the Java class for flotsam
+  ;; (functions and variables)
+  (return (concatenate (java-stella-package) ".javalib.Native")))
+
+(defun (java-translate-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree representing a Java definition of
+  ;;    the object stored in 'unit'.
+  (case (category unit)
+    (GLOBAL-VARIABLE
+     (return (java-translate-define-global-variable-unit unit)))
+    (CLASS
+     (return (java-translate-define-native-class-unit unit)))
+    (TYPE
+     (return NIL)) ;; ignore types for now
+    ((METHOD MACRO)
+     (return (java-translate-define-method-unit unit)))
+    (PRINT-METHOD
+     (return (java-translate-defprint-unit unit)))
+    ((STARTUP-TIME-PROGN VERBATIM)
+     (return (java-translate-a-tree (the-object unit))))))
+
+
+(defun (java-translate-define-global-variable-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree declaring a global variable.  'tree'
+  ;;    has the form `(<global variable> <inital value>)'.
+  (let ((global GLOBAL-VARIABLE (the-object unit)))
+    (within-context (home-module global)
+      (let ((variableType (choose (variable-special? global)
+				  (wrap-literal
+				   (java-yield-special-variable-class-name))
+				  (java-translate-type-spec 
+				   (global-variable-type-spec global))))
+	    (typeList (bquote (& variableType)))
+	    (initialValueTree 
+	     (java-translate-a-tree (code-register unit)))
+	    (variableName
+	     (java-translate-global-name (variable-name global) TRUE)))
+	;; Commented out- this creates problems in C++, e.g. you can't return
+	;;   a constant from a function that returns a non-constant.-spec
+	(pushq typeList (wrap-literal "static"))
+	(when (or (variable-constant? global)
+		  (variable-special? global)) ;; The StellaSpecialVariable object is constant
+	  (pushq typeList (wrap-literal "final")))
+	(when (variable-public? global)
+	  (pushq typeList (wrap-literal "public")))
+	(if (or (eq? (code-register unit) :UNBOUND-SPECIAL-VARIABLE)
+		(variable-special? global))
+	    (return
+	      (bquote (JAVA_GLOBAL
+		       & (documentation global)
+		       (JAVA_TYPE && typeList)
+		       & variableName
+		       (JAVA_MAKE
+			(JAVA_IDENT & variableType)
+			(JAVA_ACTUALS)))))
+	  (return
+	    (bquote (JAVA_GLOBAL 
+		       & (documentation global)
+		       (JAVA_TYPE && typeList)
+		       & variableName
+		       & initialValueTree)))) ))))
+
+
+(defun (wrap-method-body-with-java-auxiliary-declarations CONS)
+    ((methodBody CONS) (declarations CONS))
+  ;; Helping function for `java-translate-function-call'
+  ;; When there are dummy arguments for unused multiple-value return
+  ;;   statements, create a let-block which declares (and frees) the
+  ;;   dummy arguments
+  (let ((oDeclarations CONS NIL)
+	(oTree CONS NULL))
+    (setq declarations (reverse declarations))
+    (foreach declaration in declarations ; translate each declaration:
+             do
+	     (let ((d CONS declaration))
+	       (pushq oDeclarations
+		      (bquote (& (java-translate-type-spec
+				  (second d))
+				 & (java-translate-a-tree (first d))
+                                 && (choose
+                                     (defined? (third d))
+                                     (cons-list
+                                      (java-translate-a-tree (third d)))
+                                     NIL))))))
+    ;; TO DO: AVOID THE EXTRA BLOCK IF THE FUNCTION STARTS WITH A 'LET'.
+    (setq oTree (bquote (JAVA_STATEMENTS
+			 (JAVA_BLOCK & (reverse oDeclarations) 
+				    & methodBody))))
+    (return oTree) ))
+
+(defun (java-synchronized-method? BOOLEAN) ((method METHOD-SLOT))
+  ;; Returns true if the method should be synchronized.
+  ;; Currently always returns FALSE.
+  (ignore method)
+  (return false))
+
+(defun (java-translate-method-signature CONS) ((method METHOD-SLOT))
+  ;; Returns the method signature part of the translation.
+  (let ((modifiers (CONS OF STRING-WRAPPER) NIL)
+	(returnType (CONS OF STRING-WRAPPER) NULL))
+    (when (java-synchronized-method? method)
+      (pushq modifiers "synchronized"))
+    (when (java-method-object-is-function? method)
+      (pushq modifiers "static"))
+    (when (abstract? method)
+      (pushq modifiers "abstract"))
+    (when (public? method)
+      (pushq modifiers "public"))
+    (setq returnType 
+      (bquote (& (java-translate-type-spec
+		  ;; Use most general return type of virtual method
+		  ;;    (see comments in walk.ste):
+		  (compute-most-general-return-type
+		   method (compute-return-type-spec
+			   method (slot-owner method)))))))
+    (return (bquote (& modifiers
+		       & returnType
+		       & (java-translate-method-name method)
+		       & (java-translate-method-parameters method)))) ))
+
+(defun (java-translate-define-method-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Translate a definition of a method, function, or operator into a
+  ;;    Java parse tree definition.
+  ;; NOTE: THIS CODE IS SIMILAR TO "YIELD-JAVA-MEMBER-FUNC-TREE".
+  ;;   MAY WANT TO MERGE THE SIMILAR PIECES INTO A SINGLE ROUTINE.
+  ;;
+  (special (;(*varArgDecls* NIL)
+            ;(*varArgStatements* NIL)
+	    ;(*currentVarArgIndex* 1)
+	    (*localGensymTable* (allocate KEY-VALUE-LIST))
+	    (*methodBeingWalked* NULL)
+	    (*currentDummyIndex* 0)
+	    (*dummyDeclarations* NIL))
+    (let ((method METHOD-SLOT (the-object unit))
+	  (unitIsFunction (java-method-object-is-function? method))
+	  (bodyTree CONS (code-register unit))
+	  (oTree NIL)
+	  (translatedMethodBody CONS NULL))
+
+      ;; If a TWO-PASS translation is being done to allow forward references
+      ;;  this may be called on an already translated unit.  In that case
+      ;;  return that translation and set the translation to NIL.
+      (when (and (defined? (translation unit))
+		 (not (null? (translation unit))))
+	(setq oTree (translation unit))
+	(setf (translation unit) NIL)
+	(return oTree))
+
+;      (within-context (home-module unit)
+	(setq *methodBeingWalked* method)
+
+	;; Eliminate all null statements
+	(setq bodyTree (delete-quoted-null-statements bodyTree))
+
+	(when (not unitIsFunction)
+	  ;; NOTE: Simply replacing all occurrences of the first argument with
+	  ;;    'this' fails if somebody rebinds 'self' or uses the symbol in
+	  ;;    a 'bquote', etc., so we don't do that anymore.
+	  ;;(substitute-cons-tree
+	  ;;  bodyTree (quote this) (first (method-parameter-names method)))
+	  ;; Instead, generate a local 'self' variable and bind it to 'this'
+	  ;;    (this avoids the problems mentioned above and also allows
+	  ;;    assignments to the self variable which is illegal in C++):
+	  (pushq *dummyDeclarations*
+		 (bquote (& (first (method-parameter-names method))
+			    & (slot-owner method)
+			    this))))
+
+	(if (abstract? method)
+	  (setq translatedMethodBody NIL)
+	  (progn 
+	    (setq translatedMethodBody
+	      (bquote (JAVA_STATEMENTS
+		       && (java-translate-list-of-trees bodyTree))))
+	    ;; If the method body contains a method body with return parameters
+	    ;;   that are not used, wrap the body in a block that creates the dummys
+	    (unless (empty? *dummyDeclarations*)
+	      (setq translatedMethodBody
+		(wrap-method-body-with-java-auxiliary-declarations 
+		 translatedMethodBody *dummyDeclarations*)))))
+
+
+	  (when (defined? (documentation method))
+            (if (empty? translatedMethodBody)
+              (setq translatedMethodBody
+                    (bquote (JAVA_STATEMENTS
+                             (JAVA_COMMENT & (wrap-literal (documentation method))))))
+	      ;; This assumes that we have a `JAVA_STATEMENTS' tree:
+	      (setf (rest translatedMethodBody)
+	            (bquote ((JAVA_COMMENT & (wrap-literal (documentation method)))
+		             && (rest translatedMethodBody))))))
+
+	  (setq oTree
+	    (bquote (& (choose unitIsFunction
+			       (quote JAVA_FUNCTION)
+			       (quote JAVA_METHOD))
+		       && (java-translate-method-signature method)
+		       & translatedMethodBody)))
+	  ;; Set this to NIL (instead of NULL) to signal that this
+	  ;;   method body has been incorporated into an existing class.
+	  (setf (translation unit) NIL)
+	  (return oTree) )
+					;)
+    ))
+
+
+(defun (java-translate-defprint-unit CONS) ((unit TRANSLATION-UNIT))
+  (special ((*methodBeingWalked* (new METHOD-SLOT))  ;; Dummy object
+	    (*localGensymTable* (allocate KEY-VALUE-LIST))
+	    (*currentDummyIndex* 0)
+	    (*dummyDeclarations* NIL))
+    (let ((class CLASS (the-object unit))
+	  (bodyTree CONS (code-register unit))
+	  (oTree NIL)
+	  (translatedMethodBody CONS NULL))
+
+      (within-context (home-module class)
+	(setq bodyTree (delete-quoted-null-statements bodyTree))
+	(pushq *dummyDeclarations*
+	       (bquote (self & (canonical-type (class-type class)) this)))
+	(setq translatedMethodBody
+	  (wrap-method-body-with-java-auxiliary-declarations 
+	   (bquote (JAVA_STATEMENTS
+		    & (java-translate-a-tree bodyTree)))
+	   *dummyDeclarations*))
+	(setq oTree
+	  (bquote (JAVA_METHOD
+		   (& (wrap-literal "public")) ; modifiers
+		   (& (wrap-literal "String")) ; return type
+		   & (wrap-literal "toString") ; methodName
+		   ()			; parameters
+		   & translatedMethodBody)))
+	;; Set this to NIL (instead of NULL) to signal that this
+	;;   method body has been incorporated into an existing class.
+	(setf (translation unit) NIL)
+	(return oTree) ))))
+
+(defun (java-translate-list-of-trees CONS) ((trees CONS))
+  ;; Translate each parse tree in 'trees';
+  ;; Return the translated list of trees.
+  (let ((cursor trees))
+    (while (non-empty? cursor)
+      (setf (value cursor) (java-translate-a-tree (value cursor)))
+      (setq cursor (rest cursor)))
+    (return trees) ))
+
+(defun (java-translate-a-tree OBJECT) ((tree OBJECT))
+  ;; Translate 'tree', converting Stella constructs into constructs
+  ;;    which can be consumed by the Java outputter.
+  (typecase tree
+    (CONS
+     (when (nil? tree)
+       (return (java-translate-atomic-tree tree)))
+     (case (first tree)
+       (SPECIAL (return (java-translate-special-tree tree)))
+       (VERBATIM (return (java-translate-verbatim-tree tree)))
+       (SYS-UNWIND-PROTECT (return (java-translate-unwind-protect tree)))
+       (SYS-SIGNAL (return (java-translate-signal tree)))
+       (SYS-HANDLER-CASE (return (java-translate-handler-case tree)))
+       (SYS-HANDLE-EXCEPTION (return (java-translate-handle-exception tree)))
+       (VOID-SYS (return (java-translate-void-sys tree)))
+       (TYPED-SYS
+	(return (java-translate-typed-sys tree))) 
+       (BAD-SYS
+	(return (java-translate-bad-sys tree)))
+       (SETQ (return (java-translate-setq-tree tree)))
+       (SYS-SET-DEFAULT
+	(return (java-translate-sys-set-default tree)))
+       (SYS-SLOT-VALUE
+	(return (java-translate-sys-slot-value tree)))
+       (SYS-SLOT-VALUE-SETTER
+	(return (java-translate-sys-slot-value-setter tree)))
+       (SYS-CALL-METHOD 
+	(return (java-translate-method-call tree)))
+       (SYS-CALL-FUNCTION
+	(return (java-translate-function-call tree NULL)))
+       (PROGN 
+	(return (java-translate-progn tree)))
+       (WITH-PROCESS-LOCK
+	(return (java-translate-with-process-lock tree)))
+       (LOOP				    
+	(return (java-translate-loop tree)))
+       (SYS-FOREACH
+	(return (java-translate-foreach-tree tree)))
+       (LET (return (java-translate-let-tree tree)))
+       ((CAST SAFE-CAST) (return (java-translate-cast tree)))
+       (RETURN (return (java-translate-return-tree tree)))
+       (BREAK
+	(return (java-translate-break tree)))
+       (CONTINUE		
+	(return (java-translate-continue tree)))
+       (WHILE				
+	(return (java-translate-while tree)))
+       (IF (return (java-translate-if-tree tree)))
+       (CHOOSE (return (java-translate-choose-tree tree)))
+       (WHEN (return (java-translate-when-tree tree)))
+       (UNLESS (return (java-translate-unless-tree tree)))
+       ;; Q: ARE THESE HANDLED BY OPERATORS ALREADY?
+       ;; NOTE: NEED TO COMPLETE OPERATOR LIST
+       ((AND OR NOT EQ? > >= < <= ++ --)
+	(return (java-translate-operator-tree tree)))
+       (COND
+	(return (java-translate-cond-tree tree)))
+       (CASE                               
+	(return (java-translate-case-tree tree)))
+       (MAKE (return (java-translate-make-tree tree)))
+       (SYS-NEW (return (java-translate-sys-new tree)))
+       (MV-SETQ			
+	(return (java-translate-mv-setq tree)))
+       (SYS-CALL-FUNCTION-CODE
+	(return (java-translate-call-function-code tree)))
+       (SYS-CALL-METHOD-CODE
+	(return (java-translate-call-method-code tree)))
+       (SYS-INLINE-CALL
+        (return (java-translate-inline-call-tree tree)))
+       (THE-CODE
+	(return (java-translate-the-code tree)))
+       ((INLINE IGNORE)
+	(return (java-translate-ignore-tree tree)))
+       (PRINT-STREAM (return (java-translate-print-stream tree)))
+       (PRINT-NATIVE-STREAM (return (java-translate-print-native-stream tree)))
+       ))
+    (otherwise
+     (when (null? tree) 
+       (return (java-translate-null)))
+     (return (java-translate-atomic-tree tree)))) )
+
+(defspecial *varArgStatements* (CONS OF CONS) NIL
+	    :documentation 
+	    "A list of new vectors generated for variable-length argument 
+             lists")
+
+(defspecial *varArgDecls* (CONS OF CONS) NIL
+	    :documentation 
+	    "A list of vector-pushes generated for variable-length argument 
+             lists")
+
+(defspecial *currentVarArgIndex* INTEGER 1
+	    :documentation 
+	    "The current index of the variable length arguments")
+
+(defglobal *java-operator-table* KEY-VALUE-LIST
+  (dictionary @KEY-VALUE-LIST
+	      (quote ++) (cons (wrap-literal "++") NIL)
+	      (quote --) (cons (wrap-literal "--") NIL)
+	      (quote +) (cons (wrap-literal "+") NIL)
+	      (quote -) (cons (wrap-literal "-") NIL)
+	      (quote *) (cons (wrap-literal "*") NIL)
+;;; NOTE: NEXT LINE CAUSES STELLA TO CRASH -- Not any more?
+	      (quote /) (cons (wrap-literal "/") NIL)
+	      (quote eq?) (cons (wrap-literal "==") NIL)
+	      (quote >) (cons (wrap-literal ">") NIL)
+	      (quote >=) (cons (wrap-literal ">=") NIL)
+	      (quote =>) (cons (wrap-literal ">=") NIL)
+	      (quote <) (cons (wrap-literal "<") NIL)
+	      (quote =<) (cons (wrap-literal "<=") NIL)
+	      (quote <=) (cons (wrap-literal "<=") NIL)
+	      (quote AND) (cons (wrap-literal "&&") NIL)
+	      (quote OR) (cons (wrap-literal "||") NIL)
+	      (quote NOT) (cons (wrap-literal "!") NIL)
+	      (quote CHOOSE) (cons (wrap-literal "?")
+				   (cons (wrap-literal ":") NIL)))
+  :documentation "Mapping from STELLA operators to Java operators")
+
+(defun (java-lookup-operator-table CONS) ((operator SYMBOL))
+  (let ((entry (CONS OF STRING-WRAPPER)
+	       (lookup *java-operator-table* operator))
+	(copiedEntry NIL))
+    (when (defined? entry)
+      (foreach wrapper in entry
+	       collect (wrap-literal (wrapper-value wrapper))
+	       into copiedEntry)
+      (return copiedEntry))
+    (return NULL)))
+
+(defun (java-create-character-substitution-table STRING) ()
+  ;; Create a Java character substitution table that can be used
+  ;;    to map illegal Java characters onto legal replacements.
+  ;; Entry i in the table defines the substitution for the
+  ;;    character '(code-character i)'.
+  ;; Legal Java characters are mapped onto #\= (instead of themselves)
+  ;;    to indicate that no substitution is necessary.
+  (let ((table (make-mutable-string 256 #\_))) ;; default substitution is #\_
+    ;; Legal characters are indicated with an #\= sign:
+    (foreach code in (interval (character-code #\0) (character-code #\9))
+             do (setf (nth table code) #\=))
+    (foreach code in (interval (character-code #\A) (character-code #\Z))
+             do (setf (nth table code) #\=))
+    (foreach code in (interval (character-code #\a) (character-code #\z))
+             do (setf (nth table code) #\=))
+    (setf (nth table (character-code #\_)) #\=)
+    ;; Mapping for other printing characters:
+    (setf (nth table (character-code #\ )) #\_)
+    (setf (nth table (character-code #\!)) #\X) ;; eXclamation
+    (setf (nth table (character-code #\")) #\_)
+    (setf (nth table (character-code #\#)) #\H) ;; Hash
+    (setf (nth table (character-code #\$)) #\B) ;; Buck
+    (setf (nth table (character-code #\%)) #\R) ;; peRcent
+    (setf (nth table (character-code #\&)) #\A) ;; Ampersand
+    (setf (nth table (character-code #\')) #\Q) ;; Quote
+    (setf (nth table (character-code #\()) #\_)
+    (setf (nth table (character-code #\))) #\_)
+    (setf (nth table (character-code #\*)) #\$) ;; was #\O simply cute
+    (setf (nth table (character-code #\+)) #\I) ;; Increase
+    (setf (nth table (character-code #\,)) #\_)
+    (setf (nth table (character-code #\-)) #\_)
+    (setf (nth table (character-code #\.)) #\D) ;; Dot
+    (setf (nth table (character-code #\/)) #\S) ;; Slash
+    ;; Here go #\0 to #\9.
+    (setf (nth table (character-code #\:)) #\C) ;; Colon
+    (setf (nth table (character-code #\;)) #\_)
+    (setf (nth table (character-code #\<)) #\L) ;; Less than
+    (setf (nth table (character-code #\=)) #\E) ;; Equal
+    (setf (nth table (character-code #\>)) #\G) ;; Greater than
+    (setf (nth table (character-code #\?)) #\P) ;; Predicate
+    (setf (nth table (character-code #\@)) #\M) ;; Monkey tail
+    ;; Here go #\A to #\Z.
+    (setf (nth table (character-code #\[)) #\J) ;; Arbitrary (array index?)
+    (setf (nth table (character-code #\\)) #\_)
+    (setf (nth table (character-code #\])) #\K) ;; Arbitrary (array index?)
+    (setf (nth table (character-code #\^)) #\U) ;; Up arrow
+    ;; Here goes #\_.
+    (setf (nth table (character-code #\`)) #\_)
+    ;; Here go #\a to #\z.
+    (setf (nth table (character-code #\{)) #\Y) ;; Arbitrary (adjacent free letter)
+    (setf (nth table (character-code #\|)) #\V) ;; Vertical bar
+    (setf (nth table (character-code #\})) #\Z) ;; Arbitrary (adjacent free letter)
+    (setf (nth table (character-code #\~)) #\T) ;; Tilde
+    (return table)))
+
+(defglobal *java-character-substitution-table* STRING
+  (java-create-character-substitution-table))
+
+(defun (java-substitute-forbidden-characters STRING)
+    ((name STRING) (caseConvention KEYWORD))
+  ;; Substitute all forbidden characters in 'name' (e.g., '-', '*', etc.),
+  ;;    with legal Java characters from *java-character-substitution-table*.
+  ;; 'caseConvention' indicates the case for 'name' and has to be one of
+  ;;    :uppercase, :lowercase, or :capitalized.  Replacement characters
+  ;;    will be changed into the opposite case to avoid name clashes.
+  ;; If no substitutions were necessary, the unmodified and uncopied
+  ;;    'name' will be returned.
+  (let ((result MUTABLE-STRING NULL)
+        (substitution CHARACTER NULL))
+    (case (nth name 0)
+      ;; Handle leading digits:
+      (#\0 (setq result (replace-first-character-with-string name "zero")))
+      (#\1 (setq result (replace-first-character-with-string name "one")))
+      (#\2 (setq result (replace-first-character-with-string name "two")))
+      (#\3 (setq result (replace-first-character-with-string name "three")))
+      (#\4 (setq result (replace-first-character-with-string name "four")))
+      (#\5 (setq result (replace-first-character-with-string name "five")))
+      (#\6 (setq result (replace-first-character-with-string name "six")))
+      (#\7 (setq result (replace-first-character-with-string name "seven")))
+      (#\8 (setq result (replace-first-character-with-string name "eight")))
+      (#\9 (setq result (replace-first-character-with-string name "nine")))
+      (otherwise (setq result name)))
+    (foreach
+     i in (interval 0 (- (length result) 1))
+     do
+     (setq substitution
+       (nth *java-character-substitution-table*
+            (character-code (nth result i))))
+     (when (not (eq? substitution #\=))
+       ;; We need a substitution.
+       (case caseConvention
+         (:uppercase (setf (nth result i) (downcase-character substitution)))
+         (:lowercase (setf (nth result i) (upcase-character substitution)))
+         (:capitalized
+          ;; TO DO: This should do something different at word boundaries.
+          (setf (nth result i) (upcase-character substitution))))))
+    (return result)))
+
+(defun (java-change-case STRING)
+    ((symbol GENERALIZED-SYMBOL) (caseConvention KEYWORD))
+  ;; Change the case of 'symbol' according to 'caseConvention' and return
+  ;;    a copy of the modified symbol name.
+  ;; Do not perform any case change if the home module of 'symbol' is
+  ;;    case-sensitive, but still return a copy of the symbol name.
+  ;; TO DO: Optimize to not allocate a new string when the case of
+  ;;    'symbol' is already correct.
+  (let ((module (interned-in symbol))
+        (name (symbol-name symbol)))
+    (when (null? module)
+      (setq module *module*))
+    (when (or (case-sensitive? module)
+	      (not (eq? (compute-symbol-escape-code name false) :unescaped)))
+      (return 
+	(make-matching-name-full name
+				 :no :no "- "
+				 "" "" "" ""
+				 :preserve "_")))
+    (case caseConvention
+      (:uppercase 
+       (return (make-matching-name-full name
+					:no :no "- "
+					"" "" "" ""
+					:upcase "_")))
+      (:lowercase 
+       (return (make-matching-name-full name
+					:clever :clever "- "
+					"" "" "" ""
+					:titlecaseX "")))
+      (:capitalized 
+       (return (make-matching-name-full name
+					:clever :clever "- "
+					"" "" "" ""
+					:titlecase ""))) )))
+
+(defun (java-literal? BOOLEAN) ((typeSpec TYPE-SPEC))
+  ;; Return true if the typeSpec is represented by a Java literal.
+  ;;   This is the same as a Stella literal except for strings,
+  ;;   mutable strings and code objects which are Java objects.
+  (return (and (sub-type-spec-of? typeSpec @LITERAL)
+	       (not (sub-type-spec-of? typeSpec @STRING))
+	       (not (sub-type-spec-of? typeSpec @MUTABLE-STRING))
+	       (not (sub-type-spec-of? typeSpec @CODE)))))
+
+
+(defun (java-native-literal-wrapper-names STRING-WRAPPER STRING-WRAPPER)
+    ((typeSpec TYPE-SPEC))
+  ;; Return the Java class-name and value extractor associated with
+  ;; literals of `typeSpec'
+  (case typeSpec
+    (@BOOLEAN   (return "Boolean" "booleanValue"))
+    ((@INTEGER @SHORT-INTEGER @UNSIGNED-SHORT-INTEGER @BYTE @OCTET @THIRY-TWO-BIT-VECTOR)
+     (return "Integer" "intValue"))
+    ((@FLOAT @DOUBLE)
+     (return "Double" "doubleValue"))
+    (@CHARACTER
+     (return "Character" "charValue"))
+    (@LONG-INTEGER
+     (return "Long" "longValue"))
+    (@SINGLE-FLOAT
+     (return "Float" "floatValue"))))
+
+(defun (java-special-setter-name STRING-WRAPPER)
+    ((typeSpec TYPE-SPEC))
+  ;; Return the Java native function name for setting thread-safe special variables
+  ;; for general objects of type `typeSpec'
+  (case (type-spec-to-base-type typeSpec)
+    (@BOOLEAN   (return "setBooleanSpecial"))
+    ((@INTEGER @SHORT-INTEGER @UNSIGNED-SHORT-INTEGER @BYTE @OCTET @THIRY-TWO-BIT-VECTOR)
+     (return "setIntSpecial"))
+    ((@FLOAT @DOUBLE)
+     (return "setDoubleSpecial"))
+    (@CHARACTER
+     (return "setCharSpecial"))
+    (@LONG-INTEGER
+     (return "setLongSpecial"))
+    (@SINGLE-FLOAT
+     (return "setFloatSpecial"))
+    (otherwise
+     (return "setSpecial"))))
+
+(defun (java-yield-flotsam-type-name STRING) ((flotsam-class-name STRING))
+  ;; Heuristically determine what Stella name would be translated into
+  ;; `flotsam-class-name' and return that.
+  ;; TO DO: Should be memoized!
+  (let ((last-period INTEGER NULL)
+	(next-period (position flotsam-class-name #\. 0))
+	(bare-class-name STRING NULL))
+    (while (defined? next-period)
+      (setq last-period next-period)
+      (setq next-period (position flotsam-class-name #\. next-period)))
+    (if (defined? last-period)
+      (setq bare-class-name (subsequence flotsam-class-name last-period NULL))
+      (setq bare-class-name flotsam-class-name))
+    (return (make-matching-name-full bare-class-name
+				     :YES :NO "_"
+				     "" "" "" ""
+				     :UPCASE "-"))))
+
+(defun (java-translate-symbol-constant-name STRING-WRAPPER)
+    ((symbol GENERALIZED-SYMBOL))
+  ;; Convert 'symbol' representing a symbol/surrogate/keyword constant
+  ;;    into a Java symbol/surrogate/keyword constant identifier.
+  (let ((globalSymbol (lookup *symbol-registry* symbol))
+	(translatedName STRING "")
+	(flotsam-class-name STRING ""))
+    (unless (defined? globalSymbol)
+      (warn "Couldn't lookup symbol name for " symbol EOL
+	    "     in java-translate-symbol-constant-name"))
+    (setq flotsam-class-name (java-yield-flotsam-class-name (home-module globalSymbol)))
+    (setq translatedName 
+      (concatenate flotsam-class-name "."
+		   (java-substitute-forbidden-characters
+		    (symbol-name globalSymbol)
+		    :uppercase)))
+    (unless (omit-java-package-prefix? (home-module globalSymbol)
+				       (java-yield-flotsam-type-name flotsam-class-name))
+      (setq translatedName
+	(concatenate (java-package-prefix (home-module globalSymbol) ".") 
+		     translatedName)))
+    (return (wrap-literal translatedName))))
+
+
+(defun (java-translate-symbol-constant-id STRING-WRAPPER)
+    ((symbol GENERALIZED-SYMBOL))
+  ;; Convert a reference to the ID of 'symbol' into a Java
+  ;;    symbol-id identifier.
+  (let ((translatedSymbol (java-translate-symbol-constant-name symbol)))
+    (setf (wrapper-value translatedSymbol)
+      (concatenate (wrapper-value translatedSymbol) "_id"))
+    (return translatedSymbol)))
+
+(defun (java-translate-symbol-name STRING-WRAPPER) ((symbol SYMBOL))
+  ;; Convert 'symbol' representing a symbol constant to a Java
+  ;;    symbol constant identifier.
+  (return (java-translate-symbol-constant-name symbol)))
+
+(defun (java-translate-symbol-id STRING-WRAPPER) ((symbol SYMBOL))
+  ;; Convert a reference to the ID of 'symbol' into a Java
+  ;;    symbol-id identifier.
+  (return (java-translate-symbol-constant-id symbol)))
+
+(defun (java-translate-surrogate-name STRING-WRAPPER) ((surrogate SURROGATE))
+  ;; Convert 'surrogate' representing a surrogate constant to a Java
+  ;;    surrogate constant identifier.
+  (return (java-translate-symbol-constant-name surrogate)))
+
+(defun (java-translate-surrogate-id STRING-WRAPPER) ((surrogate SURROGATE))
+  ;; Convert a reference to the ID of 'surrogate' into a Java
+  ;;    surrogate-id identifier.
+  (return (java-translate-symbol-constant-id surrogate)))
+
+(defun (java-translate-keyword-name STRING-WRAPPER) ((keyword KEYWORD))
+  ;; Convert 'keyword' representing a keyword constant to a Java
+  ;;    keyword constant identifier.
+  (return (java-translate-symbol-constant-name keyword)))
+
+(defun (java-translate-keyword-id STRING-WRAPPER) ((keyword KEYWORD))
+  ;; Convert a reference to the ID of 'keyword' into a Java
+  ;;    keyword-id identifier.
+  (return (java-translate-symbol-constant-id keyword)))
+
+(defun (java-translate-class-namestring STRING-WRAPPER)
+    ((nameString STRING-WRAPPER))
+  ;; Convert a string representing a class name to a Java class name.
+  ;; Capitalize, and substitute forbidden characters and check for
+  ;;   name conflicts.
+  (let ((translatedName (java-substitute-forbidden-characters
+			 (make-matching-name-full 
+			  nameString
+			  :clever :clever "- "
+			  "" "" "" ""
+			  :titlecase "")
+			 :capitalized)))
+    (if (defined? (java-lookup-reserved-word-table translatedName))
+	(return
+	  (wrap-literal
+	   (concatenate "Stella_" translatedName)))
+      (return (wrap-literal translatedName)))))
+
+(defun (java-translate-class-name STRING-WRAPPER)
+    ((nameSymbol GENERALIZED-SYMBOL))
+  ;; Convert a lisp symbol representing a class name to a Java class name.
+  ;; Go via the type-spec route to capture native class translations.
+  (return (java-translate-type-spec (surrogatify nameSymbol))))
+
+(defun (in-current-java-package? BOOLEAN) ((module MODULE))
+  ;; Returns true if "module" is in the same Java package as the
+  ;; current MODULE.
+  ;; TO DO:  Consider adding a less safe mode to this which returns
+  ;;         TRUE for the Stella package as well, to cut down on
+  ;;         translated file package prefix clutter.
+  ;;         Also consider returning TRUE if `module' is visible from
+  ;;         `*MODULE*'
+  (return (or (eql? module *MODULE*)
+	      (string-eql? (java-package-prefix module ".") 
+			   (java-package-prefix *module* ".")))))
+
+(defun (inherited-class-name-conflicts? BOOLEAN) ((stella-class-name STRING))
+  ;; Returns true if there is more than one class with name `stella-class-name'
+  ;; visible from the current `*MODULE*'
+  ;; TRICKY:  There might not actually be a class found with the name `stella-class-name'
+  ;;   because the name could be from a Java catchall class, for which we don't construct an
+  ;;   actual Stella class.  That is why there are null checks and the catchall class logic.
+  (let ((stella-class (get-stella-class stella-class-name FALSE))
+	(test-class CLASS NULL)
+	(java-class-name "")
+	(catchall-module MODULE NULL))
+    ;; First check for direct class conflict
+    (foreach module in (uses *MODULE*)
+	do (special ((*module* module))
+	     (setq test-class (get-stella-class stella-class-name FALSE))
+	     (when (null? stella-class)
+	       (setq stella-class test-class))
+	     (when (and (defined? test-class)
+			(not (eq? test-class stella-class)))
+	       (return true))))
+    (foreach module in (all-super-contexts *MODULE*)
+	where (isa? module @MODULE)
+	do (special ((*module* module))
+	     (setq test-class (get-stella-class stella-class-name FALSE))
+	     (when (null? stella-class)
+	       (setq stella-class test-class))
+	     (when (and (defined? test-class)
+			(not (eq? test-class stella-class)))
+	       (return true))))
+    ;; Then check for conflict with catchall class name:
+    (setq java-class-name (java-translate-class-namestring stella-class-name))
+    (foreach module in (uses *MODULE*)
+	where (string-eql? java-class-name (java-yield-flotsam-class-name module))
+	do (when (or (defined? stella-class)
+		     (defined? catchall-module))
+	     (return true))
+	   (setq catchall-module module))
+    (foreach module in (all-super-contexts *MODULE*)
+	where (and (isa? module @MODULE)
+		   (string-eql? java-class-name (java-yield-flotsam-class-name module)))
+	do (when (or (defined? stella-class)
+		     (defined? catchall-module))
+	     (return true))
+	   (setq catchall-module module))
+    ;; TODO: Maybe add a check that looks at handwritten *.java files
+    ;; that are copied as part of the system?
+    (return false)))
+
+(defun (omit-java-package-prefix? BOOLEAN) ((module MODULE) (stella-class-name STRING))
+  ;; Returns true if the java prefix for "java-class-name" in "module" does not
+  ;;    need to be included.
+  ;;    This will always be true if "module" is the same as the current module.
+  ;;    When the feature :minimize-java-prefixes is set, this will also be true
+  ;;    if "module" is visible from the current module and "java-class-name" is
+  ;;    unique in all modules visible from the current one.
+  ;; PROBLEM:  STELLA CLASS NAMES CAN BE EASILY CHECKED USING SYMBOLS, BUT
+  ;;           THAT WON'T WORK FOR THE CATCHALL CLASS USED FOR FUNCIONS.  IT
+  ;;           IS CURRENTLY ONLY AVAILABLE AS A STRING, SO THAT WOULD MEAN
+  ;;           HAVING TO CHECK THE JAVA NAMES OF ALL CLASSES FOR A MATCH!
+  ;; SOLUTION? WOULD MEMOIZATION BE A HELP FOR THIS?  SHOULD THE TRANSLATOR
+  ;;           KEEP ITS OWN HASHTABLE?
+  (if (enabled-stella-feature? :minimize-java-prefixes)
+    (return (or (in-current-java-package? module)
+		(and (or (memb? (uses *MODULE*) module)
+			 (memb? (all-super-contexts *MODULE*) module))
+		     (not (inherited-class-name-conflicts? stella-class-name)))))
+    (return (in-current-java-package? module))))
+
+(defun (java-translate-type-spec STRING-WRAPPER) ((type-spec TYPE-SPEC))
+  ;; Translate a type specifier to a Java type.
+  ;; For now, convert parameteric types to their base types
+  (let ((final-type TYPE null)
+	(type-name STRING ""))
+    (typecase type-spec
+      (PARAMETRIC-TYPE-SPECIFIER
+       (if (array-type-specifier? type-spec)
+	 (return (java-translate-array-type type-spec))
+	 (return (java-translate-type-spec (specifier-base-type type-spec)))))
+      (TYPE
+       (cond
+	((defined? (class-java-native-type (type-class type-Spec)))
+	 (return (wrap-literal (java-native-type (type-class type-Spec)))))
+	(otherwise
+	 ;; Do a double-dereference to get a class's true name
+	 (setq final-Type (class-type (type-class type-Spec)))
+	 (setq type-name (java-translate-class-namestring (type-name final-Type)))
+	 (if (omit-java-package-prefix? (home-module final-Type) (type-name final-Type))
+	     (return type-name)
+	     (return (concatenate 
+		       (java-package-prefix (home-module final-Type) ".")
+		       type-name))))))) ))
+
+(defun (java-translate-array-type STRING-WRAPPER) ((arrayType PARAMETRIC-TYPE-SPECIFIER))
+  ;; Translate `arrayType' into an appropriate Java type.
+  ;; Note that for array types, we only need to know the number of dimensions,
+  ;;   the actual values of the dimensions don't matter.
+  (let ((dimensions (array-type-dimensions arrayType))
+        (elementType (extract-parameter-type arrayType (quote ANY-VALUE)))
+        (translatedType STRING (java-translate-type-spec elementType)))
+    (case (length dimensions)
+      (1 (return (concatenate translatedType "[]")))
+      (2 (return (concatenate translatedType "[][]")))
+      (3 (return (concatenate translatedType "[][][]")))
+      (otherwise 
+       ;; (setq translatedType (concatenate translatedType " "))
+       (foreach unused-dim in dimensions
+	   do (ignore unused-dim)
+	      (setq translatedType (concatenate translatedType "[]")))
+       (return translatedType))) ))
+
+(defun (java-translate-array-of-type-spec STRING-WRAPPER) 
+    ((typeSpec TYPE-SPEC) (fullyQualified? BOOLEAN))
+  ;; Translate a type specifier to an array of Java type.
+  (let ((baseTypeString STRING (choose fullyQualified?
+				       (java-yield-fully-qualified-type-name typeSpec)
+				       (java-translate-type-spec typeSpec))))
+    (return (concatenate baseTypeString " []"))))
+
+
+(defun (java-yield-renamed-reserved-word STRING-WRAPPER) ((word SYMBOL))
+  ;; Yield a properly renamed replacement for the reserved Java symbol 'word'.
+  (return
+    (wrap-literal
+     (concatenate "renamed_" (string-capitalize (symbol-name word))))))
+
+(defun (java-create-reserved-word-table STRING-HASH-TABLE) ()
+  ;; Create a table of reserved Java symbols and their associated replacements.
+  (let ((table (new STRING-HASH-TABLE)))
+    (foreach
+     word in (bquote
+              ;; NOTE: Can't add 'this' to the table, since first method
+              ;;       arguments get replaced with 'this' before translation.
+              (object
+	      ;; From James Gosling, Bill Joy, Guy Steele,
+	      ;;   The Java(tm) Language Specification, 1996
+	      ;;   Section 3.9 Keywords, p. 118
+		     abstract boolean break byte
+		     case catch char class const continue
+		     default do double else extends
+		     final finally float for goto
+		     if implements import instanceof int interface
+		     long native new package private protected public
+		     return short static super switch synchronized
+		     #| this |# throw throws transient try
+		     void volatile while
+              ;; Added in Java 1.4
+                     assert
+		     ))
+     do (insert-at
+         table
+         (string-downcase (symbol-name (cast word SYMBOL)))
+         (java-yield-renamed-reserved-word word))
+	(insert-at
+         table
+         (string-capitalize (symbol-name (cast word SYMBOL)))
+         (java-yield-renamed-reserved-word word)))
+    ;; The next two are not really reserved identifiers, but
+    ;; they are renamed for readability (is this still needed?):
+    (insert-at table "++" (wrap-literal "stella_Increment"))
+    (insert-at table "--" (wrap-literal "stella_Decrement"))
+    (return table)))
+
+(defglobal *java-reserved-word-table*
+    (STRING-HASH-TABLE OF STRING STRING-WRAPPER)
+  (java-create-reserved-word-table))
+
+(defun (java-lookup-reserved-word-table STRING) ((word STRING))
+  ;; Check whether 'word' is a reserved Java symbol, and if so, return
+  ;;    a properly renamed replacement.
+  (let ((entry (lookup *java-reserved-word-table* word)))
+    (if (defined? entry)
+	(return entry)
+      (return NULL))))
+
+(defun (java-translate-namestring STRING) ((nameString STRING))
+  ;; Convert 'nameString' representing an identifier to a Java identifier.
+  ;; Check against reserved words, and substitute forbidden characters.
+  ;; DOES NOT DO CASE CHANGES!
+  (let ((reservedName (java-lookup-reserved-word-table nameString)))
+    (when (null? nameString)
+      (return "NULL"))
+    (when (defined? reservedName)
+      (return reservedName))
+    (return
+      (java-substitute-forbidden-characters nameString :lowercase))))
+
+(defun (java-translate-name STRING-WRAPPER) ((nameSymbol SYMBOL))
+  ;; Convert 'nameSymbol' representing an identifier to a Java identifier.
+  ;; Make lowercase, and substitute forbidden characters.
+  ;; NOTE: We use the symbol name as the key instead of the symbol itself
+  ;;    to also make it work for symbols in different modules.  If at some
+  ;;    point the modules become part of identifier names this needs to
+  ;;    be fixed!
+  ;; NOTE: Use "java-change-case" on the nameSymbol to do appropriate handling
+  ;;    of case-sensitive module issues.
+  (return (wrap-literal (java-translate-namestring
+			 (java-change-case nameSymbol :lowercase)))) )
+
+  ;;
+;;;;;; top-level translation routines
+  ;;
+
+
+(defun (java-translate-special-tree CONS) ((tree CONS))
+  ;; Called by 'java-translate-a-tree'.
+  ;; Translate a special statement to a Java block which saves and restores
+  ;;    special variable values.
+  (let ((saveDeclarations CONS NIL)
+	(setForms CONS NIL)
+        (restoreForms CONS NIL)
+	(oTree CONS NULL))
+    (foreach declaration in (cast (second tree) CONS)	; translate each declaration:
+	do (let ((d CONS declaration)
+		 (specialVariableName SYMBOL (first d))
+		 (oldValueVariable 
+		  (java-translate-a-tree
+		   (local-gensym
+		   (concatenate "OLD-" (symbol-name specialVariableName))))))
+	     (pushq saveDeclarations
+		    (bquote (& (wrap-literal "Object")
+			       & oldValueVariable
+			       (JAVA_METHOD_CALL
+				(JAVA_IDENT & (wrap-literal ""))
+				(JAVA_IDENT & (wrap-literal "get"))
+				(JAVA_IDENT & (java-translate-global-name specialVariableName FALSE))
+				(JAVA_ACTUALS)))))
+	     (pushq setForms
+		    (java-translate-a-tree
+		     (bquote (setq & (first d) & (third d)))))
+	     (pushq restoreForms
+		    (bquote (JAVA_METHOD_CALL
+			     (JAVA_IDENT & (wrap-literal ""))
+			     (JAVA_IDENT & (wrap-literal "set"))
+			     (JAVA_IDENT & (java-translate-global-name specialVariableName FALSE))
+			     (JAVA_ACTUALS & oldValueVariable))))))
+    (setq oTree (bquote (JAVA_BLOCK & (reverse saveDeclarations)
+				    (JAVA_STATEMENTS
+				     (JAVA_UNWIND_PROTECT
+				      (JAVA_STATEMENTS
+				       && (reverse setForms)
+				       && (java-translate-list-of-trees
+					   (rest (rest tree))))
+				      && restoreForms)))))
+    (return oTree) ))
+
+
+;;;;;;;;;;;;
+
+(defun (java-translate-verbatim-tree CONS) ((tree CONS))
+  ;; Return the code assigned to the :java option inside of '(rest tree)'.
+  (let ((cursor (rest tree))
+        (verbatimCode OBJECT NULL))
+    (while (non-empty? cursor)
+      (when (eq? (value cursor) :java)
+        (setq verbatimCode (value (rest cursor)))
+        (return (bquote (JAVA_VERBATIM & verbatimCode))))
+      (setq cursor (rest (rest cursor))))
+    (error "Verbatim has no :java option") ))
+
+;;; THIS IS ALMOST IDENTICAL TO `cpp-translate-inline-call-tree', MAYBE THEY
+;;;    CAN BE MERGED?
+(defun (java-translate-inline-call-tree OBJECT) ((tree CONS))
+  ;; Inline a call to a function or method whose inlinable body
+  ;;    is a single verbatim expression.
+  (let ((callTree CONS (second tree))
+        (arguments
+         (choose (eql? (first callTree) (quote SYS-CALL-FUNCTION))
+                 (nth-rest callTree 2)
+                 (nth-rest callTree 3)))
+        (tokenizedBody (tokenize-verbatim-method-body callTree)))
+    (when (defined? tokenizedBody)
+      (let ((inlinedParameters (new LIST))
+            (inlinedBody STRING NULL)
+            (success? TRUE))
+	(special ((*current-stream* (new STRING-OUTPUT-STREAM)))
+	  (foreach token in tokenizedBody
+	      do (typecase token
+		   (STRING
+		    (print-stream *current-stream* (wrapper-value token)))
+		   (CONS
+		    (let ((parameter STRING-WRAPPER (first token))
+			  (position INTEGER-WRAPPER (second token))
+			  (argument (nth arguments position)))
+		      (when (not (side-effect-free-expression? argument))
+			(if (member? inlinedParameters parameter)
+                          (progn
+                            (setq success? FALSE)
+                            (break))
+			  (insert inlinedParameters parameter)))
+		      (unless (atomic-expression? argument)
+			;; parenthesize, to avoid precedence problems:
+			(print-stream *current-stream* "("))
+		      (java-output-statement
+		       (java-translate-a-tree
+			;; insulate us from destructiveness in case we have to punt:
+			(copy-cons-tree argument)))
+		      (unless (atomic-expression? argument)
+			(print-stream *current-stream* ")"))))))
+	  (setq inlinedBody
+	    (the-string (cast *current-stream* STRING-OUTPUT-STREAM)))
+	  (when success?
+	    (return (bquote (JAVA_VERBATIM & (new VERBATIM-STRING-WRAPPER
+						  :wrapper-value inlinedBody))))))))
+    ;; Otherwise, we punt:
+    (return (java-translate-a-tree callTree))))
+
+(defun (java-translate-unwind-protect CONS) ((tree CONS))
+  (setf (first tree) (quote JAVA_UNWIND_PROTECT))
+  (setf (rest tree)
+    (java-translate-list-of-trees (rest tree)))
+  (return tree))
+
+(defun (java-translate-signal CONS) ((tree CONS))
+  ;; Translate a signal statement into Java
+  ;; `tree' has form (sys-signal <exception-expression> <exception-type>)
+  ;; A call to fill-in-stack-trace is added so that the stack trace reflects
+  ;;   the location of the throw rather than the location where the exception
+  ;;   was created (typically a Stella-created factory method).
+  ;; The type is used to cast the return value appropriately, which is mainly
+  ;;   important to suppress the need to declare the exception type in the
+  ;;   Java signature.
+  (setf (first tree) (quote JAVA_SIGNAL))
+  (setf (second tree) 
+        (java-translate-a-tree (bquote (CAST
+                                        (SYS-CALL-METHOD 
+                                         & (third tree)
+                                         fill-in-stack-trace
+                                         & (second tree))
+                                        & (third tree)))))
+  (setf (rest (rest tree)) NIL)
+  (return tree))
+
+(defun (java-translate-handler-case CONS) ((tree CONS))
+  (setf (first tree) (quote JAVA_HANDLER_CASE))
+  (setf (rest tree)
+    (java-translate-list-of-trees (rest tree)))
+  (return tree))
+
+(defun (java-translate-handle-exception CONS) ((tree CONS))
+  ;; Input: (SYS-HANDLE-EXCEPTION (var type) code...)
+  (setf (first tree) (quote JAVA_CATCH))
+  (setf (second tree) 
+    (bquote (& (java-translate-type-spec (second (cast (second tree) CONS)))
+	       & (java-translate-name (first (cast (second tree) CONS))))))
+  (setf (rest (rest tree))
+    (java-translate-list-of-trees (rest (rest tree))))
+  (return tree))
+
+(defun (java-translate-void-sys CONS) ((tree CONS))
+  ;; Skip over SYS operator and translate the embedded tree.
+  ;; COMPARE WITH CL VERSION: THE SECOND LIST MEMBER ISN'T A TYPE
+  (return (java-translate-a-tree (second tree))))
+
+(defun (java-translate-typed-sys CONS) ((tree CONS))
+  ;; Translate a typed sys.  This can downcast method calls if
+  ;;   the return type of a method should be narrower than the declared
+  ;;   return type
+  (return (java-translate-a-tree (second tree))))
+
+(defun (java-translate-bad-sys OBJECT) ((tree CONS))
+  ;; Emit a tree that complains when compiled.
+  (return (bquote 
+	   (JAVA_VERBATIM
+	    & (wrap-literal (concatenate "*** TRANSLATION FAILURE FROM "
+					 (stringify (second tree))))))))
+
+(defun (java-translate-setq-tree OBJECT) ((tree CONS))
+  ;; Translate a setq statement into a Java assignment statement.
+  (let ((variableName SYMBOL (second tree))
+	(globalVar (lookup-global-variable (soft-permanentify variableName))))
+    (if (and (defined? globalVar) (variable-special? globalVar))
+      ;; TO DO: Handle literal conversions...
+      (return (bquote (JAVA_FUNCTION_CALL
+		       (JAVA_IDENT & (wrap-literal (java-yield-native-class-name)))
+		       (JAVA_IDENT & (java-special-setter-name 
+				      (global-variable-type-spec globalVar)))
+		       (JAVA_ACTUALS (JAVA_IDENT
+				      & (java-translate-global-name variableName FALSE))
+				     & (java-translate-a-tree (third tree))))))
+      (return (bquote (JAVA_ASSIGN
+		       & (java-translate-a-tree (second tree))
+		       & (java-translate-a-tree (third tree)))))) ))
+
+(defun (java-translate-sys-set-default OBJECT) ((tree CONS))
+  (let ((variableName SYMBOL (second tree))
+	(globalVar (lookup-global-variable (soft-permanentify variableName))))
+    (safety 2 (and (defined? globalVar) (variable-special? globalVar))
+	    "Only works for special variables: " tree)
+    (return (bquote (JAVA_METHOD_CALL
+		     (JAVA_IDENT & (wrap-literal ""))
+		     (JAVA_IDENT
+		      & (wrap-literal "setDefaultValue"))
+		     (JAVA_IDENT & (java-translate-global-name variableName FALSE))
+		     (JAVA_ACTUALS 
+		      & (java-translate-with-native-wrapper 
+			 (third tree)
+			 (choose (defined? (variable-type-specifier globalVar))
+				 (variable-type-specifier globalVar)
+				 (variable-type globalVar)))))))))
+
+(defun (java-translate-sys-slot-value-setter CONS) ((tree CONS))
+  ;; Translate a slot-value-setter statement.
+  (let ((objectRef (fourth tree))
+	(objectType TYPE (second tree))
+	(slotName (true-slot-name (third tree) objectType))
+	(valueRef (java-translate-a-tree (fifth tree)))
+	(oTree
+	 (bquote (JAVA_SLOT_VALUE_SETTER
+		  & (java-translate-a-tree objectRef)
+		  & (java-translate-name slotName)
+		  & valueRef))))
+    ;; Clip tree for GC
+    (setf (third tree) NULL)
+    (setf (fourth tree) NULL)
+    (setf (fifth tree) NULL)
+    (return oTree) ))
+
+(defun (java-translate-sys-slot-value CONS) ((tree CONS))
+  ;; Translate a slot-value statement.
+  (let ((objectType TYPE (second tree))
+	(objectRef (fourth tree))
+	(slotName (true-slot-name (third tree) objectType))
+	(oTree
+	 (bquote (JAVA_SLOT_VALUE & (java-translate-a-tree objectRef)
+			 	  & (java-translate-name slotName)))))
+    (return oTree) ))
+
+(defun (java-translate-progn CONS) ((tree CONS))
+  ;; Translate into a JAVA_PROGN (i.e. a list of statements surround w/braces)
+  (return 
+    (bquote 
+     (JAVA_PROGN 
+      (JAVA_STATEMENTS
+       && (java-translate-list-of-trees (rest tree)))))) )
+
+(defun (java-translate-with-process-lock CONS) ((tree CONS))
+  ;; Translate into a JAVA_WITH_PROCESS_LOCK (i.e. a list of synchronized statements
+  ;; surrounded w/braces guarded by a lock)
+  (return 
+    (bquote 
+     (JAVA_WITH_PROCESS_LOCK
+      & (java-translate-a-tree (second tree))
+      (JAVA_STATEMENTS
+       && (java-translate-list-of-trees (rest (rest tree)))))) ))
+
+(defspecial *java-loop-name* SYMBOL NULL)
+(defspecial *java-loop-name-used?* BOOLEAN FALSE)
+
+(defun (java-translate-loop CONS) ((tree CONS))
+  ;; Translate a loop 
+  (special ((*java-loop-name* (local-gensym "LOOP"))
+	    (*java-loop-name-used?* FALSE))
+    (let ((body (java-translate-list-of-trees (rest tree))))
+      (if *java-loop-name-used?*
+	  (return
+	    (bquote (JAVA_NAMED_STATEMENT
+		     & (java-translate-a-tree *java-loop-name*)
+		     (JAVA_LOOP 
+		      (JAVA_PROGN
+		       (JAVA_STATEMENTS 
+			&& body))))))
+	  (return
+	    (bquote (JAVA_LOOP
+		     (JAVA_PROGN
+		      (JAVA_STATEMENTS 
+		       && body))))))) ))
+
+(defun (java-translate-argument-list-iterator CONS) ((iteratorBindings (CONS OF CONS))
+						     (cursorBindings (CONS OF CONS))
+						     (body CONS))
+  ;; Translate an iterator over a variable-length parameter list
+
+  (let ((cursorVar (first (first cursorBindings)))
+	(cursorType (second (first cursorBindings)))
+	(dummyArg (fourth (cast (third (first iteratorBindings)) CONS)))
+	(iteratorConstructor OBJECT NULL)
+	(declarations 
+	 (bquote ((& (wrap-literal "Enumeration") 
+		   & (java-translate-a-tree (bquote arg_enum)))
+		  (& (java-translate-type-spec cursorType)
+		   & (java-translate-a-tree cursorVar))))))
+
+    ;; The first parameter is a dummy parameter for the variable-length
+    ;;   arguments- skip it
+    (foreach binding in (rest iteratorBindings)   ; collect iterator bindings
+             do
+	     (setq iteratorConstructor 
+	       (java-translate-a-tree (third (cast binding CONS))))
+	     (setf (third binding) NULL) ; clip before gc
+	     collect (bquote (& (java-translate-type-spec
+				 (second (cast binding CONS)))
+				& (java-translate-a-tree (first (cast binding
+								     CONS)))
+				& iteratorConstructor))
+	     into declarations)
+
+    (return (bquote
+	     (JAVA_BLOCK & declarations
+			(JAVA_STATEMENTS 
+			 (JAVA_ASSIGN
+			  (JAVA_IDENT
+			   & (java-translate-name (bquote arg_enum)))
+			  (JAVA_METHOD_CALL
+			   (JAVA_IDENT & (wrap-literal ""))
+			   (JAVA_IDENT
+			    & (java-translate-name (bquote elements)))
+			   & (java-translate-a-tree dummyArg)
+			   (JAVA_ACTUALS)))
+			 (JAVA_WHILE 
+			  (JAVA_METHOD_CALL
+			   (JAVA_IDENT & (wrap-literal ""))
+			   (JAVA_IDENT
+			    & (wrap-literal "hasMoreElements"))
+			   (JAVA_IDENT
+			    & (java-translate-name (bquote arg_enum)))
+			   (JAVA_ACTUALS))
+			  (JAVA_PROGN
+			   (JAVA_STATEMENTS
+			    (JAVA_ASSIGN 
+			     & (java-translate-a-tree cursorVar)
+			     (JAVA_CAST
+			      (JAVA_METHOD_CALL
+			       (JAVA_IDENT & (wrap-literal ""))
+			       (JAVA_IDENT
+				& (wrap-literal "nextElement"))
+			       (JAVA_IDENT
+				& (java-translate-name 
+				   (bquote arg_enum)))
+			       (JAVA_ACTUALS))
+			      & (java-translate-type-spec @OBJECT)))
+			    && body ))) )))) ))
+
+(defun (java-translate-foreach-tree CONS) ((tree CONS))
+  ;; Translate a SYS-FOREACH tree.
+  ;; Tree has the form
+  ;;    (SYS-FOREACH ((<iterVar> <type> <constructor expression>)*)
+  ;;                 ((<cursorVar> <type> <next expression>)*)
+  ;;                 <continuation test> <body>)
+  (special ((*java-loop-name* (local-gensym "LOOP"))
+	    (*java-loop-name-used?* FALSE))
+    (let ((iteratorBindings (CONS OF CONS) (second tree))
+	  (cursorBindings (CONS OF CONS) (third tree))
+	  (continuationTest (java-translate-a-tree (fourth tree)))
+	  (body (java-translate-list-of-trees (nth-rest tree 4)))
+	  (declarations NIL)
+	  (nextAssignments NIL)
+	  (iteratorConstructor OBJECT NULL))
+      (setf (nth-rest tree 4) NIL)	; clip before gc
+      (when (eql? (second (cast (first iteratorBindings) CONS))
+		  @LISP-CONS-ITERATOR)
+	(return
+	  (java-translate-argument-list-iterator iteratorBindings cursorBindings
+						 body)))
+      (foreach binding in iteratorBindings ; collect iterator bindings
+	  do
+	    (setq iteratorConstructor (java-translate-a-tree (third binding)))
+	    (setf (third binding) NULL)	; clip before gc
+	  collect (bquote (& (java-translate-type-spec
+			      (second (cast binding CONS)))
+			     & (java-translate-a-tree (first (cast binding
+								   CONS)))
+			     & iteratorConstructor))
+	  into declarations)
+      (foreach binding in cursorBindings
+	  do				; collect next assigns
+	    (pushq nextAssignments (java-translate-a-tree (third binding)))
+	    (setf (third binding) NULL)	; clip before gc
+	    (unless (duplicate-cursor-variable? (first binding) iteratorBindings)
+	      (pushq declarations
+		     (bquote (& (java-translate-type-spec
+				 (second (cast binding CONS)))
+				& (java-translate-a-tree (first 
+							  (cast binding CONS)))
+				& (java-translate-a-tree
+				   (type-to-walked-null-value-tree
+				    (type-spec-to-base-type
+				     (second binding)))))))))
+			      
+      (if *java-loop-name-used?*
+	  (return
+	    (bquote (JAVA_BLOCK & declarations
+				(JAVA_STATEMENTS
+				 (JAVA_NAMED_STATEMENT
+				  & (java-translate-a-tree *java-loop-name*)
+				  (JAVA_FOREACH & continuationTest
+						& (reverse nextAssignments)
+						& body))))))
+	  (return
+	    (bquote (JAVA_BLOCK & declarations
+				(JAVA_STATEMENTS
+				 (JAVA_FOREACH & continuationTest
+					       & (reverse nextAssignments)
+					       & body)))))) )))
+
+
+(defun (java-translate-let-tree CONS) ((tree CONS))
+  ;; Called by 'java-translate-a-tree'.
+  ;; Translate a let statement to a Java block.
+  (let ((oDeclarations CONS NIL)
+	(oTree CONS NULL))
+    (foreach declaration in 
+	  (cast (second tree) CONS)	; translate each declaration:
+	do
+	  (let ((d CONS declaration))
+	    (pushq oDeclarations
+		   (bquote (& (java-translate-type-spec
+			       (second d))
+			      & (java-translate-a-tree (first d))
+			      & (java-translate-a-tree (third d)))))))
+    (setq oTree (bquote (JAVA_BLOCK & (reverse oDeclarations) 
+				    (JAVA_STATEMENTS
+				     && (java-translate-list-of-trees
+					 (rest (rest tree)))))))
+    (return oTree) ))
+
+(defun (java-translate-cast CONS) ((tree CONS))
+  ;; Translate a cast
+  ;; `tree' has form (CAST <expression> <type>)
+  (let ((expression (second tree))
+        (type (type-spec-to-base-type (third tree))))
+    (when (and (subtype-of? type @FLOAT) (isa? expression @INTEGER-WRAPPER))
+      (return (java-translate-a-tree
+	       (wrap-literal (cast (wrapper-value (cast expression INTEGER-WRAPPER))
+				   @FLOAT)))))
+    (when (and (subtype-of? type @INTEGER) (isa? expression @FLOAT-WRAPPER))
+      (return (java-translate-a-tree
+	       (wrap-literal (cast (wrapper-value (cast expression FLOAT-WRAPPER))
+				   @INTEGER)))))
+    (setf (first tree) (quote JAVA_CAST))
+    (setf (second tree) (java-translate-a-tree (second tree)))
+    (setf (third tree) (java-translate-type-spec (third tree)))
+    (return tree) ))
+
+(defun (java-translate-return-tree CONS) ((tree CONS))
+  ;; Translate a return tree
+  ;; Tree has form "(return <exp1> <exp2> . . . <expn>)"
+  (let ((oTree CONS NULL)
+	(returnAssignments CONS NIL)
+	(methodOtherReturnTypes
+         ;; If we're returning the results of a function which returns
+         ;;   multiple values, we must appropriately return each of them:
+         (rest (method-return-type-specifiers *methodBeingWalked*)))
+	(returnExpression OBJECT NULL)
+	(translatedReturnExpression CONS NIL)
+	(MVReturnParameterTranslation CONS NIL))
+    
+    ;; Generate return variables when returning multiple values
+    ;; TO DO:  Do we need to possibly coerce return values? i.e., INTEGER -> FLOAT ?
+    (foreach exp in (rest (rest tree))
+	as parameterIndex in (interval 0 NULL)
+	as parameterType in methodOtherReturnTypes
+	do
+	  (if (subtype-of? (type-spec-to-base-type parameterType) @LITERAL)
+	      (setq MVReturnParameterTranslation 
+		(java-translate-a-tree 
+		 (bquote (SYS-CALL-FUNCTION & (lookup-literal-type-info 
+					       (type-spec-to-base-type parameterType)
+					       :wrap-function)
+					  & exp))))
+	    (setq MVReturnParameterTranslation 
+	      (java-translate-a-tree exp)))
+	  (pushq returnAssignments 
+		 (bquote 
+		  (JAVA_ASSIGN
+		   (JAVA_AREF (JAVA_IDENT & (wrap-literal "MV_returnarray"))
+			      & parameterIndex)
+		   & MVReturnParameterTranslation))))
+    
+    (setq returnAssignments (reverse returnAssignments))
+    (setq returnExpression (second tree))
+
+    ;; If we're returning the result of a function which returns
+    ;;   multiple values, pass this function's return variables to the callee
+    (if (and (> (length methodOtherReturnTypes) 0)
+	     (empty? (rest (rest tree)))
+	     (cons? returnExpression)
+	     (defined? (first (cast returnExpression CONS)))
+	     (or
+	      (eql? (first (cast returnExpression CONS))
+		    (quote SYS-CALL-FUNCTION))
+	      (eql? (first (cast returnExpression CONS))
+		    (quote SYS-CALL-METHOD))))
+	(setq translatedReturnExpression
+	  ;; Pass the mv_returnarray variable used in the call to the
+	  ;; function containing the return statement to the function
+	  ;; being called in the return statement:
+	  (java-translate-mv-function-call returnExpression (quote |MV_returnarray|)))
+        (setq translatedReturnExpression
+	  (java-translate-a-tree returnExpression)))
+		
+
+    (if (empty? returnAssignments)
+	(if (nil? (rest tree))
+	    (setq oTree
+	      (bquote (JAVA_RETURN)))
+	    (setq oTree 
+	      (bquote (JAVA_RETURN & translatedReturnExpression))))
+      (let ((tempVarName "_return_temp"))
+        (setq oTree
+	  (bquote (JAVA_BLOCK
+		   ((& (java-translate-type-spec
+			(compute-return-type-spec *methodBeingWalked* 
+						  (slot-owner *methodBeingWalked*)))
+		      (JAVA_IDENT & tempVarName)
+		      & translatedReturnExpression))
+		   (JAVA_STATEMENTS
+		    && returnAssignments
+		    (JAVA_RETURN (JAVA_IDENT & tempVarName))))))))
+    (return oTree) ))
+
+(defun (java-translate-break CONS) ((tree CONS))
+  ;; Translate a break statement within a loop
+  (when (null? *java-loop-name*) (break-program "No loop name in (BREAK)"))
+  (setq *java-loop-name-used?* TRUE)
+  (setf (first tree) (quote JAVA_BREAK))
+  (setf (rest tree) (bquote (& (java-translate-a-tree *java-loop-name*))))
+  (return tree) )
+
+(defun (java-translate-continue CONS) ((tree CONS))
+  ;; Translate a continue statement within a loop
+  (when (null? *java-loop-name*) (break-program "No loop name in (CONTINUE)"))
+  (setq *java-loop-name-used?* TRUE)
+  (setf (first tree) (quote JAVA_CONTINUE))
+  (setf (rest tree) (bquote (& (java-translate-a-tree *java-loop-name*))))
+  (return tree) )
+
+(defun (java-translate-if-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is an IF statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((test (java-translate-a-tree (second tree)))
+        (trueBody CONS (java-translate-a-tree (first (rest (rest tree)))))
+	(falseBody CONS (java-translate-a-tree (second (rest (rest tree))))))
+    (setf (rest (rest tree)) NIL)	; detach before garbage collecting
+    (if (and (cons? (first trueBody))
+	       (non-empty? (rest trueBody)))
+	(setq truebody (bquote (JAVA_PROGN (JAVA_STATEMENTS && trueBody))))
+        (setq truebody (bquote (JAVA_PROGN (JAVA_STATEMENTS & trueBody)))))
+    (if (and (cons? (first falseBody))
+	       (non-empty? (rest falseBody)))
+	(setq falseBody (bquote (JAVA_PROGN (JAVA_STATEMENTS && falseBody))))
+        (setq falseBody (bquote (JAVA_PROGN (JAVA_STATEMENTS & falseBody)))))
+    (return 
+      (bquote (JAVA_IF 
+	       & test 
+	       & truebody
+	       & falseBody))) ))
+
+(defun (java-symbol-case? BOOLEAN) ((keyform OBJECT))
+  ;; Return TRUE if the keyform of a case statement accesses the symbol-id
+  (typecase keyform
+    (CONS
+     (return 
+       (and (eql? (first keyform) (quote sys-slot-value))
+	    (eql? (third keyform) (quote symbol-id)))))
+    (otherwise
+     (return FALSE))) )
+
+(defun (java-yield-symbol-id-form CONS) ((symbolId INTEGER))
+  ;; Helping function for `java-translate-condition':
+  ;; Yield a form for the symbolic name of a symbol id given an integer
+  (let ((symbol (get-sym symbolId)))
+    (return (bquote (JAVA_IDENT & (java-translate-symbol-id symbol)))) ))
+
+(defun (java-translate-condition CONS) ((condition CONS) 
+					 (symbolCaseP BOOLEAN))
+  ;; Helping function for `java-translate-case-tree': translate
+  ;;   condition part of case.  If we're translating a symbol case,
+  ;;   translate integer offsets into symbolic constants.
+  (let ((translatedActions (bquote (JAVA_STATEMENTS
+				    && (java-translate-list-of-trees 
+					(rest condition)))))
+	(keys (first condition))
+	(translatedKeys OBJECT NULL)
+	(translatedKeysList CONS NIL))
+    ;; If symbol case, keys are integers, translate them into symbolic ids
+    (if symbolCaseP
+      (if (cons? keys)
+	(progn            
+	  (foreach key in (cast keys CONS)
+		   collect (java-yield-symbol-id-form 
+			    (wrapper-value (cast key INTEGER-WRAPPER)))
+		   into translatedKeysList)
+	  (setq translatedKeys translatedKeysList))
+	(setq translatedKeys (java-yield-symbol-id-form 
+			      (wrapper-value (cast keys INTEGER-WRAPPER)))))
+      ;; Else we're not a symbol case
+      (setq translatedKeys
+	(choose (cons? keys)
+		(java-translate-list-of-trees 
+		 keys)
+		(java-translate-a-tree keys))))
+    (return (bquote ( & translatedKeys & translatedActions))) ))
+
+(defun (java-translate-case-tree CONS) ((tree CONS))
+  ;; Translate a case statement
+  (let ((otherwiseCondition CONS NULL)
+	(conditions CONS NIL)
+	(keyForm OBJECT NULL)
+	(symbolCaseP BOOLEAN FALSE))
+    (setq symbolCaseP (java-symbol-case? (second tree)))
+    (setq keyForm (java-translate-a-tree (second tree)))
+    (foreach condition in (rest (rest tree))
+	     do
+	     (typecase condition 
+		 (CONS
+		  (if (eq? (value condition) (quote OTHERWISE))
+		    (setq otherwiseCondition 
+		      (bquote 
+		       (JAVA_STATEMENTS
+			&& (java-translate-list-of-trees (rest condition)))))
+		    
+		    (pushq
+		     conditions
+		     (java-translate-condition condition symbolCaseP))))))
+    ;; Clip for gc
+    (setf (rest (rest tree)) NIL)
+    (return (bquote (JAVA_CASE 
+		     & keyForm
+		     & otherwiseCondition
+		     & (reverse conditions)))) ))
+
+(defun (java-translate-cond-tree CONS) ((tree CONS))
+  ;; Translate a cond statement
+  (let ((otherwiseCondition CONS NULL)
+	(conditions CONS NIL))
+    (foreach condition in (rest tree)
+	     do
+	     (typecase condition
+	       (CONS
+		(if (eq? (value condition) (quote OTHERWISE))
+		    (setq otherwiseCondition 
+		      (bquote 
+		       (JAVA_PROGN
+			(JAVA_STATEMENTS
+			 && (java-translate-list-of-trees (rest condition))))))
+	            (pushq
+		     conditions
+		     (bquote
+		      (& (java-translate-a-tree (first condition))
+			 (JAVA_PROGN
+			  (JAVA_STATEMENTS
+			   && (java-translate-list-of-trees 
+			       (rest condition)))))))))))
+    (return (bquote (JAVA_COND & otherwiseCondition
+			      & (reverse conditions)))) ))
+
+(defun (java-translate-while CONS) ((tree CONS))
+  ;; Translate a while loop.
+  (special ((*java-loop-name* (local-gensym "LOOP"))
+	    (*java-loop-name-used?* FALSE))
+    (let ((test (java-translate-a-tree (second tree)))
+	  (body (java-translate-list-of-trees (rest (rest tree)))))
+      (setf (rest (rest tree)) NIL)	; clip subtree before gc
+      (if *java-loop-name-used?*
+	  (return
+	    (bquote (JAVA_NAMED_STATEMENT
+		     & (java-translate-a-tree *java-loop-name*)
+		     (JAVA_WHILE
+		      & test
+		      (JAVA_PROGN
+		       (JAVA_STATEMENTS
+			&& body))))))
+	  (return
+	    (bquote (JAVA_WHILE
+		     & test
+		     (JAVA_PROGN
+		      (JAVA_STATEMENTS
+		       && body))))))
+      )))
+
+(defun (java-translate-choose-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is a CHOOSE statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((test (second tree))
+        (trueBody (first (rest (rest tree))))
+	(falseBody (second (rest (rest tree)))))
+    (setf (rest (rest tree)) NIL)      ; detach before garbage collecting
+    (return
+      (java-translate-operator-call 
+       (bquote (& (wrap-literal "?")
+		  & (wrap-literal ":")))
+       (bquote (& test & trueBody & falseBody))
+       3 )) ))
+
+(defun (java-translate-when-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is a WHEN statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((test (java-translate-a-tree (second tree)))
+        (body (java-translate-list-of-trees (rest (rest tree)))))
+    (setf (rest (rest tree)) NIL)      ; detach before garbage collecting
+    (return 
+      (bquote (JAVA_WHEN 
+	       & test 
+	       (JAVA_STATEMENTS
+		&& body)))) ))
+
+(defun (java-translate-unless-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is a WHEN statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((test (java-translate-a-tree (second tree)))
+        (body (java-translate-list-of-trees (rest (rest tree)))))
+    (setf (rest (rest tree)) NIL)      ; detach before garbage collecting
+    (return 
+      (bquote (JAVA_UNLESS 
+	       & test 
+	       (JAVA_STATEMENTS
+		&& body)))) ))
+
+(defun (java-translate-make-tree CONS) ((tree CONS))
+  ;; Translate a make statement.
+  (let ((class (get-stella-class (cast (second tree) SYMBOL) TRUE))
+	(className (choose (defined? (class-java-native-type class))
+			   (wrap-literal (java-native-type class))
+			   (java-translate-class-name (second tree))))
+	(oTree
+	 (bquote (JAVA_MAKE (JAVA_IDENT & className)
+			    & (java-translate-actual-parameters (rest (rest tree)))))))
+    (return oTree) ))
+
+(defun (java-translate-sys-new CONS) ((tree CONS))
+  ;; Translate a call for allocation of new storage
+  (let ((typeSpec TYPE-SPEC (second tree)))
+    (if (array-type-specifier? typeSpec)
+        (return (java-translate-new-array tree))
+      (return
+	(bquote (JAVA_FUNCTION_CALL
+		 (JAVA_IDENT
+		  & (java-translate-type-spec typeSpec))
+		 (JAVA_IDENT
+		  & (java-translate-name 
+		     (yield-constructor-name (type-spec-to-class typeSpec))))
+		 & (java-translate-actual-parameters (rest (rest tree))))))) ))
+
+(defun (java-translate-new-array CONS) ((tree CONS))
+  ;; Translate a NEW `tree' for an array type.
+  (let ((arrayType PARAMETRIC-TYPE-SPECIFIER (second tree))
+        (initialElement
+         ;; NOTE: If this is `null?' as opposed to (quote NULL) or some other
+         ;;    value, it means we don't need to initialize the array:
+         ;; NOTE2: We ignore this for now until until we decide whether/how
+         ;;    to do that in C++ and Java.
+         (third tree))
+        (dimensions (java-translate-list-of-trees (rest (rest (rest tree)))))
+        (elementType (extract-parameter-type arrayType (quote ANY-VALUE))))
+    (return
+      (bquote
+       (JAVA_MAKE_ARRAY
+	& (java-translate-type-spec elementType)
+	&& dimensions)))))
+
+(defun (java-translate-mv-setq CONS) ((tree CONS))
+  ;; Translate a Java multiple value setq
+  ;; "tree" has form '(MV-SETQ <variables> <statement>) 
+  ;; NOTE: THIS VERSION ASSUMES THAT <STATEMENT> IS A FUNCTION CALL!!
+  (let ((variables CONS (second tree))
+	(functionCall CONS (third tree))
+	(mvAssignments NIL)
+	(oTree CONS NULL)
+	(otherReturnTypes NIL)
+	(MVReturnedValue CONS NIL))
+    (if (eq? (first functionCall) (quote SYS-CALL-FUNCTION))
+	(setq otherReturnTypes		; Function Call
+	  (rest (method-return-type-specifiers
+		 (lookup-function-or-stella-function
+		  (cast (second functionCall) SYMBOL)))))
+      (setq otherReturnTypes		; Method Call
+	(rest (method-return-type-specifiers
+	       (cast (lookup-slot
+		      (surrogate-value (cast (second functionCall) SURROGATE))
+		      (cast (third functionCall) SYMBOL))
+		     METHOD-SLOT)))))
+    (foreach variable in (rest variables)
+	as currentIndex in (interval 0 NULL)
+	as returnType in otherReturnTypes
+	do (setq MVReturnedValue
+	     (bquote (JAVA_AREF (JAVA_IDENT "caller_MV_returnarray")
+				& currentIndex)))
+	   (when (subtype-of? (type-spec-to-base-type returnType) @LITERAL)
+	     (setq MVReturnedValue
+	       (bquote (JAVA_SLOT_VALUE
+			(JAVA_CAST & MVReturnedValue
+				   & (java-translate-type-spec
+				      (yield-type-specifier
+				       (type-to-wrapped-type
+					(type-spec-to-base-type
+					 (cast returnType TYPE-SPEC))))))
+			& (wrap-literal "wrapperValue")))))
+	   (pushq
+	    mvAssignments
+	    (bquote
+	     (JAVA_ASSIGN
+	      & (java-translate-a-tree variable)
+	      (JAVA_CAST
+	       & MVReturnedValue
+	       & (java-translate-type-spec (cast returnType TYPE-SPEC)))))))
+    (setq oTree
+      (bquote
+       (JAVA_BLOCK
+	((& (java-translate-array-of-type-spec @NATIVE-OBJECT-POINTER FALSE)
+	    (JAVA_IDENT "caller_MV_returnarray")
+	    (JAVA_MAKE_ARRAY & (java-translate-type-spec @NATIVE-OBJECT-POINTER)
+			     & (length otherReturnTypes))))
+	(JAVA_STATEMENTS
+	 (JAVA_ASSIGN 
+	  & (java-translate-a-tree (first variables))
+	  & (java-translate-mv-function-call functionCall (quote |caller_MV_returnarray|)))
+	 && (reverse mvAssignments)))))
+    (return oTree) ))
+
+(defun (java-translate-mv-function-call CONS) ((functionCall CONS) (mvVectorName SYMBOL))
+  ;; Translate a function call where the function returns multiple values
+  (return (java-translate-a-tree
+	   (bquote (&& functionCall & mvVectorName)))))
+
+;; Copied from C++ code.
+;; TO DO ANSWER THE FOLLOWING:
+;; Is this needed?  We don't need to translate the signature, but
+;;   we may want to retain the original signature just so that we
+;;   can more easily generate the output.
+(defun (java-translate-code-signature CONS) ((signature CONS))
+  ;; Translate a function's signature
+  ;; `signature' has form
+  ;; ((<return type1> ... <return typen>) <param type1> ... <param typen>)
+  (let ((translatedReturnTypes CONS NIL)
+	(translatedParameterTypes CONS NIL))
+    (foreach returnType in (cast (first signature) CONS)
+	     collect (java-translate-type-spec returnType)
+	     into translatedReturnTypes)
+    (foreach parameterType in (rest signature)
+	     collect (java-translate-type-spec parameterType)
+	     into translatedParameterTypes)
+    (return (bquote (JAVA_FUNCTION_SIGNATURE & translatedReturnTypes
+					     & translatedParameterTypes))) ))
+
+
+(defun (java-translate-with-native-wrapper CONS) ((tree OBJECT) (type TYPE-SPEC))
+  ;; translate tree used in wrapping literal types with native wrappers.
+  ;; Helping function for "java-translate-actual-parameters-with-native-wrappers"
+  ;;   and "java-translate-setq-tree" for special variables.
+  (if (java-literal? type)
+      (return
+	(bquote 
+	 (JAVA_MAKE (JAVA_IDENT & (java-native-literal-wrapper-names type))
+		    (JAVA_ACTUALS & (java-translate-a-tree tree)))))
+    (return (java-translate-a-tree tree))) )
+
+(defun (java-translate-actual-parameters-with-native-wrappers CONS) 
+    ((trees CONS) (parameterTypes (CONS OF TYPE-SPEC)))
+  ;; translate actual parameters used in a method or function call, with wrapping
+  ;;   of literal types with native wrappers.
+  (let ((cursor trees) (typeCursor parameterTypes))
+    (while (non-empty? cursor)
+      (setf (value cursor)
+	(java-translate-with-native-wrapper (value cursor) (value typeCursor)))
+      (setq cursor (rest cursor))
+      (setq typeCursor (rest typeCursor)))
+    (return trees) ))
+
+(defun (java-wrap-with-native-value-extraction CONS) 
+    ((tree CONS) (primaryReturnType TYPE-SPEC))
+  ;; Wrap `tree' with code to extract the proper native Value from a Native
+  ;;  wrapper class for the literal type in `primaryReturnType';
+  (mv-bind (wrapperType extractorName)
+      (java-native-literal-wrapper-names primaryReturnType)
+    (return
+      (bquote
+       (JAVA_METHOD_CALL 
+	(JAVA_IDENT & (wrap-literal ""))
+	(JAVA_IDENT & extractorName)
+	(JAVA_CAST & tree & wrapperType)
+	(JAVA_ACTUALS))))))
+
+(defun (java-translate-object-to-return-type CONS) ((tree CONS) (returnType TYPE-SPEC))
+  ;; Funcalls and special variables store objects of type java.lang.Object,
+  ;;  so they need to be translated (by extraction or casting) to
+  ;;  handle appropriately the transformation into literals, stella objects
+  ;;  and suppress the casting for VOID returns.
+  (cond ((java-literal? returnType)
+	 (return 
+	   (java-wrap-with-native-value-extraction tree returnType)))
+	((or (eq? returnType @STRING)
+	     (eq? returnType @MUTABLE-STRING))
+	 (return
+	   (bquote (JAVA_CAST & tree & (java-translate-type-spec returnType)))))
+	((eq? returnType @VOID)
+	 (return tree))
+	(otherwise
+	 (return
+	   (bquote (JAVA_CAST & tree & (java-translate-type-spec returnType)))))) )
+
+(defun (java-translate-call-function-code CONS) ((tree CONS))
+  ;; Translate a funcall, including the signature
+  ;; `tree' has form 
+  ;; (SYS-CALL-FUNCTION-CODE
+  ;;  ((<return type1> ... <return typen>) <param type1> ... <param typen>)
+  ;;  <code expr>)
+  (let ((signature (java-translate-code-signature (second tree)))
+	(functionNameExpr (java-translate-a-tree (third tree)))
+	(functionArgs (rest (rest (rest tree))))
+	(primaryReturnType (first (cast (first (cast (second tree) CONS))
+					(CONS OF TYPE-SPEC)))) 
+	(oTree CONS NULL))
+
+    (setq oTree
+      (bquote
+       (JAVA_FUNCALL
+	 & signature
+	 & functionNameExpr
+	 (JAVA_ACTUALS 
+	  && (java-translate-actual-parameters-with-native-wrappers
+	      functionArgs
+	      (rest (cast (second tree) (CONS OF TYPE-SPEC))))))))
+
+    (return 
+      (java-translate-object-to-return-type oTree primaryReturnType)) ))
+
+(defun (java-translate-call-method-code CONS) ((tree CONS))
+  ;; Translate a method call, including the signature
+  ;; `tree' has form 
+  ;; (((<return type1> ... <return typen>) <param type1> ... <param typen>)
+  ;;     <code expr> <arg1> ... <argN>)
+  ;; NOTE: ideally this should be implemented using a cast, but
+  ;;   casts currently only handle simple types 
+  (let ((signature (java-translate-code-signature (second tree)))
+	(methodNameExpr (java-translate-a-tree (third tree)))
+	(primaryReturnType (first (cast (first (cast (second tree) CONS))
+					(CONS OF TYPE-SPEC))))
+	(theObject (first (rest (rest (rest tree)))))
+	(methodArgs (rest (rest (rest (rest tree)))))
+	(oTree CONS NULL))
+    (setq oTree
+      (bquote
+       (JAVA_METHOD_CODE_CALL
+	 & signature
+	 & methodNameExpr
+	 & (java-translate-a-tree theObject)
+	 (JAVA_ACTUALS 
+	  && (java-translate-actual-parameters-with-native-wrappers
+	      methodArgs 
+	      (rest (rest (cast (second tree) (CONS OF TYPE-SPEC)))))))))
+
+    (return 
+      (java-translate-object-to-return-type oTree primaryReturnType)) ))
+
+;; Returns a hierarchy of the names of packages below root.
+(defun (java-package-prefix STRING) ((module MODULE) (separator STRING))
+  ;; Returns the package prefix for "mod", with multiple entries
+  ;;   separated by "separator".  THERE WILL BE A TRAILING SEPARATOR!
+  ;; TODO:  Consider using a separate cache for the "/" 
+  ;;        separator result for directory names.
+  (let ((result STRING "")
+	(separator-char CHARACTER (nth separator 0))
+	(package-prefix (java-package module)))
+    (when (defined? package-prefix)
+      (if (eq? separator-char #\.)
+	(setq result package-prefix)
+	(setq result (substitute package-prefix separator-char #\.)))
+      (return (concatenate result separator)))
+    
+    (setq result 
+      (concatenate (java-translate-namestring (string-downcase (name module)))
+		   separator))
+    (foreach mod in (parent-contexts module)
+	where (and (isa? mod @MODULE)
+		   (not (eq? mod *root-module*)))
+	do (setq result 
+	     (concatenate (java-package-prefix mod separator) result))
+	   (break))
+    ;; Cache result for the general case.
+    (when (eq? separator-char #\.)
+      (setf (java-package module) (subsequence result 0 (- (length result) 1))))
+    (return result) ))
+
+(defun (java-yield-fully-qualified-type-name STRING-WRAPPER) ((typeSpec TYPE-SPEC))
+  ;; Returns a fully qualified Java name for "typeSpec" in module "module"
+  (let ((baseTypeSpec (type-spec-to-base-type typeSpec))
+	(translatedType STRING-WRAPPER NULL)
+	(nativeType (java-native-type (type-class baseTypeSpec))))
+    (when (eql? basetypeSpec @ARGUMENT-LIST)  ; Ugh.  Special case code to map this to CONS.
+      (setq basetypeSpec @CONS)
+      (setq nativeType NULL))
+    (when (defined? nativeType)
+      (if (or (member? nativeType #\.)  ; This is already fully specified
+	      (java-literal? typeSpec))
+	  (return nativeType)
+	(return (concatenate "java.lang." nativeType))))
+    (setq translatedType (java-translate-type-spec baseTypeSpec))
+    (if (member? (wrapper-value translatedType) #\.)    ;; This is already fully specified
+	(return translatedType)
+      (return
+	(concatenate (java-package-prefix (home-module baseTypeSpec) ".")
+		     (wrapper-value translatedType)))) ))
+
+(defun (java-yield-translated-class-and-function-names STRING-WRAPPER STRING-WRAPPER) ((f FUNCTION))
+  ;; Returns multiple values of the (1) the fully qualified class Name on which
+  ;;   the function is defined and (2) the translated name of the function.
+  (cond ((java-flotsam-function? f)
+	 (return (concatenate (java-package-prefix (home-module f) ".")
+			      (java-yield-flotsam-class-name (home-module f)))
+		 (java-translate-function-name f)))
+	((method-native? f)
+	 (return (java-yield-full-native-class-name)
+		 (java-translate-function-name f)))
+	((method-startup-function? f)
+	 (return (concatenate
+		  (java-package-prefix (home-module f) ".")
+		  (java-translate-class-namestring (method-startup-classname f)))
+		 (java-translate-function-name f)))
+	((method-constructor? f)
+	 (return (java-yield-fully-qualified-type-name
+		  (first (method-return-type-specifiers f)))
+		 (java-translate-function-name f)))
+	(otherwise
+	 (return (java-yield-fully-qualified-type-name
+		  (first (method-parameter-type-specifiers f)))
+		 (java-translate-function-name f)))) )
+
+(defun (java-yield-translated-class-and-method-names STRING STRING) ((owner TYPE-SPEC) (f FUNCTION))
+  ;; Returns multiple values of the (1) the fully qualified class Name on which
+  ;;   the function is defined and (2) the translated name of the function.
+  (cond ((method-native? f)
+	 (return (java-yield-full-native-class-name)
+		 (java-translate-function-name f)))
+	((java-flotsam-function? f)
+	 (return (concatenate (java-package-prefix (home-module f) ".")
+				     (java-yield-flotsam-class-name (home-module f)))
+		 (java-translate-function-name f)))
+;; Shouldn't be needed:
+;	((method-startup-function? f)
+;	 (return (concatenate
+;		  (java-package-prefix (home-module f) ".")
+;		  (java-translate-class-namestring (method-startup-classname f)))
+;		 (java-translate-function-name f)))
+	(otherwise
+	 (return (java-yield-fully-qualified-type-name owner)
+		 (java-translate-function-name f)))) )
+
+(defun (java-translate-class-object-lookup CONS) ((className STRING))
+  (return 
+    (bquote (JAVA_FUNCTION_CALL
+	     (JAVA_IDENT & (wrap-literal (java-yield-native-class-name)))
+	     (JAVA_IDENT & (wrap-literal "find_java_class"))
+	     (JAVA_ACTUALS & (wrap-literal className))))))
+
+(defun (java-yield-class-object-array-expression CONS) ((typeSpec TYPE-SPEC) (nDimensions INTEGER))
+  ;; Returns an expression that will produce a Java class object corresponding
+  ;;   to an array of "typeSpec" with "nDimensions" dimensions;
+  ;; This special-cases the literal types and otherwise produces calls to
+  ;;   a reflective function that returns the proper type.
+  (let ((prefix STRING (make-string nDimensions #\[))
+	(classType TYPE NULL)
+	(classID STRING NULL))
+    (typecase typeSpec
+      (PARAMETRIC-TYPE-SPECIFIER
+       (setq classType (specifier-base-type typeSpec)))
+      (TYPE
+       ;; Do double indirection to find true type in the face of synonyms.
+       (setq classType (class-type (type-class typeSpec)))))
+    (case classType
+      (@VOID      
+       (error "VOID is an invalid array base type."))
+      (@BOOLEAN
+       (setq classID "Z"))
+      (@INTEGER
+       (setq classID "I"))
+      (@CHARACTER
+       (setq classID "C"))
+      ((@BYTE @OCTET)
+       (setq classID "B"))
+      ((@FLOAT @DOUBLE-FLOAT)
+       (setq classID "D"))
+
+      ((@SHORT-INTEGER @UNSIGNED-SHORT-INTEGER)
+       (setq classID "S"))
+      ((@LONG-INTEGER @UNSIGNED-LONG-INTEGER)
+       (setq classID "J"))
+      (@SINGLE-FLOAT
+       (setq classID "F"))
+
+      (@STRING
+       (setq classID "Ljava.lang.String;"))
+      (@MUTABLE-STRING
+       (setq classID "Ljava.lang.StringBuffer;"))
+    
+      (otherwise
+       (setq classID
+	 (concatenate "L" (java-yield-fully-qualified-type-name typeSpec) ";"))) )
+
+    (return (java-translate-class-object-lookup
+	     (concatenate prefix classID))) ))
+
+(defun (java-yield-class-object-expression CONS) ((typeSpec TYPE-SPEC))
+  ;; Returns an expression that will produce a Java class object corresponding
+  ;;   to "typeSpec";
+  ;; This special-cases the literal types and otherwise produces calls to
+  ;;   a reflective function that returns the proper type.
+  (let ((oTree CONS NULL)
+	(classType TYPE NULL))
+    (typecase typeSpec
+      (PARAMETRIC-TYPE-SPECIFIER
+       (if (array-type-specifier? typeSpec)
+	   (return (java-yield-class-object-array-expression
+		    (extract-parameter-type typeSpec (quote ANY-VALUE))
+		    (length (array-type-dimensions typeSpec))))
+	   (setq classType (specifier-base-type typeSpec))))
+      (TYPE
+       ;; Do double indirection to find true type in the face of synonyms.
+       (setq classType (class-type (type-class typeSpec)))))
+    (case classType
+      (@VOID      
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Void.TYPE")))))
+      (@BOOLEAN
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Boolean.TYPE")))))
+      ((@INTEGER @THIRTY-TWO-BIT-VECTOR)
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Integer.TYPE")))))
+      (@CHARACTER
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Character.TYPE")))))
+      ((@BYTE @OCTET)
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Byte.TYPE")))))
+      ((@FLOAT @DOUBLE-FLOAT)
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Double.TYPE")))))
+
+      ((@SHORT-INTEGER @UNSIGNED-SHORT-INTEGER)
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Short.TYPE")))))
+      ((@LONG-INTEGER @UNSIGNED-LONG-INTEGER @TICKTOCK @NATIVE-DATE-TIME)
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Long.TYPE")))))
+      (@SINGLE-FLOAT
+       (setq oTree (bquote (JAVA_VERBATIM & (wrap-literal "java.lang.Float.TYPE")))))
+
+      (@STRING
+       (setq oTree (java-translate-class-object-lookup "java.lang.String")))
+      (@MUTABLE-STRING
+       (setq oTree (java-translate-class-object-lookup "java.lang.StringBuffer")))
+    
+      (otherwise
+       (if (and (not (eql? classType @ARGUMENT-LIST)) ;; need to special-case this
+                (defined? (class-java-native-type (type-class classType))))
+           (setq oTree 
+	     (java-translate-class-object-lookup
+	      (yield-class-object-lookup-name-for-native-type
+	       (java-native-type (type-class classType)))))
+         (setq oTree (java-translate-class-object-lookup 
+                      (java-yield-fully-qualified-type-name typeSpec))))))
+    (return oTree)))
+
+(defglobal *java-primitive-array-type-names* KEY-VALUE-LIST
+  (dictionary @KEY-VALUE-LIST
+              "byte"    "B"
+              "char"    "C"
+              "double"  "D"
+              "float"   "F"
+              "int"     "I"
+              "long"    "J"
+              "short"   "S"
+              "boolean" "Z"))
+
+(defun (yield-class-object-lookup-name-for-native-type STRING) ((nativeType STRING))
+  ;; Parse `nativeType' and return a string that can be used to lookup the
+  ;;    corresponding Java class object.
+  (let ((baseType nativeType)
+        (package "java.lang.") ;; if unqualified, assume `java.lang'
+        (arrayDimensions 0)
+        (index -1)
+	(arrayMarkerIndex INTEGER NULL))
+    (foreach ch in nativeType
+        as i in (interval 0 NULL)
+	   ;; Look for package markers
+	do (when (eql? ch #\.)
+	     (setq index i))
+	   ;; Count array dimensions
+	   (when (eql? ch #\[)
+	     (when (null? arrayMarkerIndex)
+	       (setq arrayMarkerIndex i))
+	     (++ arrayDimensions)))
+    (when (>= index 0)
+      (setq package (subsequence nativeType 0 (1+ index))))
+    (setq baseType (subsequence nativeType (1+ index) arrayMarkerIndex))
+    (cond ((defined? (lookup *java-primitive-array-type-names* baseType))
+	   (setq baseType (lookup *java-primitive-array-type-names* baseType)))
+	  ((> arrayDimensions 0)
+	   (setq baseType (concatenate "L" package baseType ";")))
+	  (otherwise 
+	   (setq baseType (concatenate package baseType))))
+    (case arrayDimensions
+      (0 (return baseType))
+      (1 (return (concatenate "[" baseType)))
+      (2 (return (concatenate "[[" baseType)))
+      (otherwise (return (concatenate (make-string arrayDimensions #\[) baseType))))))
+
+(defun (java-translate-param-type-specifications CONS) ((fn METHOD-SLOT) (owner TYPE-SPEC))
+  ;; Returns a translation for the type specifiers which creates an array at
+  ;;  runtime holding the appropriate Java native Class objects for the
+  ;;  translated parameter types.
+  ;; If owner is supplied, then this is a METHOD rather than a FUNCTION.
+  ;; Parameter Types:
+  (let ((paramClasses CONS NIL)
+	;; Skip first parameter if a method defined on a non-native type.
+	(skipParameter? (and (not (method-function? fn))
+			     (not (java-method-object-defined-on-native-type? fn)))))
+    ;; Parameter Types:
+    (foreach ts in (method-parameter-type-specifiers fn)
+	do (cond (skipParameter?
+		  (setq skipParameter? FALSE))
+		 ((anchored-type-specifier? ts)
+		  (pushq paramClasses 
+			 (java-yield-class-object-expression
+			  (compute-anchored-type-spec owner ts))))
+		 (otherwise
+		  (pushq paramClasses (java-yield-class-object-expression ts)))))
+    ;; TO DO:  DO WE NEED VARIABLE ARGS CODE HERE?
+       
+    ;; Additional Multiple Value return:
+    (unless (empty? (rest (method-return-type-specifiers fn)))
+      (pushq paramClasses 
+	     (java-yield-class-object-array-expression @NATIVE-OBJECT-POINTER 1)))
+
+    (return
+      (bquote (JAVA_ANONYMOUS_ARRAY
+	       & (wrap-literal "java.lang.Class")
+	       && (reverse paramClasses)))) ))
+
+
+(defun (java-translate-the-code OBJECT) ((tree CONS))
+  ;; Tree is either (the-code :function <name>)
+  ;;             or (the-code :function <name> <methodSlotObject>)
+  ;;             or (the-code :method <owner> <name>)
+  ;; Form #2 is used for unregistered methods like EVALUATOR-WRAPPERs.
+  (let ((oTree CONS NULL)
+	(fn METHOD-SLOT NULL)
+	(className STRING "") 
+	(functionName STRING "")
+	)
+    (case (second tree)
+      (:function
+       (setq fn (lookup-function (cast (third tree) SYMBOL)))
+       (unless (defined? fn)
+	 (setq fn (cast (fourth tree) METHOD-SLOT)))
+       (unless (defined? fn)
+	 (warn "Can't translate the-code form for function " (third tree) EOL
+	       " because it there is no corresponding function object")
+	 (return (java-translate-null)))
+       (mv-setq (className functionName)
+	 (java-yield-translated-class-and-function-names fn))
+       (setq oTree
+         (bquote
+	   (JAVA_FUNCTION_CALL
+	    (JAVA_IDENT &  (wrap-literal (java-yield-native-class-name)))
+	    (JAVA_IDENT & (wrap-literal "find_java_method"))
+	    (JAVA_ACTUALS & (wrap-literal className)
+			  & (wrap-literal functionName)
+			  & (java-translate-param-type-specifications fn NULL))))))
+      (:method
+       (setq fn (lookup-slot (type-class (cast (third tree) SURROGATE))
+			     (cast (fourth tree) SYMBOL)))
+       (unless (defined? fn)
+	 (warn "Can't translate the-code form for method " (fourth tree) EOL
+	       " because it there is no corresponding function object")
+	 (return (java-translate-null)))
+       ;; Might need class type
+       (mv-setq (className functionName)
+	 (java-yield-translated-class-and-method-names
+	  (cast (third tree) TYPE-SPEC) fn))
+       (setq oTree
+         (bquote
+	  (JAVA_FUNCTION_CALL
+	    (JAVA_IDENT &  (wrap-literal (java-yield-native-class-name)))
+	    (JAVA_IDENT & (wrap-literal "find_java_method"))
+	    (JAVA_ACTUALS & (wrap-literal className)
+			  & (wrap-literal functionName)
+			  & (java-translate-param-type-specifications 
+			     fn (cast (third tree) TYPE-SPEC))))))))
+    (return oTree) ))
+
+(defun (java-translate-function-name STRING-WRAPPER) ((function METHOD-SLOT))
+  ;; Create a name for the Java function defined by METHOD-SLOT.
+  ;; Do not prefix the name with the method's class.
+  (let ((functionName
+         (yield-renamed-name-if-native (slot-name function) :java :function))
+	(translatedName STRING NULL))
+    (when (java-method-object-is-overloaded-function? function)
+      (setq functionName (java-create-overloaded-function-name 
+			  functionName (slot-owner function))))
+    (setq translatedName (wrapper-value (java-translate-name functionName)))
+    ;; KLUDGE: we generate reader names and setter names in the translator.
+    ;;   The walker generates setter names.  Should it also generate reader
+    ;;   names?
+    (when (method-setter? function)
+      (setq translatedName (concatenate translatedName "_setter")))
+    (when (slot-reader? function)
+      (setq translatedName (concatenate translatedName "_reader")))
+    (return (wrap-literal translatedName)) ))
+
+(defun (java-translate-ignore-tree OBJECT) ((tree CONS))
+  ;; Inline and ignore statements are meant only for Lisp.
+  ;; They are ignored in Java.
+  (ignore tree)
+  (return (java-translate-null)) )
+
+(defun (java-stream-is-standard-output? BOOLEAN) ((tree OBJECT))
+  ;; Return TRUE if 'tree' is the native STANDARD-OUTPUT stream.
+  (typecase tree
+    (CONS
+     (return
+       (equal-cons-trees?
+        tree
+        (quote
+         (SYS-SLOT-VALUE @OUTPUT-STREAM NATIVE-STREAM STANDARD-OUTPUT)))))
+    (otherwise (return FALSE))))
+
+(defun (java-translate-print-stream CONS) ((tree CONS))
+  ;; Translate a print statement to a Java stream class output statement.
+  (setf (first tree) (quote JAVA_PRINT_STREAM))
+  (typecase (second tree)
+    (KEYWORD
+     (case (second tree)
+       ((:WARN :ERROR :CONTINUABLE-ERROR) 
+	(setf (second tree) (quote JAVA_STANDARD_ERROR)))))
+    (otherwise
+     (if (java-stream-is-standard-output? (second tree))
+         ;; Special-case standard output:
+         (setf (second tree) (quote JAVA_STANDARD_OUT))
+       (setf (second tree) (java-translate-a-tree (second tree))))
+     ))
+  (java-translate-list-of-trees (rest (rest tree)))
+  (return tree) )
+
+(defun (java-translate-print-native-stream CONS) ((tree CONS))
+  ;; Translate "print-native-stream" statement.  Currently
+  ;;  almost identical to 'print-stream' except that we
+  ;;  label this code fragment "JAVA_PRINT_NATIVE_STREAM" so
+  ;;  that a ".nativeStream" doesn't get appended to the stream
+  ;;  in the stream body.
+  (let ((oTree (java-translate-print-stream tree)))
+    (setf (first oTree) (quote JAVA_PRINT_NATIVE_STREAM))
+    (return oTree) ))
+
+(defun (java-translate-null CONS) ()
+  ;; Return a representation of NULL
+  (return (bquote (JAVA_IDENT & (wrap-literal "null")))) )
+
+(defun (java-translate-eol CONS) ()
+  ;; Return a representation of EOL
+  (return (bquote (JAVA_EOL & (java-translate-global-name (quote EOL) false)))) )
+
+
+(defmethod (java-translate-atomic-tree CONS) ((tree OBJECT))
+  ;; Return the value of the atom wrapped in a list.  
+  (return (bquote (JAVA_LITERAL & tree))) )
+
+
+(defun (java-prepend-global-class-name STRING) ((nameString STRING) (module MODULE))
+  ;; Return a reference to a (static) variable in the class used to define
+  ;;  global variables.
+  (return (concatenate (java-yield-flotsam-class-name module) "." nameString)))
+
+(defun (java-translate-global-name STRING-WRAPPER) ((nameSymbol SYMBOL) (definition? BOOLEAN))
+  ;; Convert 'nameSymbol' representing a global identifier to a Java identifier
+  ;; Like 'java-translate-name', except don't downcase name.
+  (when (null? nameSymbol)
+    (return (wrap-literal "NULL")))
+  (let ((rawName (java-substitute-forbidden-characters
+		  (java-change-case nameSymbol :uppercase) :uppercase))
+	(module (home-module nameSymbol)))
+    (cond (definition?
+	      (return (wrap-literal rawName)))
+	  ((omit-java-package-prefix? module
+				      (java-yield-flotsam-type-name (java-yield-flotsam-class-name module)))
+	   (return (wrap-literal (java-prepend-global-class-name rawName module))))
+	  (otherwise
+	   (return (wrap-literal (concatenate
+				   (java-package-prefix module ".")
+				   (java-prepend-global-class-name rawName  module)))))) ))
+
+
+(defun (java-translate-general-symbol CONS) ((tree  SYMBOL))
+  ;; Handle general purpose symbols.
+  ; Was: (globalVar (surrogate-value (surrogatify tree)))
+  (let ((globalVar (lookup-global-variable (soft-permanentify tree))))
+     ;; Regular symbol:
+    (cond ((null? globalVar)
+	   #|
+	    ;; Debugging Code:
+	    (when (and (> (length (symbol-name tree)) 4)
+		       (or (eql? (subsequence (symbol-name tree) 0 4) "KWD-")  ;; ZZZ
+			   (eql? (subsequence (symbol-name tree) 0 4) "kwd-")
+			   (eql? (subsequence (symbol-name tree) 0 4) "SYM-")
+			   (eql? (subsequence (symbol-name tree) 0 4) "sym-")))
+	      (verbatim :common-lisp (cl:break "Bad Symbol? ~S" tree)
+	      :otherwise (warn "Bad Symbol?")))
+	      |#
+	   (return (bquote (JAVA_IDENT 
+			    & (java-translate-name tree)))))
+	  ;; Special variable?
+	  ((variable-special? globalVar) 
+	   ;; Handle literal conversions & type casting or values.
+	   (return 
+	     (java-translate-object-to-return-type
+	      (bquote (JAVA_METHOD_CALL
+		       (JAVA_IDENT & (wrap-literal ""))
+		       (JAVA_IDENT & (wrap-literal "get"))
+		       (JAVA_IDENT & (java-translate-global-name tree FALSE))
+		       (JAVA_ACTUALS)))
+	      (global-variable-type-spec globalVar))))
+	  ;; Non-special Global variable
+	  (otherwise 
+	   (return 
+	     (bquote (JAVA_IDENT
+		      & (java-translate-global-name tree FALSE)))))) ))
+
+
+(defmethod (java-translate-atomic-tree CONS) ((tree SYMBOL))
+  ;; Return the value of the atom wrapped in a list.  
+  ;; Special case some known constants.
+  (cond 
+   ;; Special case some symbols
+   ((eq? tree (quote NULL))
+    (return (java-translate-null)))
+   ((eq? tree (quote EOL))
+    (return (java-translate-eol)))
+   (otherwise
+    (return (java-translate-general-symbol tree)))) )
+
+(defun (java-translate-method-parameter OBJECT) ((name SYMBOL) (type TYPE-SPEC) (method METHOD-SLOT))
+  ;; Translate a formal parameter specification, which consists of
+  ;;   a name and a type.
+  ;; For variables arguments, this maps ARGUMENT-LIST to CONS
+  (setq type (compute-relative-type-spec type (slot-owner method)))
+  (when (and (method-variable-arguments? method)
+             (eql? (variable-arguments-name method) name)
+             (or (pass-variable-arguments-as-list? method)
+		 (string-concatenate-method? method)  ;; For definition of method.
+		 ))
+    (setq type (yield-listified-variable-arguments-type method)))
+  (return
+    (bquote (& (java-translate-type-spec type)
+             & (java-translate-name name)))))
+
+(defun (java-translate-return-parameter CONS) ()
+  ;; Translate a return parameter for mv returns
+  (return
+    (bquote ("Object []" "MV_returnarray"))))
+
+(defun (java-translate-method-parameters CONS) ((method METHOD-SLOT))
+  ;; Translate a list of formal parameters into Java parameters
+  ;; NOTE: CAREFUL ABOUT GARBAGE! CURRENTLY DON'T FREE PARAMETERS
+  ;;   SINCE THIS IS CALLED MULTIPLE TIMES WITH THE SAME LIST.
+  (let ((skipFirstParameter? (not (java-method-object-is-function? method)))
+	(translatedParameters NIL))
+    (foreach pName in (method-parameter-names method)
+        as pType in (method-parameter-type-specifiers method)
+        as i in (interval 1 NULL)
+        where (and (or (not skipFirstParameter?)
+                       (> i 1)))
+        collect (java-translate-method-parameter pName pType method)
+        into translatedParameters)
+    ;; If more than one return type, add a parameter for multiple-value returns:
+    (unless (empty? (rest (method-return-type-specifiers method)))
+      (setq translatedParameters
+	(bquote (&& translatedParameters & (java-translate-return-parameter)))))
+    (return translatedParameters) ))
+
+
+(defun (zero-argument-function? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if `method' is a zero argument function.
+  (return (and (method-function? method)
+	       (empty? (method-parameter-names method)))) )
+
+(defun (java-method-object-defined-on-native-type? BOOLEAN) 
+    ((method METHOD-SLOT))
+  ;; Return TRUE if `method' is a function or method whose first argument is
+  ;;   a native type.
+  ;; Returns FALSE for zero argument functions.
+  (let ((firstParameterType (first (method-parameter-type-specifiers method))))
+    (return (and (defined? firstParameterType)
+		 (defined? (class-java-native-type 
+			    (type-spec-to-class firstParameterType))))) ))
+
+(defun (java-method-object-is-overloaded-function? BOOLEAN)
+    ((method METHOD-SLOT))
+  ;; Return TRUE if `method' is defined on a native literal type.
+  (return (and (not (method-function? method))
+	       (java-method-object-defined-on-native-type? method)
+               (or (not (method-native? method))
+                   (subtype-of? (slot-owner method) @LITERAL)))))
+
+(defun (java-method-object-is-function? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if `method' is a function or if it is a method defined
+  ;;   on a native type
+  (return (or (method-function? method)
+	      (java-method-object-is-overloaded-function?  method))) )
+
+
+(defun (java-function-in-different-module? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if `method' is a function whose first argument is a class
+  ;;   defined in a different module than `method'.
+  ;; Returns FALSE for zero argument functions.
+  ;; Prints warning if the modules do not match and this is not a function.
+  (let ((firstParameterType (first (method-parameter-type-specifiers method))))
+    (if (or (not (defined? firstParameterType))
+	    (eq? (home-module method) 
+		 (home-module (type-spec-to-class firstParameterType))))
+	(return FALSE)
+      (progn
+	(unless (java-method-object-is-function? method)
+	  (warn "Method " method " being defined on type "
+		firstParameterType ", but they are not in the same module!"))
+	(return TRUE))) ))
+
+(defun (java-create-overloaded-function-name SYMBOL) ((functionName SYMBOL)
+						      (classType TYPE))
+  ;; Create a name for overloaded function based on the original name
+  ;;   and a method's type
+  (return
+    (intern-symbol
+     (concatenate (symbol-name classType) "_" (symbol-name functionName)))) )
+
+(defmethod (java-translate-method-name STRING-WRAPPER) ((method METHOD-SLOT))
+  ;; Create a name for the Java method defined by `method'.
+  (let ((methodName SYMBOL (yield-renamed-name-if-native
+			    (slot-name method) :java :function)) 
+	(translatedName STRING NULL))
+    (when (java-method-object-is-overloaded-function? method)
+      (setq methodName (java-create-overloaded-function-name 
+			  methodName (slot-owner method))))
+    (setq translatedName (wrapper-value (java-translate-name methodName)))
+    (return (wrap-literal translatedName)) ))
+
+(defun (java-delete-quoted-null-statements CONS) ((trees CONS))
+  ;; Return 'trees' with all (quote NULLs) deleted
+  (return (remove trees (quote NULL))) )
+
+(defun (java-wrap-method-body-with-vararg-declarations CONS)
+    ((methodBody CONS))
+  ;; If there are variable length args, wrap method body w/declarations
+  (return 
+    (bquote 
+      (JAVA_BLOCK     ;; Do we need JAVA_STATEMENTS here?
+       & (reverse *varArgDecls*)
+       & methodBody))))
+
+(defun (java-wrap-method-body-with-vararg-value-setup CONS)
+    ((methodBody CONS))
+  ;; If there are variable length args, wrap insert code to set the
+  ;;   vararg vector.
+  (return 
+    (bquote (JAVA_STATEMENTS
+	     && (reverse *varArgStatements*)
+	     & methodBody))))
+
+(defun (java-translate-variable-length-arg-name STRING-WRAPPER) 
+    ((nameSymbol SYMBOL) (parameterNumber INTEGER))
+  ;; Given a name (e.g. 'return) and a number (e.g. 3), create
+  ;;   a return parameter name (e.g. "return3")
+  (let ((returnSymbol 
+	 (intern-symbol (concatenate (symbol-name nameSymbol)
+			  (integer-to-string parameterNumber))))
+	(translatedName (java-translate-name returnSymbol)))
+    (return translatedName) ))
+
+(defun (java-translate-variable-length-actuals CONS)
+    ((actuals CONS) (unused-method METHOD-SLOT))
+  ;; Translate a variable-length actual parameter list
+  (ignore unused-method)
+  (return (java-translate-actual-parameters actuals)))
+
+(defun (java-translate-actual-parameters CONS) ((tree CONS))
+  ;; translate actual parameters used in a method or function call
+  (return (bquote (JAVA_ACTUALS && (java-translate-list-of-trees tree)))) )
+
+(defun (java-yield-class-name-for-function STRING) ((function METHOD-SLOT))
+  ;; Return the class that is used to call the function `function'
+  ;; This will either be the class of its first argument or the flotsam class;
+  (let ((raw-class-name STRING ""))
+    (cond ((java-flotsam-function? function)
+	   (setq raw-class-name (java-yield-flotsam-class-name (home-module function)))
+	   (if (omit-java-package-prefix? (home-module function)
+					  (java-yield-flotsam-type-name raw-class-name))
+	     (return raw-class-name)
+	     (return (concatenate (java-package-prefix (home-module function) ".")
+				  raw-class-name))))
+	  ((method-native? function)
+	   (return (java-yield-native-class-name)))
+	  ((method-startup-function? function)
+	   (setq raw-class-name (java-translate-class-namestring
+				 (method-startup-classname function)))
+	   (if (omit-java-package-prefix? (home-module function) 
+					  (java-yield-flotsam-type-name raw-class-name))
+	     (return raw-class-name)
+	     (return (concatenate (java-package-prefix (home-module function) ".")
+				  raw-class-name))))
+	  ((method-constructor? function)
+	   (return (java-translate-type-spec
+		    (first (method-return-type-specifiers function)))))
+	  (otherwise
+	   (return (java-translate-type-spec
+		    (first (method-parameter-type-specifiers function)))))) ))
+
+(defun (java-translate-function-call CONS) ((tree CONS) (method METHOD-SLOT))
+  ;; Translate a function call to appropriate Java syntax
+  ;; Kludge to make compatible w/ cpp version
+  (setq tree (rest tree))
+  (let ((functionName SYMBOL (first tree))
+	(functionArgs (copy-cons-list (rest tree)))
+	(firstArg (first functionArgs))
+	;; NOTE: An already existing method can be passed in if we're
+	;;  calling an overloaded function in the guise of a method
+	;;  (see `java-translate-method-call')
+	(function (choose (defined? method)
+			  method
+			  (lookup-function-or-stella-function
+			   functionName)))
+	(operator (java-lookup-operator-table
+		   (soft-permanentify functionName)))
+	(oTree CONS NULL)
+	; (dummyArgs CONS NIL)
+	; (numberOfUnusedReturnParameters INTEGER 0)
+	; (unusedReturnTypes CONS NIL)
+	; (dummyName SYMBOL NULL)
+	)
+    ;; Special case certain functions:
+    ;; NOTE: We check the type of the get-xxx argument: if it's not an integer
+    ;;   wrapper than we assume it originates from the source code.  I.e.,
+    ;;   its' not an embedded symbol.
+    ;; NOTE: The handling of embedded symbols will be modified in the future:
+    ;;   they will come out of the walker rather than be GET-SYM method calls.
+    (cond 
+     ((and (eql? functionName (quote GET-SYM))
+	   (isa? firstArg @INTEGER-WRAPPER))
+      (return 
+	(bquote (JAVA_SYMBOL & (get-sym 
+			       (wrapper-value 
+				(cast firstArg INTEGER-WRAPPER)))))))
+     ((and (eql? functionName (quote GET-KWD))
+	   (isa? firstArg @INTEGER-WRAPPER))
+      (return 
+	(bquote (JAVA_SYMBOL & (get-kwd 
+			       (wrapper-value
+				(cast firstArg INTEGER-WRAPPER)))))))
+     ((and (eql? functionName (quote GET-SGT))
+	   (isa? firstArg @INTEGER-WRAPPER))
+      (return 
+	(bquote (JAVA_SYMBOL & (get-sgt 
+			       (wrapper-value
+				(cast firstArg INTEGER-WRAPPER))))))))
+
+    ;; NOTE: This is Java translation code which will have to be revisited
+;    ;; If some of the return values of this function are not used
+;    ;;   (e.g., we're not being called inside a mv-setq), then add
+;    ;;   dummy parameters
+;    (setq numberOfUnusedReturnParameters
+;      (- (+ (length (method-parameter-names function))
+;	     (1- (length (method-return-type-specifiers function))))
+;	 (length functionArgs)))
+;    (when (> numberOfUnusedReturnParameters 0)
+;      ;; Create list of dummy variables, one for each return value that is
+;      ;;   not used
+;      (setq unusedReturnTypes
+;	(get-last-n-elements (rest (method-return-type-specifiers function))
+;			     numberOfUnusedReturnParameters))
+;
+;      (foreach unusedParameterType in unusedReturnTypes
+;	       do 
+;	       (setq *currentDummyIndex* (+ *currentDummyIndex* 1))
+;	       (setq dummyName (intern-symbol 
+;				(wrapper-value
+;				 (java-translate-return-parameter-name 
+;				  (quote dummy) *currentDummyIndex*))))
+;	       ;; NOTE: I tried using `collect', but that doesn't seem to work!
+;	       (pushq *dummyDeclarations*
+;		      (bquote (& dummyName & unusedParameterType)))
+;	       (pushq dummyArgs dummyName))
+;      (concatenate functionArgs dummyArgs) )
+
+    ;; Operators (e.g., + and -) are translated so the operators are infix.
+    ;; Functions are translate with syntax "functionName(args)"
+
+    
+    
+    (cond ((defined? operator)
+	   (setq oTree (java-translate-operator-call operator functionArgs
+						     (length functionArgs))))
+	  ((null? function)
+	   (warn "Can't translate function call: Undefined function or method " functionName)
+	   (setq oTree NIL))
+	  (otherwise
+	   (special ((*varArgStatements* NIL))
+	     (let ((actuals
+		    (choose (method-variable-arguments? function)
+			    (java-translate-variable-length-actuals 
+			     functionArgs function)
+			    (java-translate-actual-parameters functionArgs))))
+	       ;; If multiple values are returned, and outside code hasn't already supplied a
+	       ;;   variable into which they should go, then create a new java array (which will
+	       ;;   be ignored).
+	       ;; The length test to see if outside codes supplies the parameter uses
+	       ;;   the translated actuals, which have an additional tag which makes
+	       ;;   the true length 1 shorter than the list length.
+	       (unless (or (empty? (rest (method-return-type-specifiers function)))
+			   (> (- (length actuals) 1) (length (method-parameter-names function))))
+		 (setq actuals 
+		   (bquote (&& actuals 
+			       (JAVA_MAKE_ARRAY 
+				& (java-translate-type-spec @NATIVE-OBJECT-POINTER)
+				& (- (length (method-return-type-specifiers function)) 1))))))
+	       (setq oTree 
+		 (bquote (JAVA_FUNCTION_CALL 
+			  (JAVA_IDENT
+			   & (java-yield-class-name-for-function function))
+			  (JAVA_IDENT
+			   & (java-translate-function-name function))
+			  & actuals)))
+	    	    
+	       (unless (empty? *varArgStatements*)
+		 (setq oTree
+		   (java-wrap-method-body-with-vararg-value-setup oTree))) ))))
+      (return oTree) ))
+
+
+(defun (java-translate-defined-or-null CONS) ((classType TYPE) (object OBJECT) (null? BOOLEAN))
+  ;; Helping function for "java-translate-method-call".   
+  ;; Handles DEFINED? or NULL? special case.
+  (let ((operator (choose null? "==" "!=")))
+    (cond 
+     ((subtype-of? classType @OBJECT)
+      (return (java-translate-operator-call 
+	       (bquote (& operator))
+	       (bquote (& object NULL))
+	       2)))
+     ((subtype-of? classType @INTEGER)
+      (return (java-translate-operator-call 
+	       (bquote (& operator))
+	       (bquote (& object NULL-INTEGER))
+	       2)))
+     ((subtype-of? classType @FLOAT)
+      (return (java-translate-operator-call 
+	       (bquote (& operator))
+	       (bquote (& object NULL-FLOAT))
+	       2)))
+     ((subtype-of? classType @SINGLE-FLOAT)
+      (return (java-translate-operator-call 
+	       (bquote (& operator))
+	       (bquote (& object NULL-SINGLE-FLOAT))
+	       2)))
+     ((subtype-of? classType @CHARACTER)
+      (return (java-translate-operator-call 
+	       (bquote (& operator))
+	       (bquote (& object NULL-CHARACTER))
+	       2)))
+     (otherwise 
+      ;; Assume general pointer type
+      (return (java-translate-operator-call 
+	       (bquote (& operator))
+	       (bquote (& object NULL))
+	       2))))
+  ))
+
+(defun (java-translate-method-call CONS) ((tree CONS))
+  ;; Translate a method call to appropriate Java syntax
+  (let ((methodName SYMBOL (third tree))
+	(classType TYPE (second tree))
+	(allArgs (rest (rest (rest tree))))  ;; Includes method argument
+	(object (fourth tree)))
+
+    ;; Special case certain functions:
+    ;; NOTE: We check the type of the get-xxx argument: if it's not an integer
+    ;;   wrapper than we assume it originates from the source code.  I.e.,
+    ;;   its' not an embedded symbol.
+    ;; NOTE: The handling of embedded symbols will be modified in the future:
+    ;;   they will come out of the walker rather than be GET-SYM method calls.
+    (case methodName
+      (DEFINED? 
+	(return (java-translate-defined-or-null classType object false)))
+      (NULL? 
+        (return (java-translate-defined-or-null classType object true)))
+      (CONCATENATE
+       (when (eq? classType @STRING)
+	 (return
+	   (java-translate-operator-call (quote ("+")) allArgs 2))))
+      ((NTH NTH-SETTER)
+       (return (java-translate-NTH-method-call methodName classType allArgs)))
+      ((AREF AREF-SETTER)
+       (return (java-translate-AREF-method-call methodName classType allArgs)))
+      (otherwise NULL))
+
+    (return
+      (java-translate-normal-method-call methodName classType allArgs)) ))
+
+(defun (java-translate-normal-method-call CONS)
+    ((methodName SYMBOL) (classType TYPE) (allArgs CONS))
+  ;; Translate a method call to appropriate Java syntax
+  (let ((slot (safe-lookup-slot (type-class classType) methodName))
+        (methodSlot METHOD-SLOT
+                    (choose (and (defined? slot)
+                                 (isa? slot @METHOD-SLOT))
+                            slot
+                            NULL))
+	(object (first allArgs))
+	(operator (java-lookup-operator-table (soft-permanentify methodName))))
+
+    ;; If we're calling a method on a native type, its actually supposed
+    ;;   to be a function call, unless it is a native method on non-LITERAL class.
+    ;; This checks that.
+    (when (and (defined? methodSlot)	; Added TAR 3/23/01
+	       (java-method-object-is-overloaded-function? methodSlot))
+      (return 
+	(java-translate-function-call 
+	 (bquote (SYS-CALL-FUNCTION
+		  & (java-create-overloaded-function-name
+		     methodName classType)
+		  && allArgs))
+	 methodSlot)))
+
+    (if (defined? operator)
+      (return (java-translate-operator-call operator allArgs (length allArgs)))
+      (return
+	(bquote (JAVA_METHOD_CALL
+		 (JAVA_IDENT
+		  & (java-translate-class-name 
+		     (symbolize classType)))
+		 (JAVA_IDENT
+		  & (choose (defined? methodSlot)
+                            (java-translate-method-name methodSlot)
+                            (java-translate-name methodName)))
+		 & (java-translate-a-tree object)
+		 & (choose (and (defined? methodSlot)
+				(not (empty? (rest (method-return-type-specifiers
+						    methodSlot))))
+				;; If multiple values are returned, and
+				;; outside code hasn't already supplied
+				;; a variable into which they should go,
+				;; then create a new Java array (which
+				;; will be ignored)
+				;;
+				;; QUESTION: DOES THE LENGTH HAVE TO BE
+				;; MODIFIED FOR VARIABLE-LENGTH
+				;; ARGUMENTS?
+				(<= (length allArgs)
+				    (length (method-parameter-names methodSlot))))
+			   (bquote (&& (java-translate-actual-parameters (rest allArgs))
+				       (JAVA_MAKE_ARRAY 
+					& (java-translate-type-spec @NATIVE-OBJECT-POINTER)
+					& (- (length (method-return-type-specifiers 
+						      methodSlot)) 
+					     1))))
+			   (java-translate-actual-parameters (rest allArgs))))))) ))
+
+(defun (java-translate-operator-tree CONS) ((tree CONS))
+  ;; Translate a boolean operator (i.e. AND, OR or NOT)
+  (let ((operator (java-lookup-operator-table (first tree)))
+	(args (rest tree))
+	(arity INTEGER NULL))
+    (case (first tree)
+      ((AND OR EQ? > >= < <=) (setq arity 2))
+      ((NOT ++ --) (setq arity 1)))
+    (return (java-translate-operator-call operator args arity)) ))
+
+
+(defun (java-translate-operator-call CONS) ((operatorNames CONS)
+					    (arguments CONS)
+					    (arity INTEGER))
+  ;; Translate an operator call to appropriate Java syntax
+  ;; Operators (e.g., + and -) are translated so the operators are infix.
+  ;; Assume binary operator.
+  ;; CAREFUL: BASING ARITY ON # ARGUMENTS MAY BE DANGEROUS! 
+  (let ((oTree CONS NULL))
+    (case arity
+      (1 (setq oTree
+	   (bquote (JAVA_UNARY_OP
+		    & (first operatorNames)
+		    & (java-translate-a-tree (first arguments))))))
+      ;; NOTE: Binary operators can be associative, so can have more
+      ;;   than 2 arguments.  In that case, recursively call this function.
+      (2 (if (> (length arguments) 2)
+	     (setq oTree
+	       (bquote (JAVA_BINARY_OP
+			& (java-translate-a-tree (first arguments))
+			& (first operatorNames)
+			& (java-translate-operator-call 
+			   operatorNames (rest arguments) 2))))
+	     (setq oTree
+	       (bquote (JAVA_BINARY_OP
+			& (java-translate-a-tree (first arguments))
+			& (first operatorNames)
+			& (java-translate-a-tree (second arguments)))))))
+      (3 (setq oTree
+	   (bquote (JAVA_TERNARY_OP
+		    & (java-translate-a-tree (first arguments))
+		    & (first operatorNames)
+		    & (java-translate-a-tree (second arguments))
+		    & (second operatorNames)
+		    & (java-translate-a-tree (third arguments)))))))
+    ;; NOTE: This is commented out because the recursive call in case 2
+    ;;  frees up arguments in the leaf call when it shouldn't.  This should
+    ;;  be cleaned up.
+    (return oTree) ))
+
+(defun (java-translate-AREF-method-call CONS)
+    ((operator SYMBOL) (owner TYPE) (arguments CONS))
+  ;; Translate a call to `aref' or `aref-setter'.
+  ;; Arguments are AREF: (place dim0 .. dimN)
+  ;;        AREF-SETTER: (place value dim0 ... dimN)
+ (case owner
+   (@ARRAY
+    (let ((setter? (eql? operator (quote AREF-SETTER)))
+	  (oTree (bquote
+		  (JAVA_AREF
+		   & (java-translate-a-tree (first arguments))
+		   && (java-translate-list-of-trees
+		       (choose setter?
+			       (rest (rest arguments))
+			       (rest arguments)))))))
+      (when setter?
+	(setq oTree
+	  (bquote
+	   (JAVA_ASSIGN & oTree
+			& (java-translate-a-tree (second arguments))))))
+      (return oTree)))
+   (otherwise
+    (return
+      (java-translate-normal-method-call operator owner arguments)))) )
+
+(defun (java-translate-NTH-method-call CONS)
+    ((operator SYMBOL) (owner TYPE) (arguments CONS))
+  ;; Translate and possibly optimize a call to 'nth'.
+  (let ((setter? (eql? operator (quote NTH-SETTER)))
+        (collection (first arguments))
+        (position (last arguments))
+        (value (choose setter?
+                       (second arguments)
+                       NULL))
+        (tree CONS NULL))
+    (case owner
+      (@NATIVE-VECTOR
+       (setq tree
+	 (bquote
+	  (JAVA_AREF
+	   & (java-translate-a-tree collection)
+	   & (java-translate-a-tree position))))
+       (when setter?
+	 (setq tree
+	   (bquote (JAVA_ASSIGN & tree & (java-translate-a-tree value)))))
+       (return tree))
+      (otherwise NULL))
+    (return
+      (java-translate-normal-method-call operator owner arguments))))
+
+
+

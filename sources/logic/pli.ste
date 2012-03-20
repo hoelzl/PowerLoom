@@ -1,0 +1,1761 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                          ;
+;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 2000-2002              ;
+;  University of Southern California, Information Sciences Institute       ;
+;  4676 Admiralty Way                                                      ;
+;  Marina Del Rey, California 90292                                        ;
+;                                                                          ;
+;  This software was developed under the terms and conditions of Contract  ;
+;  No. N00014-94-C-0245 between the Defense Advanced Research Projects     ;
+;  Agency and the University of Southern California, Information Sciences  ; 
+;  Institute.  Use and distribution of this software is further subject    ;
+;  to the provisions of that contract and any other agreements developed   ;
+;  between the user of the software and the University of Southern         ;
+;  California, Information Sciences Institute.  It is supplied "AS IS",    ;
+;  without any warranties of any kind.  It is furnished only on the basis  ;
+;  that any party who receives it indemnifies and holds harmless the       ;
+;  parties who furnish and originate it against any claims, demands, or    ;
+;  liabilities connected with using it, furnishing it to others or         ;
+;  providing it to a third party.  THIS NOTICE MUST NOT BE REMOVED FROM    ;
+;  THE SOFTWARE, AND IN THE EVENT THAT THE SOFTWARE IS DIVIDED, IT SHOULD  ;
+;  BE ATTACHED TO EVERY PART.                                              ;
+;                                                                          ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;; Version: pli.ste,v 1.23 2003/05/21 21:44:22 tar Exp
+
+;;; Application Program Interface (API) for PowerLoom
+
+(in-package "STELLA")
+
+(in-module "PLI")
+
+
+;;;  !!!! ****  STILL MISSING:   
+;;;             retrieve-partial
+
+  ;;
+;;;;;; SETUP
+  ;;
+
+(defun initialize ()
+  :documentation "Initialize the PowerLoom logic system.  This needs to
+be called by all applications before using PowerLoom."
+  :public? TRUE
+  (startup-logic-system))
+
+
+  ;;
+;;;;;; ENVIRONMENTS
+  ;;
+
+;;; THIS IS JUST A STUB CLASS:
+(defclass ENVIRONMENT (STANDARD-OBJECT)
+  :slots ((level :type STRING))
+  :print-form (print-native-stream stream "|ENV|" (level self))
+  )
+
+(defconstant ASSERTION-ENV ENVIRONMENT (new ENVIRONMENT :level "ASSERTION"))
+(defconstant TAXONOMIC-ENV ENVIRONMENT (new ENVIRONMENT :level "TAXONOMIC"))
+(defconstant INFERENCE-ENV ENVIRONMENT (new ENVIRONMENT :level "INFERENCE"))
+
+
+  ;;
+;;;;;; PL ITERATOR
+  ;;
+
+;; Bob's original PL-ITERATOR.  Replaced by code below that doesn't
+;; try to handle the Java interface side of things.
+;; TO DO:  Revisit this to insert a special class in just the
+;; Java hierarchy in order to get the appropriate inclusion of
+;; the implements java.util.Iterator
+
+(defclass PL-ITERATOR (ITERATOR)
+  :parameters ((any-value :type OBJECT))
+  :slots ((cursor :type CONS))
+;;  :java-native-type "pli.PL_ITERATOR"
+  )
+
+(defmethod (next? BOOLEAN) ((self PL-ITERATOR))
+  :documentation "Advance the PL-Iterator `self' and return `true' if more
+elements are available, `false' otherwise."
+  (let ((cursor (cursor self)))
+    (when (nil? cursor)
+      (setf (slot-value self value) NULL)
+      (return FALSE))
+    (setf (slot-value self value) (value cursor)) 
+    (setf (cursor self) (rest cursor))
+    (return TRUE)))
+
+(defmethod (empty? BOOLEAN) ((self PL-ITERATOR))
+  :documentation "Return TRUE if the iterator `self' has no more elements."
+  :public? TRUE
+  (return (eq? (cursor self) NIL)))
+
+(defmethod (length INTEGER) ((self PL-ITERATOR))
+  :documentation "Number of items in `self'."
+  :public? TRUE
+  (return (length (cursor self))))
+
+(defglobal EMPTY-PL-ITERATOR PL-ITERATOR (new PL-ITERATOR :cursor NIL)
+  :documentation "Iterator that generates no values.")
+
+(defun (cons-to-pl-iterator PL-ITERATOR) ((self CONS))
+  :documentation "Convert a Stella cons list into an API iterator."
+  (if (empty? self)
+    (return EMPTY-PL-ITERATOR)
+    (return (new PL-ITERATOR :cursor self))))
+
+(defun (list-to-pl-iterator PL-ITERATOR) ((self LIST))
+  :documentation "Convert a Stella list into an API iterator."
+  (if (empty? self)
+    (return EMPTY-PL-ITERATOR)
+    (return (cons-to-pl-iterator (the-cons-list self)))))
+
+(defun (iterator-to-pl-iterator PL-ITERATOR) ((self ITERATOR))
+  :documentation "Convert an arbitrary Stella iterator into an API iterator."
+  ;; Strategy: Generate a cons list of values from `self' and stuff them
+  ;;    into an iterator.
+  (return (cons-to-pl-iterator (consify self))))
+
+(defmethod (listify LIST) ((self PL-ITERATOR))
+  (return (new LIST :the-cons-list (collect x in self))))
+
+(defmethod (consify CONS) ((self PL-ITERATOR))
+  (return (collect x in self)))
+
+
+  ;;
+;;;;;; Utility functions for PLI bodies
+  ;;
+
+(defun (safely-get-object OBJECT)
+       ((name STRING) (module MODULE) (environment OBJECT))
+  ;; Helping function for API functions.  Retrieve and object
+  ;;    named `name' in `module' subject to `environment' options.
+  ;; If there is none, generate a suitable message.
+  ;; Designed not to break if `name' is null.  Returns NULL if
+  ;;    `name' is null.
+  (when (null? name)
+    (return NULL))
+  (let ((object (get-object name module environment)))
+    (if (null? object)
+      (signal NO-SUCH-OBJECT-EXCEPTION
+	      "Can't find an object named " name)
+      (return object))))
+
+(defun (safely-get-concept OBJECT)
+       ((name STRING) (module MODULE) (environment OBJECT))
+  ;; Helping function for API functions.  Retrieve and object
+  ;;    named `name' in `module' subject to `environment' options.
+  ;; If there is none, generate a suitable message.
+  ;; Designed not to break if `name' is null.  Returns NULL if
+  ;;    `name' is null.
+  (when (null? name)
+    (return NULL))
+  (let ((object (get-concept name module environment)))
+    (if (null? object)
+      (signal NO-SUCH-OBJECT-EXCEPTION
+	      "Can't find a concept named " name)
+      (return object))))
+
+(defun (safely-get-relation OBJECT)
+       ((name STRING) (module MODULE) (environment OBJECT))
+  ;; Helping function for API functions.  Retrieve and object
+  ;;    named `name' in `module' subject to `environment' options.
+  ;; If there is none, generate a suitable message.
+  ;; Designed not to break if `module' is null.  Returns NULL if
+  ;;    `module' is null.
+  (when (null? name)
+    (return NULL))
+  (let ((object (get-relation name module environment)))
+    (if (null? object)
+      (signal NO-SUCH-OBJECT-EXCEPTION
+	      "Can't find a relation named " name)
+      (return object))))
+
+(defun (safely-get-module CONTEXT) ((name STRING) (environment OBJECT))
+  ;; If `name' is non-null and non-empty, look for a module named `name',
+  ;;    and complain if none is found.
+  ;; Otherwise, return the current module.
+  (ignore environment)                  ; TEMPORARY?
+  (when (or (null? name)
+            (eql? name ""))
+    (return *module*))
+  (return (get-stella-module name TRUE)))
+
+(defun (safely-get-object-or-null OBJECT)
+       ((name STRING) (module MODULE) (environment OBJECT))
+  ;; Helping function for API functions.
+  ;; Same as `safely-get-object' but tolerates a null input.
+  (when (or (null? module)
+            (null? name)
+	    (string-eql? name "")
+            (string-equal? name "null"))
+    (return NULL))
+  (exception-case
+      (return (get-object name module environment))
+    (NO-SUCH-OBJECT-EXCEPTION ()
+      (return NULL))))
+
+(defun (sequence-to-cons-list CONS) ((sequence OBJECT))
+  ;; Convert `sequence' to a cons list.
+  (typecase sequence
+    (CONS (return sequence))
+    (LIST (return (the-cons-list sequence)))
+    (VECTOR
+     (let ((result nil))
+       (foreach i in (interval 0 (length sequence))
+	   collect (nth sequence i) into result)
+       (return result)))
+    (otherwise
+     (signal STELLA-EXCEPTION
+	     "Don't know how to convert object of type "
+	      (primary-type sequence) " into a cons list."))))
+
+(defun (explode-string-list CONS) ((stringList STRING) (module MODULE))
+  ;; Return a list of logic terms extracted from `stringList'.
+  (within-module module
+   (let ((expression CONS (unstringify stringList))
+         (term OBJECT NULL)
+         (result NIL))
+     (foreach ref in expression
+              do (setq term (choose (eql? ref (quote NULL))
+                                    NULL
+                                    (evaluate-term ref)))
+              collect term into result)
+     (return result))))
+
+  ;;
+;;;;;; Names to instances and back
+  ;;
+
+(defun (get-object OBJECT) ((name STRING) (module MODULE) (environment OBJECT))
+  :documentation "Look for an object named `name' that is local to
+or visible from the module `module'."
+  :public? TRUE
+  (let ((currentModule (either module *module*)))
+    (unless (or (case-sensitive? currentModule)
+		(all-upper-case-string? name))
+      (setq name (string-upcase name))))
+  (with-logic-environment module environment
+			  (return (LOGIC/get-instance name))))
+
+(defun (s-get-object OBJECT) ((name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Look for an object named `name' that is local to
+or visible from the module `module-name'."
+  :public? TRUE
+  (return 
+    (get-object name (safely-get-module module-name environment) environment)))
+
+(defun (get-concept LOGIC-OBJECT) ((name STRING) (module MODULE) (environment OBJECT))
+  :documentation "Return a class/concept named `name' that is local to
+or visible from the module `module'."
+  :public? TRUE
+  (let ((currentModule (either module *module*)))
+    (unless (or (case-sensitive? currentModule)
+		(all-upper-case-string? name))
+      (setq name (string-upcase name))))
+  (with-logic-environment module environment
+			  (return (LOGIC/get-class name))))
+
+(defun (s-get-concept LOGIC-OBJECT) ((name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return a class/concept named `name' that is local to
+or visible from the module `module-name'."
+  :public? TRUE
+  (return 
+    (get-concept name (safely-get-module module-name environment) environment)))
+
+(defun (get-relation LOGIC-OBJECT) ((name STRING) (module MODULE) (environment OBJECT))
+  :documentation "Return a concept or relation named `name' that is local to
+or visible from the module `module'."
+  :public? TRUE
+  (let ((currentModule (either module *module*)))
+    (unless (or (case-sensitive? currentModule)
+		(all-upper-case-string? name))
+      (setq name (string-upcase name))))
+  (with-logic-environment module environment
+			  (return (LOGIC/get-relation name))))
+
+(defun (s-get-relation LOGIC-OBJECT) ((name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return a concept or relation named `name' that is local to
+or visible from the module `module-name'."
+  :public? TRUE
+  (return 
+    (get-relation name (safely-get-module module-name environment) environment)))
+
+;; TO DO:  WHAT ABOUT SKOLEMS? -- Nothing, they are unnamed objects.
+(defun (get-name STRING) ((obj OBJECT))
+  :documentation "Return the name of `obj', if it has one.  Otherwise return `null'."
+  :public? TRUE
+  (typecase obj
+    (SKOLEM
+     (return NULL))
+    (LOGIC-OBJECT
+     (return (object-name-string obj)))
+    ;; Do we want to do this?
+    (KEYWORD
+     (return (concatenate ":" (symbol-name obj))))
+    (GENERALIZED-SYMBOL
+     (return (symbol-name obj)))
+    (CONTEXT
+     (return (context-name obj)))
+    (/PL-KERNEL-KB/COMPUTED-PROCEDURE
+     (return (symbol-name (surrogate-value-inverse obj))))
+    (otherwise 
+     (return NULL))))
+
+(defun (object-to-string STRING) ((self OBJECT))
+  :documentation "Return a printed representation of the term `self' as a string."
+  :public? TRUE
+  (if (null? self)
+    (return NULL)
+    (special ((*printReadably?* TRUE))
+      (typecase self
+        (STRING-WRAPPER
+         (return (wrapper-value self)))
+	(SKOLEM 
+	 (let ((value (value-of self)))
+	   (if (eql? value self)
+	     (return (stringify self))
+	     (return (object-to-string value)))))
+	(PL-ITERATOR
+	 (return (stringify (consify self))))
+	(otherwise (return (stringify self)))))))
+
+(defun (object-to-integer INTEGER) ((self OBJECT))
+  :documentation
+  "Coerce `self' to an integer, or throw a Stella Exception if the coersion is not feasible."
+  :public? TRUE
+  (typecase self
+    (SKOLEM 
+     (let ((value (value-of self)))
+       (if (eql? value self)
+	 (signal STELLA-EXCEPTION "Can't coerce " self " to an integer.")
+	 (return (object-to-integer value)))))
+    (INTEGER-WRAPPER (return self))
+    (FLOAT-WRAPPER (return (round (wrapper-value self))))
+    (otherwise 
+     (signal STELLA-EXCEPTION "Can't coerce " self " to an integer."))))
+
+(defun (object-to-float FLOAT) ((self OBJECT))
+  :documentation
+  "Coerce `self' to a float, or throw a Stella Exception if the coersion is not feasible."
+  :public? TRUE
+  (typecase self
+    (SKOLEM 
+     (let ((value (value-of self)))
+       (if (eql? value self)
+	 (signal STELLA-EXCEPTION "Can't coerce " self " to a float.")
+	 (return (object-to-float value)))))
+    (INTEGER-WRAPPER (return self))
+    (FLOAT-WRAPPER (return self))
+    (otherwise 
+     (signal STELLA-EXCEPTION "Can't coerce " self " to a float."))))
+
+(defun (object-to-parsable-string STRING) ((self OBJECT))
+  :documentation "Return a string representing a printed
+representation of the object `self'.  Like `object-to-string', but puts
+escaped double quotes around strings."
+  :public? TRUE
+  (typecase self
+    (STRING-WRAPPER
+     (return (concatenate "\"" self "\"")))
+    (otherwise
+     (return (object-to-string self)))))
+
+;;; TO DO: Implement this:
+;;; Note that this is different from (string-search-for-object string type)
+;;; because the `type' here is a logic object, not a stella type! 
+;;;
+;;; Bob's intent was to use the type to help decide how to interpret the
+;;; argument string, so that for example "foo" would be treated as an
+;;; object of type STRING (or perhaps STRING-WRAPPER ?) if the type argument
+;;; indicated that, whereas if type were Person, it would be treated as
+;;; a logic object.
+;;;
+
+(defglobal *literal-concept* NAMED-DESCRIPTION NULL
+  :public? FALSE)
+(defglobal *string-concept* NAMED-DESCRIPTION NULL
+  :public? FALSE)
+(defglobal *integer-concept* NAMED-DESCRIPTION NULL
+  :public? FALSE)
+(defglobal *float-concept* NAMED-DESCRIPTION NULL
+  :public? FALSE)
+
+(startup-time-progn :final
+  (setq *literal-concept* (s-get-concept "LITERAL" "PL-USER" NULL))
+  (setq *string-concept*  (s-get-concept "STRING" "PL-USER" NULL))
+  (setq *integer-concept* (s-get-concept "INTEGER" "PL-USER" NULL))
+  (setq *float-concept*   (s-get-concept "FLOAT" "PL-USER" NULL)))
+
+
+(defun (string-to-object OBJECT) 
+    ((string STRING) (type LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Evaluate `string' with respect to `module' and `environment'
+and return the corresponding logical term.  `type' is a concept used to assist the
+correct interpretation of `string'.
+
+Currently `type' only has an effect on the interpretation of literal types."
+  :public? TRUE
+  (with-logic-environment module environment
+    (let ((obj (unstringify string)))
+      (typecase obj
+	(LITERAL-WRAPPER
+	 (when (null? type)
+	   (return obj))
+	 (typecase obj
+	   (STRING-WRAPPER
+	    (if (subrelation-of? type *string-concept*)
+	      (return obj)
+	      (signal PARSING-ERROR "String argument found, but " type " is not a subconcept of " *string-concept*)))
+	   (INTEGER-WRAPPER
+	    (cond ((subrelation-of? type *integer-concept*)
+		   (return obj))
+		  ((subrelation-of? type *float-concept*)
+		   (return (cast (wrapper-value obj) FLOAT)))
+		  (otherwise 
+		   (return (get-object string module environment)))))
+	   (FLOAT-WRAPPER
+	    (cond ((subrelation-of? type *float-concept*)
+		   (return obj))
+		  (otherwise 
+		   (return (get-object string module environment)))))))
+	(otherwise
+	 (cond ((null? type)
+		(return (get-object string module environment)))
+	       ((subrelation-of? type *string-concept*)
+		(return string))
+	       ((subrelation-of? type *literal-concept*)
+		(signal PARSING-ERROR string " is a non-literal, but " type " is a subconcept of " *literal-concept*))
+	       (otherwise
+		(return (get-object string module environment)))))))))
+
+
+  ;;
+;;;;;; Retrieval
+  ;;
+
+#|
+(get-nth-string (retrieve "(?y)" "(age Fred ?y)" *module* NULL) 1)
+v.
+(get-nth-string (retrieve "(age ?x ?y)" "(= ?x Fred)" *module* NULL) 2)
+v.
+(get-nth-string (retrieve "(age Fred ?y)" "TRUE" *module* NULL) 2)
+v.
+(get-nth-string (parametric-retrieve "(age ?x ?y)" "TRUE" (list "Fred" NULL) *module* NULL) 2)
+v.
+(get-nth-string (parametric-retrieve "(?x ?y)" "(age ?x ?y)" (list "Fred" NULL) *module* NULL) 2)
+v.
+(get-nth-string (s-get-proposition "(age Fred null)" *module* NULL) 2)
+v.
+(get-nth-string (s-get-propositions "(age Fred null)" *module* NULL) 2)
+v.
+(get-nth-string (get-binary-proposition
+                 (get-relation "age") (get-object "Fred") NULL *module* NULL) 2)
+|#
+
+(defun (help-get-true-extension-members (CONS OF PROPOSITION)) 
+       ((relation NAMED-DESCRIPTION) (specialize? BOOLEAN))
+  :public? FALSE
+  ;; Return the asserted extension of `relation'.
+  ;; TO DO: REWRITE AS AN ITERATOR?
+  (let ((result (collect p in (all-extension-members relation)
+                         where (true-proposition? p))))
+    (when specialize?
+      (foreach sub in (all-subcollections relation)
+          ;; Needed because all-extension-members is only defined on named-descriptions
+	  where (isa? sub @NAMED-DESCRIPTION)
+	  do (foreach p in (all-extension-members sub)
+		 where (true-proposition? p)
+		 do (pushq result p)))
+      (return (remove-duplicates result)))
+    (return result)))
+
+(defun (help-get-propositions (CONS OF PROPOSITION))
+       ((relation LOGIC-OBJECT) (arguments CONS) (limit INTEGER)
+        (module MODULE) (environment OBJECT))
+  ;; Retrieve propositions with relation `relation' and arguments matching
+  ;;    the bound members of `arguments'.  Retrieve at most `limit' propositions
+  ;;    (zero or negative `limit' represents no bound).
+  ;; Called by other API routines.
+  :public? FALSE
+  (when (null? relation)
+    (return NIL))
+  (with-logic-environment module environment
+    (let ((specialize? (not (eql? environment ASSERTION-ENV)))
+          (argumentWithBacklinks (some arg in arguments
+                                       where (and (defined? arg)
+                                                  (isa? arg @LOGIC-OBJECT))))
+          (iterator (choose (defined? argumentWithBacklinks)
+                            (all-true-dependent-propositions
+                             argumentWithBacklinks (surrogate-value-inverse relation) specialize?)
+                            (allocate-iterator
+                             (help-get-true-extension-members relation specialize?))))
+          (results NIL))
+      (foreach p in iterator
+               where (and (forall inputArg in arguments
+                                  as arg2 in (arguments p)
+                                  always (or (null? inputArg)
+                                             (eql? inputArg (value-of arg2))))
+                          (eql? (length arguments)
+                                (length (arguments p))))
+               do 
+               (pushq results p)
+               (-- limit)
+               (when (eql? limit 0)
+                 (break)))
+      (return results))))
+    
+(defun (get-proposition PROPOSITION)
+       ((relation-and-arguments OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return a proposition matching `relation-and-arguments' that
+has been asserted (or inferred by forward chaining).  `relation-and-arguments'
+is a sequence containing objects and nulls.  The first argument must be the
+name of a relation.  A null value acts like a wild card.  If more than one 
+proposition matches the input criteria, the selection among satisficing
+propositions is arbitrary.  This procedure is normally applied to single-valued
+relations or functions."
+  (let ((list (sequence-to-cons-list relation-and-arguments))
+        (relation (first list))
+        (arguments (rest list)))
+    (return (first (help-get-propositions
+                    relation arguments 1 module environment)))))
+
+(defun (s-get-proposition PROPOSITION)
+       ((relation-and-arguments STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return a proposition matching `relation-and-arguments' that
+has been asserted (or inferred by forward chaining).  `relation-and-arguments'
+is a string that begins with a left parenthesis, followed by a relation name, 
+one or more argument identifiers, and terminated by a right parenthesis.  Each
+argument identifier can be the name of a logical constant, a literal
+reference (e.g., a number), the null identifier, or a variable (an identifier that begins
+with a question mark). Each occurrence of a null or a variable acts like a wild card.
+If more than one proposition matches the input criteria, the selection among
+satisficing propositions is arbitrary.  This procedure is normally applied to
+single-valued relations or functions."
+  (let ((module (safely-get-module module-name environment))
+        (elements (explode-string-list relation-and-arguments module))
+        (relation (first elements))
+        (arguments (rest elements)))
+    (return
+     (first (help-get-propositions relation arguments 1 module environment)))))
+
+(defun (get-propositions (PL-ITERATOR OF PROPOSITION))
+       ((relation-and-arguments OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return propositions matching `relation-and-arguments' that
+have been asserted (or inferred by forward chaining).  `relation-and-arguments'
+is a sequence containing objects and nulls.  The first argument must be the
+name of a relation.  A null value acts like a wild card."
+  (let ((list (sequence-to-cons-list relation-and-arguments))
+        (relation (first list))
+        (arguments (rest list)))
+    (return (cons-to-pl-iterator
+             (help-get-propositions relation arguments 0 module environment)))))
+
+(defun (s-get-propositions (PL-ITERATOR OF PROPOSITION))
+       ((relation-and-arguments STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return propositions matching `relation-and-arguments' that
+have been asserted (or inferred by forward chaining).  `relation-and-arguments'
+is a string that begins with a left parenthesis, followed by a relation name, 
+one or more argument identifiers, and terminated by a right parenthesis.  Each
+argument identifier can be the name of a logical constant, a literal 
+reference (e.g., a number), the null identifier, or a variable (an identifier that begins
+with a question mark). Each occurrence of a null or a variable acts like a wild card."
+  (let ((module (safely-get-module module-name environment))
+        (elements (explode-string-list relation-and-arguments module))
+        (relation (first elements))
+        (arguments (rest elements)))
+    (return (cons-to-pl-iterator
+             (help-get-propositions relation arguments 0 module environment)))))
+
+
+;; TO DO:  SHOULD THESE HAVE UNARY FORMS AS WELL?
+
+(defun (get-binary-proposition PROPOSITION)
+       ((relation LOGIC-OBJECT) (arg1 OBJECT) (arg2 OBJECT)
+        (module MODULE) (environment OBJECT))
+  :documentation "Return a proposition such that (`relation' `arg1' `arg2')
+is true.  The `relation' argument must be bound to a relation.  One or both
+of the `arg1' and `arg2' arguments may be set to NULL, which is interpreted
+as a wildcard. If more than one proposition matches the input criteria,
+the selection is arbitrary.  This procedure is normally applied to single-valued
+relations or functions."
+  ;; Instead of calling `help-get-propositions' immediately, a bit of extra
+  ;;    code results in a small speedup.  If and when `help-get-propositions'
+  ;;    is rewritten to return an iterator, the speed-up may be greater.
+  (with-logic-environment module environment
+    (let ((argumentWithBacklinks LOGIC-OBJECT NULL))
+      (cond
+       ((and (defined? arg1)
+             (isa? arg1 @LOGIC-OBJECT))
+        (setq argumentWithBacklinks arg1))
+       ((and (defined? arg2)
+             (isa? arg2 @LOGIC-OBJECT))
+        (setq argumentWithBacklinks arg2)))
+      (if (defined? argumentWithBacklinks)
+        (foreach p in (all-true-dependent-propositions
+                       argumentWithBacklinks (surrogate-value-inverse relation) FALSE)
+                 where
+                 (and (or (null? arg1)
+                          (eql? arg1 (value-of (nth (arguments p) 0))))
+                      (or (null? arg2)
+                          (eql? arg2 (value-of (nth (arguments p) 1)))))
+                 do (return p))
+        ;; switch to more general-purpose retrieve:
+        (return (first (help-get-propositions 
+                        relation (cons-list arg1 arg2) 1 module environment))))
+      (return NULL))))
+
+(defun (get-binary-propositions (PL-ITERATOR OF PROPOSITION))
+       ((relation LOGIC-OBJECT) (arg1 OBJECT) (arg2 OBJECT)
+        (module MODULE) (environment OBJECT))
+  :documentation "Return propositions such that (`relation' `arg1' `arg2')
+is true.  The `relation' argument
+must be bound to a relation.  One or both of the `arg1' and `arg2' arguments
+may be set to NULL, which is interpreted as a wildcard."
+  (return (cons-to-pl-iterator
+           (help-get-propositions 
+            relation (cons-list arg1 arg2) 0 module environment))))
+
+(defun (get-inferred-binary-proposition-values PL-ITERATOR)
+       ((relation LOGIC-OBJECT) (arg OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return all values `v' such that (`relation' `arg' `v')
+has been asserted or can be inferred."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator
+             (apply-retrieve (?r ?i ?v) (?r ?i ?v) (relation arg NULL))))))
+
+(defun (s-get-inferred-binary-proposition-values PL-ITERATOR)
+       ((relation-name STRING) (arg-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return all values `v' such that (`relation-name' `arg-name' `v')
+has been asserted or can be inferred."
+  (let ((module (safely-get-module module-name environment))
+        (relation (safely-get-relation relation-name module environment))
+        (object (safely-get-object arg-name module environment)))
+    (if (all-defined? object relation)
+      (return (get-inferred-binary-proposition-values relation object module environment))
+      (return EMPTY-PL-ITERATOR))))
+
+(defun (get-propositions-of (PL-ITERATOR OF PROPOSITION)) 
+       ((object LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return all propositions that have `object' among their arguments,
+and that are TRUE in the scope of the module `module'."
+  (with-logic-environment module environment
+    (return (list-to-pl-iterator (all-facts-of-instance object FALSE FALSE)))))
+
+(defun (s-get-propositions-of (PL-ITERATOR OF PROPOSITION))
+       ((object-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return all propositions that have the object named `object-name' among
+their arguments, and that are TRUE in the scope of the module `module'."
+  (let ((module (safely-get-module module-name environment))
+        (object (safely-get-object object-name module environment)))
+    (if (all-defined? object)
+      (return (get-propositions-of object module environment))
+      (return EMPTY-PL-ITERATOR))))
+
+(defun (get-propositions-in-module (PL-ITERATOR OF PROPOSITION))
+       ((module MODULE) (environment OBJECT))
+  :documentation "Return propositions that have been conceived in
+the module `module'."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator 
+             (consify (all-propositions *module* TRUE))))))
+
+
+  ;;
+;;;;;; Probes
+  ;;
+
+(defun (is-true-unary-proposition BOOLEAN)
+       ((relation LOGIC-OBJECT) (arg OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return TRUE if the proposition (`relation' `arg') has
+been asserted (or inferred by forward chaining)."
+  (return (defined? (help-get-propositions
+                     relation (cons-list arg) 1 module environment))))
+
+(defun (is-true-binary-proposition BOOLEAN)
+       ((relation LOGIC-OBJECT) (arg OBJECT) (value OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return TRUE if the proposition (`relation' `arg' `value') has
+been asserted (or inferred by forward chaining)."
+  (return (defined? (get-binary-proposition relation arg value module environment))))
+
+;;; WHAT ARE THE DIFFERENCES BETWEEN THESE NEXT THREE???
+;; NOT CLEAR IF WE SHOULD SUPPORT THIS: -rmm
+(defun (is-true-proposition1 BOOLEAN) 
+       ((relation-and-arguments OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return TRUE if a proposition (`relation' `args') has
+been asserted (or inferred by forward chaining)."
+  (let ((list (sequence-to-cons-list relation-and-arguments))
+        (relation (first list))
+        (arguments (rest list)))
+    (return (defined? (help-get-propositions
+                       relation arguments 1 module environment)))))
+
+(defun (is-true-proposition BOOLEAN) 
+       ((proposition PROPOSITION) (module MODULE) (environment OBJECT))
+  :documentation "Return TRUE if `proposition' is  TRUE in the module `module'."
+  (with-logic-environment module environment
+    (return (true-proposition? proposition))))
+
+(defun (s-is-true-proposition BOOLEAN) 
+       ((relation-and-arguments STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return TRUE if a proposition that prints as the string
+`relation-and-arguments' is true in the module named `module-name'."
+  (return (defined? (s-get-proposition
+                     relation-and-arguments module-name environment))))
+
+
+  ;;
+;;;;;; Isa and Subsumption Hierarchies
+  ;;
+
+(defun (is-subrelation BOOLEAN)
+       ((sub LOGIC-OBJECT) (super LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return TRUE if `sub' is a subconcept/subrelation of `super'."
+  (when (or (null? sub) (null? super))
+    (return FALSE))
+  (with-logic-environment module environment
+    (return
+      (true-truth-value? (description-specializes-description? sub super)))))
+
+(defun (get-proper-subrelations (PL-ITERATOR OF LOGIC-OBJECT))
+       ((relation LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return relations that specialize `relation'.
+Non-reflexive."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator (all-subrelations relation TRUE)))))
+
+(defun (get-direct-subrelations (PL-ITERATOR OF LOGIC-OBJECT))
+       ((relation LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return relations that directly specialize `relation'.
+Non-reflexive."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator (all-direct-subrelations relation TRUE)))))
+
+(defun (get-proper-superrelations (PL-ITERATOR OF LOGIC-OBJECT))
+       ((relation LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return relations that generalize `relation'.
+Non-reflexive."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator (all-superrelations relation TRUE)))))
+
+(defun (get-direct-superrelations (PL-ITERATOR OF LOGIC-OBJECT))
+       ((relation LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return relations that directly generalize `relation'.
+Non-reflexive."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator (all-direct-superrelations relation TRUE)))))
+
+(defun (is-a BOOLEAN) ((object OBJECT) (concept LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return TRUE if `object' is a member of the concept `concept'."
+  (with-logic-environment module environment
+    (return (test-isa? object (surrogate-value-inverse concept)))))
+
+(defun (get-concept-instances PL-ITERATOR)
+       ((concept LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return instances of the concept `concept'.
+Include instances of subconcepts of `concept'.  Depending on `concept',
+the return values could be (wrapped) literals."
+  (with-logic-environment module environment
+    (return 
+     (list-to-pl-iterator 
+      (remove-deleted-members (asserted-collection-members concept FALSE))))))
+
+(defun (s-get-concept-instances PL-ITERATOR)
+       ((concept-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return instances of concept `concept-name'.
+Include instances of subconcepts of `concept-name'.  Depending on `concept-name',
+the return values could be (wrapped) literals."
+  (let ((module (safely-get-module module-name environment))
+        (concept (safely-get-concept concept-name module environment)))
+    (if (all-defined? concept)
+      (return (get-concept-instances concept module environment))
+      (return EMPTY-PL-ITERATOR))))
+
+(defun (get-direct-concept-instances PL-ITERATOR)
+       ((concept LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return instances of concept `concept'.
+Exclude instances of subconcepts of `concept'.  Depending on `concept',
+the return values could be (wrapped) literals."
+  (with-logic-environment module environment
+    (return 
+     (list-to-pl-iterator 
+      (asserted-collection-members concept TRUE)))))
+
+(defun (s-get-direct-concept-instances PL-ITERATOR)
+       ((concept-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return instances of concept `concept-name'.
+Exclude instances of subconcepts of `concept-name'.  Depending on `concept-name',
+the return values could be (wrapped) literals."
+  (let ((module (safely-get-module module-name environment))
+        (concept (safely-get-concept concept-name module environment)))
+    (if (all-defined? concept)
+      (return (get-direct-concept-instances concept module environment))
+      (return EMPTY-PL-ITERATOR)) ))
+
+(defun (get-concept-instances-matching-value PL-ITERATOR)
+       ((concept LOGIC-OBJECT) (relation LOGIC-OBJECT) (value OBJECT)
+        (module MODULE) (environment OBJECT))
+  :documentation "Return members of concept `concept' that
+have an attribute matching `value' for the binary relation `relation', i.e.,
+`(relation <result> value)' holds."
+  (with-logic-environment module environment
+    (let ((instances (get-concept-instances concept module environment))
+          (answers NIL))
+      (foreach i in instances
+               where (is-true-binary-proposition relation i value module environment)
+               do (pushq answers i))
+      (return (cons-to-pl-iterator answers)))))
+
+(defun (get-concept-instance-matching-value OBJECT)
+       ((concept LOGIC-OBJECT) (relation LOGIC-OBJECT) (value OBJECT)
+        (module MODULE) (environment OBJECT))
+  :documentation "Return a member of concept `concept' that
+has an attribute matching `value' for the binary relation `relation', i.e.,
+`(relation <result> value)' holds."
+  (with-logic-environment module environment
+    (let ((instances (get-concept-instances concept module environment)))
+      (foreach i in instances
+               where (is-true-binary-proposition relation i value module environment)
+               do (return i))
+      (return NULL))))
+
+#|
+;; What about?
+(defun (get-types (PL-ITERATOR OF LOGIC-OBJECT))
+       ((object LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return all named concepts that `object' belongs to."
+  (with-logic-environment module environment
+     (return (cons-to-pl-iterator (all-types object)))))
+
+(defun (get-types (PL-ITERATOR OF LOGIC-OBJECT))
+       ((object LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return all named concepts that `object' belongs to."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator (all-direct-types object)))))
+|#
+
+(defun (get-types (PL-ITERATOR OF LOGIC-OBJECT))
+       ((object LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return all named concepts that `object' belongs to."
+  (let ((directTypes (get-direct-types object module environment))
+        (types NIL))
+    (foreach d in directTypes
+             do
+             (when (not (member? types d))
+               (pushq types d))
+             (foreach c in (all-supercollections d)
+                      where (isa? c @NAMED-DESCRIPTION)
+                      do
+                      (when (not (member? types c))
+                        (pushq types c))))
+    (return (cons-to-pl-iterator types))))
+
+(defun (get-direct-types (PL-ITERATOR OF LOGIC-OBJECT))
+       ((object LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return most specific concepts that `object' belongs to."
+  (with-logic-environment module environment
+   (let ((derivableTypes NIL))
+     (foreach prop in (all-true-dependent-propositions object NULL FALSE)
+              where (eql? (kind prop) :ISA)
+              do (pushq derivableTypes (get-nth-value prop 0)))
+     (return (cons-to-pl-iterator (most-specific-named-descriptions derivableTypes))))))
+
+(defun (get-relation-extension (PL-ITERATOR OF PROPOSITION))
+       ((relation LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return propositions that satisfy `relation'.
+Include propositions that satisfy subrelations of `relation'."
+  (with-logic-environment module environment
+    (return (cons-to-pl-iterator
+             (help-get-true-extension-members relation TRUE)))))
+
+(defun (s-get-relation-extension (PL-ITERATOR OF PROPOSITION))
+       ((relation-name STRING) (module MODULE) (environment OBJECT))
+  :documentation "Return propositions that satisfy the relation named
+`relation-name'.  Include propositions that satisfy subrelations of the relation."
+  (let ((relation (safely-get-relation relation-name module environment)))
+    (if (all-defined? relation)
+      (return (get-relation-extension relation module environment))
+      (return EMPTY-PL-ITERATOR))))
+
+
+  ;;
+;;;;;; Modules and modules
+  ;;
+
+(defun (get-module MODULE) ((name STRING) (environment OBJECT))
+  :documentation "Return a module named `name'."
+  :public? TRUE
+  (ignore environment)
+  (return (get-stella-module name FALSE)))
+
+(defun (get-home-module MODULE) ((object LOGIC-OBJECT))
+  :documentation "Return the module in which `object' was created."
+  (return (home-module object)))
+
+(defun (change-module OBJECT) ((module MODULE))
+  :documentation "Set the current module to `module'.  The return value
+is `module' unless the context switch cannot be performed, in which case
+the current module is returned."
+  (when (null? module)
+    (return *module*))
+  (return (LOGIC/change-context module)))
+
+(defun (s-change-module OBJECT) ((name STRING) (environment OBJECT))
+  :documentation "Set the current module to the module named `name'.  
+The return value is the module named `name' unless the context switch
+cannot be performed, in which case the current module is returned."
+  (let ((module (safely-get-module name environment)))
+    (if (all-defined? module)
+      (return (LOGIC/change-context module))
+      (return *module*))))
+
+(defun (clear-module MODULE) ((module MODULE))
+  :documentation "Destroy the contents of the module `module' as well as
+the contents of all of its children, recursively."
+  :public? TRUE
+  (call-clear-module module)
+  (return module))
+
+(defun (s-clear-module MODULE) ((name STRING) (environment OBJECT))
+  :documentation "Destroy the contents of the module named `name', as
+well as the contents of all of its children, recursively."
+  :public? TRUE
+  (let ((module (safely-get-module name environment)))
+    (call-clear-module module)
+    (return module)))
+
+(defun (get-child-modules (PL-ITERATOR OF MODULE)) ((module MODULE))
+  :documentation "Return the modules that are immediate children of `module'."
+  :public? TRUE
+  (let ((directSubModules NIL))
+    ;; Filter out non-modules:
+    (foreach child in (child-contexts module)
+	where (isa? child @MODULE)
+	collect child into directSubModules)
+    (return (cons-to-pl-iterator directSubModules)) ))
+
+(defun (s-get-child-modules (PL-ITERATOR OF MODULE)) 
+    ((name STRING) (environment OBJECT))
+  :documentation "Return the modules that are immediate children of module `name'."
+  :public? TRUE
+  (return (get-child-modules (safely-get-module name environment))))
+
+(defun (get-parent-modules (PL-ITERATOR OF MODULE)) ((module MODULE))
+  :documentation "Return the modules that are immediate parents of `module'."
+  :public? TRUE
+  (return (list-to-pl-iterator (parent-modules module))))
+
+(defun (s-get-parent-modules (PL-ITERATOR OF MODULE))
+ ((name STRING) (environment OBJECT))
+  :documentation "Return the modules that are immediate parents of module `name'."
+  :public? TRUE
+  (return (get-parent-modules (safely-get-module name environment))))
+
+(defun (get-modules (PL-ITERATOR OF MODULE)) ()
+  :documentation "Return all modules currently loaded into PowerLoom."
+  :public? TRUE
+  (let ((modules (collect m in (all-modules))))
+    (return (cons-to-pl-iterator modules))))
+
+(defun (generate-unique-name STRING) ((prefix STRING) (module MODULE) (environment OBJECT))
+  :documentation "Generates a name based on `prefix' with a number appended that
+is not currently in use in the knowledge base."
+  :public? TRUE
+  (ignore environment)
+  (when (null? module) (setq module *module*))
+  (return (yield-unique-gensym-name prefix module)))
+ 
+
+  ;;
+;;;;;; Update
+  ;;
+
+
+(defun (create-object LOGIC-OBJECT) 
+    ((name STRING) (concept LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Create an object named `name' of type `concept' in the designated
+module.  Both `name' and `concept' can be `null'.  If `name' is `null' then an object
+will be created with a new, non-conflicting name based on the name of `concept', or
+system-generated if no concept is specified.  If `concept' is `null', then the object
+will be of type THING.
+
+Return the object."
+  (with-logic-environment module environment
+    (let ((object LOGiC-OBJECT null))
+      (cond ((defined? name)
+             (setq object (create-logic-instance (intern-surrogate name) NULL)))
+            ((defined? concept)
+             (setq object (create-logic-instance 
+                           (intern-surrogate 
+                            (generate-unique-name (get-name concept) null null))
+                           NULL)))
+            (otherwise
+             (setq object (create-logic-instance 
+                           (intern-surrogate (generate-unique-name "I-" null null))
+                           NULL))))
+      (when (defined? concept)
+        (if (defined? (assert-unary-proposition concept object module environment))
+          (return object)
+          (return NULL)))
+      (return object) )))
+
+(defun (s-create-object LOGIC-OBJECT)
+ ((name STRING) (concept-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Create an object named `name' of type `concept-name' in the designated
+module.  Both `name' and `concept-name' can be null strings.  If `name' is a null string
+then an object will be created with a new, non-conflicting name based on `concept-name', or
+system-generated if no concept nameis specified.  If `concept-name' is the null string, then
+the object will be of type THING.
+
+Return the object."
+  (let ((module (safely-get-module module-name environment)))
+    (return 
+     (create-object name 
+                    (safely-get-concept concept-name module environment)
+                    module
+                    environment)) ))
+
+(defun (create-concept LOGIC-OBJECT) ((name STRING) (parent LOGIC-OBJECT)
+				      (module MODULE) (environment OBJECT))
+  :documentation
+  "Create a concept named `name' in the designated `module', with the
+designated `parent' superconcept (which can be left undefined).  Additional
+superconcepts can be added via assertions of the `subset-of' relation.  Note
+that a specified `parent' concept needs to be created separately."
+  (with-logic-environment module environment
+    (return 
+      (call-defconcept
+       (bquote (& (intern-symbol name)
+                  && (choose (defined? parent)
+                             (bquote (:subset-of & (object-name parent)))
+                             NIL)))))))
+
+(defun (s-create-concept LOGIC-OBJECT) ((name STRING) (parent-name STRING) 
+					(module-name STRING) (environment OBJECT))
+  :documentation
+  "Create a concept named `name' in the designated module, with
+with the concept named `parent-name' as superconcept (which can be left
+undefined).  Additional superconcepts can be added via assertions of the
+`subset-of' relation.  Note that a specified parent concept needs to be
+created separately."
+  (let ((module (safely-get-module module-name environment)))
+    (return 
+      (create-concept name
+		      (safely-get-concept parent-name module environment)
+		      module
+		      environment))))
+
+(defun (create-relation LOGIC-OBJECT) ((name STRING) (arity INTEGER)
+				       (module MODULE) (environment OBJECT))
+  :documentation "Create a relation named `name' with arity `arity' in the
+designated module.  Domain and range information can be added via assertions
+of `nth-domain' (or `domain' and `range') relations."
+  (unless (> arity 0)
+    (signal-parsing-error "Relations must have arity of at least 1"))
+  (let ((args NIL))
+    (with-logic-environment module environment
+      (foreach i in (interval 0 (1- arity))
+          collect (yield-system-defined-parameter-name i *module*)
+          into args)
+      (return
+	(call-defrelation (bquote (& (intern-symbol name) & args)))))))
+
+(defun (s-create-relation LOGIC-OBJECT) ((name STRING) (arity INTEGER) 
+                                         (module-name STRING) (environment OBJECT))
+  :documentation "Create a relation named `name' with arity `arity' in the
+designated module.  Domain and range information can be added via assertions
+of `nth-domain' (or `domain' and `range') relations."
+  (return 
+    (create-relation name arity
+                     (safely-get-module module-name environment)
+                     environment)))
+
+(defun (create-function LOGIC-OBJECT) ((name STRING) (arity INTEGER)
+				       (module MODULE) (environment OBJECT))
+  :documentation
+  "Create a function named `name' with arity `arity'  in the designated 
+`module'.  Domain and range information can be added via assertions of
+`nth-domain' (or `domain' and `range') relations."
+  (unless (> arity 0)
+    (signal-parsing-error "Functions must have arity of at least 1"))
+  (let ((args NIL))
+    (with-logic-environment module environment
+      (foreach i in (interval 0 (1- arity))
+          collect (yield-system-defined-parameter-name i *module*)
+          into args)
+      (return
+	(call-deffunction (bquote (& (intern-symbol name) & args)))))))
+
+(defun (s-create-function LOGIC-OBJECT) ((name STRING) (arity INTEGER) 
+                                         (module-name STRING) (environment OBJECT))
+  :documentation
+  "Create a function named `name' with arity `arity' in the designated 
+module.  Domain and range information can be added via assertions of
+`domain', `nth-domain' and `range' relations."
+  (return 
+    (create-function name arity
+                     (safely-get-module module-name environment)
+                     environment)))
+
+(defun (create-enumerated-list LOGIC-OBJECT) ((members CONS))
+  :documentation
+  "Create a logical term that denotes a list containing `members'.
+Useful for passing lists as arguments to parameterized queries."
+  :public? TRUE
+  (return (create-logical-list (new LIST :the-cons-list members))))
+
+(defun (create-enumerated-set LOGIC-OBJECT) ((members CONS))
+  :documentation
+  "Create a logical term that denotes the enumerated set containing `members'."
+  :public? TRUE
+  (return (/logic/create-enumerated-set (new LIST :the-cons-list members))))
+
+(defun destroy-object ((object LOGIC-OBJECT))
+  :documentation "Delete the object `object', retracting all facts attached to it."
+  (destroy-instance object))
+
+(defun s-destroy-object
+ ((object-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Delete the object named `object-name', retracting all facts
+attached to it."
+  (let ((module (safely-get-module module-name environment))
+        (object (safely-get-object object-name module environment)))
+    (when (all-defined? object)
+      (destroy-object object))))
+
+(defun (assert-unary-proposition PROPOSITION) 
+    ((relation LOGIC-OBJECT) (arg OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Assert that the proposition (`relation' `arg') is TRUE in `module'.  Return the asserted proposition."
+  (with-logic-environment 
+    module environment
+    (if (class? relation)
+      (return (assert-isa-proposition arg (surrogate-value-inverse relation)))
+      (return (assert-property arg (surrogate-value-inverse relation))))))
+
+(defun (assert-binary-proposition PROPOSITION)
+       ((relation LOGIC-OBJECT) (arg OBJECT) (value OBJECT)
+	(module MODULE) (environment OBJECT))
+  :documentation "Assert that the proposition (`relation' `arg' `value') is TRUE
+in `module'.  Return the asserted proposition."
+  (with-logic-environment module environment
+    (return (assert-binary-value (surrogate-value-inverse relation) arg value))))
+
+(defun (assert-nary-proposition PROPOSITION) 
+       ((relation-and-arguments OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Assert that the proposition represented by the list `arguments' satisfies
+the relation `relation'."
+  (let ((list (sequence-to-cons-list relation-and-arguments))
+        (relation NAMED-DESCRIPTION (first list))
+        (relationSurrogate (surrogate-value-inverse relation))
+        (arguments (rest list)))
+    (with-logic-environment module environment
+      (return (assert-tuple relationSurrogate arguments)))))
+
+(defun (retract-unary-proposition PROPOSITION) 
+    ((relation LOGIC-OBJECT) (arg OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Retract that the proposition (`relation' `arg') is TRUE in `module'.  Return the asserted proposition."
+  (with-logic-environment 
+    module environment
+    (if (class? relation)
+      (return (retract-isa-proposition arg (surrogate-value-inverse relation)))
+      (return (retract-property arg (surrogate-value-inverse relation))))))
+
+(defun (retract-binary-proposition PROPOSITION)
+       ((relation LOGIC-OBJECT) (arg OBJECT) (value OBJECT)
+	(module MODULE) (environment OBJECT))
+  :documentation "Retract that the proposition (`relation' `arg' `value') is TRUE
+in `module'.  Return the asserted proposition."
+  (with-logic-environment module environment
+    (return (retract-binary-value (surrogate-value-inverse relation) arg value))))
+
+
+(defun (retract-nary-proposition PROPOSITION) 
+       ((relation-and-arguments OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Retract the proposition that `arguments' satisfies
+the relation `relation'."
+  (let ((list (sequence-to-cons-list relation-and-arguments))
+        (relation NAMED-DESCRIPTION (first list))
+        (relationSurrogate (surrogate-value-inverse relation))
+        (arguments (rest list)))
+    (with-logic-environment module environment
+      (return (update-tuple relationSurrogate arguments :RETRACT-TRUE)))))
+
+(defun (assert-proposition PROPOSITION) 
+    ((proposition PROPOSITION) (module MODULE) (environment OBJECT))
+  :documentation "Assert that the proposition `proposition' is true in `module'.
+Return the asserted proposition."
+  ;;; PROBLEM: `assert' is already defined in the C++ <stdexcept> include
+  ;;;    file and does get renamed apart by the C++ translator.
+  (with-logic-environment module environment
+    (help-update-top-level-proposition proposition :ASSERT-TRUE)
+    (return proposition)))
+
+(defun (s-assert-proposition (PL-ITERATOR OF PROPOSITION))
+    ((sentence STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Assert that the logical sentence `sentence' is true in the module
+named `module-name'. Return an iterator of the propositions resulting
+from sentence."
+  (let ((module (safely-get-module module-name environment))
+        (propositions (PL-ITERATOR OF PROPOSITION) NULL)
+	(return-value (PL-ITERATOR OF PROPOSITION) NULL))
+    (with-logic-environment module environment
+      (setq propositions (s-conceive sentence module-name environment))
+      (setq return-value (cons-to-pl-iterator (cursor propositions))) ; Preserve for return
+      (foreach proposition in propositions
+	  do (help-update-top-level-proposition proposition :ASSERT-TRUE))
+      (return return-value))))
+
+(defun (retract-proposition PROPOSITION) 
+    ((proposition PROPOSITION) (module MODULE) (environment OBJECT))
+  :documentation "Retract the truth of the proposition `proposition' in `module'.
+Return the retracted proposition."
+  (with-logic-environment module environment
+    (update-proposition-truth-value proposition :RETRACT-TRUE)
+    (return proposition)))
+
+(defun (s-retract-proposition (PL-ITERATOR OF PROPOSITION)) 
+    ((sentence STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Retract the truth of the logical sentence `sentence' in the module named
+`module-name'.  Return an iterator of the retracted propositions resulting
+from sentence."
+  (let ((module (safely-get-module module-name environment))
+        (propositions (PL-ITERATOR OF PROPOSITION) NULL)
+	(return-value (PL-ITERATOR OF PROPOSITION) NULL))
+    (with-logic-environment module environment
+      (setq propositions (s-conceive sentence module-name environment))
+      (setq return-value (cons-to-pl-iterator (cursor propositions))) ; Preserve for return
+      (foreach proposition in propositions
+	  do (update-proposition-truth-value proposition :RETRACT-TRUE))
+      (return return-value))))
+
+(defun (conceive (PL-ITERATOR OF PROPOSITION))
+    ((sentence OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Create one or more proposition objects from the sentence `sentence'
+in the  module `module'.  Return an iterator of the propositions.
+If any of the new propositions has the same structure as an already existing
+proposition, an automatic check for duplicates will return the pre-existing
+proposition.  Multiple propositions may be returned for a single sentence
+because of normalization of equivalences, conjunctions, etc.
+
+Signals a `Proposition-Error' if PowerLoom could not conceive `sentence'."
+  (if (null? sentence)
+    (return NULL)
+    (with-logic-environment module environment
+      (let ((propositions (conceive-formula sentence)))
+	(when (null? propositions)
+	  (signal-proposition-error "Failed to conceive " sentence))
+	(typecase propositions
+	  (PROPOSITION
+	   (return (cons-to-pl-iterator (cons propositions NIL))))
+	  (CONS
+	   (return (cons-to-pl-iterator propositions)))
+          (otherwise
+           (signal-proposition-error "Formula is not a sentence: " sentence)))) )))
+
+(defun (s-conceive (PL-ITERATOR OF PROPOSITION))
+    ((sentence STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Create one or more proposition objects from the sentence `sentence'
+in the  module named `module-name'.  Return an iterator of the propositions.
+If any of the new propositions has the same structure as an already existing
+proposition, an automatic check for duplicates will return the pre-existing
+proposition.  Multiple propositions may be returned for a single sentence
+because of normalization of equivalences, conjunctions, etc.
+
+Signals a `Proposition-Error' if PowerLoom could not conceive `sentence'."
+  (let ((module (safely-get-module module-name environment)))
+    (with-logic-environment module environment
+      (return (conceive (unstringify sentence) module environment))) ))
+
+
+  ;;
+;;;;;; Rules
+  ;;
+
+(defun (get-rules (PL-ITERATOR OF PROPOSITION)) 
+    ((relation LOGIC-OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Return rules attached to the concept/relation `relation'
+in either antecedent or consequent position."
+  :public? TRUE
+  (if (null? relation)
+    (return EMPTY-PL-ITERATOR)
+    (with-logic-environment module environment
+       (return (cons-to-pl-iterator (call-get-rules relation))))))
+
+(defun (s-get-rules (PL-ITERATOR OF PROPOSITION)) 
+       ((relation-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return rules attached to the concept/relation named
+`relation-name' found in the module named `module-name'."
+  :public? TRUE
+  (let ((module (safely-get-module module-name environment))
+        (relation (safely-get-relation relation-name module environment)))
+    (return (get-rules relation module environment))))
+
+(defun s-print-rules ((name STRING) (stream OUTPUT-STREAM)
+		      (module-name STRING) (environment OBJECT))
+  :documentation "Print rules attached to the concept/relation named `name'."
+  :public? TRUE
+  (when (null? stream)
+    (setq stream STANDARD-OUTPUT))
+  (foreach rule in (s-get-rules name
+				module-name
+				environment)
+      do (print-logical-form rule stream)
+         (print-stream stream EOL EOL)))
+
+(defun run-forward-rules ((module OBJECT) (force? BOOLEAN))
+  :documentation "Run forward inference rules in module `module'.
+If `module' is NULL, the
+current module will be used.  If forward inferencing is already up-to-date
+in the designated module, no additional inferencing will occur, unless `force'
+is set to TRUE, in which case all forward rules are run or rerun.
+
+Calling `run-forward-rules' temporarily puts the module into a mode where
+future assertional (monotonic) updates will trigger additional forward
+inference.  Once a non-monotonic update is performed, i.e., a retraction
+or clipping of relation value, all cached forward inferences will be discarded
+and forward inferencing will be disabled until this function is
+called again."
+  (when (null? module)
+    (setq module *module*))
+  (when (defined? module)
+    (call-run-forward-rules module force?)))
+
+
+  ;;
+;;;;;; Frame queries
+  ;;
+
+(defun (get-arity INTEGER) ((relation LOGIC-OBJECT))
+  :documentation "Return the arity of the relation `relation'."
+  (typecase relation
+    (NAMED-DESCRIPTION (return (arity relation)))
+    (otherwise (return 0))))
+
+(defun (s-get-arity INTEGER) ((relation-name STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Return the arity of the relation named `relation-name'."
+  (let ((module (safely-get-module module-name environment))
+        (relation (safely-get-relation relation-name module environment)))
+    (if (all-defined? relation)
+      (return (get-arity relation))
+      (return NULL))))
+
+(defun (get-domain LOGIC-OBJECT) ((relation LOGIC-OBJECT))
+  :documentation "Return the type (a concept) for the first argument to the binary
+relation `relation'."
+  (typecase relation
+    (NAMED-DESCRIPTION (return (get-nth-domain relation 0)))
+    (otherwise (return NULL))))
+
+(defun (s-get-domain LOGIC-OBJECT) ((relation-name STRING) 
+                                    (module-name STRING) (environment OBJECT))
+  :documentation "Return the type (concept) for the first argument to the binary
+relation `relation-name'."
+  (let ((module (safely-get-module module-name environment))
+        (relation (safely-get-relation relation-name module environment)))
+    (if (all-defined? relation)
+      (return (get-domain relation))
+      (return NULL))))
+
+(defun (get-range LOGIC-OBJECT) ((relation LOGIC-OBJECT))
+  :documentation "Return the type (a concept) for fillers of the binary relation
+`relation'."
+  (typecase relation
+    (NAMED-DESCRIPTION (return (get-nth-domain relation 1)))
+    (otherwise (return NULL))))
+
+(defun (s-get-range LOGIC-OBJECT) ((relation-name STRING)
+                                   (module-name STRING) (environment OBJECT))
+  :documentation "Return the type (a concept) for fillers of the binary relation
+`relation-name'."
+  (let ((module (safely-get-module module-name environment))
+        (relation (safely-get-relation relation-name module environment)))
+    (if (all-defined? relation)
+      (return (get-range relation))
+      (return NULL))))
+
+(defun (get-nth-domain LOGIC-OBJECT) ((relation LOGIC-OBJECT) (n INTEGER))
+  :documentation "Return the type (a concept) for the the nth argument of the
+relation `relation'.  Counting starts at zero."
+  (if (class? relation)
+    (return (choose (eql? n 0) relation NULL))
+    (typecase relation
+      (NAMED-DESCRIPTION
+       (if (and (>= n 0)
+                (< n (length (io-variable-types relation))))
+         (let ((type (surrogate-value (nth (io-variable-types relation) n))))
+           (when (null? type)
+             (return NULL))
+           (typecase type
+             (CLASS (return (description type)))
+             (LOGIC-OBJECT (return type))))
+         (return NULL)))
+      (otherwise (return NULL)))))
+
+(defun (s-get-nth-domain LOGIC-OBJECT)
+       ((relation-name STRING) (n INTEGER) (module-name STRING) (environment OBJECT))
+  :documentation
+  "Return the type (a concept) for the nth argument of the relation
+named `relation-name'.  Counting starts at zero."
+  (let ((module (safely-get-module module-name environment))
+        (relation (safely-get-relation relation-name module environment)))
+    (if (all-defined? relation)
+      (return (get-nth-domain relation n))
+      (return NULL))))
+
+(defun load ((filename STRING))
+  :documentation "Read logic commands from the file named `filename' and evaluate them.
+The file should begin with an `in-module' declaration that specifies
+the module within which all remaining commands are to be evaluated
+The remaining commands are evaluated one-by-one, applying the function
+`evaluate' to each of them."
+  :public? TRUE
+  (LOGIC/load filename))
+
+(defun save-module ((module MODULE) (filename STRING) (ifexists STRING) (environment OBJECT))
+  :documentation "Save the contents of the module `mod' into a file named `filename'.
+If a file named `filename' already exists, then the action taken depends on the
+value of `ifexists'.  Possible values are \"ASK\", \"REPLACE\", \"WARN\" and \"ERROR\":
+
+  REPLACE => Means overwrite without warning.
+  WARN    => Means overwrite with a warning.
+  ERROR   => Means don't overwrite, signal an error instead.
+  ASK     => Ask the user whether to overwrite or not.  If not overwritten, an
+             exception is thrown."
+  :public? TRUE
+  (let ((exists? (stella/probe-file? filename)))
+    (cond ((or (not exists?) (string-equal? ifexists "REPLACE"))
+	   NULL)			; Do nothing, replace file if needed.
+	  ((string-equal? ifexists "ASK")
+	   (unless (yes-or-no? (concatenate "File `" filename 
+					    "' already exists.  Overwrite it? (yes or no) "))
+	     (error "File " filename " already exists")))
+	  ((string-equal? ifexists "WARN")
+	   (warn "File " filename " already exists, overwriting."))
+	  ((string-equal? ifexists "ERROR")
+	   (error "File " filename " already exists."))
+	  (otherwise
+	   (error "Unrecognized ifexists option " ifexists)))
+    (with-logic-environment module environment
+      (with-output-file (stream filename)
+	(do-save-module *MODULE* stream))) ))
+
+(defun s-save-module ((module-name STRING) (filename STRING) (ifexists STRING) (environment OBJECT))
+  :documentation "Save the contents of the module `module-name' into a file named `filename'.
+If a file named `filename' already exists, then the action taken depends on the
+value of `ifexists'.  Possible values are \"ASK\", \"REPLACE\", \"WARN\" and \"ERROR\":
+
+  REPLACE => Means overwrite without warning.
+  WARN    => Means overwrite with a warning.
+  ERROR   => Means don't overwrite, signal an error instead.
+  ASK     => Ask the user whether to overwrite or not.  If not overwritten, an
+             exception is thrown."
+  :public? TRUE
+  (save-module (safely-get-module module-name environment) filename ifexists environment))
+
+
+  ;;
+;;;;;; Extracting column values from propositions and iterators
+  ;;
+
+(defun (get-predicate LOGIC-OBJECT) ((prop PROPOSITION))
+  :documentation "Return the concept or relation predicate for
+the proposition `prop'."
+  :public? TRUE
+  ;; Called by `get-nth-value'.
+  (let ((relation LOGIC-OBJECT (get-description (relationref prop))))
+    (when (null? relation)
+      ;; if we can't return a NAMED-DESCRIPTION, we settle for returning
+      ;;    a LOGIC-OBJECT:
+      (setq relation (surrogate-value (relationref prop))))
+    (return relation)))
+
+(defun (get-column-count INTEGER) ((obj OBJECT))
+  :documentation "Return the number of columns in `obj', which must
+be of type proposition, cons, vector or PL-iterator.  For a proposition,
+the number includes both the predidate and arguments. For the PL-iterator
+case,the number of columns is for the current value of the iterator."
+  :public? TRUE
+  (when (null? obj)
+    (return 0))
+  (typecase obj
+    (PROPOSITION
+     (return (1+ (length (arguments obj)))))
+    (PL-ITERATOR
+     (return (get-column-count (value obj))))
+    (CONS
+     (return (length obj)))
+    (VECTOR
+     (return (length obj)))))
+
+(defun (get-nth-value OBJECT) ((sequence OBJECT) (n INTEGER))
+  :documentation "Return the value in the `nth' column of `sequence'.
+Counting starts at zero.  `sequence' must be of type proposition, cons,
+vector or PL-iterator.  A zero column number returns a proposition's 
+relational predicate.  For the PL-iterator case, the number of columns
+is for the current value of the iterator."
+  :public? TRUE
+  (when (or (>= n (get-column-count sequence))
+	    (< n 0))
+    (signal LOGIC-EXCEPTION "Column index " n " is out of range for " sequence))
+  (typecase sequence
+    (PROPOSITION
+     (if (eql? n 0)
+       (return (get-predicate sequence))
+       (return (nth (arguments sequence) (1- n)))))
+    (PL-ITERATOR
+     (return (get-nth-value (value sequence) n)))
+    (CONS
+     (return (nth sequence n)))
+    (VECTOR
+     (return (nth sequence n)))))
+
+(defun (get-nth-string STRING) ((sequence OBJECT) (n INTEGER))
+  :documentation "Return a string representation of the value in the `nth' column of
+`sequence'. Counting starts at zero.  `sequence' must be of type
+proposition, cons, vector or PL-iterator.  A zero column number returns
+a proposition's relational predicate.  For the PL-iterator case, the
+the current value pointed to by the iterator is used.  This will always
+succeed, even if the `nth' value is not a string object.  In that case, a
+string reprensentation will be returned."
+  :public? TRUE
+  (return (object-to-string (get-nth-value sequence n))))
+
+(defun (get-nth-integer INTEGER) ((sequence OBJECT) (n INTEGER))
+  :documentation  "Return an integer representation of the value in the `nth' column of
+`sequence'. Counting starts at zero.  `sequence' must be of type
+proposition, cons, vector or PL-iterator.  A zero column number returns
+a proposition's relational predicate.  For the PL-iterator case, the
+the current value pointed to by the iterator is used.  If this is not
+an integer value, then NULL-INTEGER will be returned."
+  :public? TRUE
+  (return (object-to-integer (get-nth-value sequence n))))
+
+(defun (get-nth-float FLOAT) ((sequence OBJECT) (n INTEGER))
+  :documentation  "Return the floating point value in the `nth' column of
+`sequence'. Counting starts at zero.  `sequence' must be of type
+proposition, cons, vector or PL-iterator.  A zero column number returns
+a proposition's relational predicate.  For the PL-iterator case, the
+the current value pointed to by the iterator is used.  If this is not
+a floating point value, then NULL-FLOAT will be returned."
+  :public? TRUE
+  (return (object-to-float (get-nth-value sequence n))))
+
+(defun (get-nth-logic-object LOGIC-OBJECT) ((sequence OBJECT) (n INTEGER))
+  :documentation
+  "Return a logic object representation of the value in the `nth' column
+of `sequence'.  Counting starts at zero.  `sequence' must be of type
+proposition, cons, vector or PL-iterator.  A zero column number returns
+a proposition's relational predicate.  For the PL-iterator case, the
+the current value pointed to by the iterator is used.  A zero column number
+returns the proposition's relational predicate."
+  :public? TRUE
+  (let ((value (get-nth-value sequence n)))
+    (if (isa? value @LOGIC-OBJECT)
+      (return value)
+      (return NULL))))
+
+(defun (get-enumerated-collection-members CONS) ((collection OBJECT))
+  :documentation
+  "Returns the members of an enumerated collection.  This works on all types
+of collection, i.e., sets and lists"
+  :public? TRUE
+  (return (the-cons-list (asserted-collection-members collection TRUE))))
+
+
+  ;;
+;;;;;;
+  ;;
+
+(defun (evaluate OBJECT) ((command OBJECT) (module MODULE) (environment OBJECT))
+  :documentation "Evaluate the command `command' within `module' and return
+the result. Currently, only the evaluation of (possibly nested) commands and
+global variables is supported.  Commands are simple to program in Common Lisp,
+since they are built into the language, and relatively awkward in Java and C++.
+Users of either of those languages are more likely to want to call `s-evaluate'."
+  :public? TRUE 
+  (when (defined? command)
+    (with-logic-environment module environment
+      (return (STELLA/evaluate command))))
+  (return NULL))
+
+(defun (s-evaluate OBJECT) ((command STRING) (module-name STRING) (environment OBJECT))
+  :documentation
+  "Evaluate the command represented by the string `command' within `module' and
+return the result.  Currently, only the evaluation of (possibly nested) commands and
+global variables is supported."
+  :public? TRUE
+  (let ((module (safely-get-module module-name environment)))
+    (with-logic-environment module environment
+       (return (evaluate (unstringify command)
+			 module
+			 environment)))))
+
+
+  ;;
+;;;;;;  Queries
+  ;;
+
+
+;;; Type tests for returned values:
+
+(defun (is-logic-object BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is of type LOGIC-OBJECT"
+  :public? TRUE
+  (return (isa? obj @LOGIC-OBJECT)))
+
+(defun (is-integer BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is of type INTEGER"
+  :public? TRUE
+  (return (isa? obj @INTEGER-WRAPPER)))
+
+(defun (is-float BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is of type FLOAT (double)"
+  :public? TRUE
+  (return (isa? obj @FLOAT-WRAPPER)))
+
+(defun (is-number BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is of type NUMBER.  This can
+be either an integer or a floating point number.  One key characteristic
+is that 'object-to-integer' and `object-to-float' will both work on it."
+  :public? TRUE
+  (return (isa? obj @NUMBER-WRAPPER)))
+
+(defun (is-string BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is of type STRING"
+  :public? TRUE
+  (return (isa? obj @STRING-WRAPPER)))
+
+(defun (is-enumerated-collection BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is an enumerated collection.  This
+subsumes both sets and lists."
+  :public? TRUE
+  (return (logical-collection? obj)))
+
+(defun (is-enumerated-set BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is an enumerated set."
+  :public? TRUE
+  (return (enumerated-set? obj)))
+
+(defun (is-enumerated-list BOOLEAN) ((obj OBJECT))
+  :documentation "Test whether `obj' is an enumerated list"
+  :public? TRUE
+  (return (enumerated-list? obj)))
+
+
+;;; Interpreting truth values:
+
+(defun (is-true BOOLEAN) ((tv TRUTH-VALUE))
+  :documentation "Tests whether `tv' is a true truth value.  It can be true
+either absolutely or by default."
+  :public? TRUE
+  (return (true-truth-value? tv)))
+
+(defun (is-false BOOLEAN) ((tv TRUTH-VALUE))
+  :documentation "Tests whether `tv' is a false truth value.  It can be false
+either absolutely or by default."
+  :public? TRUE
+  (return (false-truth-value? tv)))
+
+(defun (is-unknown BOOLEAN) ((tv TRUTH-VALUE))
+  :documentation "Tests whether `tv' is an unknown truth value."
+  :public? TRUE
+  (return (unknown-truth-value? tv)))
+
+(defun (is-strict BOOLEAN) ((tv TRUTH-VALUE))
+  :documentation "Tests whether `tv' is a strict (non-default) truth value."
+  :public? TRUE
+  (return (strict-truth-value? tv)))
+
+(defun (is-default BOOLEAN) ((tv TRUTH-VALUE))
+  :documentation "Tests whether `tv' is a default truth value."
+  :public? TRUE
+  (return (default-truth-value? tv)))
+
+(defun (ask TRUTH-VALUE) ((query CONS) (module MODULE) (environment OBJECT))
+  :documentation "Returns a truth value for the `query' in `module' and `environment'.
+The truth value represents the degree of belief in the answer.  See also the
+helping functions `is-true', `is-false' , `is-unknown'."
+  :public? TRUE
+  (with-logic-environment module environment
+    ;; Test for the case where no ASK options are being given and
+    ;; add the required extra level of nesting.
+    (when (isa? (first query) @SYMBOL)
+      (setq query (cons query NIL)))
+    (return (call-ask query))))
+
+(defun (s-ask TRUTH-VALUE) ((query STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Returns a truth value for the `query' in `module-name' and `environment'.
+The truth value represents the degree of belief in the answer.  See also the
+helping functions `is-true', `is-false' , `is-unknown'."
+  :public? TRUE
+  (let ((queryForm NIL))
+    (foreach sexp in (s-expressions (new STRING-INPUT-STREAM :the-string query))
+	collect sexp into queryForm)
+    (when (and (or (null? (rest queryForm))
+		   (empty? (rest queryForm)))
+	       (not (isa? (first (cast (first queryForm) CONS)) @SYMBOL)))
+      (setq queryForm (first queryForm)))
+    (return (ask queryForm (safely-get-module module-name environment) environment))))
+
+
+(defun (retrieve PL-ITERATOR) ((query CONS) (module MODULE) (environment OBJECT))
+  :documentation "Returns an iterator for variables that satisfy `query' in `module-name'
+and `environment'.  This uses the normal PowerLoom query syntax:
+
+   `[n-values] output-variables query-form [options]'
+
+The `output-variables' should either be a single variable name
+-- preceded by the '?' character -- or a list of one or more such names.
+If a single variable name is provided, then each element in the returned
+iterator will be a value binding.  If a list (even of one variable name)
+is provided, then each element in the returned iterator can be accessed
+using the `get-nth-'... functions."
+  :public? TRUE
+  (with-logic-environment module environment
+    ;; NOTE: This works around problem that query iterators would
+    ;; otherwise be forced to completion by iterator-to-pl-iterator.
+    ;; If that changes, then we can simplify this code.
+    (return (cons-to-pl-iterator (consify-current-solutions (call-retrieve query))))))
+
+(defun (s-retrieve PL-ITERATOR) ((query STRING) (module-name STRING) (environment OBJECT))
+  :documentation "Returns an iterator for variables that satisfy `query' in `module-name'
+and `environment'.  This uses the normal PowerLoom query syntax:
+
+   `\"[n-values] output-variables query-form [options]\"'
+
+The `output-variables' should either be a single variable name
+-- preceded by the '?' character -- or a list of one or more such names.
+If a single variable name is provided, then each element in the returned
+iterator will be a value binding.  If a list (even of one variable name)
+is provided, then each element in the returned iterator can be accessed
+using the `get-nth-'... functions."
+  :public? TRUE
+  (let ((queryForm NIL))
+    (foreach sexp in (s-expressions (new STRING-INPUT-STREAM :the-string query))
+	collect sexp into queryForm)
+    (when (or (null? (rest queryForm)) (empty? (rest queryForm)))
+      (setq queryForm (first queryForm)))
+    (return (retrieve queryForm
+                      (safely-get-module module-name environment)
+                      environment))))
+
+;;; TO DO:  PARTIAL RETRIEVE?
+;;;
+
+
+;;; Main entry point.
+;;;
+
+(defmain ()
+  :documentation "Main PowerLoom entry point for your code in C++ and Java."
+  :public? TRUE :startup-system? FALSE
+  (print "Initializing STELLA..." EOL)
+  (startup-stella-system)
+  (print "Initializing PowerLoom..." EOL)
+  (startup-logic-system)
+  (powerloom))

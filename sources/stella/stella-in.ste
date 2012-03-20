@@ -1,0 +1,986 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: stella-in.ste,v 1.68 2003/04/18 21:15:32 hans Exp
+
+;;; Stella-specific routines for interpreting Stella parse trees of class
+;;;     definitions and turning them into Stella class objects.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+(defglobal *redefine-identical-classes?* BOOLEAN FALSE
+  :documentation "If `true', always redefine classes, even if an
+                  identical class exists")
+
+  ;;
+;;;;;; Utility functions:
+  ;;
+
+(defun (permanentify-form OBJECT) ((form OBJECT))
+  ;; Take a Stella 'form' and convert it into a permanent object that
+  ;;    can be stored in a class or slot object.
+  ;; Perform pre-evaluation of some selected constants.
+  ;; This is used to store values of keywords such as :initially, etc.
+  ;; Eventually, we might want to store all such forms as strings.
+  :public? TRUE
+  (typecase form
+    (SYMBOL
+     (case form
+       ;; Evaluate some constants for a minute efficiency gain
+       ;; (but maybe this should really be done by the walker?):
+       ;(TRUE (return TRUE-WRAPPER))
+       ;(FALSE (return FALSE-WRAPPER))
+       (TRUE (return form))
+       (FALSE (return form))
+       (otherwise (return (permanentify form)))))
+    (CONS
+     (return (permanent-copy form)))
+    (otherwise
+     (return (permanentify form)))))
+
+(defun (transientify-form OBJECT) ((form OBJECT))
+  ;; Convert 'form' into a transient one so it can be stuck into a parsetree.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (copy-cons-tree form)))
+
+(defun (stringify-in-module STRING) ((tree OBJECT) (module MODULE))
+  :documentation "Stringify a parse `tree' relative to `module', or
+`*module*' if no module is specified."
+  :public? TRUE
+  (when (null? module)
+    (setq module *module*))
+  (within-module module
+    (return (stringify tree))))
+  
+(defun (unstringify-in-module OBJECT) ((string STRING) (module MODULE))
+  :documentation "Unstringify relative to `module', or `*MODULE*' if no
+module is specified."
+  :public? TRUE
+  (when (null? module)
+    (setq module *module*))
+  (within-module module
+    (return (unstringify string))))
+
+(defun (unstringify-stella-source OBJECT) ((source STRING) (module MODULE))
+  :documentation "Unstringify a STELLA `source' string relative to `module',
+or `*MODULE*' if no module is specified.  This function allocates transient
+objects as opposed to `unstringify-in-module' or the regular `unstringify'."
+  :public? TRUE
+  (let ((result OBJECT NULL))
+    (with-transient-objects
+      (setq result (unstringify-in-module source module)))
+    (return result)))
+
+(defun (collect-feature-list (LIST OF GENERALIZED-SYMBOL)) ((tree OBJECT))
+  ;; Collect the list of symbolic features in 'tree' into a permanent
+  ;;    list and return the result.
+  (typecase tree
+    (CONS
+     (let ((result LIST NULL))
+       (when (> (length tree) 0)
+         (setq result (new LIST)))
+       (foreach feature in tree
+                do
+                (when (not (isa? feature @GENERALIZED-SYMBOL))
+                  (walk-error "Ignoring illegal feature " feature
+                              " in feature list: " tree)
+                  (continue))
+                collect (permanentify feature) into result)
+       (return result)))
+    (otherwise
+     (walk-error "Illegal atomic feature list: " tree)
+     (return NULL))))
+
+(defun (collect-key-value-list (KEY-VALUE-LIST OF GENERALIZED-SYMBOL OBJECT))
+    ((tree OBJECT))
+  ;; Collect the list of key/value pairs in 'tree' into a permanent
+  ;;    key-value list and return the result.
+  (typecase tree
+    (CONS
+     (let ((length (length tree))
+           (cursor tree)
+           (key OBJECT NULL)
+           (value OBJECT NULL)
+           (result KEY-VALUE-LIST NULL))
+       (when (eq? length 0)
+         (return NULL))
+       (when (odd? length)
+         (walk-error "Unbalanced keys and values in key-value list: " tree)
+         (return NULL))
+       (setq result (new KEY-VALUE-LIST))
+       (while (non-empty? cursor)
+         (setq key (first cursor))
+         (setq value (second cursor))
+         (setq cursor (rest (rest cursor)))
+         (when (not (isa? key @GENERALIZED-SYMBOL))
+           (walk-error "Ignoring illegal key " key " in key-value list: " tree)
+           (continue))
+         (if (or (eql? value (quote TRUE))
+                 (eql? value (quote FALSE)))
+             (setq value (coerce-to-boolean value))
+           (setq value (permanent-copy value)))
+         (insert-at result (permanentify key) value))
+       (return result)))
+    (otherwise
+     (walk-error "Illegal atomic key-value list: " tree)
+     (return NULL))))
+     
+
+  ;;
+;;;;;; 'define-class-from-parse-tree'
+  ;;
+
+(defun (define-inline-method METHOD-SLOT)
+    ((name SYMBOL) (parametersAndBody CONS))
+  ;; Define an inline method 'name' according to 'parametersAndBody'.
+  (let ((parseTree CONS NULL)
+        (method METHOD-SLOT NULL))
+    (setq parseTree (bquote (defmethod & name && parametersAndBody)))
+    ;; Stringify the body of the inline method.  The main purpose of
+    ;; this scheme is to be able to walk and translate inline methods
+    ;; multiple times.
+    (setq method
+      (help-define-method-from-parse-tree parseTree (stringify parseTree)))
+    (return method)))
+
+(defun (help-define-class-from-parse-tree CLASS)
+       ((parseTree CONS) (stringifiedSource STRING))
+  ;; Called by 'define-class-from-parse-tree'.
+  ;; Convert a class definition based on a cons tree definition into
+  ;;    a class definition based on collections, and feed the
+  ;;    result to 'define-stella-class'.
+  (let ((treeDefinition (rest parseTree))       ; skip 'defclass'
+        (theSupers CONS (second treeDefinition))
+        (theOptions (allocate PROPERTY-LIST))
+        (classType (typify (first treeDefinition)))
+        (directSupers (allocate (LIST OF TYPE)))
+        (slots (allocate (LIST OF SLOT)))
+        (classOptions (allocate KEYWORD-KEY-VALUE-LIST))
+        (key KEYWORD NULL)
+        (parameters (LIST OF SLOT) NULL)
+        (slotTree CONS NULL))
+    ;; place options into a property list:
+    (setf (the-plist theOptions) (rest (rest treeDefinition)))
+    ;; build temporary list of super classes:
+    (foreach s in theSupers
+             collect (typify s)
+             into directSupers)
+    ;; reformat options into temporary dictionary of legal inputs for
+    ;;    'define-stella-class'.
+    (foreach
+      (theKey theValue) in theOptions
+      do
+      (setq key (permanentify theKey))
+      (case key
+        ((:public-slots :slots)
+         (let ((localSlot SLOT NULL))
+           (foreach slotDef in (cast theValue CONS)
+                    do
+                    (when (not (cons? slotDef))
+                      (walk-inform "Illegal slot definition:" EOL
+                            "   " slotDef EOL)
+                      (continue))
+                    (setq localSlot (define-storage-slot-from-parse-tree
+                                    slotDef classType))
+                    (when (eq? key :public-slots)
+                      (setf (slot-public? localSlot) TRUE))
+                    collect localSlot into slots)))
+        ((:public-methods :methods)
+         (let ((localSlot SLOT NULL))
+           (foreach methodDef in (cast theValue (CONS OF CONS))
+                    do
+                    (when (not (cons? methodDef))
+                      (walk-inform "Illegal inline method definition:" EOL
+                                   "   " methodDef EOL)
+                      (continue))                                  
+                    (setq localSlot
+                          (define-inline-method 
+                            (first methodDef) (rest methodDef)))
+                    (when (eq? key :public-methods)
+                      (setf (slot-public? localSlot) TRUE))
+                    (when (not (eq? (slot-owner localSlot) classType))
+                      (walk-error "Defining a method for the class " (slot-owner localSlot)
+                                  " inside of the class " classType)
+                      ;;(Cl:break)
+                      )
+                    collect localSlot into slots)))
+        (:parameters
+         (setq parameters (local-new (LIST OF SLOT)))
+         (foreach slotDef in (cast theValue CONS)
+                    collect (define-storage-slot-from-parse-tree
+                              slotDef classType)
+                    into parameters)
+         (insert-at classOptions key parameters))         
+        (:key
+         (when (not (cons? theValue))
+           ;; make 'theValue' a cons list:
+           (setq theValue (cons theKey NIL)))
+         (in-place-objects-to-symbols theValue)
+         (insert-at classOptions key (cast theValue CONS)))
+        (:synonyms
+         (when (not (cons? theValue))
+           ;; make 'theValue' a cons list:
+           (setq theValue (cons theKey NIL)))
+         (in-place-objects-to-types theValue)
+         (insert-at classOptions key (cast theValue CONS)))
+        ((:documentation :cl-native-type :cpp-native-type :java-native-type
+	  :idl-native-type)
+         (insert-at classOptions key theValue))
+        ((:abstract? :active? :public? :cl-struct? :mixin?)
+         (insert-at classOptions key (coerce-to-boolean theValue)))
+        (:recycle-method
+         (setq theValue (permanentify theValue))
+         (insert-at classOptions key theValue)
+         (when (member? (quote (:sweep-list :free-and-sweep-list)) theValue)
+           ;; Add slot definition for 'next-sweep-list-object':
+           (setq slotTree (bquote (next-sweep-list-object
+                                   :type & (first treeDefinition))))
+           (push slots (define-storage-slot-from-parse-tree
+                           slotTree classType))))
+        ((:extension :creator :destructor :initializer :terminator :equality-test)
+         (insert-at classOptions key (permanentify theValue)))
+        ((:initial-value :print-form)
+         (insert-at classOptions key (permanentify-form theValue)))
+        (:properties
+         (insert-at classOptions key (collect-feature-list theValue)))
+        (:meta-attributes
+         (insert-at classOptions key (collect-key-value-list theValue)))
+        (:children
+         (typecase theValue
+           (CONS
+            (let ((children (new LIST)))
+              (foreach child in theValue
+                       where (symbol? child)
+                       collect (typify child) into children)
+              (insert-at classOptions key children)))
+           (otherwise
+            (walk-error "Illegal :children specification: " theValue))))
+        (otherwise
+         (insert-at classOptions key theValue))))
+    (setf (the-plist theOptions) NULL)          ; avoid premature gc
+    (let ((class (define-stella-class
+                   classType directSupers slots (reverse classOptions))))
+      (when (defined? class)
+        (setf (class-stringified-source class) stringifiedSource))
+      (return class)) ))
+
+(defun (define-storage-slot-from-parse-tree STORAGE-SLOT)
+       ((slotDef CONS) (owner TYPE))
+  ;; Called by 'help-define-class-from-parse-tree'.  Create a slot and
+  ;;    fill it with values defined in the parse tree 'slotDef'.
+  ;; Storage note: Subtrees supplying values for :reader and :writer options
+  ;;    are clipped off here and attached to the new slot.
+  (let ((name (permanentify (first slotDef)))
+        (baseType TYPE NULL)
+        (typeExpression NIL)
+        (theOptions (allocate PROPERTY-LIST))
+        ;;(slotOptions (allocate (DICTIONARY OF KEYWORD OBJECT)))
+        (slotOptions (allocate KEYWORD-KEY-VALUE-LIST))
+        (key KEYWORD NULL)
+        (slot STORAGE-SLOT NULL))
+    (setf (the-plist theOptions) (rest slotDef))
+    (foreach
+      (theKey theValue) in theOptions
+      do
+      (setq key (permanentify theKey))
+      (case key
+        ((:initially :default)
+         (insert-at slotOptions key (permanentify-form theValue)))
+        (:type
+         (typecase theValue
+           (CONS
+            (setq typeExpression theValue)
+            (if (eq? (first theValue) (quote LIKE))
+                (setq baseType NULL)
+              ;; type specifier = '(<baseType> OF <parametricTypes>)'
+              (setq baseType (typify (first theValue)))))
+           (otherwise
+            (setq baseType (typify theValue))
+            (when (defined-type? baseType)
+              (let ((realType (yield-type-specifier theValue)))
+                (setq baseType (type-spec-to-base-type realType))
+                (unless (type? realType)
+                  (setq typeExpression
+                    (yield-type-spec-tree realType))))))))
+        (:allocation
+         (insert-at slotOptions key (permanentify theValue)))
+        (:reader
+         (insert-at slotOptions key (permanentify theValue)))
+        (:writer
+         (insert-at slotOptions key (permanentify theValue)))
+        ((:inverse :renames)
+         (insert-at slotOptions key (permanentify theValue)))
+        ((:public? :required? :component? :read-only? :active?
+          :context-sensitive? :hardwired? :abstract?)
+         (insert-at slotOptions key (coerce-to-boolean theValue)))
+        (:documentation
+         (insert-at slotOptions key theValue))
+        (:properties
+         (insert-at slotOptions key (collect-feature-list theValue)))
+        (:meta-attributes
+         (insert-at slotOptions key (collect-key-value-list theValue)))
+        ((:option-keyword :option-handler)
+         (insert-at slotOptions key (permanentify theValue)))
+        (otherwise
+         (insert-at slotOptions key theValue))))
+    (setf (the-plist theOptions) NULL)        ; avoid premature gc
+    (setq slot
+          (define-stella-slot
+              name owner baseType typeExpression (reverse slotOptions)))
+    (record-slot-home-module slot)
+    (return slot) ))
+
+(defun (record-slot-home-module MODULE) ((self SLOT))
+  ;; Determine the home module of `self', record it in `slot-home-module'
+  ;;    if it differs from the module of slot's `name' (this is exploited
+  ;;    by the associated `home-module' method), and return the result.
+  ;; If a slot was defined with an unqualified name its home module is
+  ;;    identical to the module within which it was defined.  If the
+  ;;    name was explicitly qualified, the home module is the one indicated
+  ;;    by the qualification.
+  ;; NOTE: Target languages such as C++ or Java cannot translate slots or
+  ;;    methods whose home module is different than that of their owner class.
+  ;; A better way to record this for functions (but not slots and methods)
+  ;;    is to change the name symbol to the proper module, but that would
+  ;;    require upgrading our function lookup, since forward references to
+  ;;    the function name might not be resolvable then.
+  (let ((name (slot-name self))
+        (nameModule (interned-in name))
+        (definitionModule *module*)
+        (homeModule nameModule))
+    (if (explicitly-qualified-name? name definitionModule)
+        (setq homeModule nameModule)
+      (setq homeModule definitionModule))
+    (unless (eql? homeModule nameModule)
+      (setf (slot-home-module self) homeModule))
+    (return homeModule)))
+
+(defun (explicitly-qualified-name? BOOLEAN) ((name GENERALIZED-SYMBOL)
+                                             (definitionModule MODULE))
+  ;; Return TRUE if `name' is interned in a module different from
+  ;;    `definitionModule' and was explicitly qualfied for that purpose.
+  ;; NOTE: THIS IS A KLUDGE!  We currently cannot completely reliably
+  ;;    determine whether a name was explicitly qualified and have to rely
+  ;;    on some heuristic guessing to make that determination.
+  ;;    A way around this would be to have the reader generate a different,
+  ;;    non-interned EXPLICITLY-QUALIFIED-SYMBOL for those and then have
+  ;;    the various definition and lookup functions treat them specially.
+  (let ((nameModule (interned-in name))
+        (shadow GENERALIZED-SYMBOL NULL))
+    (cond ((eql? nameModule definitionModule)
+           ;; the easy case:
+           (return FALSE))
+          ((not (visible-from? nameModule definitionModule))
+           ;; we must have an explicitly qualified name:
+           (return TRUE))
+          ((and (setq? shadow (lookup-symbol-in-module
+                               (symbol-name name) definitionModule TRUE))
+                (not (eql? shadow name)))
+           ;; there is a shadowing symbol, assume this was an explicit override
+           ;;    (should we check whether there is a conflicting binding?):
+           (return TRUE))
+          (otherwise
+           ;; assume we inherited the name symbol by accident or because we
+           ;;    specialized a slot or method:
+           (return FALSE)))))
+
+(defun (get-identical-class CLASS) ((className STRING) (stringifiedSource STRING))
+  :public? TRUE
+  ;; If a class with name 'name' and stringified source equal to
+  ;;    'stringifiedSource' already exists, return it.
+  (let ((surrogate (lookup-surrogate className))
+        (oldValue (only-if (defined? surrogate)
+                           (surrogate-value surrogate))))                       
+    (when (defined? oldValue)
+      (typecase oldValue
+        (CLASS 
+         (when (and
+                (defined? (class-stringified-source oldValue))
+                (string-eql?
+                 (class-stringified-source oldValue)
+                 stringifiedSource)
+                (eql? (interned-in surrogate) *module*))
+           (return oldValue)))
+        (otherwise NULL)))
+    (return NULL) ))
+
+(defun (define-class-from-parse-tree CLASS) ((parseTree CONS))
+  :public? TRUE
+  ;; Stringify 'parseTree' and test for existing equivalent class.
+  ;; Convert a class definition based on a cons tree definition into
+  ;;    a class definition based on collections, and feed the
+  ;;    result to 'define-stella-class'.
+  ;; Save the stringified 'parseTree' in the class.
+  (when (bad-argument-range? parseTree 2 NULL)
+    (return NULL))
+  (when (not (and (symbol? (second parseTree))
+                  (cons? (third parseTree))))
+    (walk-error "Illegal class definition: " parseTree)
+    (return NULL))
+  (let ((className SYMBOL (second parseTree))
+        (stringifiedSource (stringify parseTree))
+        (oldClass
+         (get-identical-class (symbol-name className) stringifiedSource)))
+    (when (and (defined? oldClass) (not *redefine-identical-classes?*))
+      (return oldClass))
+    (return
+     (help-define-class-from-parse-tree
+      parseTree stringifiedSource)) ))
+
+(defun (define-class-from-stringified-source CLASS)
+       ((className STRING) (stringifiedSource STRING))
+  :public? TRUE
+  ;; Unstringify 'source' into a class definition, and parse the definition.
+  ;; Return the new class object.
+  ;; If a class with the same stringified definition already exists, don't
+  ;;    bother creating the new class.
+  (let ((oldClass (get-identical-class className stringifiedSource))
+        (newClass CLASS NULL))
+    (when (and (defined? oldClass)               
+               (not *redefine-identical-classes?*))
+      (return oldClass))
+    (setq newClass
+      (help-define-class-from-parse-tree
+       (unstringify-stella-source stringifiedSource NULL)
+       stringifiedSource))
+    (return newClass) ))
+
+
+  ;;
+;;;;;; 'define-method-from-parse-tree'
+  ;;
+
+(defun (extract-options CONS) ((tree CONS) (optionsTable KEY-VALUE-LIST))
+  :public? TRUE
+  ;; Destructively remove a list of keyword/value options from 'tree'
+  ;;    and return the list of options.  'tree' will keep its original
+  ;;    structure just with all options removed.
+  ;; If 'optionsTable' is non-NULL, every option will also be inserted
+  ;;    into that table.
+  ;; It is assumed that the first element of 'tree' is not an option
+  ;;    keyword (a safe assumption for all definition trees).
+  (let ((options CONS NULL)
+        (tail CONS NULL))
+    (while (and (non-empty? (rest tree))
+                (not (keyword? (value (rest tree)))))
+      (setq tree (rest tree)))
+    (when (or (empty? (rest tree))
+              ;; Did the keyword have a value?
+              (empty? (rest (rest tree))))
+      (return NIL))
+    (when (defined? optionsTable)
+      (insert-at optionsTable (value (rest tree)) (value (rest (rest tree)))))
+    (setq options (rest tree))
+    (setq tail (rest (rest tree)))
+    (while (and (non-empty? (rest (rest tail)))
+                (keyword? (value (rest tail))))
+      (when (defined? optionsTable)
+        (insert-at optionsTable
+                   (value (rest tail))
+                   (value (rest (rest tail)))))
+      (setq tail (rest (rest tail))))
+    (setf (rest tree) (rest tail))
+    (setf (rest tail) NIL)
+    (return options)))
+
+(defun (destructure-defmethod-tree  
+        OBJECT                          ; name tree
+        CONS                            ; parameters tree
+        CONS)                           ; code body tree
+       ((method-tree CONS) (options-table KEY-VALUE-LIST))
+  :public? TRUE
+  :documentation "Return three parse trees representing the name,
+parameters, and code body of the parse tree `method-tree'.  Fill
+`options-table' with a dictionary of method options.
+Storage note:  Options are treated specially because the other return
+values are subtrees of `method-tree', while `options-table' is a newly-created
+cons tree.  Note also, the parameter and body trees are destructively
+removed from `method-tree'."
+  (let ((nameTree (second method-tree))
+        (parametersTree (third method-tree)))
+    (when (not (cons? parametersTree))
+      (if (null? parametersTree)
+        (walk-error "Missing parameter list")
+        (walk-error "Illegal parameter list: " parametersTree))
+      (setq parametersTree NIL))
+    (extract-options method-tree options-table)
+    (return nameTree parametersTree (nth-rest method-tree 3))))
+
+(defun (yield-setter-method-name SYMBOL) ((methodName SYMBOL))
+  ;; Return 'methodName' suffixed by "-SETTER".
+  (return
+    (intern-derived-symbol
+     methodName (concatenate (symbol-name methodName) "-SETTER"))) )
+
+(defun (destructure-method-name-tree SYMBOL CONS)
+       ((nameTree OBJECT))
+  ;; Given the name argument 'nameTree' of a method definition,
+  ;;    return a method name and a cons list of type specifiers.
+  (typecase nameTree
+    (CONS
+     (when (not (symbol? (first nameTree)))
+       (walk-error "Illegal method name: " nameTree)
+       (return NULL NULL))
+     (if (eq? (second nameTree) (quote SETTER))
+         (return (yield-setter-method-name (first nameTree)) NIL)
+       (return (first nameTree) (rest nameTree))))
+    (SYMBOL
+     (return nameTree NIL))
+    (otherwise
+     (walk-error "Illegal method name: " nameTree)
+     (return NULL NULL))))
+
+(defun in-place-normalize-method-options
+       ((methodOptions KEYWORD-KEY-VALUE-LIST) (methodName SYMBOL))
+  ;; Called by 'define-method-from-parse-tree'.
+  ;; Convert option values from their parse tree representation to
+  ;;    a more permanent representation.
+  (ignore methodName)
+  (foreach 
+    (key value) in methodOptions
+    do
+    (case key
+      ((:type :return-types)            ; no change
+       NULL)
+      ((:renames :storage-slot :inherits-through)
+       (insert-at methodOptions key (permanentify value)))
+      ((:public? :abstract? :setter? :native? :constructor? :auxiliary? :globally-inline?
+        :command? :lisp-macro? :evaluate-arguments?)
+       (insert-at methodOptions key (coerce-to-boolean value)))
+      (:documentation
+       (insert-at methodOptions key value))
+      (:inline
+       (typecase value
+         (SYMBOL (insert-at methodOptions key (permanentify value)))
+         (CONS
+          (let ((symbolsList NIL))
+            (foreach symbol in value
+                collect (permanentify symbol) into symbolsList)
+            (insert-at methodOptions key symbolsList)))))
+      (:properties
+       (insert-at methodOptions key (collect-feature-list value)))
+      (:meta-attributes
+       (insert-at methodOptions key (collect-key-value-list value)))
+      (otherwise
+       (insert-at methodOptions key (permanentify value)))))
+  (reverse methodOptions))
+
+(defun (get-function-with-identical-signature METHOD-SLOT)
+    ((name SYMBOL) (stringifiedSource STRING))
+  ;; Try to retrieve a function object for function 'name' whose signature
+  ;;    is identical to the one encoded in 'stringifiedSource'.
+  (let ((oldMethod (lookup-function-or-stella-function name)))
+    (when (and (defined? oldMethod)
+               (string-eql? (method-stringified-source oldMethod)
+                            stringifiedSource))
+      (return oldMethod))
+    (return NULL)))
+
+(defun (get-method-with-identical-signature METHOD-SLOT)
+    ((name SYMBOL) (parametersTree CONS) (stringifiedSource STRING))
+  ;; Try to retrieve a method object for method 'name' on the type/class
+  ;;    of the first argument in 'parametersTree' whose signature
+  ;;    is identical to the one encoded in 'stringifiedSource'.
+  (let ((existingSlot SLOT NULL))
+    (when (cons? (first parametersTree))
+      (setq parametersTree (first parametersTree))
+      (when (symbol? (last parametersTree))
+        (setq existingSlot
+          (safe-lookup-slot
+           (type-to-class (typify (safe-cast (last parametersTree) SYMBOL)))
+           name))
+        (when (defined? existingSlot)
+          (typecase existingSlot
+            (METHOD-SLOT
+             (when (string-eql? (method-stringified-source existingSlot)
+                                stringifiedSource)
+               (return existingSlot)))
+            (otherwise NULL)))))
+    (return NULL)))
+
+(defun (help-define-method-from-parse-tree METHOD-SLOT BOOLEAN)
+       ((inputTree CONS) (stringifiedSource STRING))
+  ;; Extract 'define-stella-method-slot' parameters from 'inputTree' and
+  ;;    check whether a function or method object with identical signature
+  ;;    already exists.  If so, return the pre-existing object, otherwise,
+  ;;    call 'define-stella-method-slot' and return the new method.
+  ;; The second return value will be TRUE if an already exisiting method
+  ;;    was returned, FALSE otherwise.
+  ;; If `stringifiedSource' is supplied, it will be stored as the source
+  ;;    string of the defined method.  If it is NULL, a source string
+  ;;    encoding the method signature (and possibly its body) will be
+  ;;    generated from `inputTree'.
+  ;; Note: Does not redefine a method, nor does it attach the method to
+  ;;    its owner class.
+  ;; Note2: Any option/value pairs are destructively detached from
+  ;;    'inputTree', which means that any subsequent processing (e.g.,
+  ;;    in the walker) can safely assume that they are gone.
+  (let ((nameTree OBJECT NULL)
+        (parametersTree CONS NULL)
+        (methodOptions (allocate KEYWORD-KEY-VALUE-LIST))
+        (bodyTree CONS NULL)
+        (name SYMBOL NULL)
+        (returnTypesTree CONS NULL)
+        (function? (eq? (first inputTree) (quote DEFUN)))
+        (oldMethod METHOD-SLOT NULL)
+        (signatureString
+         (choose (null? stringifiedSource)
+                 (stringify-method-signature inputTree)
+                 stringifiedSource)))
+    (mv-setq (nameTree parametersTree bodyTree)
+             (destructure-defmethod-tree inputTree methodOptions))
+    (mv-setq (name returnTypesTree)
+             (destructure-method-name-tree nameTree))
+    (when (null? name)
+      (return NULL FALSE))
+    (setq oldMethod
+      (choose function?
+              (get-function-with-identical-signature
+               name signatureString)
+              (get-method-with-identical-signature
+               name parametersTree signatureString)))
+    (when (defined? oldMethod)
+      (return oldMethod TRUE))
+    (in-place-normalize-method-options methodOptions name)
+    (let ((method (define-stella-method-slot 
+                    name returnTypesTree function?
+                    parametersTree methodOptions)))
+      (when (null? stringifiedSource)
+        (setq stringifiedSource
+          (choose
+           (stringify-method-body? method)
+           (stringify
+            (concatenate (cast (unstringify signatureString) CONS) bodyTree))
+           signatureString)))
+      (setf (method-stringified-source method) stringifiedSource)
+      (record-slot-home-module method)
+      (return method FALSE)) ))
+
+(defun (define-method-from-parse-tree METHOD-SLOT) ((parseTree CONS))
+  ;; Convert a method definition based on a CONS-tree definition into
+  ;;    an actual method object.
+  ;; Save the stringified 'parseTree' in the generated object.
+  ;; If a method object with identical signature already exists,
+  ;;    return it instead of creating a new object.
+  (when (bad-argument-range? parseTree 2 NULL)
+    (return NULL))
+  (mv-bind (method identicalMethod?)
+      (help-define-method-from-parse-tree parseTree NULL)
+      (unless (or identicalMethod?
+                  (null? method))
+	(if (method-auxiliary? method)
+	    ;; set this for auxiliaries also so `home-module' will do the right thing:
+	    (setf (slot-external? method) TRUE)
+	  (attach-method-slot-to-owner method)))
+    (return method)))
+
+(defun (stringify-method-signature STRING) ((parseTree CONS))
+  ;; Stringify the method signature contained in 'parseTree'.
+  (let ((signature NIL)
+        (signatureString STRING NULL)
+        (optionsTree (nth-rest parseTree 3)))
+    (pushq signature (first parseTree))
+    (pushq signature (second parseTree))
+    (pushq signature (third parseTree))
+    (while (keyword? (first optionsTree))
+      (pushq signature (first optionsTree))
+      (pushq signature (second optionsTree))
+      (setq optionsTree (rest (rest optionsTree))))
+    ;; TO DO: FIGURE OUT WHAT TO DO FOR OUT-OF-MODULE FORWARD DECLARATIONS,
+    ;;    SINCE THEY MIGHT NEED TO BE STRINGIFIED IN A DIFFERENT MODULE.
+    (setq signatureString (stringify (reverse signature)))
+    (return signatureString)))
+
+(defun (stringify-method-body? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if the body of `method' needs to be stringified.
+  (return
+    (or (method-globally-inline? method)
+        ;(inline-method? method) ;; too early for this check
+        (and (not (method-function? method))
+             (or
+              ;; Unfortunately, if we are too early in the game and don't yet have
+              ;;    the class of the first argument defined, we have to store the
+              ;;    source just in case it later turns out to be a mixin class.
+              ;; This could be fixed later by `yield-define-stella-method-object',
+              ;;    but we won't bother for now:
+              (null? (type-class (slot-owner method)))
+              (mixin? (type-class (slot-owner method))))))))
+
+(defun (define-method-from-stringified-source METHOD-SLOT)
+       ((methodName STRING) (className STRING) (stringifiedSource STRING))
+  :public? TRUE
+  ;; Define a stella method slot using a parse tree derived from
+  ;;    'stringifiedSource', and attach the method to its owner class.
+  (ignore methodName className)
+  (mv-bind (method identicalMethod?)
+      (help-define-method-from-parse-tree
+       (unstringify-stella-source stringifiedSource NULL)
+       stringifiedSource)
+    (unless (or identicalMethod?
+                ;; Auxiliary methods should really never make it into
+                ;;    startup code, so, this test might be a no-op:
+                (method-auxiliary? method))
+      (attach-method-slot-to-owner method))
+    (return method)))
+
+(defun define-method-object ((definition STRING)
+                             (code METHOD-CODE)
+                             (wrapperCode METHOD-CODE))
+  ;; Define a STELLA method object from its stringified `definition' and
+  ;;    assign `code' and `wrapperCode' to the appropriate slots.
+  ;; Assumes that this is called during startup with `*module*' bound to
+  ;;    the home module of the method.
+  ;; Ideally, this should do a lazy definition similar to
+  ;;    `define-function-object', however, that's too complicated right now
+  ;;    for what it's worth (only about 20% of all code objects are methods).
+  (ignore wrapperCode) ;; methods are not yet evaluable
+  (let ((method (define-method-from-stringified-source NULL NULL definition)))
+    (when (defined? method)
+      (when (defined? code)
+        (setf (method-code method) code))
+      ;; Place holder in case we make methods evaluable:
+      ;(when (defined? wrapperCode)
+      ;  (setf (evaluator-wrapper-code method) wrapperCode))
+      )))
+
+  ;;
+;;;;;; 'define-external-slot-from-parse-tree'
+  ;;
+
+(defglobal *unsupported-external-slot-options* (LIST OF KEYWORD)
+  (list :allocation :initially :context-sensitive? :hardwired?))
+
+(defun (define-external-slot-from-parse-tree STORAGE-SLOT) ((parseTree CONS))
+  ;; Define an external slot from 'parseTree'.
+  ;; The syntax is '(defslot <classname> <slotname> <slotoptions>*)'.
+  ;; External slots can only be dynamic.  They are useful to add slots to
+  ;;    core Stella classes from other modules (e.g., the logic system),
+  ;;    and they are essential to add new slot option keywords dynamically,
+  ;;    without having to touch the definitions of the various parsing
+  ;;    functions for class, slot, method, and module definitions.
+  (when (bad-argument-range? parseTree 2 NULL)
+    (return NULL))
+  (when (or (not (symbol? (second parseTree)))
+            (not (symbol? (third parseTree)))
+            (not (even? (length (nth-rest parseTree 3)))))
+    (walk-error "Illegal external slot definition: " parseTree)
+    (return NULL))
+  (let ((className SYMBOL (second parseTree))
+        (owner (typify className))
+        (ownerClass (type-class owner))
+        (slot STORAGE-SLOT NULL)
+        (options (nth-rest parseTree 3))
+        ;; Marker element (modules never appear in parse trees):
+        (marker *stella-module*)
+        (abstract? FALSE))
+    (when (null? ownerClass)
+      (walk-error "Can't define a slot on the non-existent class " className)
+      (return NULL))
+    ;; THIS LOOP SHOULD HAVE USED A PROPERTY LIST (but it would have been
+    ;;    equally tedious plus waste a list and an iterator):
+    (while (non-empty? options)
+      (let ((option (first options))
+            (value (second options)))
+        (when (member? *unsupported-external-slot-options* option)
+          (when (or (not (eql? option :allocation))
+                    (not (eql? value :dynamic)))
+            (walk-warn "Skipping slot option " option
+                       " which is unsupported on external slots"))
+          (setf (first options) marker)
+          (when (defined? value)
+            (setf (second options) marker)))
+        (when (or (and (eql? option :abstract?)
+                       (eql? value (quote TRUE)))
+                  (eql? option :renames))
+          (setq abstract? TRUE)))
+      (setq options (rest (rest options))))
+    (when (and (not abstract?)
+               (class-finalized? ownerClass)
+               (not (subtype-of? owner @DYNAMIC-SLOTS-MIXIN)))
+      (walk-error
+       "Can't define a non-abstract external slot on class " className
+       "," EOL " since it does not inherit DYNAMIC-SLOTS-MIXIN")
+      (return NULL))
+    (setq parseTree (remove parseTree marker))
+    (unless abstract?
+      (setq parseTree
+        (bquote (&& parseTree :allocation :dynamic))))
+    (setq slot
+      (define-storage-slot-from-parse-tree (rest (rest parseTree)) owner))
+    (when (defined? slot)
+      (attach-slot-to-owner slot))
+    (return slot)))
+
+(defun (define-external-slot-from-stringified-source STORAGE-SLOT)
+    ((stringifiedSource STRING))
+  :public? TRUE
+  ;; Define an external slot from 'stringifiedSource' (used in startup code).
+  (return
+    (define-external-slot-from-parse-tree (unstringify stringifiedSource))))
+
+
+  ;;
+;;;;;; Handling of extensible object definition options
+  ;;
+
+(defun (lookup-slot-from-option-keyword STORAGE-SLOT)
+    ((owner TYPE) (keyword KEYWORD))
+  ;; Return the most specific slot on 'owner' that has 'keyword' specified
+  ;;    as its option keyword.
+  ;; Return NULL if no such slot exists.
+  ;; TO DO: Use a caching scheme, so we don't have to run up
+  ;;        the slot hierarchy every time this is called.
+  (let ((ownerClass (type-class owner)))
+    (when (defined? ownerClass)
+      (foreach slot in (class-slots ownerClass)
+               where (and (storage-slot? slot)
+                          (eql? (slot-option-keyword
+                                 (safe-cast slot STORAGE-SLOT))
+                                keyword))
+               do (return slot)))
+    (return NULL)))
+
+(defglobal *default-option-handler* METHOD-SLOT NULL)
+;; Need to do this explicitly, since variables get initialized
+;;    before method objects get generated:
+(startup-time-progn
+    (setq *default-option-handler*
+      (lookup-function (quote default-option-handler))))
+
+(defun (lookup-option-handler METHOD-SLOT) ((slot STORAGE-SLOT))
+  :public? TRUE
+  ;; Return the option handler function object for 'slot'.
+  ;; If none was specified via the :option-handler keyword,
+  ;;    'default-option-handler' will be used.
+  ;; Option handler signatures have to be compatible with that of
+  ;;    'default-option-handler'.
+  (let ((handlerName (slot-option-handler slot))
+        (handler METHOD-SLOT NULL))
+    (when (null? handlerName)
+      (if (defined? *default-option-handler*)
+          (return *default-option-handler*)
+        ;; Handle bootstrap situations where the startup code
+        ;;    hasn't initialized '*default-option-handler*' yet:
+        (return (lookup-function (quote default-option-handler)))))
+    (setq handler (lookup-function handlerName))
+    (when (and (>= *safety* 2)
+               (defined? handler)
+               (not (eql? handlerName (quote default-option-handler)))
+               (not (conforming-signatures? handler *default-option-handler*)))
+      ;; Better to break here than in the 'funcall' below:
+      (error "The signature of slot option handler " handlerName
+             " does not conform to that of 'default-option-handler'."))
+    (return handler)))
+
+(defun (run-option-handler? BOOLEAN)
+    ((object OBJECT) (option KEYWORD) (valueTree OBJECT))
+  :public? TRUE
+  ;; Run the option handler for 'option' on 'object' and 'valueTree'.
+  ;; Return TRUE if an option handler could be found; FALSE otherwise.
+  (let ((slot (lookup-slot-from-option-keyword (primary-type object) option))
+        (handler (choose (defined? slot)
+                         (lookup-option-handler slot)
+                         NULL)))
+    (when (defined? handler)
+      (funcall (function-code handler) object slot valueTree)
+      (return TRUE))
+    (return FALSE)))
+
+(defun default-option-handler ((self OBJECT) (slot STORAGE-SLOT) (tree OBJECT))
+  ;; Handler for otherwise unhandled option keywords.
+  ;; Parse 'tree' and store it as the value of 'slot' on 'self'.
+  ;; This can also handle option keywords on internal slots that aren't
+  ;;    handled explicitly by the definition functions, e.g., it could
+  ;;    now handle `:setter?' on a method definition.
+  (let ((parsedValue OBJECT NULL))
+    (case (type slot)
+      (@BOOLEAN (setq parsedValue (coerce-to-boolean tree)))
+      (otherwise
+       (when (defined? tree)
+         (setq parsedValue (permanent-copy tree)))))
+    (when (and (>= *safety* 2)
+               (defined? parsedValue))
+      (when (not (isa? parsedValue (type-to-wrapped-type (type slot))))
+        (walk-error "Illegal value for " (slot-option-keyword slot)
+                    " option: " tree)
+        (return)))
+    (write-slot-value self slot parsedValue)))
+
+#|
+
+;; Examples:
+
+(defslot STORAGE-SLOT min-cardinality :type INTEGER
+         :option-keyword :min-cardinality)
+
+(defslot RELATION unresolved-issues :type STRING :option-keyword :issues)
+
+(defclass foo (standard-object)
+  :issues "foo issues"
+  :slots ((some-slot :type BOOLEAN
+                     :issues "foo slot issues ")
+          (another-slot :type SET :min-cardinality 3)))
+
+;; Example handling of a :children option:
+
+(defslot CLASS class-children :type (LIST OF TYPE) :abstract? TRUE
+         :option-keyword :children :option-handler class-children-handler)
+
+(defglobal *unfinalized-classes-with-children* (LIST OF CLASS) (list))
+
+(defun class-children-handler
+    ((class CLASS) (slot STORAGE-SLOT) (tree OBJECT))
+  (ignore slot)
+  (typecase tree
+    (CONS
+     (foreach child in tree
+              where (symbol? child)
+              collect (typify child) into (class-direct-subs class))
+     (push *unfinalized-classes-with-children* class))
+    (otherwise
+     (walk-error "Illegal :children specification: " tree))))
+
+|#

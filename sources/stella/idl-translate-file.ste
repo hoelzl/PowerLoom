@@ -1,0 +1,128 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: idl-translate-file.ste,v 1.13 2003/04/18 21:15:02 hans Exp
+
+;;; Translating Stella files into IDL.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; Next 2 are useful debugging utilities
+
+(defun idl-translate-class-to-stream ((class CLASS) 
+				      (native-stream NATIVE-OUTPUT-STREAM))
+  ;; Translate a single class and output to `stream'
+  (let ((tempUnit (new TRANSLATION-UNIT :the-object class)))
+    (special ((*current-stream* (new OUTPUT-STREAM :native-stream native-stream)))
+      (idl-output-statement 
+       (idl-translate-define-native-class-unit tempUnit))) ))
+
+;; Current extension for translated file names
+(defglobal *idl-translated-file-suffix* STRING "")
+
+;;; Note: we use .sidl instead of .idl to avoid conflicts w/ original source
+(defun (idl-make-code-output-file-name FILE-NAME) ((sourceFile FILE-NAME))
+  (return (concatenate (file-name-without-extension sourceFile)
+                       (concatenate *idl-translated-file-suffix* ".sidl"))))
+
+(defun idl-output-all-units-to-file ((sourceFile FILE-NAME))
+  ;; Called by 'translate-file', produce a .idl file
+  ;;   by iterating over translation units.
+  (let ((codeOutputFile (idl-make-code-output-file-name sourceFile))
+        (codeOutputStream
+         (new OUTPUT-FILE-STREAM :filename codeOutputFile))
+	(globals nil)
+	(methods nil)
+	(verbatimStatements nil)
+	(forms nil))
+    (special ((*current-stream* codeOutputStream))
+
+      ;; TODO: instead of sorting translated parse trees, sort the units
+      ;;   themselves.  This will allow annotations to be output during
+      ;;   code generation.
+      ;; Reverse before sorting- classes, etc get reversed during sort.
+      (setq *translationUnits* (reverse *translationUnits*))
+      (foreach
+	  unit in *translationUnits*
+	  do (case (category unit)
+	       ((METHOD PRINT-METHOD MACRO)
+		(pushq methods (translation unit)))
+	       (VERBATIM
+		(pushq verbatimStatements (translation unit)))
+					;	  (TYPE
+					;	   (pushq typedefs (translation unit)))
+	       (GLOBAL-VARIABLE
+		(pushq globals (translation unit)))
+	       (otherwise
+		(pushq forms (translation unit)))))
+
+      (inform "Writing " codeOutputFile "...")
+      (print-stream *current-stream* "// " codeOutputFile EOL EOL)
+      (when (translate-with-copyright-header?)
+	(output-copyright-header *current-stream*))
+      (foreach form in forms 
+	  do
+	    (idl-output-statement (cast form CONS)))
+    
+      ;; TODO: add stuff for collecting functions, globals, etc
+      (free codeOutputStream) )))
+
+(defun idl-translate-file ((fileName FILE-NAME))
+  ;; Translate a stella file to C++.
+  (translate-file fileName :idl FALSE) )
+
+;; OLD:  But do we still need the toggle-translators code?
+;;;(defun idl-translate-file ((fileName FILE-NAME))
+;;;  ;; Translate a stella file to Idl
+;;;  (let ((oldLanguage (translator-output-language))
+;;;	(toggle-walker? (use-bootstrap-translator?)))
+;;;    (set-translator-output-language :idl)
+;;;    (when toggle-walker?
+;;;      (toggle-translators))
+;;;    (translate-file fileName FALSE)
+;;;    (set-translator-output-language oldLanguage)
+;;;    (when toggle-walker?
+;;;      (toggle-translators)) ))
+

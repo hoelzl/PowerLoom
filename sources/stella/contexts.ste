@@ -1,0 +1,515 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: contexts.ste,v 1.30 2003/09/05 00:45:08 tar Exp
+
+;;; Contexts.  Implements the differential storage mechanism for
+;;;    contexts.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+(defglobal *unlink-discarded-contexts-on-read?* BOOLEAN TRUE
+  :documentation "Eliminate pointers to discarded contexts while
+accessing a CS-VALUE context table.")
+
+(defglobal *unlink-discarded-contexts-on-write?* BOOLEAN TRUE
+  :documentation "Eliminate pointers to discarded contexts while
+inserting into a CS-VALUE context table.")
+
+(defglobal *context-backtracking-mode* BOOLEAN FALSE
+  :documentation "If true, indicates that contexts are being allocated
+and deallocated in depth-first fashion, and that deallocation of
+CS-VALUE entries is taken care of during context destruction.")
+
+
+  ;;
+;;;;;; Utility context functions
+  ;;
+
+(defun (cs-value? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  ;; Return TRUE if 'self' isa CS-VALUE.
+  ;; Optimized under the assumption that the class CS-VALUE has no children.
+  :globally-inline? TRUE
+  (return (and (defined? self)
+               (eql? (primary-type self) @CS-VALUE))) )
+
+(defun (subcontext? BOOLEAN) ((subContext CONTEXT) (superContext CONTEXT))
+  :public? TRUE
+  ;; Return TRUE if "subContext" is a descendant of "superContext".
+  ;; QUESTION: DOES IT MAKE SENSE TO ADD MELZ'S INTEGER INTERVALS TO SPEED 
+  ;;    THIS UP???
+  :globally-inline? TRUE
+  (return (or (eql? subContext superContext)
+              (memb? (all-super-contexts subContext) superContext))) )
+
+
+;;; Convention:  Active contexts have EVEN numbers,
+;;;              Discarded contexts have odd numbers;
+(defun (discarded-context? BOOLEAN) ((context CONTEXT))
+  :public? TRUE
+  ;; "context" is discarded when it has an odd number;
+  :globally-inline? TRUE
+  (return (odd? (context-number context))) )
+
+(defmethod (deleted? BOOLEAN) ((context CONTEXT))
+  :public? TRUE
+  (return (odd? (context-number context))))
+
+
+  ;;
+;;;;;; Finding contexts
+  ;;
+
+;;; Return a context with a given number, n.
+
+;;; The search is depth-first, left to right.  However, since a context
+;;; always has a higher number than its parents, we do not need to search
+;;; the descendents of any context with a number > n.  (The descendents
+;;; will also have numbers > n.)
+
+(defun (help-find-context-by-number CONTEXT)
+       ((number INTEGER) (siblings (LIST OF CONTEXT)))
+  ;; Helping function for "find-context-by-number".
+  (foreach c in siblings
+        do (cond
+            ((eql? (context-number c) number) 
+             (return c))
+            ((< (context-number c) number)
+             (return
+              (help-find-context-by-number number (child-contexts c))))
+            (otherwise
+             (continue))))
+  (signal NO-SUCH-CONTEXT-EXCEPTION 
+	  "Couldn't find context with number " number) )
+
+(defun (find-context-by-number CONTEXT) ((contextNumber INTEGER))
+  ;; Find the context with number 'contextNumber'.
+  (return (help-find-context-by-number
+           contextNumber (child-contexts *root-module*))) )
+
+(defmethod (get-stella-context-slowly CONTEXT) ((self STRING))
+  ;; Look everywhere for a match to 'self'.
+  (let ((context CONTEXT NULL))
+    (foreach cxt in (child-contexts *root-module*)
+	where (eql? (context-name cxt) self)
+	do (return cxt))
+    (foreach cxt in (all-contexts)
+	where (or (eql? (context-name cxt) self)
+		  (and (isa? cxt @MODULE)
+		       (defined? (nicknames (cast cxt MODULE)))
+		       (member? (nicknames (cast cxt MODULE)) self))) 
+	do (when (defined? context)
+	     (signal NO-SUCH-CONTEXT-EXCEPTION 
+		     "More than one context has the name or nickname " self))
+	   (setq context cxt))
+    (if (defined? context)
+      (return context)
+      (signal NO-SUCH-CONTEXT-EXCEPTION 
+	      "No context with name or nickname " self)) ))
+
+(defmethod (get-stella-context-slowly CONTEXT) ((self INTEGER))
+  (return (find-context-by-number self)) )
+
+;; TO DO: FIGURE OUT WHETHER "relative-name" IS A GOOD THING
+;;    OR NOT (IT CAN THROW OFF THE SEARCH):
+;; IDEA: TEMPORARILY CHANGE TO MODULE OF 'self' AND THEN
+;;    PASS UNQUALIFIED STRING:
+(defmethod (get-stella-context-slowly CONTEXT) ((self SYMBOL))
+  (return (get-stella-context-slowly (relative-name self))) )
+
+(defun (change-context-slowly CONTEXT) ((self CONTEXT))
+  ;; Version of 'change-context' compatible with 'get-stella-context-slowly'.
+  (if (defined? self)
+    (return (change-context self))
+    (return *context*)) )
+
+(defun (cc CONTEXT) (&rest (name NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Change the current context to the one named `name'.  Return the
+value of the new current context.  If no `name' is supplied, return
+the pre-existing value of the current context.  `cc' is a no-op if the
+context reference cannot be successfully evaluated."
+  (let ((context *context*)
+        (nameSpec (first (coerce-&rest-to-cons name))))
+    (when (defined? nameSpec)
+      (typecase nameSpec
+        (INTEGER-WRAPPER
+         (setq context (get-stella-context-slowly (wrapper-value nameSpec))))
+        (otherwise
+         (let ((contextName (coerce-to-module-name nameSpec TRUE)))
+           (when (defined? contextName)
+             (setq context (get-stella-context contextName TRUE)))))))
+    (return (change-context-slowly context))))
+
+(verbatim :common-lisp "(cl:defvar cl-user::*stella-case-sensitive-read-mode* :PRESERVE)"
+	  :otherwise NULL)
+
+(defun (ccc CONTEXT) (&rest (name NAME))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Change the current context to the one named `name'.  Return the
+value of the new current context.  If no `name' is supplied, return
+the pre-existing value of the current context.  `cc' is a no-op if the
+context reference cannot be successfully evaluated.
+In CommonLisp, if the new context is case sensitive, then change
+the readtable case to :INVERT, otherwise to :UPCASE."
+  (let ((context *context*)
+        (nameSpec (first (coerce-&rest-to-cons name))))
+    (when (defined? nameSpec)
+      (typecase nameSpec
+        (INTEGER-WRAPPER
+         (setq context (get-stella-context-slowly (wrapper-value nameSpec))))
+        (otherwise
+         (let ((contextName (coerce-to-module-name nameSpec TRUE)))
+           (when (defined? contextName)
+             (setq context (get-stella-context contextName TRUE)))))))
+    (verbatim :common-lisp "(CL:if (%case-sensitive? (%base-module context))
+        (cl:setf (cl:readtable-case cl:*readtable*) 
+                 cl-user::*stella-case-sensitive-read-mode*)
+        (cl:setf (cl:readtable-case cl:*readtable*) :upcase))"
+              :otherwise NULL)
+    (return (change-context-slowly context))))
+
+
+  ;;
+;;;;;; Context print functions
+  ;;
+
+#|
+(cl:defun STELLA:print-context (self stream)
+  ;; Print function for contexts.
+  (CL:format stream "|CXT|") )
+|#
+
+(defun print-context ((self CONTEXT) (stream NATIVE-OUTPUT-STREAM))  
+  ;; Print function for contexts.
+  (let ((typeString STRING NULL)
+        (name STRING NULL)
+        (number (context-number self)))
+    (when (not *class-hierarchy-booted?*)
+      ;; Printing before the classes are bootstrapped:
+      (print-native-stream stream "|MDL|" (module-name (cast self MODULE)))
+      (return))
+    (typecase self
+      (MODULE
+       (setq name (module-full-name self))
+       (if (discarded-context? self)
+         (setq typeString "|DeLeTeD MDL|")
+         (setq typeString "|MDL|")))
+      (WORLD
+       (setq name (world-name self))
+       (if (discarded-context? self)
+         (setq typeString "|DeLeTeD WLD|")
+         (setq typeString "|WLD|"))))
+    (when (discarded-context? self)
+      (setq number (+ number 1)))
+    (if *printReadably?*
+      (if (defined? name)
+	(print-native-stream stream name)
+	;; TO DO: WHAT SHOULD THIS DO?  Non-NAMED CONTEXTS CAN'T BE DONE READABLY?
+	(print-native-stream stream "#<" typeString number ">"))
+      (if (defined? name)
+	(print-native-stream stream typeString name)
+	(print-native-stream stream typeString number)))))
+
+(defun help-print-context-tree ((list (LIST OF CONTEXT)) (level INTEGER))
+  ;; Helping function for "print-context-tree".
+  (foreach c in list
+      do (print EOL)
+	 (foreach i in (interval 1 level) 
+	     do (ignore i)
+		(print "   "))
+	 (print (context-number c))
+	 (when (defined? (context-name c))
+	   (print "   " (context-name c)))
+	 (print EOL)
+	 (help-print-context-tree (child-contexts c) (+ level 1))) )
+
+;;; May want parameters that specify a root and a depth limit.
+(defun print-context-tree ((root CONTEXT))
+  ;; Print a tree of contexts starting at "root".
+  (when (null? root)
+    (setq root *root-module*))
+  (let ((topList (list root)))
+    (help-print-context-tree topList 0)
+    (free topList)) )
+
+
+    ;;
+  ;;;;;;
+;;;;;;;;;; THE MAIN EVENT
+  ;;;;;;
+    ;;
+
+;;; Simple context mechanism, a rational reconstruction of KWC's "obcontext".
+;;; Derived from code written by Jeff Dalton, and extended by Tom Russ
+;;;    for Loom.  Rewritten for PowerLoom by Bob MacGregor.
+;;; This code has origins in the work on Contexts in POP-2 by
+;;;    Harry Barrow.
+
+;;; There are two possible garbage collection strategies available:
+;;; Discarded contexts can be removed from individual slots on reading
+;;; or on writing. Although writing is presumably less frequent than
+;;; reading, it also does not reach as high up the slot list, therefore
+;;; limiting the depth of collection. Which item is chosen depends on
+;;; the selection of one of the features :gc-on-read or :gc-on-write.
+;;; If neither is selected, then no garbage collection will occur.
+
+  ;;
+;;;;;; access-in-context
+  ;;
+
+;;; A CS-VALUE could contain a 1-element cache for the value most
+;;; recently looked-up.  This would win if lookups significantly
+;;; outnumbered updates and context switches.  N.B.  It would cache
+;;; the current context (and the value), not the context that
+;;; established the value.
+
+;;; We want the value for the current context or the nearest ancestor
+;;; for which a value's been stored.
+
+;;; Newer contexts have higher numbers.  A context is always newer
+;;; than its parents.  In the CS-VALUE kvList, entries for newer contexts
+;;; appear first.
+
+(defun (access-in-context OBJECT)
+       ((value OBJECT) (homeContext CONTEXT) (dontInherit? BOOLEAN))
+  :public? TRUE
+  ;; Return a value for "value" determined by the current context.
+  ;; If "dontInherit?", the current context must match a stored
+  ;;    context (or the home context) exactly
+  ;;    (we don't scan for inherited values).
+  (when (or (null? value)
+            (not (cs-value? value)))
+    ;; A value that isn't a CS-VALUE doesn't depend on context:
+    (if dontInherit?
+      (when (eql? *context* homeContext)
+        (return value))
+      (when (or (null? homeContext)
+                (subcontext? *context* homeContext)
+                (and (isa? homeContext @MODULE)
+                     (visible-from? homeContext *module*)))
+        (return value)))
+    (return NULL))
+  (let ((kvCons (the-kv-list (cast value CS-VALUE)))
+        (contextNumber INTEGER NULL))
+    ;; CAREFUL: Code duplication here and in "foreach" loop.  Fix
+    ;;    both places if bug appears:
+    (let ((target *context*))
+      (setq contextNumber (context-number target))
+      ;; Skip entries for contexts newer than the target:
+      (while (and (defined? kvCons) 
+                  (< contextNumber
+                     (context-number (cast (key kvCons) CONTEXT))))
+        ;; splice out discarded contexts:
+        (if (and (discarded-context? (cast (key kvCons) CONTEXT))
+                 (not *context-backtracking-mode*)
+                 *unlink-discarded-contexts-on-read?*)
+          (if (defined? (rest kvCons))
+            (let ((nextKVCons (rest kvCons)))
+              (setf (key kvCons) (key nextKVCons))
+              (setf (value kvCons) (value nextKVCons))
+              (setf (rest kvCons) (rest nextKVCons))
+              (free nextKVCons))
+            (progn ;; the last entry is a discard; remove and exit:
+              (remove-at (cast value CS-VALUE) (key kvCons))
+              (return NULL)))
+          ;; skip to next older context:
+          (setq kvCons (rest kvCons))))
+      (when (null? kvCons)
+        (return NULL))
+      (when (eql? target (key kvCons))
+        (return (value kvCons)))
+      ;; Here, all remaining entries are older than the target
+      (when dontInherit?
+        (return NULL))
+      ;; remaining entries may not be older than the target's parents,
+      ;;    so drop into the loop:
+      ) ; end let    
+    (foreach target in (all-super-contexts *context*)
+             do
+             (setq contextNumber (context-number target))
+             ;; Skip entries for contexts newer than the target:
+             (while (and (defined? kvCons) 
+                         (< contextNumber
+                            (context-number (cast (key kvCons) CONTEXT))))
+               ;; splice out discarded contexts:
+               (if (and (discarded-context? (cast (key kvCons) CONTEXT))
+                        (not *context-backtracking-mode*)
+                        *unlink-discarded-contexts-on-read?*)
+                 (if (defined? (rest kvCons))
+                   (let ((nextKVCons (rest kvCons)))
+                     (setf (key kvCons) (key nextKVCons))
+                     (setf (value kvCons) (value nextKVCons))
+                     (setf (rest kvCons) (rest nextKVCons))
+                     (free nextKVCons))
+                   (progn ;; the last entry is a discard; remove and exit:
+                     (remove-at (cast value CS-VALUE) (key kvCons))
+                     (return NULL)))
+                 ;; skip to next older context:
+                 (setq kvCons (rest kvCons))))
+             (when (null? kvCons)
+               (return NULL))
+             (when (eql? target (key kvCons))
+               (return (value kvCons)))
+             ;; Here, all remaining entries are older than the target
+             (when dontInherit?
+               (return NULL))
+             ;; remaining entries may not be older than the target's parents,
+             ;;    so continue looping.
+             ) ;; end foreach loop
+    (return NULL) ))
+
+
+  ;;
+;;;;;; update-in-context
+  ;;
+
+(defun help-insert-a-cs-value ((kvCons KV-CONS) (newValue OBJECT)
+                               (target CONTEXT) (overwrite? BOOLEAN))
+  ;; Situation: "csValue" is a CS-VALUE and needs "newValue" added
+  ;;     as the value for "target" context.
+  ;; If "overwrite?", then replace an existing value;
+  ;; Tricky: Relies on the destructive operations to update the contents of
+  ;;    the underlying CS-VALUE object;
+  ;; Look for the right place to add the value, removing discarded
+  ;;  contexts in the process;
+  ;; NOTE: REMOVAL DOESN'T WORK PROPERLY, BECAUSE WE WILL ALWAYS
+  ;;       STOP LOOKING ONCE WE SEE A NUMBER > THE TARGET'S, THUS
+  ;;       NOT CLEARING ANY OLDER CONTEXTS THAN THIS ONE!
+  (let ((contextNumber (context-number target)))
+    (loop
+      (when (and (not *context-backtracking-mode*)
+                 *unlink-discarded-contexts-on-write?*
+                 (discarded-context? (cast (key kvCons) CONTEXT)))
+        (if (defined? (rest kvCons))
+          ;; if more context values exist, splice out the value:
+          (let ((nextKVCons (rest kvCons)))
+            (setf (key kvCons) (key nextKVCons))
+            (setf (value kvCons) (value nextKVCons))
+            (setf (rest kvCons) (rest nextKVCons))
+            (free nextKVCons))
+          ;; otherwise, replace it with the new value:
+          (progn
+            (setf (key kvCons) target)
+            (setf (value kvCons) newValue)
+            (return))))
+      (cond
+       ((eql? (key kvCons) target)
+        (when overwrite?
+          (setf (value kvCons) newValue))
+        (return))
+       ((< (context-number (cast (key kvCons) CONTEXT)) contextNumber)
+        (setf (rest kvCons)
+              (kv-cons (key kvCons) (value kvCons) (rest kvCons)))
+        (setf (key kvCons) target)
+        (setf (value kvCons) newValue)
+        (return))
+       ((null? (rest kvCons))
+        (setf (rest kvCons) (kv-cons target newValue NULL))
+        (return))
+       (otherwise
+        (setq kvCons (rest kvCons))))) ))
+
+(defmethod insert-at ((self CS-VALUE) (context CONTEXT) (newValue OBJECT))
+  :public? TRUE
+  ;; Situation: "self" is a CS-VALUE and needs to have "newValue"
+  ;;    added as the value for "context".
+  (when (null? (the-kv-list self))
+    (let ((kvCons (new KV-CONS)))
+      (setf (key kvCons) context)
+      (setf (value kvCons) newValue)
+      (setf (the-kv-list self) kvCons)
+      (return)))
+  (help-insert-a-cs-value (the-kv-list self) newValue context TRUE) )
+
+(defun (update-in-context OBJECT)
+       ((oldValue OBJECT) (newValue OBJECT)
+        (homeContext CONTEXT) (copyToChildren? BOOLEAN))
+  :public? TRUE
+  ;; Update "oldValue" in a context-dependent way, and return a value
+  ;;    which is either "newValue" or a CS-VALUE object containing
+  ;;    an entry for "newValue".
+  ;; If a newly-allocated CS-VALUE is returned, it will contain entries
+  ;;    for both "oldValue" and "newValue".
+  (let ((csValue CS-VALUE NULL))
+    (if (cs-value? oldValue)
+      (setq csValue (cast oldValue CS-VALUE))
+      ;; avoid allocating a CS-VALUE if the current context is also
+      ;;    the home context:
+      (if (and (eql? homeContext *context*)
+               (or (empty? (child-contexts *context*))
+                   (not copyToChildren?)))
+        (return newValue)
+        (progn
+          (setq csValue (new CS-VALUE))
+          (when (defined? oldValue)
+            (insert-at csValue homeContext oldValue)))))
+    (insert-at csValue *context* newValue)
+    (when copyToChildren? 
+      (copy-current-value-to-children csValue homeContext newValue))
+    (return csValue) ))
+
+(defun copy-current-value-to-children
+       ((csValue CS-VALUE) (homeContext CONTEXT) (parentValue OBJECT))
+  ;; Determine the value for each child context and copy that value to
+  ;;    each child context that doesn't already have a local value stored for it.
+  ;; Optimization: Don't bother to copy values that equal "parentValue".
+  ;; Tricky: Lightweight context switching (using a special variable)
+  ;;    precedes each update.
+  ;; QUESTION:  DOES THE INLINED-FUNCTION NEED TO BE A MACRO SO THAT
+  ;;   WE CAN REALLY EXPLOIT THE FACT THAT child-contexts IS SORTED?  IN OTHER
+  ;;   WORDS, DOES THE RESETTING OF csValue IN THE BODY OF THE FUNCTION HELP
+  ;;   US HERE?
+  (foreach childCxt in (child-contexts *context*)
+           do
+           (special ((*context* childCxt))
+             (let ((currentValue (access-in-context csValue homeContext FALSE)))
+               (when (not (eql? currentValue parentValue))
+                 (help-insert-a-cs-value
+                  (the-kv-list csValue) currentValue childCxt FALSE))))) )
+

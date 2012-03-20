@@ -1,0 +1,579 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: type-predicates.ste,v 1.18 2003/04/18 21:15:41 hans Exp
+
+;;; Bootstrap type predicates.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; Set of type-predicates that have two features the standard 'isa?'
+;;;    predicate doesn't have:
+;;;
+;;;    (1) They work with undefined (NULL) objects.
+;;;    (2) They can be used early in the bootstrap to parse class and
+;;;        slot definitions when the class object hierarchy is not yet
+;;;        available.
+;;;
+;;; Each type-predicate has a `subtype-of-' brother that is used in the
+;;;    translation of `typecase's to avoid multiple calls to `primary-type'.
+
+;;; NOTE: We use the idiom `(safe-cast (surrogate-value ...) CLASS)' at
+;;;    various places instead of `(type-class ...)' to make sure this
+;;;    code works during bootstrap even if it wasn't translated with
+;;;    an optimization level that eliminated runtime type checks.
+
+;;; Set to TRUE in 'startup-kernel' once the class hierarchy
+;;; has been booted so it can be used for subclass/type tests:
+(defglobal *class-hierarchy-booted?* BOOLEAN FALSE)
+
+(defun (safe-primary-type TYPE) ((x OBJECT))
+  :public? TRUE
+  ;; Return the primary type of `x' or @UNKNOWN if `x' is undefined.
+  ;; Used in the translation of `typecase's to gracefully handle undefined
+  ;;    objects.
+  ;; TO DO: SHOULD WE GLOBALLY-INLINE? THIS?
+  (return (choose (null? x) @UNKNOWN (primary-type x))))
+
+(defun (bootstrap-isa? BOOLEAN) ((x OBJECT) (type TYPE))
+  ;; Safe version of 'isa?' that can be used early in the bootstrap to
+  ;;    perform simple isa tests before the class hierarchy is available.
+  (return (and (defined? x)
+               (or (eq? (primary-type x) type)
+                   (and (defined? (surrogate-value type))
+                        (defined? (surrogate-value (primary-type x)))
+                        (isa? x type))))))
+
+(defun (bootstrap-subtype-of? BOOLEAN) ((subType TYPE) (superType TYPE))
+  ;; Safe version of 'subtype-of?' that can be used early in the bootstrap to
+  ;;    perform simple type tests before the class hierarchy is available.
+  (return (or (eql? subType superType)
+              (and (defined? (safe-cast (surrogate-value subType) CLASS))
+                   (defined? (safe-cast (surrogate-value superType) CLASS))
+                   (subtype-of? subType superType)))))
+
+(defun (boolean? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @BOOLEAN-WRAPPER))))
+  (return (bootstrap-isa? x @BOOLEAN-WRAPPER)))
+
+(defun (subtype-of-boolean? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                            (safe-cast (surrogate-value @BOOLEAN-WRAPPER) CLASS)))
+    (return (bootstrap-subtype-of? type @BOOLEAN-WRAPPER))))
+
+(defun (integer? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @INTEGER-WRAPPER))))
+  (return (bootstrap-isa? x @INTEGER-WRAPPER)))
+
+(defun (subtype-of-integer? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                            (safe-cast (surrogate-value @INTEGER-WRAPPER) CLASS)))
+    (return (bootstrap-subtype-of? type @INTEGER-WRAPPER))))
+
+(defun (float? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @FLOAT-WRAPPER))))
+  (return (bootstrap-isa? x @FLOAT-WRAPPER)))
+
+(defun (subtype-of-float? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                            (safe-cast (surrogate-value @FLOAT-WRAPPER) CLASS)))
+    (return (bootstrap-subtype-of? type @FLOAT-WRAPPER))))
+
+(defun (string? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @STRING-WRAPPER))))
+  (return (or (bootstrap-isa? x @STRING-WRAPPER)
+              (bootstrap-isa? x @VERBATIM-STRING-WRAPPER))))
+
+(defun (subtype-of-string? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                            (safe-cast (surrogate-value @STRING-WRAPPER) CLASS)))
+    (return (or (bootstrap-subtype-of? type @STRING-WRAPPER)
+                (bootstrap-subtype-of? type @VERBATIM-STRING-WRAPPER)))))
+
+(defun (verbatim-string? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @VERBATIM-STRING-WRAPPER))))
+  (return (bootstrap-isa? x @VERBATIM-STRING-WRAPPER)))
+
+(defun (subtype-of-verbatim-string? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of?
+         (safe-cast (surrogate-value type) CLASS)
+         (safe-cast (surrogate-value @VERBATIM-STRING-WRAPPER) CLASS)))
+    (return (bootstrap-subtype-of? type @VERBATIM-STRING-WRAPPER))))
+
+(defun (character? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @CHARACTER-WRAPPER))))
+  (return (bootstrap-isa? x @CHARACTER-WRAPPER)))
+
+(defun (subtype-of-character? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                      (safe-cast (surrogate-value @CHARACTER-WRAPPER) CLASS)))
+    (return (bootstrap-subtype-of? type @CHARACTER-WRAPPER))))
+
+(defun (wrapper? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @WRAPPER))))
+  ;; This is ugly, but it has to work early in the bootstrap,
+  ;; otherwise un/stringification will not work properly.
+  (return (or (boolean? x)
+              (integer? x)
+              (float? x)
+              (string? x)
+              (character? x)
+              (bootstrap-isa? x @WRAPPER))))
+
+(defun (subtype-of-wrapper? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                            (safe-cast (surrogate-value @WRAPPER) CLASS)))
+    ;; This is ugly, but it has to work early in the bootstrap,
+    ;; otherwise un/stringification will not work properly.
+    (return (or (subtype-of-boolean? type)
+                (subtype-of-integer? type)
+                (subtype-of-float? type)
+                (subtype-of-string? type)
+                (subtype-of-character? type)
+                (bootstrap-subtype-of? type @WRAPPER)))))
+
+(defun (surrogate? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @SURROGATE))))
+  (return (bootstrap-isa? x @SURROGATE)))
+
+(defun (subtype-of-surrogate? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                            (safe-cast (surrogate-value @SURROGATE) CLASS)))
+    (return (bootstrap-subtype-of? type @SURROGATE))))
+
+(defun (type? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @SURROGATE))))
+  (return (bootstrap-isa? x @SURROGATE)))
+
+(defun (subtype-of-type? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  :globally-inline? TRUE
+  (return (subtype-of-surrogate? type)))
+
+(defun (symbol? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @SYMBOL))))
+  (return (or (bootstrap-isa? x @SYMBOL)
+              (bootstrap-isa? x @TRANSIENT-SYMBOL))))
+
+(defun (subtype-of-symbol? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return (subclass-of? (safe-cast (surrogate-value type) CLASS)
+                            (safe-cast (surrogate-value @SYMBOL) CLASS)))
+    (return (or (bootstrap-subtype-of? type @SYMBOL)
+                (bootstrap-subtype-of? type @TRANSIENT-SYMBOL)))))
+
+(defun (transient-symbol? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @TRANSIENT-SYMBOL))))
+  (return (bootstrap-isa? x @TRANSIENT-SYMBOL)))
+
+(defun (subtype-of-transient-symbol? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of?
+         (safe-cast (surrogate-value type) CLASS)
+         (safe-cast (surrogate-value @TRANSIENT-SYMBOL) CLASS)))
+    (return (bootstrap-subtype-of? type @TRANSIENT-SYMBOL))))
+
+(defun (keyword? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @KEYWORD))))
+  (return (bootstrap-isa? x @KEYWORD)))
+
+(defun (subtype-of-keyword? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of?
+         (safe-cast (surrogate-value type) CLASS)
+         (safe-cast (surrogate-value @KEYWORD) CLASS)))
+    (return (bootstrap-subtype-of? type @KEYWORD))))
+
+(defun (cons? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  ;; It pays to optimize this, since it is called a lot:
+  (if (defined? x)
+      (return (eql? (primary-type x) @CONS))
+    (return FALSE)))
+
+(defun (subtype-of-cons? BOOLEAN) ((type TYPE))
+  :globally-inline? TRUE
+  :public? TRUE
+  ;; It pays to optimize this, since it is called a lot:
+  (return (eql? type @CONS)))
+
+(defun (stella-class? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (if (defined? x)
+        (let ((typeClass (safe-cast (surrogate-value (primary-type x)) CLASS)))
+          (return (and (defined? typeClass)
+                       (subclass-of?
+                        typeClass (safe-cast (surrogate-value @CLASS) CLASS)))))
+      (return FALSE)))
+  (return (bootstrap-isa? x @CLASS)))
+
+(defun (subtype-of-class? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (let ((typeClass (safe-cast (surrogate-value type) CLASS)))
+        (return
+          (and (defined? typeClass)
+               (subclass-of?
+                typeClass (safe-cast (surrogate-value @CLASS) CLASS)))))
+    (return (bootstrap-subtype-of? type @CLASS))))
+
+(defun (storage-slot? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @STORAGE-SLOT))))
+  (return (bootstrap-isa? x @STORAGE-SLOT)))
+
+(defun (subtype-of-storage-slot? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of?
+         (safe-cast (surrogate-value type) CLASS)
+         (safe-cast (surrogate-value @STORAGE-SLOT) CLASS)))
+    (return (bootstrap-subtype-of? type @STORAGE-SLOT))))
+
+(defun (method-slot? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @METHOD-SLOT))))
+  (return (bootstrap-isa? x @METHOD-SLOT)))
+
+(defun (subtype-of-method-slot? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of?
+         (safe-cast (surrogate-value type) CLASS)
+         (safe-cast (surrogate-value @METHOD-SLOT) CLASS)))
+    (return (bootstrap-subtype-of? type @METHOD-SLOT))))
+
+(defun (anchored-type-specifier? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @ANCHORED-TYPE-SPECIFIER))))
+  (return (bootstrap-isa? x @ANCHORED-TYPE-SPECIFIER)))
+
+(defun (subtype-of-anchored-type-specifier? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of?
+         (safe-cast (surrogate-value type) CLASS)
+         (safe-cast (surrogate-value @ANCHORED-TYPE-SPECIFIER) CLASS)))
+    (return (bootstrap-subtype-of? type @ANCHORED-TYPE-SPECIFIER))))
+
+(defun (parametric-type-specifier? BOOLEAN) ((x OBJECT))
+  :public? TRUE
+  (when *class-hierarchy-booted?*
+    (return (and (defined? x)
+                 (isa? x @PARAMETRIC-TYPE-SPECIFIER))))
+  (return (bootstrap-isa? x @PARAMETRIC-TYPE-SPECIFIER)))
+
+(defun (subtype-of-parametric-type-specifier? BOOLEAN) ((type TYPE))
+  :public? TRUE
+  (if *class-hierarchy-booted?*
+      (return
+        (subclass-of?
+         (safe-cast (surrogate-value type) CLASS)
+         (safe-cast (surrogate-value @PARAMETRIC-TYPE-SPECIFIER) CLASS)))
+    (return (bootstrap-subtype-of? type @PARAMETRIC-TYPE-SPECIFIER))))
+
+  ;;
+;;;;;; Special type-predicates used for optimizations:
+  ;;
+
+(defmethod (standard-object? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  ;; Used for `eq?/eql?' optimization that cannot be made at compile time
+  ;;    (e.g., in `member?').
+  (return FALSE))
+
+(defmethod (standard-object? BOOLEAN) ((self STANDARD-OBJECT))
+  :public? TRUE
+  ;; Used for `eq?/eql?' optimization that cannot be made at compile time
+  ;;    (e.g., in `member?').
+  (return TRUE))
+
+
+  ;;
+;;;;;; `typecase' optimization support
+  ;;
+
+;;; Great idea, unfortunately, it didn't give us any speedup :-)
+;;; Not sure why, maybe because of the indirection via the cache table
+;;;    (instead of using a global per `typecase' to hold the cache), or
+;;;    maybe there is some underlying inlining/cache behavior going on
+;;;    that is disturbed by the more complex mechanism, and, hence, eats
+;;;    up the expected speedup.
+
+#|
+;;; IMPORTANT: If this gets resurrected, the cache table needs to get cleared
+;;;    everytime the class hierarchy changes (e.g., in `finalize-classes').
+;;;    This could also be done more in a more fine-grained manner via time-stamps.
+
+(defglobal *typecase-cache-size* INTEGER 1024 :public? TRUE)
+(defglobal *typecase-cache-table* (VECTOR OF TYPECASE-CACHE)
+           (new (VECTOR OF TYPECASE-CACHE)
+                :array-size *typecase-cache-size*))
+
+(defclass TYPECASE-CACHE (STANDARD-OBJECT)
+  :slots ((key :type STRING)
+          (entries :type TYPECASE-CLAUSE-CACHE)
+          (next :type TYPECASE-CACHE)))
+
+(defclass TYPECASE-CLAUSE-CACHE (STANDARD-OBJECT)
+  :slots ((clause-key :type TYPE)
+          (clause-id :type TYPE)
+          (intervals :type (CONS OF INTERVAL))
+          (next :type TYPECASE-CLAUSE-CACHE)))
+
+(defun (select-typecase-clause TYPE)
+    ((object OBJECT) (clauseKeys STRING) (clauseKeysCode INTEGER))
+  (when (null? object)
+    (return NULL))
+  (let ((cache (nth *typecase-cache-table* clauseKeysCode)))
+    (cond ((and (defined? cache)
+                (eq? (key cache) clauseKeys))
+           ;; we have a cache hit, the hopefully most common case:
+           NULL)
+          (otherwise
+           ;; null cache or collision:
+           (let ((cursor cache))
+             (while (and (defined? cursor)
+                         (not (eq? (key cursor) clauseKeys)))
+               (setq cursor (next cursor)))
+             (cond ((defined? cursor)
+                    ;; swap it to the front to - hopefully - speed up future access
+                    ;;    (this also defuses collisions due to incremental
+                    ;;    redefinitions which introduce equal but not eq strings):
+                    (let ((entries (entries cursor)))
+                      (setf (entries cursor) (entries cache))
+                      (setf (key cursor) (key cache))
+                      (setf (key cache) clauseKeys)
+                      (setf (entries cache) entries)))
+                   (otherwise
+                    (setq cache
+                      (new TYPECASE-CACHE
+                           :key clauseKeys
+                           :entries (decode-typecase-keys clauseKeys)
+                           :next cache))
+                    (setf (nth *typecase-cache-table* clauseKeysCode) cache))))))
+
+    (if *class-hierarchy-booted?*
+        (let ((objectType (primary-type object))
+              (objectLabel (label (class-taxonomy-node (type-class objectType))))
+              (cursor (entries cache))
+              (intervals (CONS OF INTERVAL) NULL)
+              (interval INTERVAL NULL))
+          (while (defined? cursor)
+            (when (eql? objectType (clause-key cursor))
+              (return (clause-id cursor)))
+            (setq intervals (intervals cursor))
+            (while (not (eql? intervals NIL))
+              (setq interval (value intervals))
+              (when (and (>= objectLabel (lower-bound interval))
+                         (<= objectLabel (upper-bound interval)))
+                (return (clause-id cursor)))
+              (setq intervals (rest intervals)))
+            (setq cursor (next cursor)))
+          (return NULL))
+      ;; We are somewhere during bootstrap - do it the slow way:
+      (return (bootstrap-select-typecase-clause object cache)))))
+
+(defun (bootstrap-select-typecase-clause TYPE)
+    ((object OBJECT) (cache TYPECASE-CACHE))
+  (let ((cursor (entries cache)))
+    (while (defined? cursor)
+      (case (clause-key cursor)
+        (@INTEGER-WRAPPER
+         (when (integer? object)
+           (return (clause-id cursor))))
+        (@FLOAT-WRAPPER
+         (when (float? object)
+           (return (clause-id cursor))))
+        ((@STRING-WRAPPER @VERBATIM-STRING-WRAPPER)
+         (when (string? object)
+           (return (clause-id cursor))))
+        (@CHARACTER-WRAPPER
+         (when (character? object)
+           (return (clause-id cursor))))
+        (@WRAPPER
+         (when (wrapper? object)
+           (return (clause-id cursor))))
+        ((@SYMBOL @TRANSIENT-SYMBOL)
+         (when (symbol? object)
+           (return (clause-id cursor))))
+        (@CONS
+         (when (cons? object)
+           (return (clause-id cursor))))
+        (otherwise
+         (when (bootstrap-isa? object (clause-id cursor))
+           (return (clause-id cursor)))))
+      (setq cursor (next cursor)))
+    (return NULL)))
+
+(defun (encode-typecase-keys STRING INTEGER)
+    ((clauseKeys (CONS OF TYPE)) (method METHOD-SLOT))
+  (let ((key (concatenate (stringify clauseKeys) " " (module-full-name *module*)))
+        ;; We can't share the entries for equal clauseKeys, since that would
+        ;;    generate too many collisions for popular key patterns.
+        (code (mod (hash-string key (hash-string (stringify method) (random 113)))
+                   *typecase-cache-size*)))
+    (return key code)))
+
+(defun (decode-typecase-keys TYPECASE-CLAUSE-CACHE) ((clauseKeys STRING))
+  (let ((module
+         (get-stella-module
+          (subsequence clauseKeys (+ (string-search clauseKeys ") " 0) 2) NULL)
+          TRUE))
+        (decodedKeys TYPECASE-CLAUSE-CACHE NULL)
+        (subTypes (new (LIST OF TYPE))))
+    (safety 0 (defined? module)
+            "INTERNAL ERROR: Undefined module in `typecase' key structure: "
+            clauseKeys)
+    (within-module module
+      (foreach type in (reverse (cast (unstringify clauseKeys) (CONS OF TYPE)))
+          do (clear subTypes)
+             (cond ((at-most-n-nonabstract-subtypes? type 3 subTypes)
+                    (foreach subType in subTypes
+                        do (setq decodedKeys
+                             (new TYPECASE-CLAUSE-CACHE
+                                  :clause-key subType
+                                  :clause-id type
+                                  :intervals NIL
+                                  :next decodedKeys))))
+                   (otherwise
+                    (setq decodedKeys
+                      (new TYPECASE-CLAUSE-CACHE
+                           :clause-key type
+                           :clause-id type
+                           :intervals
+                           (choose (or (null? (type-class type))
+                                       (null? (class-taxonomy-node
+                                               (type-class type))))
+                                   ;; WE HAVE A PROBLEM - TREAT IT LIKE A LEAF:
+                                   NULL
+                                   (intervals (class-taxonomy-node
+                                               (type-class type))))
+                           :next decodedKeys))))))
+    (return decodedKeys)))
+
+(defun (at-most-n-nonabstract-subtypes? BOOLEAN)
+    ((root TYPE) (n INTEGER) (result (LIST OF TYPE)))
+  (when (or (not *class-hierarchy-booted?*)
+            *newly-unfinalized-classes?*)
+    (return FALSE))
+  (when (not (class-abstract? (type-class root)))
+    (if (>= (length result) n)
+        (return FALSE)
+      (push result root)))
+  (foreach subType in (class-direct-subs (type-class root))
+      do (unless (at-most-n-nonabstract-subtypes? subType n result)
+           (return FALSE)))
+  (return TRUE))
+|#

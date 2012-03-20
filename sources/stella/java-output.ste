@@ -1,0 +1,1559 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: java-output.ste,v 1.54 2003/09/19 00:24:41 tar Exp
+
+;;; Routines for outputing a formatted Java program.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;; Number of characters to indent the current line.
+(defspecial *java-indent-chars* INTEGER 0)
+(defglobal *java-stella-package-mapping*
+    (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)
+    (new (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+
+(defun (java-stella-package STRING) ()
+  (let ((stellaPackage STRING (java-package *stella-module*)))
+    (if (defined? stellaPackage)
+	(return stellaPackage)
+      (return "edu.isi.stella"))))
+
+(defun java-output-parse-tree ((consTree CONS))
+  ;; Top level function to output a Java program.
+  (special ((*java-indent-chars* 0))
+    (insert-at *java-stella-package-mapping* 
+	       "STELLAROOT"
+	       (java-stella-package))
+    (java-output-statement consTree) ))
+
+(defun java-bump-indent ()
+  ;; Bump the indent level 
+  (setq *java-indent-chars* (+ *java-indent-chars* 2)) )
+
+(defun java-unbump-indent ()
+  ;; Bump the indent level 
+  (setq *java-indent-chars* (- *java-indent-chars* 2)) )
+
+(defun java-indent ()
+  ;; Indent a line.
+  (print-spaces *current-stream* *java-indent-chars*) )
+
+(defun java-output-statement ((statement OBJECT))
+  ;; Output a Java statement, which involves interpreting the Java
+  ;;   parse tree
+  (typecase statement
+    (CONS
+     (when (nil? statement) (return))
+     (if (or (cons? (first statement)) (null? (first statement)))
+	 ;; Take care of the case where statement consists of nested stmts.
+	 (progn	
+	   (java-output-statement (first statement))
+	   (java-output-statement (rest statement)))
+         (case (first statement)
+	   (JAVA_CLASS (java-output-class (rest statement) FALSE))
+	   (JAVA_EXCEPTION_CLASS (java-output-class (rest statement) TRUE))
+	   (JAVA_NAMED_STATEMENT (java-output-named-statement (rest statement)))
+	   (JAVA_STATEMENTS (java-output-statements (rest statement)))
+	   (JAVA_IDENT (java-output-identifier (second statement)))
+	   (JAVA_EOL (java-output-identifier (second statement)))
+	   (JAVA_LITERAL (java-output-literal (second statement)))
+	   (JAVA_COMMENT (java-output-comment (second statement)))
+	   (JAVA_SYMBOL (java-output-literal (second statement)))
+	   (JAVA_CATCH (java-output-catch (rest statement)))
+	   (JAVA_THROW (java-output-throw (rest statement)))
+           (JAVA_UNWIND_PROTECT (java-output-unwind-protect (rest statement)))
+	   (JAVA_HANDLER_CASE (java-output-handler-case (rest statement)))
+	   (JAVA_SIGNAL (java-output-signal (second statement)))
+	   (JAVA_VERBATIM (java-output-verbatim (second statement)))
+	   (JAVA_CAST (java-output-cast (rest statement)))
+	   (JAVA_GLOBAL (java-output-global-definition (rest statement)))
+	   (JAVA_TYPE (java-output-type-expression 
+		       (cast (rest statement) (CONS OF STRING-WRAPPER))))
+	   (JAVA_PROGN (java-output-progn (second statement)))
+	   (JAVA_BLOCK (java-output-block (rest statement)))
+	   (JAVA_WITH_PROCESS_LOCK (java-output-with-process-lock (rest statement)))
+	   (JAVA_RETURN (java-output-return (second statement)))
+	   (JAVA_MAKE (java-output-make (rest statement)))
+	   (JAVA_FUNCALL (java-output-funcall (rest statement)))
+	   (JAVA_METHOD_CODE_CALL (java-output-method-code-call (rest statement)))
+	   (JAVA_ASSIGN (java-output-assignment (rest statement)))
+	   (JAVA_BREAK (java-output-break (second statement)))
+	   (JAVA_CONTINUE (java-output-continue (second statement)))
+	   (JAVA_COND (java-output-cond (rest statement)))
+	   (JAVA_CASE (java-output-case (rest statement)))
+	   (JAVA_IF (java-output-if (rest statement)))
+	   (JAVA_WHEN (java-output-when (rest statement)))
+	   (JAVA_UNLESS (java-output-unless (rest statement)))
+	   (JAVA_LOOP (java-output-loop (rest statement)))
+	   (JAVA_WHILE (java-output-while (rest statement)))
+	   (JAVA_FOREACH (java-output-foreach (rest statement)))
+
+	   (JAVA_SLOT_VALUE (java-output-slot-value (rest statement)))
+	   (JAVA_SLOT_VALUE_SETTER (java-output-slot-value-setter 
+				    (rest statement)))
+	   (JAVA_UNARY_OP
+	    (java-output-unary-operator (rest statement)))
+	   (JAVA_BINARY_OP
+	    (java-output-binary-operator (rest statement)))
+	   (JAVA_TERNARY_OP
+	    (java-output-ternary-operator (rest statement)))
+	   (JAVA_FUNCTION_CALL
+	    (java-output-function-call (rest statement)))
+	   (JAVA_METHOD_CALL
+	    (java-output-method-call (rest statement)))
+	   (JAVA_ACTUALS
+	    (java-output-actual-parameters (rest statement)))
+	   (JAVA_MAKE_ARRAY
+	    (java-output-make-array (rest statement)))
+	   (JAVA_ARRAY_INITIALIZER
+	    (java-output-array (rest statement)))
+	   (JAVA_ANONYMOUS_ARRAY
+	    (java-output-anonymous-array (rest statement)))
+	   (JAVA_AREF (java-output-aref (rest statement)))
+	   (JAVA_METHOD (java-output-method (rest statement)))
+	   (JAVA_FUNCTION (java-output-method (rest statement)))
+	   (JAVA_PRINT_STREAM 
+	    (java-output-print-stream (rest statement) FALSE))
+	   (JAVA_PRINT_NATIVE_STREAM
+	    (java-output-print-stream (rest statement) TRUE))
+	   (JAVA_DECLARATIONS (java-output-declarations 
+			       (cast (rest statement) (CONS OF CONS)))))))
+    (otherwise 
+     (when (null? statement)
+       (return))
+     (java-output-literal statement))) )
+
+(defun java-maybe-output-statement-with-parentheses ((statement OBJECT))
+  ;; If statement is an operator, enclose it with parentheses
+  (when (java-operator? statement)
+    (print-stream *current-stream* "("))
+  (java-output-statement statement)
+  (when (java-operator? statement)
+    (print-stream *current-stream* ")")) )
+
+(defun java-output-identifier ((identifier STRING-WRAPPER))
+  #|  ;; Debugging code
+  (when (and (> (length (wrapper-value identifier)) 4)
+	     (eql? (subsequence (wrapper-value identifier) 0 4) "kwd_"))
+    (verbatim :common-lisp (cl:break "Outputting ~S" identifier)
+    :otherwise (warn "Outputting kwd_")))
+    |#
+  (print-stream *current-stream* (wrapper-value identifier)) )
+
+(defmethod java-output-literal ((object OBJECT))
+  ;; Dummy method on abstract class
+  ;; TODO: Make this a function and use typecase to avoid method on OBJECT
+  NULL
+  )
+
+(defmethod java-output-literal ((string STRING))
+  ;; Output string
+  ;; NOTE: Need to insert '\' before double quotes and \s and insert 
+  ;;  \n in place of linefeed and \r for return.
+  (print-stream *current-stream* 
+		#\" 
+		(replace-character-with-substring
+		 (replace-character-with-substring
+		  (replace-character-with-substring
+		   (replace-substrings string "\\\\" "\\")
+		   "\\\"" #\")
+		  "\\n" #\LINEFEED)
+		 "\\r" #\RETURN)
+		#\"
+		))
+
+(defmethod java-output-literal ((string STRING-WRAPPER))
+  (java-output-literal (wrapper-value string)) )
+
+(defmethod java-output-literal ((string MUTABLE-STRING-WRAPPER))
+  ;; Output string
+  (print-stream *current-stream* "new StringBuffer(")
+  (java-output-literal (mutable-string-to-string (wrapper-value string)))
+  (print-stream *current-stream* #\)) )
+
+(defmethod java-output-literal ((character CHARACTER-WRAPPER))
+  ;; Output a character
+  (case (wrapper-value character)
+    (#\' (print-stream *current-stream* "'\\''"))
+    (#\\ (print-stream *current-stream* "'\\\\'"))
+    (#\LINEFEED (print-stream *current-stream* "'\\n'"))
+    (#\BACKSPACE (print-stream *current-stream* "'\\b'"))
+    (#\TAB (print-stream *current-stream* "'\\t'"))
+    ;; For Macs, 'NEWLINE' and 'RETURN' are equivalent:
+    (#\RETURN (print-stream *current-stream* "'\\r'"))
+    (#\PAGE (print-stream *current-stream* "'\\f'"))
+    (otherwise
+     (print-stream *current-stream* #\' (wrapper-value character) #\'))) )
+
+(defmethod java-output-literal ((int INTEGER-WRAPPER))
+  ;; Output an integer
+  (print-stream *current-stream* (wrapper-value int)) )
+
+(defmethod java-output-literal ((float FLOAT-WRAPPER))
+  ;; Output a float
+  (print-stream *current-stream* (wrapper-value float)) )
+
+(defmethod java-output-literal ((boolean BOOLEAN-WRAPPER))
+  ;; Output a boolean value.
+  (if (wrapper-value boolean)
+      (print-stream *current-stream* "true")
+    (print-stream *current-stream* "false")))
+
+(defun java-output-make-array ((statement CONS))
+  ;; Output code to make an array.  The form of "statement" is:
+  ;;    (typeString dim1 ... )
+  (print-stream *current-stream* "new ")
+  (print-stream *current-stream* 
+		(wrapper-value (cast (first statement) STRING-WRAPPER)))
+  (foreach dimension in (rest statement)
+      do (print-stream *current-stream* "[")
+	 (java-output-statement dimension)
+         (print-stream *current-stream* "]")))
+
+(defun java-output-array ((arrayElements CONS))
+  ;; Output a newly formed array with elements from "arrayElements";
+  ;; class for function
+  (print-stream *current-stream* "{")
+  (when (defined? (first arrayElements))
+    (java-output-statement (first arrayElements)))
+  (foreach element in (rest arrayElements)
+           do
+           ;; Output element expression
+           (print-stream *current-stream* ", ")
+           (java-output-statement element))
+  (print-stream *current-stream* "}") )
+
+(defun java-output-anonymous-array ((statement CONS))
+  ;; Output a newly formed and declared array.
+  ;; (TypeString Element1 ... ElementN)
+  (print-stream *current-stream* "new ")
+  (print-stream *current-stream* 
+		(wrapper-value (cast (first statement) STRING-WRAPPER)))
+  (print-stream *current-stream* " [] ")
+  (java-output-array (rest statement)))
+
+(defun java-output-aref ((statement CONS))
+  ;; Output an array reference statement.
+  ;;    (array index1 ...)
+  (java-output-statement (first statement))
+  (foreach dimension in (rest statement)
+      do (print-stream *current-stream* "[")
+	 (java-output-statement dimension)
+         (print-stream *current-stream* "]")))
+
+(defun java-output-slot-value ((statement CONS))
+  ;; Output a slot access statement.
+  (java-output-statement (first statement))
+  (print-stream *current-stream*
+		"." 
+		(wrapper-value (cast (second statement) 
+				     STRING-WRAPPER))) )
+
+(defun java-output-slot-value-setter ((statement CONS))
+  ;; Output a slot setting statement.
+  (java-output-statement (first statement))
+  (print-stream *current-stream* 
+		"." 
+		(wrapper-value (cast (second statement)
+				     STRING-WRAPPER))
+		" = ")
+  (java-output-statement (third statement)) )
+
+(defun java-output-implements-interfaces ((interfaceList (CONS OF STRING-WRAPPER)))
+  ;; Output a list of interfaces that are implemented
+  (print-stream *current-stream*
+                (wrapper-value (first interfaceList)))
+  (foreach interface in (rest interfaceList)
+           do
+           (print-stream *current-stream* ", " (wrapper-value interface)))
+  (print-stream *current-stream*  " "))
+
+(defun java-output-class ((classDef CONS) (exceptionClass? BOOLEAN))
+  ;; Output a Java class definition.  If exceptionClass?, then output
+  ;;    a non-default constructor as well that takes a String argument.
+  ;; ( <documentation> <modifiers> <type> <name> <superclass> (<interface>*)
+  ;;        (<declaration>*) (<constructor>*) (<method>*) )
+
+  (java-output-class-declaration classDef)
+  (print-stream *current-stream* "{" EOL)
+  
+  ;; DECLARATIONS and METHODS:
+  (java-bump-indent)
+
+  ;; VARIABLES
+  (java-output-class-variable-definitions (cast (nth classDef 6) CONS))
+  
+  ;; CONSTRUCTORS AND METHODS:
+  (java-output-class-constructors
+   (cast (nth classDef 7) (CONS OF TRANSLATION-UNIT))
+   (wrapper-value (cast (fourth classDef) STRING-WRAPPER))
+   exceptionClass?)
+
+  (java-output-class-methods (cast (nth classDef 8) (CONS OF TRANSLATION-UNIT)))
+  (java-unbump-indent)
+
+  (print-stream *current-stream* "}" EOL EOL) )
+
+(defun java-output-class-declaration ((classDef CONS))
+  ;; Output the declaration line of a Java class definition.
+  ;; ( <documentation> <modifiers> <type> <name> <superclass> (<interface>*)
+  ;;        (<declaration>*) (<constructor>*) (<method>*) )
+  ;; DOCUMENTATION:
+  (when (defined? (unwrap-string (first classDef)))
+    (java-output-javadoc-comment 
+     (first classDef) NULL NULL "Stella Java Translator" NULL))
+  ;; MODIFIERS:
+  (foreach m in (cast (second classDef) CONS)
+      do (print-stream *current-stream* 
+		       (wrapper-value (cast m STRING-WRAPPER))
+		       " "))
+  ;; TYPE and NAME:
+  (print-stream *current-stream* 
+		(wrapper-value (cast (third classDef) STRING-WRAPPER)) " "
+		(wrapper-value (cast (fourth classDef) STRING-WRAPPER)) " ")
+  ;; SUPERCLASS:
+  (when (defined? (fifth classDef))
+    (print-stream *current-stream* "extends " 
+		  (wrapper-value (cast (fifth classDef) STRING-WRAPPER)) " "))
+
+  ;; INTERFACE(S):
+  (when (non-empty? (cast (nth classDef 5) CONS))
+    (print-stream *current-stream* "implements ")
+    (java-output-implements-interfaces (cast (nth classDef 5) CONS)))
+  )
+
+(defun java-output-class-variable-definitions ((variableTranslations CONS))
+  (foreach statement in variableTranslations
+      do (java-output-statement (cast statement CONS))))
+
+(defun java-output-class-constructors ((constructors (CONS OF TRANSLATION-UNIT))
+				       (className STRING)
+				       (exceptionClass? BOOLEAN))
+  (when exceptionClass?
+    (java-output-exception-constructor className))
+  (foreach statement in constructors
+      do (java-output-statement (java-translate-unit statement))
+         (setf (translation statement) NULL)
+	 (setf (code-register statement) NULL)))
+
+(defun java-output-class-methods ((methods (CONS OF TRANSLATION-UNIT)))
+  (foreach statement in methods
+      do (java-output-statement (java-translate-unit statement))
+         (setf (translation statement) NULL)
+	 (setf (code-register statement) NULL)))
+
+(defun java-output-exception-constructor ((exceptionName STRING))
+  ;; Outputs a constructor for "exceptionName" that accepts a string
+  ;;   argument and calls its super constructor.
+  (java-indent)
+  (print-stream *current-stream*
+		"public " exceptionName " (String message) {" EOL)
+  (java-bump-indent)
+  (java-indent)
+  (print-stream *current-stream* "super(message);" EOL)
+  (java-unbump-indent)
+  (java-indent)
+  (print-stream *current-stream* "}" EOL EOL))
+
+(defun java-output-named-statement ((namedStatement CONS))
+  ;; Output a named statement.
+  ;; `namedStatement' has the form (<name> <statement>)
+  (java-output-statement (first namedStatement))
+  (print-stream *current-stream* " : ")
+  (java-output-statement (second namedStatement)))
+  
+
+(defun java-output-formal-parameters ((parameters (CONS OF CONS)))
+  ;; Output Java formal parameters
+  (print-stream *current-stream* "(")
+  (unless (empty? parameters)
+    (print-stream *current-stream* 
+		  (wrapper-value (cast (first (first parameters))
+				       STRING-WRAPPER))
+		  " " 
+		  (wrapper-value (cast (second (first parameters))
+				       STRING-WRAPPER)))
+    (foreach parameter in (rest parameters)
+	do (print-stream 
+	    *current-stream* 
+	    ", "
+	    (wrapper-value (cast (first parameter) STRING-WRAPPER))
+	    " " 
+	    (wrapper-value (cast (second parameter) STRING-WRAPPER)))) )
+  (print-stream *current-stream* ")")  )
+
+(defun java-output-method-signature ((method CONS))
+  ;; Output the signature for a method 
+  ;; "method" has form (<modifiers> <returnType> <name> <parameters> <body>)
+  (foreach m in (cast (first method) CONS)
+      do (print-stream *current-stream* 
+		       (wrapper-value (cast m STRING-WRAPPER))
+		       " "))
+  (java-output-type-expression (second method))
+  (print-stream *current-stream* (wrapper-value 
+				  (cast (third method)
+					STRING-WRAPPER)))
+  (java-output-formal-parameters (fourth method)) )
+
+
+(defun (java-separate-comment-from-body CONS CONS) ((body CONS))
+  ;; If the function or method definition has a documentation string, then
+  ;; the body will look like:
+  ;;   (JAVA_STATEMENTS
+  ;;      (JAVA_COMMENT |L|"The documentation string.")
+  ;;      ...)
+  ;;
+  ;; Returns two values:  The body minus any top-level java_comment
+  ;;                      The java_comment.
+  ;; If no java_comment is present, then NULL will be returned as the
+  ;;   second value.
+  (if (and (eq? (first body) (quote JAVA_STATEMENTS))
+           (non-empty? (rest body))
+	   (isa? (second body) @CONS)
+	   (eq? (first (cast (second body) CONS)) (quote JAVA_COMMENT)))
+      (let ((comment (second body)))
+	(setf (rest body) (rest (rest body)))
+        (if (empty? (rest body))        ; Should only happen with abstract methods!
+          (return NIL comment)
+	  (return body comment)))
+      (return body NULL)) )
+
+(defun java-output-method ((method CONS))
+  ;; Output a Java method.  Functions will have the "static" modifier.
+  ;; "method" has form (<modifiers> <returnType> <name> <parameters> <body>)
+  (mv-bind (body comment)
+      (java-separate-comment-from-body (cast (fifth method) CONS))
+    (when (defined? comment)
+      (java-indent)
+      (java-output-javadoc-comment (cast (second comment) STRING-WRAPPER)
+				   (cast (fourth method) CONS)
+				   (cast (first (cast (second method) CONS)) STRING-WRAPPER)
+				   NULL
+				   NULL))
+    (java-indent)
+    (java-output-method-signature method)
+
+    ;; Normally a method will have a body, unless it is abstract.
+    ;; It is possible that a void method will not have a body if it is a no-op.
+
+    (cond ((not (empty? body))
+	   (print-stream *current-stream* " {" EOL)
+	   ;; list of statements 
+	   (java-bump-indent)
+	   (java-output-statement body)
+	   (java-unbump-indent)
+	   (java-indent)
+	   (print-stream *current-stream* "}" EOL))
+          ((member? (cast (first method) CONS) "abstract")
+           (print-stream *current-stream* ";" EOL))
+          ((member? (cast (second method) CONS) "void")
+           (inform "Note: Void method " (third method) " has an empty body.")
+           (print-stream *current-stream* " {}" EOL))
+          (otherwise 
+           (warn "Method " (third method) " has an empty body but is not abstract or void!")
+           (print-stream *current-stream* " {}" EOL)))
+    (print-stream *current-stream* EOL)))
+
+
+
+(defmethod java-output-literal ((cons CONS))
+  ;; Output cons or NIL
+  (if (nil? cons)
+      (print-stream *current-stream* "NIL")
+      (progn
+	(print-stream *current-stream* "(" (value cons) " . ")
+	(java-output-literal (rest cons)))) )
+
+(defmethod java-output-literal ((tree QUOTED-EXPRESSION))
+  ;; Output a quoted expression.
+  ;; NOTE: for now, its just a string.  Eventually we want
+  ;;   a real reference to the quoted expression.
+  (print-stream *current-stream* "\"" tree "\"") )
+
+(defmethod java-output-literal ((symbol SYMBOL))
+  ;; Output symbol.  NOTE: We assume that a "global" variable definition
+  ;;   of the form SYM_<symbol name> exists which implements the getting 
+  ;;   of the actual symbol
+  (print-stream *current-stream* 
+		(wrapper-value (java-translate-symbol-name symbol))) )
+
+(defmethod java-output-literal ((surrogate SURROGATE))
+  ;; Output surrogate  NOTE: We assume that a "global" variable definition
+  ;;   of the form SGT_<surrogate name> exists which implements the getting 
+  ;;   of the actual kewyord.
+  (print-stream *current-stream* 
+		(wrapper-value (java-translate-surrogate-name 
+				surrogate))) )
+
+(defmethod java-output-literal ((keyword KEYWORD))
+  ;; Output Keyword.  NOTE: We assume that a "global" variable definition
+  ;;   of the form KWD_<kwd name> exists which implements the getting 
+  ;;   of the actual kewyord.
+  (print-stream *current-stream* 
+		(wrapper-value (java-translate-keyword-name keyword))) )
+
+(defun java-output-type-expression ((typeExpression 
+				    (CONS OF STRING-WRAPPER)))
+  ;; Output a type expression, which is a list of type tokens
+  ;;   (e.g., (static long int))
+  (foreach typeExpr in typeExpression
+      do (print-stream *current-stream* (wrapper-value typeExpr) " ")) )
+
+(defglobal *java-semicolon-statements* (CONS OF SYMBOL)
+	   (bquote (JAVA_ASSIGN
+		    JAVA_UNARY_OP
+		    JAVA_BINARY_OP
+		    JAVA_TERNARY_OP
+		    JAVA_CAST
+		    JAVA_FUNCALL
+		    JAVA_FUNCTION_CALL
+		    JAVA_FUNCTION_POINTER
+		    JAVA_MAKE
+		    JAVA_METHOD_CALL 
+		    JAVA_METHOD_CODE_CALL
+		    JAVA_METHOD_POINTER
+		    JAVA_METHOD_SETTER_CALL
+		    JAVA_NEW
+		    JAVA_PRINT_NATIVE_STREAM
+		    JAVA_PRINT_STREAM
+		    JAVA_RETURN
+		    JAVA_SIGNAL
+		    JAVA_SLOT_VALUE_SETTER
+		    JAVA_THROW
+		    JAVA_VERBATIM)))
+
+(defun (java-output-semicolon? BOOLEAN) ((statement CONS))
+  ;; Only output semicolons at the end of selected statements,
+  ;;  e.g., method calls.  Don't output semicolons after conditionals,
+  ;;  loops, etc.
+  (if (defined? statement)
+    (return (member? *java-semicolon-statements* (first statement)))
+    (return FALSE)) )
+
+(defun (java-indent-statement? BOOLEAN) ((statement CONS))
+  ;; Only indent selected statements.
+  ;; E.g., don't indent a JAVA_STATEMENTS statement
+  (if (defined? statement)
+      (return (not (member? (quote (JAVA_STATEMENTS JAVA_CATCH))
+			    (first statement))))
+      (return FALSE)) )
+  
+(defun (java-illegal-statement? BOOLEAN) ((statement CONS))
+  ;; Return TRUE if statement is an illegal Java statement 
+  ;;   (e.g., an identifier)
+  ;; Ideally the walker shouldn't generate illegal statements, but for
+  ;;   now I filter them out here.
+  (if (defined? statement)
+      (return (member? (quote (JAVA_LITERAL JAVA_IDENT)) (first statement)))
+      (return FALSE)) )
+
+(defun java-output-statements ((statementList CONS))
+  ;; Output a list of Java statements
+  (foreach statement in statementList
+	   do
+	   ;; KLUDGE: some stuff that comes out of the walker
+	   ;;   is ignorable.  E.g., sometimes identifiers appear as statements
+	   (unless (java-illegal-statement? statement)
+	     (when (java-indent-statement? statement)
+	       (java-indent))
+	     (java-output-statement statement)
+	     (when (java-output-semicolon? statement)
+	       (print-stream *current-stream* ";" EOL)))) )
+
+(defun java-output-declarations ((declarations (CONS OF CONS)))
+  ;; Output a list of declarations.  Declarations of the form
+  ;;   (TYPE VAR [DOC]), where TYPE is a list of type expressions
+  ;;   (e.g., (static long int)), VAR is the name of a variable
+  ;;   (e.g., x) or a function (e.g., f())
+  (java-bump-indent)
+  (foreach declaration in declarations 
+      do (when (defined? (third declaration))
+	   (java-indent)
+	   (java-output-javadoc-comment (cast (third declaration) STRING-WRAPPER)
+					NIL
+					NULL
+					NULL
+					NULL))
+	 (java-indent)
+	 (java-output-type-expression (first declaration))
+	 (print-stream *current-stream* (wrapper-value 
+					 (cast (second declaration)
+					       STRING-WRAPPER)))
+	 (print-stream *current-stream* ";" EOL)) 
+  (print-stream *current-stream* EOL)
+  (java-unbump-indent) )
+
+(defun (java-heuristically-translate-name STRING) ((stella-name STRING)
+						   (case-converted-name-list (CONS OF STRING-WRAPPER)))
+  ;; Guess at the proper translation of stella-name by examining what
+  ;; it looks like.  Use the following rules:
+  ;;  (a)  If the name matches a name in `case-converted-name-list' (ignoring case), then
+  ;;       use the matching converted name.
+  ;;  (b)  If the current module is case-sensitive, don't change case
+  ;;  (c)  If the name has any upper-case letters, don't change case
+  ;;  (d)  If the name has any * character in it, go to uppercase
+  ;;  (e)  Otherwise, go to titlecaseX
+  (foreach pname in case-converted-name-list
+      where (string-equal? pname stella-name)
+      do (return pname))
+  (cond ((or (case-sensitive? *module*)
+	     ;; BUG:  The following test doesn't work correctly, because the string
+	     ;; in the documentation may not match the correct internal case for
+	     ;; the *module* in which we are parsing this.
+	     #|(not (eq? (compute-symbol-escape-code 
+	                                stella-name false) 
+					:unescaped))
+					|#
+	     
+	     (exists ch in stella-name where (upper-case-character? ch))
+	     )
+	 (return (java-translate-namestring 
+		  (make-matching-name-full
+		   stella-name
+		   :no :no "- "
+		   "" "" "" ""
+		   :preserve "_"))))
+	((member? stella-name #\*)
+	 (return (java-translate-namestring
+		  (make-matching-name-full 
+		   stella-name
+		   :clever :clever "- "
+		   "" "" "" ""
+		   :upcase "_"))))
+	(otherwise
+	 (return (java-translate-namestring
+		  (make-matching-name-full 
+		   stella-name
+		   :clever :clever "- "
+		   "" "" "" ""
+		   :titlecaseX ""))))) )
+
+(defun java-output-comment-string ((comment STRING)
+				   (comment-start STRING)
+				   (comment-continuation STRING)
+				   (comment-end STRING)
+				   (javadoc-comment? BOOLEAN)
+				   (case-converted-name-list (CONS OF STRING-WRAPPER)))
+  ;; Output `comment' with `comment-start' at the beginning and
+  ;;    `comment-end' at the end.  If the comment contains more than
+  ;;    one line, then prefix each continuation line with `comment-continuation'.
+  ;; Convert names inside `...' pairs into java identifiers for local variables
+  ;;   and method/function names.
+  (let ((return? FALSE)
+	(escape? FALSE)
+	(inside-quote? FALSE)
+	(saved-stream *current-stream*)
+	(string-stream STRING-OUTPUT-STREAM NULL)
+	(stella-name STRING NULL))
+    (print-stream *current-stream* comment-start)
+    (foreach char in comment
+	do (case char
+	     (#\Linefeed
+	      (unless return?
+		(print-stream *current-stream* EOL)
+		(java-indent)
+		(print-stream *current-stream* comment-continuation)))
+	     (#\Return
+	      (print-stream *current-stream* EOL)
+	      (java-indent)
+	      (print-stream *current-stream* comment-continuation)
+	      (setq return? TRUE)
+	      (setq escape? FALSE)
+	      (continue))
+	     (#\`
+	      (cond (escape? 
+		     (print-stream *current-stream* char))
+		    (inside-quote?
+		     (warn "Encountered unescaped ` inside ` form in comment " comment)
+		     (print-stream *current-stream* char))
+		    (otherwise
+		     (setq string-stream (new STRING-OUTPUT-STREAM))
+		     (setq *current-stream* string-stream)
+		     (setq inside-quote? TRUE))))
+	     (#\'
+	      (cond (escape? 
+		     (print-stream *current-stream* char))
+		    (inside-quote?
+		     (setq *current-stream* saved-stream)
+		     (setq stella-name (the-string string-stream))
+		     (if javadoc-comment?
+		       (print-stream *current-stream* "<code>")
+		       (print-stream *current-stream* #\`))
+		     (print-stream *current-stream*
+				   (java-heuristically-translate-name 
+				    stella-name case-converted-name-list))
+		     (if javadoc-comment?
+		       (print-stream *current-stream* "</code>")
+		       (print-stream *current-stream* #\'))
+		     (setq inside-quote? FALSE))
+		    (otherwise
+		     (print-stream *current-stream* char))))
+	     (#\\
+		 (if escape?
+		   (print-stream *current-stream* char)
+		   (progn
+		     (setq escape? TRUE)
+		     (setq return? FALSE)
+		     (continue))))
+	     (otherwise
+	      (if (or inside-quote? (not javadoc-comment?))
+		(print-stream *current-stream* char)
+		(write-html-character-quoting-special-characters 
+		 *current-stream* char))
+	      (setq return? FALSE)
+	      (setq escape? FALSE))))
+    (if (and (defined? comment-end)
+	     (not (eql? comment-end "")))
+      (progn (java-indent)
+	     (print-stream *current-stream* comment-end))
+      (print-stream *current-stream* EOL)) ))
+
+(defun java-output-comment ((tree STRING-WRAPPER))
+  (java-output-comment-string (wrapper-value tree)
+			      "// "
+			      "// "
+			      NULL
+			      false
+			      NIL))
+
+;;ALTERNATE:
+;(defun java-output-comment ((tree STRING-WRAPPER))
+;  (print-stream *current-stream* "/* " (wrapper-value tree) " */" EOL) )
+
+(defun java-output-javadoc-comment ((tree STRING-WRAPPER)
+				    (parameter-names-and-types (CONS OF 
+								     (CONS OF STRING-WRAPPER)))
+				    (return-value STRING-WRAPPER)
+				    (author STRING)
+				    (version STRING))
+  ;; Code to produce a JavaDoc style comment.  For function and method
+  ;;  definitions, this also takes the parameter names and return Value of
+  ;;  the function.
+  ;; Tricky:  We don't have the comment string output function print the
+  ;;     comment end character, because we have to add other lines first.
+  (let ((parameter-names (CONS OF STRING-WRAPPER) NIL))
+    (when (defined? parameter-names-and-types)
+      (foreach n in parameter-names-and-types
+	  collect (second n) into parameter-names))
+    (java-output-comment-string (wrapper-value tree)
+				"/** "
+				" * "
+				NULL
+				true
+				parameter-names)
+    (foreach n in parameter-names
+	do (java-indent)
+	   (print-stream *current-stream* 
+			 " * @param " (wrapper-value n) EOL))
+    (when (and (defined? return-value)
+	       (not (string-eql? (wrapper-value return-value) "void")))
+      (java-indent)
+      (print-stream *current-stream* " * @return " (wrapper-value return-value) EOL))
+    (when (and (defined? author) (not (eq? author "")))
+      (java-indent)
+      (print-stream *current-stream* " * @author " author EOL))
+    (when (and (defined? version) (not (eq? version "")))
+      (java-indent)
+      (print-stream *current-stream* " * @version " version EOL))
+    (java-indent)
+    (print-stream *current-stream* " */" EOL)))
+
+;;; NOT (YET) USED:
+(defun (fixup-documentation-string-quoting STRING) ((documentation STRING))
+  ;; Hack to substitute 'foo' quoting into `foo' within `documentation'.
+  ;; Problem: some rare cases where a documentation string contains quoted
+  ;;    constants that themselves contain quotes wouldn't be handled right,
+  ;;    e.g., "evaluate `(append '(1 2) '(4 5))'".
+  (when (null? documentation)
+    (return NULL))
+  (let ((closingQuotePosition INTEGER NULL)
+        (precedingCharacter CHARACTER NULL)
+        (openParentheses "([{")
+        (buffer (string-to-mutable-string documentation)))
+    (foreach char in documentation
+        as i in (interval 0 NULL)
+        do (case char
+             ((#\` #\')
+              (when (= i closingQuotePosition)
+                (continue))
+              (if (= i 0)
+                  (setq precedingCharacter #\Space)
+                (setq precedingCharacter (nth documentation (1- i))))
+              (when (or (white-space-character? precedingCharacter)
+                        (member? openParentheses precedingCharacter))
+                (setq closingQuotePosition
+                  (position documentation #\' (1+ i)))
+                (when (defined? closingQuotePosition)
+                  (setf (nth buffer i) #\`))))
+             (otherwise NULL)))
+    (return buffer)))
+
+(defun java-output-verbatim ((verbatimStatement STRING-WRAPPER))
+  (print-stream *current-stream*
+		(substitute-template-variables-in-string
+		 (wrapper-value verbatimStatement) 
+		 *java-stella-package-mapping*)) )
+
+(defun java-output-make ((statement CONS))
+  ;; Output a storage-allocation statement.
+  ;; NOTE: CURRENTLY WE CALL THE DEFAULT CONSTRUCTOR. 
+  ;;   IS THIS WHAT WE WANT?
+  (print-stream *current-stream* "new ")
+  (java-output-statement (first statement))
+  (java-output-statement (second statement)))
+
+(defun java-output-cast ((tree CONS))
+  ;; `tree' has form (<expression> <type>)
+  (print-stream *current-stream* 
+		"((" 
+		(wrapper-value (cast (second tree) STRING-WRAPPER)) ")(")
+  (java-output-statement (first tree))
+  (print-stream *current-stream* "))"))
+
+(defun java-output-progn ((progn CONS))
+  ;; Output a Java progn, e.g., a block without declarations as used
+  ;;   in a for loop, if statement, etc.
+  ;; Progn has the form <STATEMENTS>
+  (print-stream *current-stream* "{" EOL)
+  (java-bump-indent)
+  (java-output-statement progn)
+  (java-unbump-indent)
+  (java-indent)
+  (print-stream *current-stream* "}" EOL) )
+
+(defun java-output-block ((block CONS))
+  ;; Output a Java block as in a let statement:
+  ;; blocks have form of "(<DECLARATIONS> <STATEMENTS>)"
+  ;; TODO: Fix this so curly braces don't show up if there is only
+  ;;   a single block within another block (e.g. a function containing
+  ;;   only one block).
+  (let ((firstStatement? TRUE))
+    (print-stream *current-stream* "{ ")
+    (java-bump-indent)
+    ;; Declarations have form "(TYPE LVALUE RVALUE)"
+    (foreach declaration in (cast (first block) (CONS OF CONS))
+	     do
+	     (unless firstStatement?
+	       (java-indent))
+	     (setq firstStatement? FALSE)
+	     (print-stream *current-stream* 
+			   (wrapper-value (cast (first declaration)
+						STRING-WRAPPER)))
+	     (print-stream *current-stream* " ")
+	     (java-output-statement (second declaration))
+	     (unless (null? (third declaration))
+	       (print-stream *current-stream* " = ")
+	       (java-output-statement (third declaration)))
+	     (print-stream *current-stream* ";" EOL))
+    (print-stream *current-stream* EOL)
+    (java-output-statement (second block))
+    (java-unbump-indent)
+    (java-indent)
+    (print-stream *current-stream* "}" EOL)) )
+
+(defun java-output-with-process-lock ((synch CONS))
+  ;; Output a Java synchronize statement.  This is
+  ;; of the form "(<LOCK> <STATEMENTS>)".
+  (print-stream *current-stream* "synchronized (")
+  (java-output-statement (first synch))
+  (print-stream *current-stream* ") ")
+  (java-output-progn (second synch)))
+
+(defun java-output-return ((returnStatement CONS))
+  (print-stream *current-stream* "return")
+  (when (defined? returnStatement)
+    (print-stream *current-stream* " (")
+    (java-output-statement returnStatement) 
+    (print-stream *current-stream* ")")) )
+
+(defun java-output-throw ((tree CONS))
+  ;; Output a Java throw form
+  ;; `tree' has form (<label>)
+  (print-stream *current-stream* "throw new ")
+  (print-stream *current-stream* (wrapper-value (cast (first tree) 
+						      STRING-WRAPPER))) )
+(defun java-output-catch ((tree CONS))
+  ;; Output a Java catch form
+  ;; "tree" has from ((<variableName> <exceptionTypeString>) <catch form>)
+  (print-stream *current-stream* " catch (")
+  ;; Output catch parameter list
+  (print-stream *current-stream*
+		(wrapper-value (cast (first (cast (first tree) CONS)) 
+				     STRING-WRAPPER)))
+  (print-stream *current-stream* " ")
+  (print-stream *current-stream*		
+		(wrapper-value (cast (second (cast (first tree) CONS))
+				     STRING-WRAPPER)))
+  (print-stream *current-stream* ") {" EOL)
+  ;; Output code inside the catch clause
+  (java-bump-indent)
+  (java-output-statements (rest tree))
+  (java-unbump-indent)
+  (java-indent)
+  (print-stream *current-stream* "}") )
+
+;;; TO DO: - MIRROR CPP-PROGNIFY
+;;;        - UPDATE TRANSLATOR
+
+(defun java-output-unwind-protect ((tree CONS))
+  ;; Output a Java try/finally form to implement unwind-protect.
+  ;; "tree" has form (<protected form> <cleanup form>*)
+  (print-stream *current-stream* "try {" EOL)
+  (java-bump-indent)
+
+  (cond ((java-progn? (first tree))  ;; Check more cases?
+	 (java-output-statement (second (cast (first tree) CONS))))
+	((java-indent-statement? (first tree))
+	 (java-indent)
+	 (java-output-statement (first tree))
+	 (when (java-output-semicolon? (first tree))
+	   (print-stream *current-stream* ";" EOL)))
+	(otherwise
+	 (java-output-statement (first tree))))
+
+  (java-unbump-indent)
+  ;; Cleanup form
+  (print-stream *current-stream* EOL)
+  (java-indent)
+  (print-stream *current-stream* "} finally {" EOL)
+  (java-bump-indent)
+  (java-output-statements (rest tree))
+  (java-unbump-indent)
+  (java-indent)
+  (print-stream *current-stream* "}" EOL))
+
+(defun java-output-handler-case ((tree CONS))
+  ;; Output a Java try/catch forms to implement handler-case
+  ;; "tree" has form (<protected form> <handler form>*)
+  (print-stream *current-stream* "try {" EOL)
+  (java-bump-indent)
+  (if (java-progn? (first tree))  ;; Check more cases?
+      (java-output-statement (second (cast (first tree) CONS)))
+      (progn
+	(java-indent)
+	(java-output-statement (first tree))
+	(when (java-output-semicolon? (first tree))
+	  (print-stream *current-stream* ";" EOL))))
+  (java-unbump-indent)
+  (java-indent)
+  (print-stream *current-stream* "}")
+  ;; Handler forms
+  (java-output-statements (rest tree))
+  (print-stream *current-stream* EOL))
+
+(defun java-output-signal ((tree CONS))
+  (print-stream *current-stream* "throw ")
+  (java-output-statement tree))
+
+(defun java-output-global-definition ((global CONS))
+  ;; Output a Java global definition (goes in .java file)
+  ;; "global" has form (<documentation> <type> <name> <initialValue>)
+  ;; NOTE: Currently, all global variables are in the flotsam class.
+  (when (defined? (wrapper-value (cast (first global) STRING-WRAPPER)))
+    (java-indent)
+    (java-output-javadoc-comment (cast (first global) STRING-WRAPPER)
+				 NIL
+				 NULL
+				 NULL
+				 NULL))
+  (java-indent)
+  (java-output-statement (second global))
+  (print-stream *current-stream* (wrapper-value
+				  (cast (third global) STRING-WRAPPER)))
+  (unless (empty? (rest (rest (rest global))))
+    (print-stream *current-stream* " = ")
+    (java-output-statement (fourth global)))
+  (print-stream *current-stream* ";" EOL EOL) )
+
+(defun java-output-actuals-as-cons-expression ((argList CONS))
+  ;; `argList' is a list of actual parameter values.  This needs to
+  ;;   be output as a nested set of calls to the cons function.
+  (if (empty? argList)
+      (print-stream *current-stream* 
+		    (java-prepend-global-class-name "NIL" *stella-module*))
+    (progn
+      (print-stream *current-stream* 
+		    (lookup *java-stella-package-mapping* "STELLAROOT")
+		    ".Stella_Object.cons(")
+      (java-output-statement (first argList))
+      (print-stream *current-stream* ", ")
+      (java-output-actuals-as-cons-expression (rest argList))
+      (print-stream *current-stream* ")"))))
+
+(defun java-output-funcall ((funcall CONS))
+  ;; `tree' has form (<function-signature> <funcallExpression> <actuals>)
+  ;; <function-signature> has form
+  ;;    ((<returnType1> ... <returnTyepN>) <paramType1> ... <paramTypeN>)
+  ;; Ingore signature for now.
+  (print-stream *current-stream* 
+		(java-yield-full-native-class-name)
+		".funcall(")
+  (java-output-statement (second funcall))
+  (print-stream *current-stream* ", null, new java.lang.Object [] ")
+  (java-output-array (rest (cast (third funcall) CONS)))
+  (print-stream *current-stream* ")") )
+
+(defun java-output-method-code-call ((methodcall CONS))
+  ;; `tree' has form (<function-signature> <methodCallExpression> <theObject> <actuals> )
+  ;; <function-signature> has form
+  ;;    ((<returnType1> ... <returnTyepN>) <paramType1> ... <paramTypeN>)
+  ;; Ingore signature for now.
+  (print-stream *current-stream* 
+		(java-yield-full-native-class-name)
+		".funcall(")
+  (java-output-statement (second methodcall))
+  (print-stream *current-stream* ", ")
+  (java-output-statement (third methodcall))
+  (print-stream *current-stream* ", new java.lang.Object []")
+  (java-output-array (rest (cast (fourth methodcall) CONS)))
+  (print-stream *current-stream* ")") )
+
+(defun java-output-break ((tag CONS))
+  ;; Output a break statement in a loop
+  (print-stream *current-stream* "break ")
+  (java-output-statement tag)
+  (print-stream *current-stream* ";" EOL) )
+
+(defun java-output-continue ((tag CONS))
+  ;; Output a continue statement in a loop
+  (print-stream *current-stream* "continue ")
+  (java-output-statement tag)
+  (print-stream *current-stream* ";" EOL))
+
+
+(defun (java-statement-returns? BOOLEAN) ((statement CONS))
+  (cond ((not (defined? statement))
+	 (return FALSE))
+	((nil? statement)
+	 (return FALSE))
+	(otherwise
+	 (case (first statement)
+	   (JAVA_VERBATIM   ;; Kludge to handle errors until we
+	    (return
+	      (defined?
+		  (string-search (wrapper-value 
+				  (cast (second statement) STRING-WRAPPER))
+				 "throw new Error"
+				 0))))
+	   ((JAVA_RETURN JAVA_CONTINUE JAVA_BREAK JAVA_SIGNAL)     ;; Add JAVA_ERROR 
+	    (return TRUE))
+	   (JAVA_STATEMENTS
+	    (return (java-last-statement-returns? (rest statement))))
+	   (JAVA_PROGN
+	    (return (java-last-statement-returns? (second statement))))
+	   (JAVA_BLOCK
+	    (return (java-last-statement-returns? (third statement))))
+	   (JAVA_IF
+	    (return (and (java-statement-returns? (third statement))
+			 (java-statement-returns? (fourth statement)))))
+	   (JAVA_COND
+	    (return (and (java-statement-returns? (second statement))
+			 (forall c in (cast (third statement) CONS) ; (rest (rest statement))
+			     always (java-last-statement-returns? c)))))
+	   (otherwise
+	    (return FALSE))))) )
+
+(defun (java-last-statement-returns? BOOLEAN) ((statements CONS))
+  ;; Helping function for `java-output-case' if the last statement
+  ;;   in this statements block is a return statement, return TRUE.
+  (let ((last-statement (last statements)))
+    (return (and (isa? last-statement @CONS)
+                 (java-statement-returns? last-statement)))))
+
+(defun java-output-case ((case CONS))
+  ;; Output a Java case (i.e. a switch) 
+  ;; "case" has form (<keyForm> <default case> <otherCases>)
+  ;; where <otherCases> = ((<key> <actions>)*)
+  (let ((keyForm (first case))
+	(defaultCase (second case))
+	(conditions (third case)))
+    (print-stream *current-stream* "switch (")
+    (java-output-statement keyForm)
+    (print-stream *current-stream* ") {" EOL)
+    (java-bump-indent)
+    (foreach c in (cast conditions (CONS OF CONS))
+	do
+	  (let ((condition CONS c))
+	    (foreach cond in 
+		  (cast 
+		   (choose (cons? (first 
+				   (cast (first condition)
+					 CONS)))
+			   (first condition)
+			   (cons (first condition) NIL))
+		   CONS)
+		do
+		  (java-indent)
+		  (print-stream *current-stream* "case ")
+		  (java-output-statement cond)
+		  (print-stream *current-stream* ": " EOL))
+	    (java-bump-indent)
+	    (java-output-statement (second condition))
+	    (java-unbump-indent)
+	    (unless (java-last-statement-returns? (second condition))
+	      (java-indent)
+	      (print-stream *current-stream* "break;" EOL))))
+	     
+    (safety 1 (defined? defaultCase)
+            "INTERNAL ERROR: `java-output-case' expects an `otherwise' clause.")
+    (java-indent)
+    (print-stream *current-stream* "default:" EOL)
+    (java-bump-indent)
+    (java-output-statement defaultCase)
+    (java-unbump-indent)
+    (unless (java-last-statement-returns? defaultCase)
+      (java-indent)
+      (print-stream *current-stream* "break;" EOL))
+    (java-unbump-indent)
+    (java-indent)
+    (print-stream *current-stream* "}" EOL) ))
+
+(defun java-output-cond ((cond CONS))
+  ;; Output a Java conditional (i.e. an extended if..then..else) statement
+  ;; "cond" has form (<default cond> <otherConds>)
+  ;; where <otherConds> = ((<test> <actions>)*)
+  (let ((defaultCondition CONS (first cond))
+	(conditions cons (second cond))
+	(firstCondition CONS (first conditions))
+	(restConditions CONS (rest conditions)))
+    ;; Handle case where defaultCondition is only conditition
+    (when (and (defined? defaultCondition)
+	       (empty? conditions))
+      (print-stream *current-stream* "if (true) ")
+      (java-output-statement defaultCondition)
+      (return))
+    (print-stream *current-stream* "if (")
+    (java-output-statement (first firstCondition))
+    (print-stream *current-stream* ") ")
+    (java-output-statement (second firstCondition))
+    (foreach c in restConditions
+	     do
+	     (let ((condition CONS c))
+	       (java-indent)
+	       (print-stream *current-stream* "else if (")
+	       (java-output-statement (first condition))
+	       (print-stream *current-stream* ") ")
+	       (java-output-statement (second condition))))
+    (when (defined? defaultCondition)
+      (java-indent)
+      (print-stream *current-stream* "else ")
+      (java-output-statement defaultCondition)) ))
+
+(defun (java-progn? BOOLEAN) ((tree OBJECT))
+  ;; Return TRUE if `tree' is a JAVA_PROGN
+  (return (and (cons? tree)
+	       (eql? (first (cast tree CONS)) (quote JAVA_PROGN)))) )
+
+(defun (java-block? BOOLEAN) ((tree OBJECT))
+  ;; Return TRUE if `tree' is a JAVA_BLOCK
+  (return (and (cons? tree)
+	       (eql? (first (cast tree CONS)) (quote JAVA_BLOCK)))) )
+
+(defun java-output-if ((tree CONS))
+  ;; Output an if statement.
+  ;; tree has the form <test> <true body> <false body>
+  (print-stream *current-stream* "if (")
+  (java-output-statement (first tree))
+  (print-stream *current-stream* ") ")
+  (if (or (java-progn? (second tree)) (java-block? (second tree)))
+      (java-output-statement (second tree))
+      (progn
+	(print-stream *current-stream* EOL)
+	(java-bump-indent)
+	(java-indent)
+	(java-output-statement (second tree))
+	(print-stream *current-stream* ";" EOL)
+	(java-unbump-indent)))
+  (unless (null? (third tree))
+    (java-indent)
+    (print-stream *current-stream* "else ")
+    (if (or (java-progn? (third tree)) (java-block? (third tree)))
+	(java-output-statement (third tree))
+        (progn
+	  (print-stream *current-stream* EOL)
+	  (java-bump-indent)
+	  (java-indent)
+	  (java-output-statement (third tree))
+	  (print-stream *current-stream* ";" EOL)
+	  (java-unbump-indent)))) )
+
+(defun java-output-when ((tree CONS))
+  ;; Output an when statement.
+  ;; tree has the form <test> <body> 
+  (print-stream *current-stream* "if (")
+  (java-output-statement (first tree))
+  (print-stream *current-stream* ") {" EOL)
+  ;; (second tree) = (JAVA_STATEMENTS...)
+  (java-bump-indent)
+  (java-output-statement (second tree))
+  (java-unbump-indent)
+  (java-indent)
+  (print-stream *current-stream* "}" EOL) )
+
+(defun java-output-unless ((tree CONS))
+  ;; Output an when statement.
+  ;; tree has the form <test> <body> 
+  (print-stream *current-stream* "if (!(")
+  (java-output-statement (first tree))
+  (print-stream *current-stream* ")) {" EOL)
+  ;; (second tree) = (JAVA_STATEMENTS...)
+  (java-bump-indent)
+  (java-output-statement (second tree))
+  (java-unbump-indent)
+  (java-indent)
+  (print-stream *current-stream* "}" EOL) )
+
+(defun java-output-assignment ((assignment CONS))
+  ;; Output assignment statement.
+  ;; Assignment has the form (<lvalue> <rvalue>)
+  (java-output-statement (first assignment))
+  (print-stream *current-stream* " = ")
+  (java-output-statement (second assignment)) )
+
+(defun java-output-loop ((loop CONS))
+  ;; Output a Java loop.  
+  ;; "loop" has the form (<statements>)
+  (print-stream *current-stream* "for (;;) ")
+  (java-output-statement (first loop)) )
+
+(defun java-output-while ((loop CONS))
+  ;; Output a Java while statement.  
+  ;; "loop" has the form (<test> <statements>)
+  (print-stream *current-stream* "while (")
+  (java-output-statement (first loop))
+  (print-stream *current-stream* ") ")
+  (java-output-statement (second loop)) )
+
+(defun java-output-foreach ((loop CONS))
+  ;; Output a Java foreach statement.  "loop" has the form
+  ;;   (<continuationTest> <nextAssignments> <body>)
+  (let ((continuationTest (first loop))
+	(nextAssignments (second loop))
+	(body (third loop)))
+    (print-stream *current-stream* "while (")
+    (java-output-statement continuationTest)
+    (print-stream *current-stream* ") {" EOL)
+    (java-bump-indent)
+    (java-output-statements nextAssignments)
+    (java-output-statements body)
+    (java-unbump-indent)
+    (java-indent)
+    (print-stream *current-stream* "}" EOL) ))
+
+(defun (java-end-of-line-token? BOOLEAN) ((token OBJECT))
+  ;; Return TRUE if 'token' represents an end-of-line character.
+  (typecase token
+    (CONS
+     (return (eql? (first token) (quote JAVA_EOL))))
+    (otherwise NULL))
+  (return FALSE))
+
+(defun java-output-print-stream ((exps CONS) (nativeStream? BOOLEAN))
+  ;; Output a stream output statement.
+  ;; First expression in the CONS is the name of the stream, rest are
+  ;;   items to print.  For cross-platform compatibility, this will
+  ;;   emit separate "println" statements each time the EOL_STRING
+  ;;   item is encountered.
+  ;; The flag "nativeStream?" indicates if this is printing to a native
+  ;;   stream or if the native stream must be extracted from the Stella
+  ;;   stream.
+  (let ((stream (first exps))
+        (foundEOL? FALSE)
+        (embeddedEOL? FALSE)
+        (printItems NIL))
+    ;; Trick to avoid consing.  We run down the list and set a flag
+    ;; when we find an EOL.  Then, if there is at least one more form
+    ;; we set the embeddedEOL? flag and exit the loop.
+    (foreach i in (rest exps)
+             do (when foundEOL?
+                  (setq embeddedEOL? TRUE)
+                  (break))
+                (when (java-end-of-line-token? i)
+                  (setq foundEOL? TRUE)))
+    (when embeddedEOL?
+      (print-stream *current-stream* "{" EOL)
+      (java-bump-indent))
+    (foreach it on (rest exps)
+             do
+             (let ((item (value it)))
+               (if (java-end-of-line-token? item)
+                 (progn
+                   (when embeddedEOL?
+                     (java-indent))
+                   (java-help-output-print-stream 
+                    stream (java-reverse-and-consolidate-strings printItems) nativeStream? TRUE)
+                   (when embeddedEOL?
+                     (print-stream *current-stream* ";" EOL))
+                   (setq printItems NIL))
+                 (pushq printItems item))))
+    (when (not (nil? printItems))
+      (when embeddedEOL?
+        (java-indent))
+      (java-help-output-print-stream 
+       stream (java-reverse-and-consolidate-strings printItems) nativeStream? FALSE)
+      (when embeddedEOL?
+        (print-stream *current-stream* ";" EOL)))
+    (when embeddedEOL?
+      (java-unbump-indent)
+      (java-indent)
+      (print-stream *current-stream* "}" EOL)) ))
+
+(defun (java-literal-string? BOOLEAN) ((item CONS))
+  ;; Return TRUE if item is a JAVA_LITERAL with a string-wrapper value.
+  (return (and (eq? (first item) (quote JAVA_LITERAL))
+               (isa? (second item) @STRING-WRAPPER))))
+  
+(defun (java-reverse-and-consolidate-strings CONS) ((items (CONS OF CONS)))
+  ;; Goes through `items' and consoliates literal string wrappers into
+  ;; single strings.
+  (when (nil? items)
+    (return NIL))
+  (let ((output-items NIL)
+        (last-item CONS (first items)))
+    (foreach new-item in (rest items)
+             do (if (java-literal-string? new-item)
+                  (if (java-literal-string? last-item)
+                    (setq last-item 
+                          (bquote (JAVA_LITERAL
+                                   & (wrap-string (concatenate (wrapper-value 
+                                                                (cast (second new-item) STRING-WRAPPER))
+                                                               (wrapper-value
+                                                                (cast (second last-item) STRING-WRAPPER)))))))
+                    (progn 
+                      (pushq output-items last-item)
+                      (setq last-item new-item)))
+                  (progn
+                   (pushq output-items last-item)
+                   (setq last-item new-item))))
+    (pushq output-items last-item)
+    (return output-items)))
+
+(defun java-help-output-print-stream 
+    ((stream OBJECT) (exps CONS) (nativeStream? BOOLEAN) (endOfLine? BOOLEAN))
+  ;; Output a stream output statement.
+  ;; Each element of "exps" is a output element.
+  ;; The flag "nativeStream?" indicates if this is a native stream or if
+  ;;   the native stream must be extracted from a Stella stream.
+  ;; The flag "endOfLine?" indicates if an end-of-line is needed as part
+  ;;   of the print.  This chooses between the print and println methods.
+  (cond 
+   ((eql? stream (quote JAVA_STANDARD_OUT))
+    (if (or (defined? (get-stella-class "SYSTEM" FALSE))
+	    (inherited-class-name-conflicts? "SYSTEM"))
+      (print-stream *current-stream* "java.lang.System.out")
+      (print-stream *current-stream* "System.out")))
+   ((eql? stream (quote JAVA_STANDARD_ERROR))
+    (if (or (defined? (get-stella-class "SYSTEM" FALSE))
+	    (inherited-class-name-conflicts? "SYSTEM"))
+      (print-stream *current-stream* "java.lang.System.err")
+      (print-stream *current-stream* "System.err")))
+   (otherwise
+    (java-output-statement stream)
+    (when (not nativeStream?)
+      (print-stream *current-stream* ".nativeStream"))))
+  (print-stream *current-stream* (choose endOfLine? ".println(" ".print("))
+  (java-maybe-output-statement-with-parentheses (first exps)) 
+  (foreach e in (rest exps)
+      do (print-stream *current-stream* " + ")
+	 (java-maybe-output-statement-with-parentheses e))
+  (print-stream *current-stream* ")"))
+
+(defun (java-indentable-binary-operator? BOOLEAN) ((operator STRING-WRAPPER))
+  ;; Return TRUE if the second argument of the operator should be broken 
+  ;;   onto a new line.
+  (return (member? (quote ("||" "&&")) operator) ))
+
+(defun (java-commutative-binary-operator? BOOLEAN) ((operator STRING-WRAPPER))
+  ;; Return TRUE if operator is commutative, so that we don't need to
+  ;;   use parentheses for nested invocations.
+  (return (member? (quote ("+" "*")) operator) ))
+
+(defun (java-binary-operator? BOOLEAN) ((statement OBJECT))
+  ;; Return TRUE if the statment is an expression containing an operator
+  (return 
+    (and (cons? statement)
+	 (eql? (quote JAVA_BINARY_OP)
+	       (value (cast statement CONS))))) )
+
+(defun (java-operator? BOOLEAN) ((statement OBJECT))
+  ;; Return TRUE if the statment is an expression containing an operator
+  (return 
+    (and (cons? statement)
+	 (member? (quote (JAVA_UNARY_OP JAVA_BINARY_OP JAVA_TERNARY_OP 
+					JAVA_ASSIGN JAVA_SLOT_VALUE_SETTER))
+		  (value (cast statement CONS))))) )
+
+(defun java-output-unary-operator ((expression CONS))
+  ;; Output a unary operator, which consists of a list of 
+  ;;   the form (OP arg)
+  (let ((op STRING-WRAPPER (first expression))
+	(arg (second expression)))
+    (print-stream *current-stream* (wrapper-value op))
+    ;; Output parenthesis if we have a nested expression
+    (java-maybe-output-statement-with-parentheses arg) ))
+    
+(defun (java-nested-operator-needs-parentheses? BOOLEAN)
+    ((op STRING-WRAPPER) (nested OBJECT))
+  ;; Return TRUE if a nested operator call needs to have
+  ;; parentheses around it.  This is true for all operators
+  ;; unless they are commutative and the same as the higher operator.
+  (return (and (java-operator? nested)
+	       (not (and (java-commutative-binary-operator? op)
+			 (string-eql? op (third (cast nested CONS))))))))
+
+(defun java-help-output-binary-operator ((expression CONS) (nestLevel INTEGER))
+  ;; Helping function for `java-output-binary-operator'.  Implements
+  ;;   semi-pretty formatting of binary operators such as `&&'.
+  ;;   Each subexpression is placed on a new line and appropriately
+  ;;   indented.
+  ;; NOTE: For now, we indent expressions 4 spaces from the left
+  ;;   margin.  This is a heuristic that matches the common 
+  ;;   "if (" statement.  A more general algorithm would figure
+  ;;   out the rightmost column of the top-level predicate.
+  (let ((arg1 (first expression))
+	(op STRING-WRAPPER (second expression))
+	(arg2 (third expression)))
+    ;; Output Parenthesis if we have nested expressions
+    (when (java-nested-operator-needs-parentheses? op arg1)
+      (print-stream *current-stream* "("))
+    (if (java-binary-operator? op)
+      (java-help-output-binary-operator (rest (cast arg1 CONS)) (+ nestLevel 1))
+      (java-output-statement arg1))
+    (when (java-nested-operator-needs-parentheses? op arg1)
+      (print-stream *current-stream* ")"))
+    (print-stream *current-stream* " ")
+    (print-stream *current-stream* (wrapper-value op))
+    (if (java-indentable-binary-operator? op)
+      (progn
+	(print-stream *current-stream* EOL)
+	(java-indent)
+	(print-stream *current-stream* "    ") ; See above note
+	(print-spaces *current-stream* nestLevel))
+      (print-stream *current-stream* " "))
+    (when (java-nested-operator-needs-parentheses? op arg2)
+      (print-stream *current-stream* "("))
+    (if (java-binary-operator? arg2)
+	(java-help-output-binary-operator (rest (cast arg2 CONS))
+					  (+ nestLevel 1))
+      (java-output-statement arg2))
+    (when (java-nested-operator-needs-parentheses? op arg2)
+      (print-stream *current-stream* ")")) ))
+
+(defun java-output-binary-operator ((expression CONS))
+  ;; Output an epression containing a binary operator, 
+  ;; which consits of a list of the form (arg1 OP arg2)
+  ;; NOTE: May eventually implement fancy formatting, e.g., if the
+  ;;   expression doesn't fit on a line.
+  (java-help-output-binary-operator expression 0) )
+
+(defun java-output-ternary-operator ((expression CONS))
+  ;; Output a TERNARY operator, which consits of a list of
+  ;;   the form (arg1 OP1 arg2 OP2)
+  ;; NOTE: May eventually implement fancy formatting, e.g., if the
+  ;;   expression doesn't fit on a line.
+  (let ((arg1 (first expression))
+	(op1 STRING-WRAPPER (second expression))
+	(arg2 (third expression))
+	(op2 STRING-WRAPPER (fourth expression))
+	(arg3 (fifth expression)))
+    ;; Surround whole statement w/parens.
+    ;; This avoid ambiguities, e.g.
+    ;;   (a (choose x b (c x))) would translate to
+    ;;   x ? b : x->c->a  w/o parens,
+    ;;   (x ? b : x->c)->  w/ parens
+    
+    (print-stream *current-stream* "(")
+    ;; Output Parenthesis if we have nested expressions
+    (java-maybe-output-statement-with-parentheses arg1)
+    (print-stream *current-stream* " ")
+    (print-stream *current-stream* (wrapper-value op1))
+    (print-stream *current-stream* " ")
+    (java-maybe-output-statement-with-parentheses arg2)
+    (print-stream *current-stream* " ")
+    (print-stream *current-stream* (wrapper-value op2))
+    (print-stream *current-stream* " ")
+    (java-maybe-output-statement-with-parentheses arg3) 
+    (print-stream *current-stream* ")")))
+
+(defun java-output-method-call ((methodCall CONS))
+  ;; Output a Java method call
+  ;; "methodCall" has format (<type> <methodName> <object> <args>)
+  ;; Class name (for now commented out)
+
+  ;; Object
+  (java-maybe-output-statement-with-parentheses (third methodCall))
+  (print-stream *current-stream* ".")
+  ;; Method name
+  (java-output-statement (second methodCall))
+  ;; Actual parameters
+  (java-output-statement (fourth methodCall)) )
+
+  
+;;; NOTE : THIS WILL EVENTUALLY GO AWAY
+(defun java-output-function-call ((functionCall CONS))
+  ;; Output a Java function call
+  ;; "functionCall" has format (<className> <functionName> <args>)
+
+  ;; class for function
+  (java-maybe-output-statement-with-parentheses (first functionCall))
+  (print-stream *current-stream* ".")
+  ;; Function name
+  (java-output-statement (second functionCall))
+  ;; Actual parameters
+  (java-output-statement (third functionCall)) )
+
+(defun java-output-actual-parameters ((parameters CONS))
+  ;; Output Java actual parameters for function call
+  (print-stream *current-stream* "(")
+  (when (defined? (first parameters))
+    (java-output-statement (first parameters)))
+  (foreach parameter in (rest parameters)
+           do
+           ;; Output parameter expression
+           (print-stream *current-stream* ", ")
+           (java-output-statement parameter))
+  (print-stream *current-stream* ")")  )
+

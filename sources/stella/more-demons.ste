@@ -1,0 +1,231 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: more-demons.ste,v 1.11 2003/04/18 21:15:23 hans Exp
+
+;;; Various system demons, experimental active values code.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Inverse slot demons
+  ;;
+
+(defdemon "inverse-slot-demon"
+    ((self STANDARD-OBJECT) (slot STORAGE-SLOT)
+     (oldValue STANDARD-OBJECT) (newValue STANDARD-OBJECT))
+  ;; An all-purpose inverse slot demon.
+  (let ((inverseSlot (inverse slot)))
+    (when (defined? oldValue)
+      (drop-slot-value oldValue inverseSlot self))
+    (when (defined? newValue)
+      (put-slot-value newValue inverseSlot self)) ))
+
+;; PROBLEM: AN INVERSE CLASS COULD GENERATE ITS SLOT
+;;    ACCESSORS BEFORE THE INVERSE DECLARATION GETS PROPAGATED TO IT.
+(defun attach-inverse-slot-demon ((slot SLOT))
+  ;; Attach a slot demon to the slot 'slot', if it is a storage slot.
+  (typecase slot
+    (STORAGE-SLOT
+     (let ((inverseDemon (lookup-demon "inverse-slot-demon")))
+       ;; because the inverse slot demon is assumed to be already activated, we
+       ;;    manually attach it to 'slot':
+       (push (demon-class-refs inverseDemon) (slot-owner slot))
+       (push (demon-slot-refs inverseDemon) (slot-name slot))
+       (setf (slot-demons slot)
+         (inject-demon (slot-demons slot) inverseDemon))))
+    (otherwise
+     (return))))
+
+  ;;
+;;;;;; Class extension demons
+  ;;
+
+(defdemon "class-extension-constructor-demon"
+    ((self ACTIVE-OBJECT) (class CLASS))
+  :documentation "Demon that inserts the instance 'self' into the extension of
+the class 'class'."
+  :create :all
+  (let ((extension (extension class)))
+    (when (defined? extension)
+      (insert extension self))))
+
+(defdemon "class-extension-destructor-demon"
+    ((self ACTIVE-OBJECT) (class CLASS))
+  :documentation "Demon that removes the instance 'self' from the extension of
+the class 'class'.  Removal removes the instance forever.  Deletion without
+removal can be achieved in constant time by setting 'deleted?' on 'self'."
+  :destroy :all
+  (let ((extension (extension class)))
+    (when (defined? extension)
+      (remove extension self))))
+
+(startup-time-progn
+  (let ((createDemon (lookup-demon "class-extension-constructor-demon"))
+        (destroyDemon (lookup-demon "class-extension-destructor-demon")))
+    (activate-demon createDemon)
+    (activate-demon destroyDemon)))
+
+#|
+;; MOVE TO "classes.ste":
+(defmethod (the-class CLASS) ((name KEYWORD))
+  :documentation "Return the class named 'name', or NULL if there is none."
+  (inline type-class)
+  (return (type-class name)) )
+
+(defmethod (the-class CLASS) ((name STRING))
+  :documentation "Return the class named 'name', or NULL if there is none."
+  (let ((keyword (lookup-keyword (string-upcase name))))
+    (return (only-if (defined? keyword) (type-class keyword))) ))
+
+(defmethod (the-class CLASS) ((name SYMBOL))
+  :documentation "Return the class named 'name', or NULL if there is none."
+  (let ((keyword (lookup-keyword (symbol-name name))))
+    (return (only-if (defined? keyword) (type-class keyword))) ))
+
+;; MOVE TO "methods.ste":
+(defmethod (the-function FUNCTION) ((name SYMBOL))
+  :documentation "Return the function named 'name', or NULL if there is none."
+  (return (lookup-function-or-stella-function name)) )
+
+(defmethod (the-function FUNCTION) ((name STRING))
+  :documentation "Return the function named 'name', or NULL if there is none."
+  (let ((symbol (lookup-symbol name SYMBOL-SYM)))
+    (return (only-if (defined? symbol) (the-function symbol))) ))
+|#
+
+  ;;
+;;;;;; Active Values
+  ;;  
+
+;;; When compiling code in active value mode, slot reads expand as
+;;; follows:
+;;;    (s x)  ->  (get-active-value (value-of x) (quote s))
+;;; and
+;;;    (r (s x))  ->  (get-active-value 
+;;;                       (value-of (get-active-value (value-of x) (quote s)))
+;;;                       (quote r))
+
+;;; Also in active value mode, slot writes expand as follows:
+;;;    (set (s x) v)  ->  (set-active-value
+;;;                           (get-active-value (value-of x) (quote s))
+;;;                           (value-of v))
+;;;    (insert (s x) v)  ->  (insert-active-value
+;;;                             (get-active-value (value-of x) (quote s))
+;;;                             (value-of v))
+;;; Note: A direct write to an active value avoids one 'value-of' wrapper:
+;;;    (set y v)  ->  (set-active-value y (value-of v))
+;;;    (insert y v)  ->  (insert-active y (value-of v))
+
+;;; QUESTION:
+
+  ;;
+;;;;;; 'get-active-value' and 'write-active-value'
+  ;;
+
+#|
+
+;;; IDEA: ALSO WRITE 'safe-get-active-value'.
+;;; IDEA: CONSIDER HAVING DIFFERENT KINDS OF AVs, ONE PER LITERAL.
+(defun (get-active-value ACTIVE-VALUE)
+       ((self OBJECT-WITH-ACTIVE-VALUES) (slotName SYMBOL))
+  :documentation "Read the slot 'slotName' on 'self', and return an
+active value object that stands for the value of the slot.  Assumes that
+'slotName' names a slot on the primary class of 'self'."
+  (let ((activeValue (lookup (active-values self) slotName)))
+    (when (defined? activeValue)
+      (return activeValue))
+    (let ((slot (lookup-slot (primary-class self) slotName)))
+      ;; create active value:
+      (setq activeValue (create-active-value self slot))
+      ;; add demons?:
+      "NOT YET IMPLEMENTED"
+      ;; fill-in the value of the active value (this may trigger demons):
+      (setf (value activeValue) (read-slot-value self slot))
+      (return activeValue) )))
+
+;;; IDEA: CONSIDER HAVING 'set-integer-active-value', 'set-float-active-value', ETC.
+(defun (set-active-value OBJECT) ((self ACTIVE-VALUE) (value OBJECT))
+  :documentation "Set the value of the active value 'self' to 'value'."
+  (let ((oldValue (value-of self)))
+    (when (= oldValue value)
+      (return value))
+    ;; TO DO: CHECK IF CLIPPING DISABLED.  IF SO, GENERATE AN INCOHERENT
+    ;;    GRAPH STRUCTURE.
+    (when (run-integrity-checks? self oldValue value)
+      (setf (value self) value)
+      (run-demons self oldValue))
+    (return value) ))
+|#
+
+
+  ;;
+;;;;;; Context sensitivity demons
+  ;;
+
+#|  
+;; TO DO: DECIDE WHETHER some ACTIVE OBJECTS SHOULD BE INTERNED
+;;    IN *context* INSTEAD OF *module*.
+  
+(defdemon "logic-object-constructor-demon" ((self ACTIVE-OBJECT) (class CLASS))
+  :documentation "Demon that inserts 'self' into the current context."
+  :create :all :activate? TRUE
+  (ignore class)
+  (let ((contextMembers (context-members *module*)))
+    (when (null-list? contextMembers)
+      (setq contextMembers (new LIST))
+      (setf (context-members *module*) contextMembers))
+    (setf (home-context self) *module*)
+    (insert contextMembers self)))
+
+(defdemon "logic-object-destructor-demon" ((self ACTIVE-OBJECT) (class CLASS))
+  :documentation "Demon that removes 'self' from the current context."
+  :destroy :all :activate? TRUE
+  (ignore class)
+  (let ((contextMembers (context-members *module*)))
+    (when (defined-list? contextMembers)
+      (remove contextMembers self))
+    (setf (home-context self) NULL)))
+|#

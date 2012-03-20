@@ -1,0 +1,1766 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: hierarchy.ste,v 1.172 2003/07/16 03:16:04 hans Exp
+
+;;; STELLA built-in classes.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Top-level and Mixin Classes
+  ;;
+
+(defclass OBJECT ()
+  :documentation "A reflective object that can participate in dynamically-typed
+contexts.  Either a STANDARD-OBJECT or a WRAPPER or a GENERIC-OBJECT.
+Also, either an OBJECT-WITH-INHERITED-TYPE or an OBJECT-WITH-OWN-TYPE."
+  :public-methods
+  ((primary-type ((self OBJECT)) :type TYPE
+                 :documentation "Returns the primary type of `self'.
+Gets defined automatically for every non-abstract subclass of OBJECT."
+                 (return NULL))
+   (home-module ((self OBJECT)) :type MODULE
+                :documentation "Return the home module of `self'."
+                (return NULL))
+   ;; This might need to move down to STANDARD-OBJECT to make Java happy:
+   (deleted? ((self OBJECT)) :type BOOLEAN
+             :documentation
+             "Default `deleted?' method which always returns FALSE.  Objects
+that inherit DYNAMIC-SLOTS-MIXIN also inherit the dynamically-allocated slot
+`deleted-object?' which is read/writable with specializations of this method."
+             (return FALSE)))
+  :print-form (print-native-stream stream "|i|" (primary-type self))
+  :methods
+  ((increment-reference-count ((self OBJECT)) NULL )
+   (decrement-reference-count ((self OBJECT)) NULL ))
+  :abstract? TRUE
+  )
+
+(defclass SECOND-CLASS-OBJECT ()
+  :documentation "A native reference-type object pretending to be second class,
+i.e., it can't/won't participate in dynamically-typed contexts such as (real)
+method dispatch.  Since it is a reference-type object, it is always passed via
+a pointer reference similar to a real object."
+  :abstract? TRUE)
+
+(defclass NON-OBJECT ()
+  :documentation "A data structure that cannot be a dispatch argument to
+a (real) method, because its type is not accessible at run-time."
+  :abstract? TRUE)
+
+(defclass STANDARD-OBJECT (OBJECT)
+  :documentation "Object that used to find its type stored in a :class slot.
+By reimplementing `primary-type' as a method, the justification for this
+class went away, but we'll keep it for now to keep things working."
+  :abstract? TRUE
+;; THIS SYNONYM GOES AWAY IF WE INVENT UNION TYPES:
+  :synonyms (TYPE-SPEC))
+
+(defclass TRANSIENT-MIXIN ()
+  :documentation "Transient objects are periodically swept back into a pool
+of free objects.  A transient object should never be pointed at by a
+permanent object."
+  :mixin? TRUE
+  :public-slots 
+  (;; The value of this slot is really not used at all, since
+   ;; non-transient objects don't have a 'transient?' slot, but its
+   ;; existence in a 'class-slots' list can be used to identify
+   ;; transient objects (see 'transient-object?').
+   (transient? :type BOOLEAN :initially TRUE :hardwired? TRUE)))
+
+(defclass REFERENCE-COUNT-OBJECT (OBJECT)
+  :documentation "A reference count objects contains a slot `reference-count' 
+that is incremented whenever the object is assigned to a slot, and decremented
+whenever it is deassigned from a slot."
+  :abstract? TRUE
+  :public-slots
+  ((reference-count :type INTEGER :initially 0))
+  :methods
+  ((increment-reference-count ((self REFERENCE-COUNT-OBJECT))
+       (setf (reference-count self) (+ (reference-count self) 1)))
+   (decrement-reference-count ((self REFERENCE-COUNT-OBJECT))
+       (setf (reference-count self) (- (reference-count self) 1))))
+  )
+
+(defclass DYNAMIC-SLOTS-MIXIN ()
+  :documentation
+  "Enables objects to store slot values in non-preallocated storage."
+  :mixin? TRUE
+  :public-slots ((dynamic-slots :type KEY-VALUE-LIST :allocation :embedded :public? TRUE)
+;; PHASING OUT 'bits' UNLESS AND UNTIL SOMEONE WANTS TO IMPLEMENT CODE THAT
+;;    ACTUALLY USES THIS SLOT:  -rmm
+;          (bits :type THIRTY-TWO-BIT-VECTOR)
+          (bad? :type BOOLEAN-WRAPPER :allocation :dynamic :default FALSE
+                :documentation "Indicates that an object is in need of repair.")
+          (deleted-object? :type BOOLEAN-WRAPPER :allocation :dynamic
+                           :reader deleted? :writer deleted?-setter
+                           :documentation "Indicates that an object has been 
+destroyed/deleted.  A deleted object is visible only if something broke
+before it was fully excised from the network)."))
+  :public-methods
+  ((deleted? ((self DYNAMIC-SLOTS-MIXIN)) :type BOOLEAN
+     (let ((deleted? (slot-value self deleted-object?)))
+       (if (defined? deleted?)
+           (return deleted?)
+         (return FALSE))))
+   (deleted?-setter ((self DYNAMIC-SLOTS-MIXIN) (value BOOLEAN)) :type BOOLEAN
+     (setf (slot-value self deleted-object?) value)
+     (return value)))
+  )
+
+(defclass CONTEXT-SENSITIVE-OBJECT (STANDARD-OBJECT CONTEXT-SENSITIVE-MIXIN)
+  :documentation "Context sensitive objects inherit a slot `home-context'
+that enables context-dependent access machinery to determine the
+visibility of objects from modules."
+  :abstract? TRUE)
+
+(defclass CONTEXT-SENSITIVE-MIXIN ()
+  :documentation "Mixin class that enables the class to support 
+context sensitive slots.  The mixin allocates and initializes the
+slot `home-context'."
+  :mixin? TRUE
+  :public-slots ((home-context :type CONTEXT :initially *context*))
+  :public-methods 
+  ((home-module ((self CONTEXT-SENSITIVE-MIXIN)) :type MODULE
+     (let ((context (home-context self)))
+       (if (defined? context)
+           (return (base-module context))
+         (return NULL))))))
+
+(defclass ACTIVE-OBJECT (CONTEXT-SENSITIVE-OBJECT DYNAMIC-SLOTS-MIXIN)
+  :documentation "Active objects call class and slot triggers in response
+to instance creation/destruction and slot updates.  They include internal
+storage slots needed for class extensions, dynamic storage, and home context."
+  :abstract? TRUE
+  )
+
+
+  ;;
+;;;;;; ITERATOR classes
+  ;;
+
+;;; Bootstrap note: We define iterator classes up front before defining
+;;;    the corresponding collections, since the collection classes
+;;     reference them in compound type specs.
+
+(defclass ABSTRACT-ITERATOR (STANDARD-OBJECT)
+  :abstract? TRUE
+  :documentation
+  "Instances of ABSTRACT-ITERATOR support iteration over collections."
+  :parameters ((any-value :type UNKNOWN))
+  :public-slots
+  ((value :type (LIKE (any-value self))
+	  :documentation "The current value of this iterator")
+   (first-iteration? :type BOOLEAN :initially TRUE))
+  :public-methods
+  ((next? ((self ABSTRACT-ITERATOR)) :type BOOLEAN (return NULL))
+   (length ((self ABSTRACT-ITERATOR)) :type INTEGER)) )
+
+(defclass ITERATOR (ABSTRACT-ITERATOR)
+  :abstract? TRUE
+  :documentation "Instances of ITERATOR support iteration over 
+collections of OBJECTs."
+  :parameters ((any-value :type OBJECT))
+  :synonyms (OBJECT-ITERATOR)
+  )
+
+(defclass CONS-ITERATOR (ITERATOR)
+  :documentation "Iterator class for the class CONS."
+  :parameters ((any-value :type OBJECT))
+  :public-slots ((cons-iterator-cursor :type CONS))
+  :terminator terminate-cons-iterator?
+  )
+
+(defclass LIST-ITERATOR (ITERATOR)
+  :documentation "Iterator class for the collection LIST."
+  :parameters ((any-value :type OBJECT))
+  :public-slots ((list-iterator-cursor :type CONS)
+          (list-iterator-collection :type LIST))
+  :terminator terminate-list-iterator?)
+
+(defclass DESTRUCTIVE-LIST-ITERATOR (ITERATOR)
+  :documentation "An iterator that contains a cons list.  Iterates over
+the stored list, and destroys it when the iterator is free'd."
+  :parameters ((any-value :type OBJECT))
+  :public-slots ((the-cons-list :type CONS :initially NIL)
+          (list-iterator-cursor :type CONS))
+  :terminator terminate-destructive-list-iterator?)
+
+(defclass ALL-PURPOSE-ITERATOR (ITERATOR)
+  :documentation "The all-purpose iterator works by storing a `next?'
+function within itself during iterator allocation.  The method
+`ALL-PURPOSE-ITERAOR.next?' funcalls the stored `next?' function.
+An assortment of storage slots are provided for constructing different
+kinds of iterators."
+  :public-slots
+  (;;(value :type OBJECT)
+   (key :type OBJECT)
+   ;; pointers to code (compiled functions):
+   (iterator-next-code :type FUNCTION-CODE)
+   (iterator-filter-code :type FUNCTION-CODE)
+   (iterator-empty-code :type FUNCTION-CODE)
+   ;; storage
+   (iterator-nested-iterator :type ITERATOR)
+   (iterator-cons-list :type CONS)
+   (iterator-object :type OBJECT)
+   (iterator-second-object :type OBJECT)
+   (iterator-integer :type INTEGER)
+   (iterator-second-integer :type INTEGER)
+   )
+  :terminator terminate-all-purpose-iterator?
+  )
+
+(defclass TYPES-TO-CLASSES-ITERATOR (ITERATOR)
+  :documentation "Iterator that returns a class for each type
+in a cons list of types."
+  :parameters ((any-value :type CLASS))
+  :public-slots ((iterator-cursor :type (CONS OF TYPE) :required? TRUE))
+  :methods
+  ((next? ((self TYPES-TO-CLASSES-ITERATOR)) :type BOOLEAN
+          (if (first-iteration? self)
+            (setf (first-iteration? self) FALSE)
+            (setf (iterator-cursor self) (rest (iterator-cursor self))))
+	  (cond ((non-empty? (iterator-cursor self))
+		 (setf (slot-value self value)
+                   (type-class (first (iterator-cursor self))))
+		 (return TRUE))
+		(otherwise
+		 (return FALSE))))))
+
+(defclass ABSTRACT-DICTIONARY-ITERATOR (ABSTRACT-ITERATOR)
+  :abstract? TRUE
+  :documentation "Instances of ABSTRACT-DICTIONARY-ITERATOR support iteration
+over dictionaries."
+  :parameters ((any-key :type UNKNOWN) (any-value :type UNKNOWN))
+  :public-slots ((key :type (LIKE (any-key self))))
+  :public-methods
+  ((value-setter ((self ABSTRACT-DICTIONARY-ITERATOR)
+                  (value (LIKE (any-value self))))
+     :type (LIKE (any-value self))
+     :documentation "Abstract method needed to allow application of this
+method on abstract iterator classes that do not implement it.  By having
+this here all `next?' methods of dictionary iterators MUST use the `slot-value'
+paradigm to set the iterator value.")
+   (key-setter ((self ABSTRACT-DICTIONARY-ITERATOR)
+                (key (LIKE (any-key self))))
+               :type (LIKE (any-key self)))))
+
+(defclass DICTIONARY-ITERATOR (ABSTRACT-DICTIONARY-ITERATOR)
+  :abstract? TRUE
+  :documentation "Instances of DICTIONARY-ITERATOR support iteration
+over dictionaries with keys and values of type OBJECT."
+  :parameters ((any-key :type OBJECT) (any-value :type OBJECT))
+  :synonyms (OBJECT-DICTIONARY-ITERATOR)
+  )
+
+(defclass PROPERTY-LIST-ITERATOR (DICTIONARY-ITERATOR)
+  :documentation "Iterator class for the collection PROPERTY-LIST."
+  :public-slots ((plist-iterator-cursor :type CONS)
+                 (plist-iterator-collection :type PROPERTY-LIST)))
+
+(defclass KV-LIST-ITERATOR (DICTIONARY-ITERATOR)
+  :public-slots ((the-kv-list :type KEY-VALUE-LIST :public? TRUE)
+                 (kv-list-iterator-cursor :type KV-CONS)))
+
+(defclass INTERVAL-ITERATOR (ABSTRACT-ITERATOR)
+  :abstract? TRUE
+  :documentation "An iterator that specifies a (possibly infinite) range of
+values.  Supports `member?' test as well as iteration methods."
+  :public-slots ((lower-bound :type UNKNOWN :required? TRUE)
+                 (upper-bound :type UNKNOWN :required? TRUE)))
+
+(defclass INTEGER-INTERVAL-ITERATOR (INTERVAL-ITERATOR)
+  :parameters ((any-value :type INTEGER))
+  :public-slots ((interval-cursor :type INTEGER)
+	  (lower-bound :type INTEGER :required? TRUE)
+	  (upper-bound :type INTEGER :required? TRUE))
+  :initializer initialize-integer-interval-iterator )
+
+(defclass  REVERSE-INTEGER-INTERVAL-ITERATOR (INTERVAL-ITERATOR)
+  :parameters ((any-value :type INTEGER))
+  :public-slots ((interval-cursor :type INTEGER)
+	  (lower-bound :type INTEGER :required? TRUE)
+	  (upper-bound :type INTEGER :required? TRUE))
+  :initializer initialize-reverse-integer-interval-iterator )
+
+(defclass STRING-ITERATOR (ABSTRACT-ITERATOR)
+  :documentation "Iterator that yields characters from a string."
+  :parameters ((any-value :type CHARACTER))
+  :public-slots ((the-string :type STRING)
+	  (cursor :type INTEGER)
+	  (end :type INTEGER)))
+
+
+  ;;
+;;;;;; Kernel Collection Class Hierarchy
+  ;;
+
+(defclass ABSTRACT-COLLECTION (STANDARD-OBJECT)
+  :parameters ((any-value :type UNKNOWN))
+  :public-methods
+  ((allocate-iterator ((self ABSTRACT-COLLECTION))
+                      :type (ABSTRACT-ITERATOR OF (LIKE (any-value self)))
+                      (return NULL))
+   (length ((self ABSTRACT-COLLECTION)) :type INTEGER (return NULL))
+   (insert ((self ABSTRACT-COLLECTION) (value (LIKE (any-value self)))))
+   (remove ((self ABSTRACT-COLLECTION) (value (LIKE (any-value self))))
+	   :type ABSTRACT-COLLECTION))
+  :abstract? TRUE
+  )
+
+(defclass COLLECTION (ABSTRACT-COLLECTION)
+  :parameters ((any-value :type OBJECT))
+  :public-methods
+  ((allocate-iterator ((self COLLECTION))
+                      :type (ITERATOR OF (LIKE (any-value self)))
+                      (return NULL))
+   (length ((self COLLECTION)) :type INTEGER (return NULL))
+   (insert ((self COLLECTION) (value (LIKE (any-value self)))) (ignore value) (return))
+   (remove ((self COLLECTION) (value (LIKE (any-value self))))
+	   :type COLLECTION (ignore value) (return NULL)))
+  :abstract? TRUE
+  :synonyms (OBJECT-COLLECTION)
+  )
+
+(defclass SET-MIXIN ()
+  :documentation "Users of this mixin check for duplicates inside of 
+the method `insert'."
+  :parameters ((any-value :type OBJECT))
+  :mixin? TRUE
+  )
+
+(defclass SEQUENCE-MIXIN ()
+  :parameters ((any-value :type UNKNOWN))
+  :public-methods
+  ((first ((sequence SEQUENCE-MIXIN))
+          :type (LIKE (any-value self)))
+   (nth ((sequence SEQUENCE-MIXIN) (position INTEGER))
+        :type (LIKE (any-value self))))
+  :mixin? TRUE)
+
+(defclass SEQUENCE (COLLECTION SEQUENCE-MIXIN)
+  :parameters ((any-value :type OBJECT))
+  :public-methods
+  ((allocate-iterator ((self SEQUENCE))
+                      :type (ITERATOR OF (LIKE (any-value self)))
+                      (return NULL))
+   (length ((sequence SEQUENCE))
+           :type INTEGER (return NULL)))
+  :abstract? TRUE
+  :synonyms (OBJECT-SEQUENCE)
+  )
+
+(defclass LIST (SEQUENCE)
+  :parameters ((any-value :type OBJECT))
+  :public-slots ((the-cons-list :type (CONS OF (LIKE (any-value self))) :initially NIL
+			 :public? TRUE))
+  :initial-value NIL-LIST
+  :print-form (progn
+                (print-stream stream "|l|")
+                (print-cons (the-cons-list self) stream "(" ")")))
+
+(defclass SET (LIST SET-MIXIN)
+  :parameters ((any-value :type OBJECT))
+  :initial-value NULL
+  :print-form (progn
+                (print-stream stream "|s|")
+                (print-cons (the-cons-list self) stream "(" ")")))
+
+(defclass CLASS-EXTENSION (LIST)
+  :parameters ((any-value :type ACTIVE-OBJECT)))
+
+(defclass CONS (STANDARD-OBJECT)
+  :parameters ((any-value :type OBJECT))
+  :methods
+  ((allocate-iterator ((self CONS)) :type (ITERATOR OF (LIKE (any-value self)))))
+  :public-slots
+  ((value :type (LIKE (any-value self)) :public? TRUE)
+   (rest :type (CONS OF (LIKE (any-value self))) :public? TRUE :initially NIL))
+  :initial-value NIL
+  :print-form (print-cons self stream "(" ")")
+  )
+
+(defclass ABSTRACT-DICTIONARY (ABSTRACT-COLLECTION)
+  :parameters ((any-key :type UNKNOWN)
+               (any-value :type UNKNOWN))
+  :public-methods
+  ((lookup ((self ABSTRACT-DICTIONARY) (key (LIKE (any-key self))))
+           :type (LIKE (any-value self)))
+   (insert-at ((self ABSTRACT-DICTIONARY) (key (LIKE (any-key self))) 
+               (value (LIKE (any-value self))))))
+  :methods
+  ((allocate-iterator
+    ((self ABSTRACT-DICTIONARY))
+    :type (ABSTRACT-DICTIONARY-ITERATOR
+           OF (LIKE (any-key self)) (LIKE (any-value self)))
+    (return NULL)))
+  :abstract? TRUE)
+
+(defclass DICTIONARY (ABSTRACT-DICTIONARY)
+  :parameters ((any-key :type OBJECT)
+               (any-value :type OBJECT))
+  :methods
+  ((allocate-iterator
+    ((self DICTIONARY))
+    :type (DICTIONARY-ITERATOR
+           OF (LIKE (any-key self)) (LIKE (any-value self)))
+    (return NULL))
+   (lookup ((self DICTIONARY) (key (LIKE (any-key self))))
+           :type (LIKE (any-value self))
+	   (ignore key)
+           (return NULL))
+   (insert-at ((self DICTIONARY)
+               (key (LIKE (any-key self)))
+               (value (LIKE (any-value self))))
+	      (ignore key value)
+              (return)))
+  :abstract? TRUE
+  :synonyms (OBJECT-TO-OBJECT-DICTIONARY))
+
+(defclass PROPERTY-LIST (DICTIONARY)
+  :parameters ((any-key :type OBJECT)
+               (any-value :type OBJECT))
+  :public-slots ((the-plist :type CONS :initially NIL))
+  :print-form (progn
+                (print-stream stream "|pl|")
+                (print-cons (the-plist self) stream "(" ")")))
+
+(defclass KV-CONS (STANDARD-OBJECT)
+  :parameters ((any-key :type OBJECT)
+               (any-value :type OBJECT))
+  :public-slots ((key :type OBJECT)
+		 (value :type OBJECT)
+		 (rest :type KV-CONS))
+  :print-form (print-native-stream stream "<" (key self) "," (value self) ">") )
+
+(defclass KEY-VALUE-LIST (DICTIONARY)
+  :parameters ((any-key :type OBJECT)
+               (any-value :type OBJECT))
+  :public-slots ((the-kv-list :type KV-CONS))
+  :print-form (print-key-value-list self stream)
+  )
+
+(defclass RECYCLE-LIST (SEQUENCE)
+  :parameters ((any-value :type OBJECT))
+  :public-slots
+  ((recycle-list-of :type TYPE)
+   (recycled-items :type (LIKE (any-value self)))
+   (list-of-recycled-items :type (LIST OF (LIKE (any-value self)))
+			   :initially (make-non-recycled-list))
+   (all-items :type (LIKE (any-value self)))
+   (unused-items :type (LIKE (any-value self)))
+   (current-length :type INTEGER :initially 0)
+   (item-size :type INTEGER))
+  :print-form (if (defined? (recycle-list-of self))
+                  (print-native-stream
+                   stream "|i|[RECYCLE-LIST OF "
+                   (current-length self) " " (recycle-list-of self) "'s]")
+                (print-native-stream stream "|i|@RECYCLE-LIST")))
+
+(defclass ABSTRACT-HASH-TABLE (ABSTRACT-DICTIONARY)
+  :parameters ((any-key :type UNKNOWN) (any-value :type UNKNOWN))
+  :public-slots ((the-hash-table :type NATIVE-HASH-TABLE)
+                 (the-stella-hash-table :type STELLA-HASH-TABLE))
+  :initializer initialize-hash-table
+  :abstract? TRUE
+  )
+
+(defclass HASH-TABLE (ABSTRACT-HASH-TABLE)
+  :parameters ((any-key :type OBJECT) (any-value :type OBJECT))
+  :initializer initialize-hash-table
+  :synonyms (OBJECT-TO-OBJECT-HASH-TABLE)
+  )
+
+(defclass INTEGER-HASH-TABLE (ABSTRACT-HASH-TABLE)
+  :parameters ((any-key :type INTEGER) (any-value :type OBJECT))
+  :initializer initialize-hash-table)
+
+(defclass FLOAT-HASH-TABLE (ABSTRACT-HASH-TABLE)
+  :parameters ((any-key :type FLOAT) (any-value :type OBJECT))
+  :initializer initialize-hash-table)
+
+(defclass STRING-HASH-TABLE (ABSTRACT-HASH-TABLE)
+  :parameters ((any-key :type STRING) (any-value :type OBJECT))
+  :initializer initialize-hash-table)
+
+(defclass STRING-TO-INTEGER-HASH-TABLE (ABSTRACT-HASH-TABLE)
+  :parameters ((any-key :type STRING) (any-value :type INTEGER))
+  :initializer initialize-hash-table)
+
+;;; TO DO: Maybe have a VECTOR-MIXIN so we can also have vectors
+;;;   on literal types such as INTEGER, etc.
+
+(defclass VECTOR (SEQUENCE)
+  :public-slots ((array-size :type INTEGER :required? TRUE)
+		 (the-array :type (NATIVE-VECTOR OF (LIKE (any-value self)))))
+  ;; If we also want vectors of literals, this class needs to
+  ;; become abstract and properly subclassed (similar to HASH-TABLE).
+  :parameters ((any-value :type OBJECT))
+  :print-form (print-vector self stream)
+  :initializer initialize-vector)
+
+(defclass EXTENSIBLE-VECTOR (VECTOR)
+  :initializer initialize-vector)
+
+(defclass EXTENSIBLE-SYMBOL-ARRAY (EXTENSIBLE-VECTOR)
+  :documentation "Self-extending array with methods for storing and
+accessing symbols within it."
+  :public-slots
+  ((top-symbol-offset :type INTEGER :initially -1)
+   (potential-free-symbol-offset :type INTEGER :initially 0))
+  ;; Explicitly specify the initializer, since those don't
+  ;;    yet get inherited during the early-walker bootstrap.
+  :initializer initialize-vector)
+
+(defclass VECTOR-SEQUENCE (VECTOR) ;;(VECTOR SEQUENCE)
+  :abstract? TRUE
+  :public-slots ((resize-increment :type INTEGER :hardwired? TRUE :initially 100)
+          (sequence-length :type INTEGER))
+  :initializer initialize-vector
+  ;;:print-form (print-vector-sequence self stream)
+  :synonyms (VSEQ) )
+
+(defclass SHORT-VECTOR-SEQUENCE (VECTOR-SEQUENCE)
+  :public-slots ((resize-increment :type INTEGER :hardwired? TRUE :initially 4)
+          (sequence-length :type INTEGER :initially 0))
+  :initializer initialize-vector
+  :synonyms (SVSEQ) )
+
+;;; TO DO: Fix literal vectors, use wrapped literals for now.
+
+(defclass BOOLEAN-VECTOR (VECTOR)
+  :parameters ((any-value :type BOOLEAN-WRAPPER)))
+
+(defclass INTEGER-VECTOR (VECTOR)
+  :parameters ((any-value :type INTEGER-WRAPPER)))
+
+
+;;; Native collections:
+
+#|
+;; Wrapper class for native arrays.  The challenge is to get by with a
+;;    single wrapper for all possible native arrays.  To do that `aref'
+;;    needs to generate an appropriate cast for the native array depending
+;;    on the type of the ARRAY object.  Also, the NEW walker needs to
+;;    allocate an appropriate native array.  To access `the-array' we
+;;    could try to generate the appropriate cast automatically, or we
+;;    could rely on the user to do that.  We will also need real slots
+;;    to store dimension and type information.  NOT YET.
+(defclass ARRAY-WRAPPER (ABSTRACT-COLLECTION)
+  :parameters ((any-value :type UNKNOWN))
+  :slots ((the-array :type ARRAY)))
+|#
+
+(defclass ARRAY (SECOND-CLASS-OBJECT)
+  :parameters ((any-value :type UNKNOWN))
+  ;; pseudo-slots special-cased by the walker (order is significant!):
+  :slots ((initial-element
+           :type (LIKE (any-value self))
+           :required? TRUE :abstract? TRUE
+           :documentation
+           "Initializer pseudo-slot special-cased by the STELLA translator.")
+          (size :type (LIST OF INTEGER-WRAPPER)
+                :required? TRUE :abstract? TRUE
+                :documentation
+                "Size pseudo-slot special-cased by the STELLA translator."))
+  ;; pseudo-methods special-cased by walker and translators:
+  :methods ((aref
+             ((self ARRAY) (dim0 INTEGER) &rest (dims INTEGER))
+             :type (LIKE (any-value self)) :public? TRUE :native? TRUE)
+            (aref-setter
+             ((self ARRAY) (value (LIKE (any-value self)))
+                           (dim0 INTEGER) &rest (dims INTEGER))
+             :type (LIKE (any-value self)) :public? TRUE :native? TRUE))
+  ;; these native types allow us to have variables of type @ARRAY
+  ;;    provided we properly cast them back into their dimensioned variants
+  ;;    before we access their elements:
+  :cl-native-type "ARRAY"
+  :cpp-native-type "char*"
+  :java-native-type "Object")
+
+(defclass NATIVE-HASH-TABLE (SECOND-CLASS-OBJECT)
+  :cpp-native-type "cpp_hash_table*"
+  :cl-native-type "HASH-TABLE"
+  :java-native-type "java.util.HashMap")
+
+;; this could now be implemented via (ARRAY () OF OBJECT):
+(defclass NATIVE-VECTOR (SECOND-CLASS-OBJECT)
+  :parameters ((any-value :type OBJECT))
+  :cpp-native-type "Object**"
+  :cl-native-type "VECTOR"
+  :java-native-type "#$(STELLAROOT).Stella_Object[]"
+  :initial-value (verbatim :common-lisp "STELLA::NULL-NATIVE-VECTOR"
+			   :java "null"
+			   :cpp "NULL"))
+
+
+;;; Active objects -- Collections and Demons:
+
+(defclass ACTIVE-COLLECTION-MIXIN ()
+  :documentation "Mixin class that provides collection instances with a
+backpointer to the instance slot they belong to."
+  :mixin? TRUE
+  :public-slots ((active-slot :type STORAGE-SLOT)
+          (owner-instance :type STANDARD-OBJECT)))
+
+(defclass ACTIVE-LIST (LIST ACTIVE-COLLECTION-MIXIN))
+(defclass ACTIVE-SET (LIST SET-MIXIN ACTIVE-COLLECTION-MIXIN))
+
+(defclass DEMON (STANDARD-OBJECT)
+  :public-slots ((demon-name :type STRING)
+          (demon-action :type KEYWORD)          ; :create, :destroy, or :modify
+          (demon-class-refs :type (LIST OF TYPE) :allocation :embedded)
+          (demon-slot-refs :type (LIST OF SYMBOL) :allocation :embedded)
+          (demon-code :type FUNCTION-CODE)
+          (demon-method :type METHOD-SLOT)
+          (demon-documentation :type STRING)
+          (demon-guard? :type BOOLEAN)
+          (demon-all? :type BOOLEAN)
+          (demon-inherit? :type BOOLEAN)))
+
+  ;;
+;;;;;; Narrowly-typed Collections
+  ;;
+
+;; NOTHING CALLS THESE:
+;(defclass LIST-OF-SLOT (LIST) :parameters ((any-value :type SLOT)) )
+;(defclass LIST-OF-SYMBOL (LIST) :parameters ((any-value :type SYMBOL)) )
+;(defclass LIST-OF-KEYWORD (LIST) :parameters ((any-value :type KEYWORD)))
+;(defclass LIST-OF-TYPE (LIST) :parameters ((any-value :type TYPE)) )
+
+(defclass KEYWORD-KEY-VALUE-LIST (KEY-VALUE-LIST) 
+  :parameters ((any-key :type KEYWORD) (any-value :type OBJECT)))
+
+
+  ;;
+;;;;;; Symbols and Keywords
+  ;;
+
+(defclass GENERALIZED-SYMBOL (CONTEXT-SENSITIVE-OBJECT)
+  :public-slots
+  ((symbol-name :type STRING :required? TRUE)
+   (symbol-id :type INTEGER)            ; stores symbol array offset
+   (interned-in :renames home-context :type MODULE))
+  :abstract? TRUE 
+  )
+
+(defclass SYMBOL (GENERALIZED-SYMBOL)
+  :public-slots
+  ((symbol-slot-offset :type INTEGER) ; used by slot lookup
+   (symbol-value-and-plist :type CONS :initially NIL))
+  :print-form (print-symbol self stream))
+
+(defclass SURROGATE (GENERALIZED-SYMBOL)
+  :documentation "Rigid surrogate."
+  :public-slots
+  ((surrogate-value :type OBJECT)
+   (surrogate-name :renames symbol-name)
+   (type-class :renames surrogate-value :type CLASS)
+   (type-name :renames symbol-name))
+  :public-slots
+  ((slotRef-slot :renames surrogate-value :type SLOT))
+  :synonyms (TYPE SLOTREF)
+  :print-form (print-surrogate self stream))
+
+(defclass KEYWORD (GENERALIZED-SYMBOL)
+  :public-slots
+  ((keyword-name :renames symbol-name))
+  :print-form (print-keyword self stream))
+
+(defclass TRANSIENT-SYMBOL (SYMBOL TRANSIENT-MIXIN))
+
+
+  ;;
+;;;;;; Class class and slot class
+  ;;
+
+;; IDEA: MAKE 'native-name' A METHOD SO THAT WE CAN, FOR EXAMPLE, MAP TO
+;;    DIFFERENT CLASSES FOR DIFFERENT COMMON LISPS.
+(defclass MAPPABLE-OBJECT (STANDARD-OBJECT DYNAMIC-SLOTS-MIXIN)
+  :documentation "The class MAPPABLE-OBJECT enables the definition of projections
+from a Stella class, slot, global variable, etc. onto a corresponding native
+entity."
+  :abstract? TRUE
+  :public-slots
+  ((projects-onto :type (LIST OF SYMBOL) :allocation :dynamic)
+   (projected-from :type (LIST OF SYMBOL) :allocation :dynamic)
+   (projection-transform :type SYMBOL :allocation :dynamic
+                         :documentation "Names a coersion function that translates
+values retrieved from the `from' entity to the `projecting' entity."))
+  :public-slots
+  ((native-name :type STRING :allocation :dynamic
+                :documentation "Used in cases when the native name cannot be
+cast as a symbol (e.g., because it contains illegal characters).")))
+
+(defclass RELATION (MAPPABLE-OBJECT)
+  :abstract? TRUE
+  :public-slots
+  ((documentation :type STRING :allocation :dynamic)
+   (abstract? :type BOOLEAN :option-keyword :abstract?)
+   (meta-attributes :type (KEY-VALUE-LIST OF GENERALIZED-SYMBOL OBJECT)
+                    :allocation :dynamic :option-keyword :meta-attributes) 
+   (properties :type (LIST OF GENERALIZED-SYMBOL)
+               :allocation :dynamic :option-keyword :properties))
+  :public-methods
+  ((name ((self RELATION)) :type STRING (return NULL))
+   (home-module ((self RELATION)) :type MODULE (return NULL))
+   (arity ((self RELATION)) :type INTEGER (return NULL))
+   (public? ((self RELATION)) :type BOOLEAN (return NULL))
+   ;; SHOULD BE "(SET OF RELATION)" HERE BUT "SET" ISN'T DEFINED:
+   (direct-supers ((self RELATION)) :type (LIST OF RELATION) (return NULL))
+   (all-supers ((self RELATION)) :type (LIST OF RELATION) (return NULL))
+   (slots ((self RELATION)) :type (ITERATOR OF SLOT) (return NULL)))
+  :slots
+  ((stored-active? :type BOOLEAN-WRAPPER :allocation :dynamic
+		   :option-keyword :active?)))
+
+(defclass CLASS (RELATION)
+  ;;:extension CLASSES
+  :public-slots
+  ((cl-struct? :type BOOLEAN :initially FALSE)
+   (mixin? :type BOOLEAN :initially FALSE)
+   (print-form :type OBJECT :allocation :dynamic :option-keyword :print-form)
+   (class-type :type TYPE :public? TRUE)
+   (class-arity :type INTEGER :initially 1 :hardwired? TRUE)
+   (class-direct-supers :type (LIST OF TYPE) :allocation :embedded)
+   (class-direct-subs :type (LIST OF TYPE) :allocation :embedded)
+   (class-all-super-classes :type (CONS OF CLASS) :initially NIL :public? TRUE)
+   (class-all-slots :type (CONS OF SLOT))
+   (class-local-slots :type (LIST OF SLOT))
+   (class-slot-and-method-cache :type (VECTOR OF SLOT))
+   (class-abstract? :type BOOLEAN :initially FALSE :renames abstract?) 
+   (class-mixin? :type BOOLEAN :initially FALSE :renames mixin?) 
+   (class-collection? :type BOOLEAN :initially FALSE) 
+   (class-cl-struct? :type BOOLEAN :initially FALSE :renames cl-struct?)
+   (class-cl-struct-slots :type (LIST OF STORAGE-SLOT) :allocation :dynamic)
+   (class-public? :type BOOLEAN :initially TRUE :option-keyword :public?)
+   (class-recycle-method :type KEYWORD :allocation :dynamic :default :none
+			 :option-keyword :recycle-method)
+   (class-finalized? :type BOOLEAN :initially FALSE :public? TRUE)
+   (class-slots-finalized? :type BOOLEAN :initially FALSE)
+   (class-stringified-source :type STRING)
+   (class-parameters :type (LIST OF SYMBOL) :allocation :dynamic 
+		     :default NIL-LIST :option-keyword :parameters)
+   (class-constructor-code :type FUNCTION-CODE)         ; user-defined
+   (class-slot-accessor-code :type FUNCTION-CODE)
+   ;; additional dynamic slots:
+   (class-creator :type SYMBOL :allocation :dynamic :option-keyword :creator)
+   (class-initializer :type SYMBOL :allocation :dynamic 
+		      :option-keyword :initializer)
+   (class-terminator :type SYMBOL :allocation :dynamic 
+		     :option-keyword :terminator)
+   (class-destructor :type SYMBOL :allocation :dynamic 
+		     :option-keyword :destructor)
+   (class-documentation :allocation :dynamic :renames documentation
+			:option-keyword :documentation)
+   (class-extension-name :type SYMBOL :allocation :dynamic
+                         :option-keyword :extension)
+   (class-extension :type CLASS-EXTENSION :allocation :dynamic)
+   (class-required-slot-names      
+    :type (LIST OF SYMBOL) :allocation :dynamic :default NIL-LIST)
+   (class-guard-constructor-demons :type (LIST OF DEMON) :allocation :dynamic)
+   (class-constructor-demons :type (LIST OF DEMON) :allocation :dynamic)
+   (class-guard-destructor-demons :type (LIST OF DEMON) :allocation :dynamic)
+   (class-destructor-demons :type (LIST OF DEMON) :allocation :dynamic)
+   (class-initial-value :type OBJECT :allocation :dynamic 
+			:option-keyword :initial-value)
+   (class-print-form :type OBJECT :renames print-form 
+		     :option-keyword :print-form)
+   (class-key :type (LIST OF SLOT) :allocation :dynamic :default NIL-LIST) 
+   (class-synonyms :type (LIST OF TYPE) :allocation :dynamic :default NIL-LIST
+		   :option-keyword :synonyms)
+   ;; Mappable Object links???:
+   (class-is-link :type TYPE :allocation :dynamic)
+   (class-inverse-is-link :type CLASS :allocation :dynamic)
+   (class-cl-native-type :type STRING :allocation :dynamic 
+			 :option-keyword :cl-native-type)
+   (class-cpp-native-type :type STRING :allocation :dynamic
+			  :option-keyword :cpp-native-type)
+   (class-java-native-type :type STRING :allocation :dynamic
+			   :option-keyword :java-native-type)
+   (class-idl-native-type :type STRING :allocation :dynamic
+			  :option-keyword :idl-native-type)
+   (class-marked? :type BOOLEAN) 
+   (class-prototype :type OBJECT :allocation :dynamic)
+   (class-taxonomy-node :type TAXONOMY-NODE))
+  :public-methods
+  ((name ((self CLASS)) :type STRING (return (symbol-name (class-type self))))
+   (home-module ((self CLASS)) :type MODULE
+                (return (interned-in (class-type self))))
+   (arity ((self CLASS)) :type INTEGER (return 1))
+   (public? ((self CLASS)) :type BOOLEAN :storage-slot class-public? (return (class-public? self)))
+   (active? ((self CLASS)) :type BOOLEAN :storage-slot stored-active?
+            (return (or (and (defined? (stored-active? self))
+			     (stored-active? self))
+                        (subtype-of? (class-type self) @ACTIVE-OBJECT))))
+   (creator ((self CLASS)) :type SYMBOL :storage-slot class-creator (return (class-creator self)))
+   (initializer ((self CLASS)) :type SYMBOL :storage-slot class-initializer
+                :inherits-through super-classes)
+   (terminator ((self CLASS)) :type SYMBOL :storage-slot class-terminator
+               :inherits-through super-classes)
+   (destructor ((self CLASS)) :type SYMBOL :storage-slot class-destructor (return (class-destructor self)))
+   (required-slots ((self CLASS)) :type (LIST OF SYMBOL) 
+     :documentation "Returns a list of names of required slots for `self'."
+     (return (class-required-slot-names self)))
+   (parameters ((self CLASS)) :type (LIST OF SYMBOL)
+     :documentation "Returns the list of parameters names of `self'."
+     :storage-slot class-parameters :inherits-through super-classes)
+   (initial-value ((self CLASS)) :type OBJECT
+     :documentation "Return an initial value for the class `self'."
+     :storage-slot class-initial-value :inherits-through super-classes)
+   (extension ((self CLASS)) :type CLASS-EXTENSION
+     :documentation "Return the nearest class extension that records instances
+of the class `self'."
+     :storage-slot class-extension :inherits-through super-classes)
+   (cl-native-type ((self CLASS)) :type STRING :storage-slot class-cl-native-type
+                   (return (class-cl-native-type self)))
+   (cpp-native-type ((self CLASS)) :type STRING :storage-slot class-cpp-native-type
+                    (return (class-cpp-native-type self)))
+   (idl-native-type ((self CLASS)) :type STRING :storage-slot class-idl-native-type
+                    (return (class-cpp-native-type self)))
+   (java-native-type ((self CLASS)) :type STRING :storage-slot class-java-native-type
+		     (let ((nativeType (class-java-native-type self)))
+		       (if (defined? nativeType)
+			 (return
+			   (substitute-template-variables-in-string
+			    nativeType 
+			    *java-stella-package-mapping*))
+			 (return NULL)))))
+  :print-form (print-native-stream stream
+				   "|C|" ; (choose *printReadably?* "" "|C|")
+				   (choose (defined? (class-type self))
+					   (relative-name (class-symbol self))
+					   "??")))
+
+(defclass POLYMORPHIC-RELATION (RELATION)
+  :abstract? TRUE
+  :public-slots
+  ((slot-direct-equivalent :type SLOT))         ; MOVED UP FROM CLASS "SLOTS"
+  :public-methods
+  ((owner ((self POLYMORPHIC-RELATION)) :type TYPE (return NULL))
+   (renames ((self POLYMORPHIC-RELATION)) :type SYMBOL (return NULL))
+   (active? ((self POLYMORPHIC-RELATION)) :type BOOLEAN
+            :storage-slot stored-active?
+            :inherits-through equivalent-slot
+            :documentation
+            "True if `self' or a superslot of `self' is marked active.")))
+
+(defclass SLOT (POLYMORPHIC-RELATION)
+  :abstract? TRUE
+  :public-methods
+  ((name ((self SLOT)) :type STRING (return (symbol-name (slot-name self))))
+   (type ((self SLOT)) :type TYPE
+         :storage-slot slot-base-type :inherits-through equivalent-slot
+         :documentation "The type of a storage slot is its base type.")
+   (type-specifier ((self SLOT)) :type TYPE-SPEC
+                   :documentation "If `self' has a complex type return its
+type specifier, otherwise, return `type' of `self'."
+                   (let ((tSpec (slot-type-specifier self)))
+                     (return (choose (defined? tSpec) tSpec (type self)))))
+   (owner ((self SLOT)) :type TYPE :storage-slot slot-owner
+          (return (slot-owner self)))
+   (home-module ((self SLOT)) :type MODULE
+                ;; see `record-slot-home-module':
+                (let ((module (slot-home-module self)))
+                  (if (defined? module)
+                      (return module)
+                    (return (interned-in (slot-name self))))))
+;   (public? ((self SLOT)) :type BOOLEAN :storage-slot slot-public?
+;            (return (slot-public? self)))
+   (renames ((self SLOT)) :type SYMBOL :storage-slot slot-renames
+            (return (slot-renames self)))
+   (collection-valued? ((self SLOT)) :type BOOLEAN
+    :documentation "True if slot values are collections."
+    (return (subtype-of? (slot-base-type self) @COLLECTION)))
+   (closure-assumption ((self SLOT)) :type KEYWORD
+                       :storage-slot slot-closure-assumption
+                       :inherits-through equivalent-slot))
+  :public-slots
+  ((inverse :type SLOT :allocation :dynamic)
+   (slot-name :type SYMBOL)
+   (slot-owner :type TYPE)
+   (slot-base-type :type TYPE)
+   (slot-slotRef :type SLOTREF)
+   (slot-direct-supers :type (LIST OF SLOT) :allocation :dynamic)
+   (slot-direct-subs :type (LIST OF SLOT) :allocation :dynamic)
+   (slot-home-module :type MODULE :allocation :dynamic)
+   (slot-type-specifier :type COMPOUND-TYPE-SPECIFIER :allocation :dynamic)
+   (slot-public? :type BOOLEAN :initially TRUE :option-keyword :public?)
+   (slot-inverse :type SYMBOL :allocation :dynamic :option-keyword :inverse)
+   (slot-renames :type SYMBOL :allocation :dynamic :option-keyword :renames)
+   (slot-renamed? :type BOOLEAN :initially FALSE) 
+   (slot-documentation :type STRING :allocation :dynamic 
+		       :renames documentation :option-keyword :documentation)
+   (slot-external? :type BOOLEAN :initially FALSE)
+   (slot-marked? :type BOOLEAN) 
+   (slot-auxiliary? :type BOOLEAN :allocation :dynamic
+		    :option-keyword :auxiliary?)
+   (slot-closure-assumption :type KEYWORD :allocation :dynamic))
+  :print-form (print-native-stream stream
+				   "|S|" ; (choose *printReadably?* "" "|S|")
+				   (symbol-name (slot-owner self))
+				   "." (symbol-name (slot-name self))))
+
+(defclass STORAGE-SLOT (SLOT)
+  :public-methods
+  ((initially ((self STORAGE-SLOT)) :type OBJECT)
+   (allocation ((self STORAGE-SLOT)) :type KEYWORD
+               :storage-slot slot-allocation :inherits-through equivalent-slot
+               :documentation "Return the most specific :allocation facet, or
+:instance if all inherited values are NULL.")
+   (default-form ((self STORAGE-SLOT)) :type OBJECT
+     :storage-slot slot-default-expression :inherits-through equivalent-slot
+     :documentation "Returns the current value of default expression when the
+slot has not been assigned a value.")
+   (required? ((self STORAGE-SLOT)) :type BOOLEAN
+              :storage-slot slot-required? :inherits-through equivalent-slot
+              :documentation "True if a value must be assigned to this slot at
+creation time.")
+   (component? ((self STORAGE-SLOT)) :type BOOLEAN
+               :storage-slot slot-component? :inherits-through equivalent-slot
+               :documentation "True if fillers of this slot are components of the
+owner slot, and therefore should be deleted if the owner is deleted.")
+   (reader ((self STORAGE-SLOT)) :type SYMBOL
+           :storage-slot slot-reader :inherits-through equivalent-slot
+           :documentation "Name of a method called to read the value of the slot
+`self'.")
+   (writer ((self STORAGE-SLOT)) :type SYMBOL
+           :storage-slot slot-writer :inherits-through equivalent-slot
+           :documentation "Name of a method called to write the value of the slot
+`self'."))
+  :public-slots
+  ((slot-initial-value :type OBJECT :allocation :dynamic 
+		       :option-keyword :initially)
+   (slot-allocation :type KEYWORD :allocation :dynamic :default :instance
+		    :option-keyword :allocation)
+   (slot-default-expression :type OBJECT :allocation :dynamic
+			    :option-keyword :default)
+   (slot-guard-demons :type (LIST OF DEMON) :allocation :dynamic)
+   (slot-demons :type (LIST OF DEMON) :allocation :dynamic)
+   (slot-required? :type BOOLEAN :option-keyword :required?)
+   (slot-component? :type BOOLEAN :option-keyword :component?)
+   (slot-read-only? :type BOOLEAN :option-keyword :read-only?)
+   (slot-hardwired? :type BOOLEAN :option-keyword :hardwired?)
+   (slot-context-sensitive? :type BOOLEAN :option-keyword :context-sensitive?)
+   (slot-reader :type SYMBOL :allocation :dynamic :option-keyword :reader)
+   (slot-writer :type SYMBOL :allocation :dynamic :option-keyword :writer)
+   (slot-option-keyword :type KEYWORD :allocation :dynamic 
+			:option-keyword :option-keyword)
+   (slot-option-handler :type SYMBOL :allocation :dynamic 
+			:option-keyword :option-handler)
+   ))
+
+;; TO DO:  MAKE 'storage-slot' :read-only? OR :abstract?:
+(defclass METHOD-SLOT (SLOT)
+  :synonyms (FUNCTION) ; we may decide to make FUNCTION a child of METHOD-SLOT
+  :public-slots
+  ((storage-slot :type SYMBOL :allocation :dynamic)
+   (slot-required? :type BOOLEAN :allocation :dynamic :default FALSE)
+   (method-setter? :type BOOLEAN)
+   (method-documentation :type STRING :allocation :dynamic :renames documentation)
+   (method-parameter-names
+    :type (LIST OF SYMBOL) :default NIL-LIST :component? TRUE)
+   (method-parameter-type-specifiers
+    :type (LIST OF TYPE-SPEC) :default NIL-LIST :component? TRUE)
+   (method-parameter-directions
+    ;; List of 'IN', 'OUT', or 'INOUT' symbols to deal with IDL methods.
+    :type (LIST OF SYMBOL) :default NIL-LIST :component? TRUE
+    :allocation :dynamic)
+   (method-return-type-specifiers
+    :type (LIST OF TYPE-SPEC) :default NIL-LIST :component? TRUE)
+   (method-stringified-source :type STRING)
+   (method-code :type METHOD-CODE)
+   ;; This is ugly, but we do need a different slot to hold function code.
+   (function-code :type FUNCTION-CODE)
+   (method-function? :type BOOLEAN)
+   (method-variable-arguments?
+    :type BOOLEAN :allocation :dynamic :default FALSE)
+   (method-body-argument? :type BOOLEAN :allocation :dynamic :default FALSE)
+   ;; TRUE indicates that this is an auxiliary method, and no
+   ;; method object should be generated for it at startup time:
+   (method-auxiliary? :renames slot-auxiliary?)
+   ;; TRUE indicates that this method will be implemented by a native method
+   ;; in the target language, but a method object should be generated for it
+   ;; at startup time:
+   (method-native? :type BOOLEAN :allocation :dynamic :default FALSE)
+   ;; TRUE indicates that this method is a constructor for its return type.
+   ;; It really should only be set to TRUE by Stella itself.
+   (method-constructor? :type BOOLEAN :allocation :dynamic :default FALSE)
+   (method-globally-inline? :type BOOLEAN :allocation :dynamic :default FALSE)
+   (method-inlined-functions
+    :type (LIST OF SYMBOL) :allocation :dynamic :default NIL-LIST)
+   (method-storage-slot :type SYMBOL :allocation :dynamic 
+			:renames storage-slot)
+   (method-inherits-through :type SYMBOL :allocation :dynamic)
+   ;; Command slots:
+   (method-command? :type BOOLEAN  :allocation :dynamic :default FALSE)
+   (method-evaluate-arguments? :type BOOLEAN :allocation :dynamic
+                               :default TRUE)
+   (method-lisp-macro? :type BOOLEAN-WRAPPER  :allocation :dynamic)
+   (evaluator-wrapper-code :type FUNCTION-CODE :allocation :dynamic)
+   )
+  :public-methods
+  ((setter? ((self METHOD-SLOT)) :type BOOLEAN :storage-slot method-setter?
+            (return (method-setter? self))))
+  :print-form (if (method-function? self)
+		  (print-native-stream stream
+				       "|F|" ; (choose *printReadably?* "" "|F|")
+				       (symbol-name (slot-name self)))
+		(print-native-stream stream 
+				     "|M|" ; (choose *printReadably?* "" "|M|")
+				     (symbol-name (slot-owner self))
+				     "." 
+				     (symbol-name (slot-name self))))
+   )
+
+(defclass COMPOUND-TYPE-SPECIFIER (STANDARD-OBJECT)
+  :abstract? TRUE
+  :public? FALSE
+  :print-form (print-native-stream stream "|TS|" (yield-type-spec-tree self)) )
+
+(defclass PARAMETRIC-TYPE-SPECIFIER (COMPOUND-TYPE-SPECIFIER)
+  :public-slots
+  ((specifier-base-type :type TYPE)
+   (specifier-parameter-types :type (LIST OF TYPE-SPEC) :allocation :embedded)
+   (specifier-dimensions :type (LIST OF OBJECT))))
+
+(defclass ANCHORED-TYPE-SPECIFIER (COMPOUND-TYPE-SPECIFIER)
+  :public-slots
+  ((specifier-parameter-name :type SYMBOL)
+   ))
+
+(defclass TABLE (SLOT)
+  :parameters ((any-value :type BOOLEAN))
+  :public-slots
+  ((tuple-domains :type (LIST OF TYPE-SPEC))
+   (variable-arity-table? :type BOOLEAN :allocation :dynamic))
+  :print-form
+  (print-native-stream stream "|T|" (symbol-name (slot-name self))))
+
+(defclass GLOBAL-VARIABLE (MAPPABLE-OBJECT)
+  :public-slots
+  ((documentation :type STRING))
+  :public-methods
+  ((name ((self GLOBAL-VARIABLE)) :type STRING
+         (return (symbol-name (variable-name self))))
+   (type ((self GLOBAL-VARIABLE)) :type TYPE :storage-slot variable-type
+         (return (variable-type self)))
+   (home-module ((self GLOBAL-VARIABLE)) :type MODULE
+                ;; see `record-variable-home-module':
+                (let ((module (variable-home-module self)))
+                  (if (defined? module)
+                      (return module)
+                    (return (interned-in (variable-name self)))))))
+  :public-slots
+  ((variable-name :type SYMBOL)
+   (variable-type :type TYPE)
+   (variable-type-specifier :type TYPE-SPEC :allocation :dynamic)
+   (variable-home-module :type MODULE :allocation :dynamic)
+   (variable-special? :type BOOLEAN)
+   (variable-constant? :type BOOLEAN)
+   (variable-public? :type BOOLEAN :initially TRUE)
+   (variable-auxiliary? :type BOOLEAN)
+   (variable-get-value-code :type FUNCTION-CODE)
+   (variable-set-value-code :type FUNCTION-CODE)
+   (variable-value-stack :type LIST)
+   (variable-documentation :type STRING :renames documentation)
+   (variable-stringified-source :type STRING)
+   ))
+
+(defclass QUOTED-EXPRESSION (STANDARD-OBJECT)
+  :public-slots ((quotation-table-offset :type INTEGER)) )
+
+(defclass VOID () :abstract? TRUE
+  :java-native-type "void"
+  :idl-native-type "void"
+  :cpp-native-type "void")
+(defclass UNKNOWN () :abstract? TRUE
+  :cpp-native-type "unknown"
+  :idl-native-type "unknown"
+  :java-native-type "unknown"
+  :slots ((unknown-slot :type UNKNOWN)))
+
+(defclass THING (STANDARD-OBJECT DYNAMIC-SLOTS-MIXIN)
+  :abstract? TRUE
+  :documentation "Defines a class that must be inherited by any
+class that participates in the PowerLoom side of things."
+  :public-slots 
+  ((surrogate-value-inverse :type SURROGATE))
+  :print-form 
+  (if (defined? (surrogate-value-inverse self))
+      (print-native-stream stream 
+			   "|i|" ; (choose *printReadably?* "" "|i|")
+			   (symbol-name (surrogate-value-inverse self)))
+    (print-native-stream stream "|i|" (primary-type self))))
+
+(defclass CONTEXT (THING)
+  :abstract? TRUE
+  :public-slots 
+  ((child-contexts :type (LIST OF CONTEXT) :allocation :embedded)
+   (base-module :type MODULE)
+   (all-super-contexts :type (CONS OF CONTEXT))
+   (context-number :type INTEGER)
+   )
+  :methods
+  ((context-name ((self CONTEXT)) :type STRING
+    ;; Kludge: Right now the 'typecase' causes a rebinding of the test-variable
+    ;; with a different type, which in C++ causes a rebinding of 'this' which
+    ;; is illegal.  Until this is fixed we need a temporary variable.
+    (let ((aux self))
+      (typecase aux
+        (MODULE (return (module-name aux)))
+        (WORLD (return (world-name aux))))))
+   (parent-contexts ((self CONTEXT)) :type (ITERATOR OF CONTEXT))
+   (home-module ((self CONTEXT))
+     :type MODULE :public? TRUE
+     ;; this means modules are their own home:
+     (return (base-module self))))
+  :print-form (print-context self stream) )
+
+;; Currently, FILE-NAME is defined as a synonym for STRING.
+
+(defclass MODULE (CONTEXT)
+  :public-slots
+  ((parent-modules :type (LIST OF MODULE) :allocation :embedded)
+   (documentation :type STRING)
+   (nicknames :type (LIST OF STRING-WRAPPER))
+   (uses :type (LIST OF MODULE) :allocation :embedded)
+   (used-by :type (LIST OF MODULE) :allocation :embedded)
+   (shadowed-surrogates :type (LIST OF SURROGATE) :allocation :dynamic)
+   (requires :type (LIST OF MODULE))
+   ;; The package names are handled differently in different languages.
+   ;; 
+   ;; The lisp-package inherits along the module chain, so it has a
+   ;; corresponding method defined below.  It denotes the Common Lisp
+   ;; package name for this module's definitions.
+   ;; 
+   ;; The cpp-package inherits along the module chain, so it has a
+   ;; corresponding method defined below.  It (will) denotes the C++
+   ;; namespace for this module's definitions.
+   ;;
+   ;; The java-package does not inherit.  A pseudo inheritance scheme is
+   ;; implemented by the Java translation code.  The slot denotes the
+   ;; full pathname of the Java package for this module's definitions.
+   (module-lisp-package :type STRING :default "STELLA" :allocation :dynamic)
+   (module-cpp-package :type STRING :default "stella" :allocation :dynamic)
+   (java-package :type STRING :default NULL :allocation :dynamic)
+   (case-sensitive? :type BOOLEAN :initially FALSE)
+   (clearable? :type BOOLEAN :allocation :dynamic :default TRUE
+               :option-keyword :clearable?)
+   (code-only? :type BOOLEAN :allocation :dynamic)
+   (api? :type BOOLEAN :allocation :dynamic)
+   (protect-surrogates? :type BOOLEAN :allocation :dynamic
+			:option-keyword :protect-surrogates?
+                        :default TRUE)
+   (java-flotsam-class :type STRING :allocation :dynamic
+		       :option-keyword :java-catchall-class)
+   (module-full-name :type STRING)
+   (module-name :type STRING :allocation :instance)
+   (module-stringified-source :type STRING)
+   ;; SHOULD GO AWAY IN FAVOR OF `module-stringified-source':
+   (stringified-options :type STRING)
+   (cardinal-module :type MODULE)
+   (symbol-offset-table :type STRING-TO-INTEGER-HASH-TABLE)
+   (surrogate-offset-table :type STRING-TO-INTEGER-HASH-TABLE)
+   ;; Logic slots that are here for efficiency reasons, since they
+   ;;    shouldn't be dynamic.  These should move back to the logic
+   ;;    implementation once we come up with a better scheme for
+   ;;    dynamically extending classes.
+   ;; Inference caches:
+   (strict-inference-cache :type WORLD)
+   (default-inference-cache :type WORLD)
+   (prototype-inference-cache :type WORLD))
+  :public-methods
+  ((name ((self MODULE)) :type STRING (return (module-name self)))
+   (parent-module ((self MODULE)) :type MODULE
+                  (return (pop (parent-contexts self))))
+   ;; Note:  lisp-package and cpp-package inherit, java-package does not!
+   (lisp-package ((self MODULE))
+                   :type STRING :storage-slot module-lisp-package
+                   :inherits-through parent-modules)
+   (cpp-package ((self MODULE))
+		:type STRING :storage-slot module-cpp-package
+		:inherits-through parent-modules)))
+
+(defclass WORLD (CONTEXT)
+  :public-slots ((parent-context :type CONTEXT)
+          (child-contexts :type (LIST OF WORLD) :allocation :embedded)
+          (world-name :type STRING :allocation :dynamic)) )
+
+(defclass CS-VALUE (KEY-VALUE-LIST)
+  :documentation "Contextualized value.  Contains a sorted kv-cons list indexed
+by context. The kv-cons list is never null.  Newer (higher numbered) contexts
+appear first."
+  :parameters ((any-key :type CONTEXT) (any-value :type OBJECT))
+  )
+
+
+;;; Taxonomies:
+
+(defclass INTERVAL (STANDARD-OBJECT)
+  :public-slots
+  ((lower-bound :type INTEGER)
+   (upper-bound :type INTEGER))
+  :print-form (print-native-stream 
+	       stream "[" (lower-bound self) "," (upper-bound self) "]"))
+
+(defclass TAXONOMY-NODE (STANDARD-OBJECT)
+  :public-slots
+  ((native-object :type OBJECT)
+   (label :type INTEGER)
+   (intervals :type (CONS OF INTERVAL) :initially NIL)
+   (initial-interval :type INTERVAL)
+   (first-interval-lower-bound :type INTEGER :initially -1)
+   (first-interval-upper-bound :type INTEGER :initially -1)
+   (parents :type (CONS OF TAXONOMY-NODE) :initially NIL)
+   (children :type (CONS OF TAXONOMY-NODE) :initially NIL)
+   (total-ancestors :type INTEGER :initially 1)
+   (tree-children :type (CONS OF TAXONOMY-NODE) :initially NIL)
+   (marker :type OBJECT))
+  :print-form (print-native-stream 
+	       stream "|TN|" (label self) " " (intervals self) " " 
+	       (native-object self)))
+
+(defclass TAXONOMY-GRAPH (STANDARD-OBJECT)
+  :public-slots
+  ((renumber-if-out-of-numbers?
+    :documentation "If TRUE, relabel the entire graph when a new interval
+for an incrementally inserted node can't be allocated due to lack of
+splittable interval space.  Otherwise, create a `foreign' interval and
+propagate it."
+    :type BOOLEAN :initially FALSE)
+   (renumber-ratio
+    :documentation "Whenever the ratio between foreign intervals and
+non-foreign intervals becomes greater than `renumber-ratio', relabel
+the whole graph non-incrementally."
+    :type FLOAT :initially 0.1))
+  :slots
+  ((incremental-mode? :type BOOLEAN)
+   (largest-postorder-number :type INTEGER)
+   (number-of-nodes :type INTEGER)
+   (number-of-foreign-interval-nodes :type INTEGER)
+   (roots :type (LIST OF TAXONOMY-NODE))
+   (broken-links :type (LIST OF (CONS OF TAXONOMY-NODE)))
+   (added-links :type (LIST OF (CONS OF TAXONOMY-NODE)))
+   (removed-links :type (LIST OF (CONS OF TAXONOMY-NODE))))
+  :initializer initialize-taxonomy-graph
+  :print-form (print-native-stream stream "|TG|" (roots self)))
+
+
+;;; Exceptions:
+
+;; This is the class that is used for trapping native language
+;; exceptions.  For Java and Common Lisp it is higher in the
+;; hierarchy than the native class STELLA-ROOT-EXCEPTION that is
+;; the basis of exceptions used by Stella.
+(defclass NATIVE-EXCEPTION ()
+  :java-native-type "java.lang.Exception"   ; could also be Throwable
+  :cl-native-type "CONDITION"
+  :cpp-native-type "std::exception")
+
+;; This in-between exception is needed for various language
+;; technical reasons:
+;; Java:  RuntimeException is used so that we don't have to include
+;;        a throws clause with function and method definitions.
+;; Lisp:  SIMPLE-ERROR is used so that we are assured that storage
+;;        and support for error messages (i.e. :format-control) is present.
+(defclass STELLA-ROOT-EXCEPTION (NATIVE-EXCEPTION)
+  :public-slots
+  ((message :type STRING :reader exception-message :required? true :abstract? true))
+  :abstract? true
+  :java-native-type "java.lang.RuntimeException"
+  :cl-native-type "SIMPLE-ERROR"
+  :cpp-native-type "std::runtime_error")
+
+(defclass STELLA-EXCEPTION (STELLA-ROOT-EXCEPTION))
+
+(defclass READ-EXCEPTION (STELLA-EXCEPTION))
+
+(defclass UNHANDLED-EXCEPTION (STELLA-EXCEPTION))
+
+(defclass EVALUATION-EXCEPTION (STELLA-EXCEPTION))
+
+(defclass NO-SUCH-OBJECT-EXCEPTION (STELLA-EXCEPTION))
+(defclass NO-SUCH-CONTEXT-EXCEPTION (NO-SUCH-OBJECT-EXCEPTION))
+
+;;; Literal Class Hierarchy
+
+(defclass LITERAL (NON-OBJECT) :abstract? TRUE)
+
+(defclass NUMBER (LITERAL) :abstract? TRUE)
+
+;;; NOTE: In Common-Lisp not all literal types are required to have
+;;; corresponding CLOS classes (e.g., INTEGER is but FIXNUM is not,
+;;; cf. page 783 in CLtL-II), which means that 'cl-native-type's of
+;;; Stella literal types should be restricted to types that are
+;;; guaranteed to have corresponding CLOS classes, otherwise,
+;;; Common-Lisp translations of Stella methods defined on literals
+;;; will not work in all Lisps.
+
+(defclass INTEGER (NUMBER)
+  :cl-native-type "INTEGER"   ;; Really FIXNUM
+  :cpp-native-type "int"
+  :idl-native-type "long"
+  :java-native-type "int"
+  :initial-value NULL-INTEGER :equality-test eql?)
+
+(defclass FLOAT (NUMBER)
+  :cl-native-type "FLOAT" 
+  :cpp-native-type "double"
+  :idl-native-type "double"
+  :java-native-type "double"
+  :initial-value NULL-FLOAT :equality-test eql?)
+
+(defclass MUTABLE-STRING (LITERAL)
+  :cl-native-type "STRING"
+  :idl-native-type "string"
+  :java-native-type "StringBuffer"
+  :cpp-native-type "char*"
+  :equality-test string-eql?
+  :initial-value (verbatim :common-lisp "STELLA::NULL-STRING"
+			   :java "null"
+			   :cpp "NULL"))
+
+(defclass STRING (LITERAL)
+  :synonyms (FILE-NAME)
+  :cl-native-type "STRING"
+  :idl-native-type "string"
+  :java-native-type "String"
+  :cpp-native-type "char*"    ;; "const char*"  ??
+  :equality-test string-eql?
+  :initial-value (verbatim :common-lisp "STELLA::NULL-STRING"
+			   :java "null"
+			   :cpp "NULL"))
+
+(defclass CHARACTER (LITERAL)
+  :cl-native-type "CHARACTER"
+  :cpp-native-type "char"
+  :idl-native-type "char"
+  :java-native-type "char"
+  :initial-value NULL-CHARACTER)
+
+;;; Extended Literal Class Hierarchy needed for IDL schema translation:
+
+(defclass SHORT-INTEGER (INTEGER)
+  :cl-native-type "INTEGER"
+  :cpp-native-type "short int"
+  :idl-native-type "short int"
+  :java-native-type "short"
+  :initial-value NULL-SHORT-INTEGER
+  :equality-test eql?)
+
+(defclass LONG-INTEGER (INTEGER)
+  :cl-native-type "INTEGER"
+  :cpp-native-type "long int"
+  :idl-native-type "long int"
+  :java-native-type "long"
+  :initial-value NULL-LONG-INTEGER
+  :equality-test eql?)
+
+(defclass UNSIGNED-SHORT-INTEGER (INTEGER)
+  :cl-native-type "INTEGER"
+  :cpp-native-type "unsigned short int"
+  :idl-native-type "unsigned short int"
+  :java-native-type "short"
+  :initial-value NULL-UNSIGNED-SHORT-INTEGER
+  :equality-test eql?)
+
+(defclass UNSIGNED-LONG-INTEGER (INTEGER)
+  :cl-native-type "INTEGER"
+  :idl-native-type "unsigned long int"
+  :cpp-native-type "unsigned long int"
+  :java-native-type "long"
+  :initial-value NULL-UNSIGNED-LONG-INTEGER
+  :equality-test eql?)
+
+(defclass SINGLE-FLOAT (FLOAT)
+  :cl-native-type "FLOAT"
+  :java-native-type "float"
+  :idl-native-type "float"
+  :cpp-native-type "float"
+  :initial-value NULL-SINGLE-FLOAT
+  :equality-test eql?)
+
+;; This is identical to FLOAT, but it defines
+;;    a better name for the NULL value:
+(defclass DOUBLE-FLOAT (FLOAT)
+  :cl-native-type "FLOAT"
+  :cpp-native-type "double"
+  :java-native-type "double"
+  :idl-native-type "double"
+  :initial-value NULL-DOUBLE-FLOAT
+  :equality-test eql?)
+
+(defclass BYTE (LITERAL)
+  :cl-native-type "FIXNUM"
+  :cpp-native-type "char"
+  :idl-native-type "char"
+  :java-native-type "byte"
+  :initial-value NULL-BYTE
+  :equality-test eql?)
+
+(defclass OCTET (BYTE)
+  :cl-native-type "FIXNUM"
+  :cpp-native-type "char"
+  :idl-native-type "octet"
+  :java-native-type "byte"
+  :initial-value NULL-OCTET
+  :equality-test eql?)
+
+;;; Wrapper classes wrap non-objects
+
+(defclass WRAPPER (OBJECT) ;; removed  REFERENCE-COUNT-OBJECT --  avoid unused slot
+  :public-slots
+  ((wrapper-value :type UNKNOWN :required? TRUE))
+  :key (wrapper-value)
+  :public? TRUE
+  :abstract? TRUE)
+
+(defclass LITERAL-WRAPPER (WRAPPER)
+  :abstract? TRUE)
+
+(defclass NUMBER-WRAPPER (LITERAL-WRAPPER)
+  :abstract? TRUE)
+
+(defclass INTEGER-WRAPPER (NUMBER-WRAPPER)
+  :public-slots ((wrapper-value :type INTEGER))
+  :print-form (if *printReadably?*
+                  (print-native-stream stream (wrapper-value self))
+                (print-native-stream stream "|L|" (wrapper-value self))))
+
+(defclass FLOAT-WRAPPER (NUMBER-WRAPPER)
+  :public-slots ((wrapper-value :type FLOAT))
+  :print-form (if *printReadably?*
+		    (print-native-stream stream (wrapper-value self))
+		  (print-native-stream stream "|L|" (wrapper-value self))))
+
+(defclass STRING-WRAPPER (LITERAL-WRAPPER)
+  :public-slots ((wrapper-value :type STRING))
+  :print-form (let ((value (wrapper-value self)))
+                (if *printReadably?*
+                  (print-string-readably value stream)
+                  (if (defined? value)
+                      (print-native-stream stream "|L|" #\" value #\")
+                    (print-native-stream stream "|L|" "NULL-STRING")))))
+
+(defclass MUTABLE-STRING-WRAPPER (LITERAL-WRAPPER)
+  :public-slots ((wrapper-value :type MUTABLE-STRING))
+  :print-form (let ((value (wrapper-value self)))
+                (if *printReadably?*
+                  (print-string-readably value stream)
+                  (if (defined? value)
+                      (print-native-stream
+                       stream "|L|" #\" (mutable-string-to-string value) #\")
+                    (print-native-stream
+                     stream "|L|" "NULL-MUTABLE-STRING")))))
+
+(defclass CHARACTER-WRAPPER (LITERAL-WRAPPER)
+  :public-slots ((wrapper-value :type CHARACTER))
+  :print-form (if *printReadably?*
+                  (print-character (wrapper-value self) stream)
+                (progn
+                  (print-native-stream stream "|L|")
+                  (print-character (wrapper-value self) stream))))
+
+(defclass BOOLEAN-WRAPPER (LITERAL-WRAPPER)
+  :documentation "Objectified version of the BOOLEAN data type.  The NULL
+value can be used for a 3-valued semantics (see THREE-VALUED-BOOLEAN)."
+  :public-slots ((wrapper-value :type BOOLEAN :allocation :instance))
+  :print-form (print-native-stream
+               stream (choose *printReadably?* "" "|L|")
+               (choose (wrapper-value self) (quote TRUE) (quote FALSE))))
+
+(defclass CODE-WRAPPER (WRAPPER)
+  :abstract? TRUE)
+
+(defclass FUNCTION-CODE-WRAPPER (CODE-WRAPPER)
+  :public-slots ((wrapper-value :type FUNCTION-CODE)))
+
+(defclass METHOD-CODE-WRAPPER (CODE-WRAPPER)
+  :public-slots ((wrapper-value :type METHOD-CODE)))
+
+(defclass VERBATIM-STRING-WRAPPER (STRING-WRAPPER)
+  :documentation "Wrapper class used to hold verbatim native code strings."
+  :print-form (print-native-stream
+               stream (choose *printReadably?* "" "|V|") (wrapper-value self)))
+
+(defclass BOOLEAN (LITERAL)
+  :documentation "Boolean type with values TRUE and FALSE."
+  :initial-value FALSE
+  :cl-native-type "FIXNUM" 
+  :cpp-native-type "boolean"
+  :idl-native-type "boolean"
+  :java-native-type "boolean")
+
+(defclass ONE-BIT-BOOLEAN (BOOLEAN)
+  :documentation "Space-saving representation of BOOLEAN which takes longer
+to read and write than BOOLEAN.  Not yet implemented." 
+  :cpp-native-type "one_bit_boolean")
+
+(deftype THREE-VALUED-BOOLEAN BOOLEAN-WRAPPER)
+
+(defclass CODE (LITERAL)
+  :abstract? TRUE)
+
+(defclass FUNCTION-CODE (CODE)
+  :cl-native-type "FUNCTION"
+  :java-native-type "java.lang.reflect.Method"
+  :cpp-native-type "cpp_function_code")
+
+(defclass METHOD-CODE (CODE)
+  :cl-native-type "STANDARD-GENERIC-FUNCTION"
+  :java-native-type "java.lang.reflect.Method"
+  :cpp-native-type "cpp_method_code"
+  :initial-value (safe-cast NULL @METHOD-CODE))
+
+(defclass LISP-CODE ()
+  :abstract? TRUE
+  :documentation "Used to indicate variables that input or output Common Lisp~
+      structures.")
+
+(defclass THIRTY-TWO-BIT-VECTOR (INTEGER)
+  :cl-native-type "FIXNUM"
+  :cpp-native-type "long"
+  :java-native-type "int"
+  :documentation "Bit vector used to implement BOOLEAN slots."
+  :initial-value NULL-INTEGER
+  )
+
+(defclass TICKTOCK ()
+  :documentation "A data type that is used to hold information for computing
+timing of code.  It is intentionally opaque to the user.
+It should only be used as an argument to the TICKTOCK-DIFFERENCE
+function.  Values are obtained with the GET-TICKTOCK function."
+  :cpp-native-type "clock_t"
+  :cl-native-type "FIXNUM"
+  :java-native-type "long")
+
+(defclass NATIVE-OBJECT-POINTER (SECOND-CLASS-OBJECT)
+  :documentation "A pointer type that can point at an arbitrary native
+non-literal object.  Usable to store native objects that fall outside the
+STELLA OBJECT hierarchy (e.g., native arrays) without having to use their
+exact type."
+  :cl-native-type "T"
+  :cpp-native-type "char*"
+  :java-native-type "Object")
+
+(defclass PROCESS-LOCK-OBJECT ()
+  :documentation 
+  "A process lock object for synchronizing in a multi-threaded environment.
+Fully supported in Java; supported in some Common Lisp systems; not supported
+in C++."
+  :cl-native-type "T"
+  :cpp-native-type "char*"
+  :java-native-type "Object")
+
+;;; System Definition
+
+(defclass SYSTEM-DEFINITION (STANDARD-OBJECT)
+  :documentation "The System-Definition class is used to define systems of files
+that constitute Stella applications."
+  :slots
+  ((name :type STRING)
+   (directory :type FILE-NAME)
+   (files :type (CONS OF STRING-WRAPPER))
+   (lisp-only-files :type (CONS OF STRING-WRAPPER))
+   (cpp-only-files :type (CONS OF STRING-WRAPPER))
+   (java-only-files :type (CONS OF STRING-WRAPPER))
+   (preprocessed-files :type (CONS OF STRING-WRAPPER))
+   (required-systems :type (CONS OF STRING-WRAPPER))
+   (loaded? :type BOOLEAN)
+   (up-to-date? :type BOOLEAN)
+   (cardinal-module :type STRING)
+   (source-root-directory :type FILE-NAME)
+   (native-root-directory :type FILE-NAME)
+   (binary-root-directory :type FILE-NAME)
+   (banner :type STRING)
+   (copyright-header :renames banner)
+   (production-settings :type (CONS OF INTEGER-WRAPPER))
+   (development-settings :type (CONS OF INTEGER-WRAPPER))
+   (finalization-function :type SYMBOL)
+   )
+  :print-form (print-native-stream stream "|SYSTEM|" (name self)))
+
+
+  ;;
+;;;;;; Support for &rest parameters
+  ;;
+
+;; ARGUMENT-LIST and ARGUMENT-LIST-ITERATOR are pseudo classes used to hook
+;;    up the pseudo methods `allocate-iterator', `next?', and `argument'
+;;    (which reads the `value' slot).  The pseudo methods are intercepted
+;;    by the various translators to produce code appropriate to iterate
+;;    over a list of arguments in the particular target language.
+
+(defclass ARGUMENT-LIST ()
+  :parameters ((any-value :type UNKNOWN))
+  :public-methods ((length ((self ARGUMENT-LIST)) :type INTEGER :native? TRUE))
+  :methods ((allocate-iterator
+             ((self ARGUMENT-LIST))
+             :type (ARGUMENT-LIST-ITERATOR OF (LIKE (any-value self)))
+             :native? TRUE))
+  :cl-native-type "CONS"
+  :cpp-native-type "void"
+  :java-native-type "void"  ;; was: Cons
+  )
+
+;; Can't make ARGUMENT-LIST-ITERATOR a stand-alone native class, since
+;;    `foreach' is looking for an ABSTRACT-ITERATOR:
+
+(defclass ARGUMENT-LIST-ITERATOR (ABSTRACT-ITERATOR)
+  :public-slots ((value :reader argument))
+  :methods ((argument ((self ARGUMENT-LIST-ITERATOR))
+                      :type (LIKE (any-value self)) :native? TRUE)
+            (next? ((self ARGUMENT-LIST-ITERATOR))
+                   :type BOOLEAN :native? TRUE))
+  :cl-native-type "CONS"
+  :cpp-native-type "va_list"
+  :java-native-type "void")  ;; was: Cons_Iterator
+
+
+  ;;
+;;;;;; Streams
+  ;;
+
+;;; Native streams
+
+;;; C++ I/O operations are generic within subclasses of 'istream' and 
+;;; 'ostream', thus, we can get away with having only two types of
+;;; native streams.
+
+
+;;; Consider eliminating NATIVE-STREAM as a class, since it doesn't
+;;;  perform any useful function in C++ and it doesn't exist as an
+;;;  abstraction in Java at all.
+
+(defclass NATIVE-STREAM ()
+  :abstract? TRUE
+  :cpp-native-type "std::ios*"
+  :java-native-type "Object"
+  :cl-native-type "STREAM")
+
+(defclass NATIVE-OUTPUT-STREAM (NATIVE-STREAM)
+  :abstract? TRUE
+  :cpp-native-type "std::ostream*"
+  :java-native-type "java.io.PrintStream"
+  :cl-native-type "STREAM")
+
+(defclass NATIVE-INPUT-STREAM (NATIVE-STREAM)
+  :abstract? TRUE
+  :cpp-native-type "std::istream*"
+  :java-native-type "java.io.PushbackInputStream"
+  :cl-native-type "STREAM")
+
+;;; Stella streams
+
+(defclass STREAM (STANDARD-OBJECT) 
+  :abstract? TRUE
+  :public-slots (;; Possible values are :OPEN, :EOF, :CLOSED, etc.:
+          (state :type KEYWORD)))
+
+;;; In C++ we have to explicitly state whether a native stream is an
+;;; 'istream' or 'ostream' in order for I/O operations to work.  Thus
+;;; there can't be a 'native-stream' slot that is shared between
+;;; INPUT-STREAMs and OUTPUT-STREAMs.  For backwards-compatibility
+;;; reasons the native stream slots are stilled called
+;;; 'native-stream', but they have aliases 'native-input-stream' and
+;;; 'native-output-stream' to emphasize their independence.  Also,
+;;; since the stream hierarchy in C++ uses virtual inheritance, we
+;;; could not achieve the same by simply narrowing the type of
+;;; 'native-stream' in subclasses of STREAM, since then the slot would
+;;; need to be defined on STREAM with the most general type 'ios', and
+;;; the walker would need to insert appropriate downcasts whenever a
+;;; 'native-stream' of an INPUT-STREAM or OUTPUT-STREAM is accessed.
+;;; However, such downcasts are illegal within a virtual inheritance
+;;; hierarchy, hence, this strategy cannot be used.
+
+(defclass OUTPUT-STREAM (STREAM)
+  :public-slots
+  ((native-stream :type NATIVE-OUTPUT-STREAM :public? TRUE)
+   (native-output-stream :renames native-stream))
+  :terminator terminate-output-stream?)
+
+(defclass INPUT-STREAM (STREAM)
+  :public-slots
+  ((native-stream :type NATIVE-INPUT-STREAM :public? TRUE)
+   (native-input-stream :renames native-stream)
+   (echo-stream :type OUTPUT-STREAM)
+   (tokenizer-state :type TOKENIZER-STREAM-STATE)
+   (buffering-scheme :type KEYWORD :initially :LINE
+     :documentation "One of :CHARACTER, :LINE or :BLOCK indicating what kind of
+input buffer we are reading from.  This determines what read function to use
+for tokenization."))
+  :terminator terminate-input-stream?)
+
+(defclass OUTPUT-FILE-STREAM (OUTPUT-STREAM)
+  :synonyms (FILE-OUTPUT-STREAM)
+  :public-slots
+  ((filename :type STRING :required? TRUE :public? TRUE)
+   (if-exists-action :type KEYWORD :initially :supersede :public? TRUE))
+  :initializer initialize-file-output-stream
+  :terminator terminate-file-output-stream?
+  :print-form (print-native-stream stream "|FOS|'" (filename self) "'"))
+
+(defclass INPUT-FILE-STREAM (INPUT-STREAM)
+  :synonyms (FILE-INPUT-STREAM)
+  :public-slots
+  ((filename :type STRING :required? TRUE :public? TRUE)
+   (if-not-exists-action :type KEYWORD :initially :error :public? TRUE)
+   (buffering-scheme :initially :BLOCK))
+  :initializer initialize-file-input-stream
+  :terminator terminate-file-input-stream?
+  :print-form (print-native-stream stream "|FIS|'" (filename self) "'"))
+
+(defclass OUTPUT-STRING-STREAM (OUTPUT-STREAM)
+  :synonyms (STRING-OUTPUT-STREAM)
+  :public-slots ((the-string :type STRING :public? TRUE :reader the-string-reader))
+  :initializer initialize-string-output-stream)
+
+(defclass INPUT-STRING-STREAM (INPUT-STREAM)
+  :synonyms (STRING-INPUT-STREAM)
+  :public-slots ((the-string :type STRING :required? TRUE :public? TRUE)
+                 (buffering-scheme :initially :BLOCK))
+  :initializer initialize-string-input-stream)

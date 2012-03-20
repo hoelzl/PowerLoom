@@ -1,0 +1,1053 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: systems.ste,v 1.31 2003/08/08 23:07:43 hans Exp
+
+;;; Command Interpreter and System Definition 'defsystem'
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+
+  ;;
+;;;;;; 'load-file'
+  ;;
+
+;;; TO DO: REPLACE THIS WITH A GENERALIZED `EVALUATE' FUNCTION AND MOVE
+;;;    THE SYSTEM-SPECIFIC FINALIZATION STEP EITHER INTO `DEFSYSTEM' OR
+;;;    SOMETHING LIKE `LOAD-SYSTEM-FILE'.
+(defun (evaluate-command OBJECT)
+       ((command OBJECT) (finalize? BOOLEAN))
+  ;; Evaluate a top-level STELLA 'command' and return its result.
+  ;; If 'finalize?' is TRUE, finalize relations before returning
+  ;;    the result.
+  (special ((*translationErrors* 0)
+            (*translationWarnings* 0)
+            (*ignoreTranslationErrors?* FALSE)
+            (*translationUnits* NULL)
+            (*translationPhase* :DEFINE)
+            (*evaluationTree* NULL))
+    (let ((operator OBJECT NULL)
+          (result OBJECT NULL))
+      (typecase command
+        (CONS
+         (setq operator (value command))
+         (typecase operator
+           (SYMBOL
+            (case operator
+              (IN-MODULE
+               (handle-in-module-tree command FALSE))
+              (otherwise
+               (cond ((declaration-tree? command)
+                      ;; Handle top-level expressions such as PROGN or macros
+                      ;;    (they should really be handled by `evaluate'):
+                      (setq *translationUnits* (list))
+                      (walk-top-level-tree command FALSE)
+                      (case (length (reverse *translationUnits*))
+                        (0 (evaluation-error "Couldn't translate " command))
+                        (1 (setq result
+                             (the-object (first *translationUnits*))))
+                        (otherwise
+                         (let ((results NIL))
+                           (foreach unit in *translationUnits*
+                                    collect (the-object unit) into results)
+                           (setq result results)))))
+                     ;; Ignore 'in-package':
+                     ((string-equal? (symbol-name operator) "in-package")
+                      NULL)
+                     (otherwise
+                      ;; Treat it as a command:
+		      (evaluate command))))))
+           (otherwise
+	    (evaluate command))))
+        ((KEYWORD SURROGATE)
+         (setq result command))
+        (otherwise
+	 (evaluate command)))
+      (when (and (not (translation-errors?)) finalize?) 
+        (setq *translationPhase* :FINALIZE)
+        (if (defined? *currentSystemDefinition*)
+          (run-system-finalization *currentSystemDefinition*)
+          (inform "Can't run finalization because *currentSystemDefinition* is not set.")))
+      (return result))))
+
+;;; TO DO: REPLACE THIS WITH A GENERALIZED STELLA `LOAD' FUNCTION AND MOVE
+;;;    THE SYSTEM-SPECIFIC BITS INTO SOMETHING LIKE `LOAD-SYSTEM-FILE'.
+(defun load-file ((file STRING))
+  :documentation "Read STELLA commands from `file' and evaluate them.
+The file should begin with an `in-module' declaration that specifies
+the module within which all remaining commands are to be evaluated
+The remaining commands are evaluated one-by-one, applying the function
+`evaluate' to each of them."
+  :command? TRUE :public? TRUE
+  (when (not (probe-file? file))
+    (signal STELLA-EXCEPTION "File " file " does not exist."))
+  (let ((topLevelInvocation? (null? *currentFile*))
+        (skipCommand? FALSE)
+        (seenInModule? FALSE)
+        (commands NIL)
+	(inputStream INPUT-FILE-STREAM NULL))
+    (unwind-protect 
+	(special ((*currentFile* (file-base-name file)))
+	  (setq inputStream (new INPUT-FILE-STREAM :filename file))
+	  (within-module *module*
+	    (foreach tree in (s-expressions inputStream)
+		do (typecase tree
+		     (CONS
+		      (mv-setq (skipCommand? seenInModule?)
+			(handle-in-module-tree tree seenInModule?))
+		      (when skipCommand?
+			(continue))
+		      (let ((operator (first tree)))
+			(typecase operator
+			  (SYMBOL
+			   ;; Commands are split into three groups:
+			   (case operator
+			     ;; (1) Those that are evaluated right away:
+			     ;; TO DO: HANG THESE ON A SLOT SOMEWHERE;
+			     ((DEFMODULE DEFSYSTEM
+				  DEFCLASS  DEFSLOT DEFUN DEFMETHOD)
+			      (evaluate-command tree FALSE))
+			     (otherwise
+			      (if (defined? (lookup-command operator))
+				(pushq commands tree)
+				(evaluate-command tree FALSE)))))
+			  (otherwise
+			   (evaluate-command tree FALSE)))))
+		     (otherwise
+		      (evaluate-command tree FALSE))))
+	    (special ((*translationPhase* :FINALIZE))
+	      (run-system-finalization *currentSystemDefinition*))
+	    (foreach tree in (reverse commands)
+		do (evaluate-command tree TRUE))))
+      (when topLevelInvocation?
+	(sweep-transients))
+      (when (defined? inputStream)
+	(free inputStream))) ))
+
+
+    ;;
+  ;;;;;;
+;;;;;;;;;; Systems
+  ;;;;;;
+    ;;
+
+(defglobal *systemDefinitions* (LIST OF SYSTEM-DEFINITION) (new LIST)
+  :documentation "A list of all defined systems.")
+
+(defun (make-system-definition-file-name FILE-NAME) ((name STRING))
+  (return (concatenate (system-definitions-directory) (directory-separator-string)
+		       (string-downcase name) "-system.ste")))
+
+(defun (parse-list-of-file-paths (CONS OF STRING-WRAPPER)) ((files CONS))
+  ;; Helping function for 'define-system'.
+  ;; Apply 'implode-pathname' to each file in 'files'.
+  (let ((strings (CONS OF STRING-WRAPPER) NIL))
+    (foreach fileSpec in files
+             do (pushq strings (implode-pathname fileSpec)))
+    (return (reverse strings)) ))
+
+(defun (define-system SYSTEM-DEFINITION) ((name OBJECT) (options CONS))
+  ;; Define or redefine a Stella system (see 'defsystem').
+  (let ((stringName STRING NULL))
+    (typecase name
+      (STRING (setq stringName name))
+      (SYMBOL (setq stringName (string-downcase (symbol-name name))))
+      (otherwise
+       (print "Illegal system name: " name)
+       (return NULL)))
+    (let ((system (new SYSTEM-DEFINITION :name stringName))
+          (required-system SYSTEM-DEFINITION NULL)
+          (pList (new PROPERTY-LIST :the-plist options))
+          (oldSystem (some s in *systemDefinitions* where (eql? (name s) stringName))))
+      ;; SHOULD WRAP AN 'exception-case' AROUND THIS:
+      (foreach (key value) in pList
+               do
+               (case key
+                 (:DIRECTORY (setf (directory system) (implode-pathname value)))
+                 (:FILES (setf (files system) (parse-list-of-file-paths value)))
+                 (:REQUIRED-SYSTEMS 
+                  (setf (required-systems system) value)
+                  (foreach sys in (cast value CONS)
+                    do (setq required-system (get-system-definition (cast sys STRING-WRAPPER)))
+                       (when (and (not (string-equal? (cast sys STRING-WRAPPER) "stella"))
+                                  (not (loaded? required-system)))
+                         (print "Making dependent system " (wrapper-value (cast sys STRING-wRAPPER)) EOL)
+                         (make-system (cast sys STRING-WRAPPER) (translator-output-language))
+                         (print EOL EOL))))
+                 (:LISP-ONLY-FILES (setf (lisp-only-files system) (parse-list-of-file-paths value)))
+                 (:CPP-ONLY-FILES (setf (cpp-only-files system) (parse-list-of-file-paths value)))
+                 (:JAVA-ONLY-FILES (setf (java-only-files system) (parse-list-of-file-paths value)))
+                 (:PREPROCESSED-FILES (setf (preprocessed-files system) (parse-list-of-file-paths value)))
+                 (:CARDINAL-MODULE (setf (cardinal-module system) (cast value STRING-WRAPPER)))
+                 (:ROOT-SOURCE-DIRECTORY
+                  (setf (source-root-directory system) (cast value STRING-WRAPPER)))
+                 (:ROOT-NATIVE-DIRECTORY
+                  (setf (native-root-directory system) (cast value STRING-WRAPPER)))
+                 (:ROOT-BINARY-DIRECTORY
+                  (setf (binary-root-directory system) (cast value STRING-WRAPPER)))
+                 ((:BANNER :COPYRIGHT-HEADER)
+                  (setf (banner system) (cast value STRING-WRAPPER)))
+                 (:PRODUCTION-SETTINGS (setf (production-settings system) value))
+                 (:DEVELOPMENT-SETTINGS (setf (development-settings system) value))
+                 (:FINALIZATION-FUNCTION 
+                  (setf (finalization-function system) value))))
+      (push *systemDefinitions* system)
+      (when (defined? oldSystem)
+        (inform "Redefining system " (name system) EOL)
+        (remove *systemDefinitions* oldSystem))
+      (return system) )))
+
+(defun (defsystem SYSTEM-DEFINITION) ((name SYMBOL) &rest (options OBJECT))
+  :command? TRUE :evaluate-arguments? FALSE :public? TRUE
+  :documentation "Define a system of files that collectively define
+a Stella application.
+   Required options are:
+   :directory -- the path from the Stella root directory to the directory
+                 containing the system files.  Can be a string or a list
+                 of strings (do not include directory separators).
+   :files -- a list of files in the system, containing strings and lists
+             of strings; the latter defines exploded paths to files
+             in subdirectories.
+   Optional options are:
+   :required-systems -- a list of systems (strings) that should be loaded
+                        prior to loading this system.
+   :cardinal-module -- the name (a string) of the principal module for this
+                       system.
+   :copyright-header -- string with a header for inclusion into all translated
+                        files produced by Stella.
+   :lisp-only-files  -- Like the :files keyword, but these are only included
+   :cpp-only-files      in the translation for the specific language, namely
+   :java-only-files     Common Lisp, C++ or Java"
+  (return (define-system name (coerce-&rest-to-cons options))) )
+
+(defun (get-system-definition SYSTEM-DEFINITION) ((name STRING))
+  ;; Return a system named 'name'.
+  ;; If its not already defined, look for a system file containing
+  ;;    a definition for a system with that name.
+  (let ((system (some s in *systemDefinitions* 
+		    where (string-equal? (name s) name))))
+    (when (null? system)
+      (let ((systemFileName (make-system-definition-file-name name)))
+        (when (not (probe-file? systemFileName))
+          (print-stream STANDARD-ERROR
+			"ERROR>> File " systemFileName " does not exist." EOL
+			"   Can't define system " name EOL)
+          (return NULL))
+        (load-file systemFileName)
+        (setq system (some s in *systemDefinitions* 
+			 where (string-equal? (name s) name)))
+        (when (null? system)
+          (print-stream STANDARD-ERROR
+			"ERROR>>  Can't find a system definition for system " name EOL
+			"   within file " systemFileName "." EOL))))
+    (return system) ))
+
+(defun (get-cardinal-module MODULE) ((system SYSTEM-DEFINITION))
+  ;; Return the cardinal module of 'system'.
+  (let ((name (cardinal-module system))
+        (module MODULE NULL))
+    (when (defined? name)
+      (setq module (get-stella-module name FALSE))
+      (when (null? module)
+	;; If not found, try upcasing:
+	(setq module (get-stella-module (string-upcase name) FALSE))))
+    (when (null? module)
+      (warn "No cardinal module defined for system: " system EOL))
+    (return module) ))
+
+(defun help-get-system-files 
+       ((fileName FILE-NAME) (collection LIST) (probeFile? BOOLEAN))
+  ;; Helping function for 'get-system-files'.
+  ;; Add 'fileName' to 'collection' if a file with that name exists.
+  (when (or (not probeFile?)
+            (probe-file? fileName))
+    (push collection fileName)) )
+
+(defun (get-system-files (LIST OF STRING-WRAPPER)) 
+       ((system SYSTEM-DEFINITION) (type KEYWORD) (probeFiles? BOOLEAN))
+  ;; Return a list of all files of type 'type' in the system-definition 'system'.
+  ;; If 'probeFiles?', only return files that physically exist.
+  (let ((files (new LIST))
+        (fileName FILE-NAME NULL))
+    (with-system-definition (name system)
+      (foreach f in (files *currentSystemDefinition*)
+               do
+               (case type
+                 (:java
+                  (setq fileName
+		    (java-translate-class-namestring
+		     (concatenate "Startup-"  f))))
+                 (otherwise
+                  (setq fileName (make-file-name-from-relative-path f type))))
+               (help-get-system-files fileName files probeFiles?))
+      (case type
+        (:java
+         (when (null? (get-cardinal-module *currentSystemDefinition*))
+           (inform "No cardinal module defined for system " (name system) EOL)
+           (return NIL-LIST))
+         (foreach class in (all-classes (get-cardinal-module *currentSystemDefinition*)
+					TRUE)
+                  do
+                  (setq fileName (java-make-code-output-file-name class FALSE))
+                  (help-get-system-files fileName files probeFiles?))
+         (setq fileName 
+	   (java-make-code-output-file-name
+	    (java-yield-flotsam-class-name 
+	     (get-cardinal-module *currentSystemDefinition*))
+	    FALSE))
+         (help-get-system-files fileName files probeFiles?))
+        (otherwise NULL)))
+    (return files) ))
+
+(defun clean-system ((systemName STRING))
+  ;; Delete all .lisp and .fasl files in the system named 'systemName'.
+  ;; Delete all .java files for the module *module*.
+  (let ((system (get-system-definition systemName)))
+    (when (null? system)
+      (return))
+    (foreach f in (get-system-files system :lisp TRUE)
+             do (delete-file f))
+    (foreach f in (get-system-files system :java TRUE)
+             do (delete-file f))
+    ;; THIS MAY NOT BE RIGHT; NEED .HH AND .CPP FILES:  -rmm
+    (foreach f in (get-system-files system :cpp TRUE)
+             do (delete-file f))
+    (foreach f in (get-system-files system :lisp-binary TRUE)
+             do (delete-file f)) ))
+
+(defun compute-optimization-levels ((system SYSTEM-DEFINITION) (productionMode? BOOLEAN))
+  ;; Set optimization levels.  If productionMode? use production settings;
+  ;;    otherwise, use development settings.  If neither is specified in
+  ;;    the defsystem, use default settings.
+  (let ((settings (CONS OF INTEGER-WRAPPER) NULL))
+    (if productionMode?
+      (setq settings (production-settings system))
+      (setq settings (development-settings system)))
+    (when (null? settings)
+      (setq settings (quote (3 2 3 3))))
+    (set-optimization-levels
+     (nth settings 0) (nth settings 1) (nth settings 2) (nth settings 3)) ))
+
+(defun (lisp-keyword-to-stella-keyword KEYWORD) ((key KEYWORD))
+  ;; If 'key' is NOT a STELLA keyword, but is in fact a Common Lisp
+  ;;    keyword, convert it to a STELLA keyword.  Otherwise, return
+  ;;    NULL.
+  (let ((stellaKeyword KEYWORD NULL))
+    (verbatim
+      :common-lisp
+      "(cl:when (cl:typep key 'CL:KEYWORD)
+        (cl:setq stellaKeyword (stellify key)))"
+      :otherwise NULL)
+    (return stellaKeyword) ))
+
+(defun (vet-options PROPERTY-LIST) ((plist OBJECT) (legalOptions (CONS OF KEYWORD)))
+  ;; Complain about each key in 'plist' that's not in 'legalOptions'
+  ;;    and remove illegal entries from 'plist'.
+  ;; Also, if a Common Lisp keyword has snuck in, replace it with an
+  ;;    equivalent Stella keyword (and convert the value as well).
+  ;; Note: The logic here is written to avoid triggering STELLA type
+  ;;    checks that would bomb on Common Lisp objects.
+  (let ((propertyList PROPERTY-LIST NULL))
+    (typecase plist
+      (PROPERTY-LIST (setq propertyList plist))
+      (CONS (setq propertyList (new PROPERTY-LIST :the-plist plist)))
+      (LIST (setq propertyList (new PROPERTY-LIST :the-plist (the-cons-list plist))))
+      (otherwise 
+       (warn "Illegal argument passed to 'vet-options'")
+       (return (new PROPERTY-LIST))))
+    (foreach (key value) in propertyList
+             where (or (not (stella-object? key))
+                       (not (keyword? key))
+                       (and (defined? legalOptions)
+                            (not (member? legalOptions key))))
+             do (ignore value)
+             ;; found badness; transform it or excise it:
+             (when (not (stella-object? key))
+               ;; convert Lisp objects within 'propertyList':
+               (let ((newPList (new PROPERTY-LIST)))
+                 (foreach (key value) in propertyList
+                          do (insert-at newPList (stellify key) (stellify value)))
+                 (setf (the-plist propertyList) (the-plist newPList)))
+               (vet-options propertyList legalOptions)
+               (return propertyList))
+             (remove-at propertyList key)
+             (inform "Skipping illegal option: " key EOL)
+             (if (keyword? key)
+               (inform "   Legal options are: " legalOptions EOL)
+               (inform "   Option must be a keyword."))
+             (vet-options propertyList legalOptions)
+             (return propertyList))
+    (return propertyList) ))
+
+(defun (make-system BOOLEAN)  
+       ((systemName STRING) (language KEYWORD) &rest (options OBJECT))
+  :documentation "Translate all out-of-date files of system `systemName'
+into `language' and then compile and load them (the latter is only possible
+for Lisp right now).  The following keyword/value `options' are recognized:
+
+`:two-pass?': if true, all files will be scanned twice, once to
+load the signatures of objects defined in them, and once to actually
+translate the definitions.  Otherwise, the translator will make one pass in
+the case that the system is already loaded (and is being remade), and two
+passes otherwise.
+
+`:development-settings?' (default false): if true translation will favor
+safe, readable and debuggable code over efficiency (according to the value
+of `:development-settings' on the system definition).  If false, efficiency
+will be favored instead (according to the value of `:production-settings'
+on the system definition).
+
+`:production-settings?' (default true): inverse to `:development-settings?'.
+
+`:force-translation?' (default false): if true, files will be translated
+whether or not their translations are up-to-date.
+
+`:force-recompilation?' (default false): if true, translated files will be
+recompiled whether or not their compilations are up-to-date (only supported
+in Lisp right now).
+
+`:load-system?' (default true): if true, compiled files will be loaded into
+the current STELLA image (only supported in Lisp right now).
+
+`:startup?' (default true): if true, the system startup function will
+be called once all files have been loaded."
+  :public? TRUE :command? TRUE
+
+  ;; Set the translator language here, since GET-SYSTEM-DEFINITION now
+  ;; depends on it to do automatic system loading for :COMMON-LISP.
+  (setq language (stellify language))   ; Is this still needed?
+  (special ((*translatorOutputLanguage* language))
+     (set-translator-output-language language)
+     (let ((plist (new PROPERTY-LIST :the-plist (coerce-&rest-to-cons options)))
+           (developmentSettings? FALSE)
+           (forceTranslation? FALSE)
+           (forceRecompilation? FALSE)
+           (twoPass? (and (defined? (get-system-definition systemName))
+                          (not (loaded? (get-system-definition systemName)))))
+           (loadSystem? (eq? language :common-lisp))
+           (startupSystem? (eq? language :common-lisp))
+           (updatedSystem? FALSE)
+           (system (get-system-definition systemName)))
+       (when (null? system)
+         (print "Can't find a declaration for system named " systemName EOL
+                "  Possibly a global path name needs to be set." EOL)
+         (return FALSE))
+       (vet-options 
+        plist (quote (:two-pass?
+                      :development-settings?
+                      :production-settings?
+                      :force-translation? 
+                      :force-recompilation?
+                      :load-system?
+                      :startup?)))
+       (foreach (key value) in plist
+                do (let ((trueValue? (eql? value TRUE-WRAPPER)))
+                     (case key
+                       (:development-settings?
+                        (setq developmentSettings? trueValue?))
+                       (:production-settings?
+                        (setq developmentSettings? (not trueValue?)))
+                       (:force-translation?
+                        (setq forceTranslation? trueValue?))
+                       (:force-recompilation?
+                        (setq forceRecompilation? trueValue?))
+                       (:two-pass?
+                        (setq twoPass? trueValue?))
+                       (:load-system?
+                        (setq loadSystem? trueValue?))
+                       (:startup?
+                        (setq startupSystem? trueValue?)))))
+       ;; Since this step is really a prerequisite for translation, it
+       ;; should probably be moved into `translate-system' (then we also
+       ;; wouldn't have to call `system-needs-translation?' twice):
+       (when (or forceRecompilation?
+                 (and (not (loaded? system))
+		      (or forceTranslation?
+		          (system-needs-translation? systemName language))))
+         (load-preprocessed-files systemName))
+       (setq updatedSystem?
+             (translate-system systemName language
+                               :two-pass? twoPass? 
+                               :force-translation? forceTranslation?
+                               :development-settings? developmentSettings?))
+       (when (and loadSystem?
+                  (load-system systemName language
+                               :force-recompilation? forceRecompilation?
+                               :startup? startupSystem?))
+         (setq updatedSystem? TRUE))
+       (return updatedSystem?) )))
+
+(defun run-system-finalization ((system SYSTEM-DEFINITION))
+  ;; Run the finalization function associated with 'system'
+  ;;    if there is one.
+  ;; TO DO: DECIDE IF THE FINALIZATION FUNCTION SHOULD BE ATTACHED
+  ;;    TO A SYSTEM OR TO A MODULE:
+  (let ((fnName STRING NULL) ; (finalization-function system))
+        (finalizationFn METHOD-SLOT NULL))
+    (when (defined? fnName)
+      (setq finalizationFn (lookup-function-by-name fnName)))
+    (when (defined? finalizationFn)
+      (funcall (function-code finalizationFn))) ))
+
+(defun (system-definition-source-files (CONS OF STRING-WRAPPER)) ((system SYSTEM-DEFINITION))
+  ;; Return a list of source files for 'system' appropriate to the
+  ;;    intended output language.
+  (let ((files (copy-cons-list (files system))))
+    (case (translator-output-language)
+      (:common-lisp
+       (setq files (subtract files (java-only-files system)))
+       (setq files (subtract files (cpp-only-files system))))
+      (:java
+       (setq files (subtract files (lisp-only-files system)))
+       (setq files (subtract files (cpp-only-files system))))
+      (:cpp
+       (setq files (subtract files (lisp-only-files system)))
+       (setq files (subtract files (java-only-files system)))))
+    (return files) ))
+
+(defun (files-plus-system-startup (CONS OF STRING-WRAPPER))
+       ((files (CONS OF STRING-WRAPPER)))
+  ;; Return a list of files 'files' concatenated with the file
+  ;;    'system-startup' that gets generate by STELLA.
+  (return (concatenate files (cons-list (system-startup-file-name NULL)))))
+
+;; TO DO: THIS DOESN'T YET DISTINGUISH BETWEEN SUFFIXED AND
+;;    NON-SUFFIXED xxx-ONLY FILES:
+(defun (system-definition-native-files (CONS OF STRING-WRAPPER)) ((system SYSTEM-DEFINITION))
+  ;; Return a list of native files for 'system' appropriate to the
+  ;;    intended output language.
+  (let ((files (copy-cons-list (files system))))
+    (case (translator-output-language)
+      (:common-lisp
+       (setq files (union files (lisp-only-files system)))
+       (when (use-cl-structs?)
+         ;; Add the system-wide CL-structs definition file (is there a better
+         ;;    - more appropriate - place to do this?):
+         (setq files
+           (cons (cl-yield-struct-class-file-name (name system)) files))))
+      (:java
+       (setq files (union files (java-only-files system))))
+      (:cpp
+       (setq files (union files (cpp-only-files system)))))
+    (return files) ))
+
+(defun (system-loaded? BOOLEAN) ((name STRING))
+  :documentation "Return `true' if system `name' has been loaded."
+  :public? TRUE
+  (return
+    (or (string-equal? name "STELLA")
+        (exists sys in *systemDefinitions*
+          where (and (string-equal? (name sys) name)
+                     (loaded? sys))))))
+
+(defun clear-system ((name STRING))
+  :documentation "Clears out the system definition named `name'.  If
+`name' is `null', then clear out all system definitions.  This function
+is useful when changes have been made to the system definition, and one
+wants to have it reloaded from the standard location in the file system."
+  :public? TRUE
+  (if (null? name)
+    (setq *systemDefinitions* (new LIST))
+    (let ((sys (some s in *systemDefinitions* where (eql? (name s) name))))
+      (when (defined? sys)
+	(remove *systemDefinitions* sys)))))
+
+
+  ;;
+;;;;;; Common Lisp support for 'make-system'
+  ;;
+
+;;; These functions perform run-time compilation that is
+;;;    easy in Common Lisp, and is hard to write in an 
+;;;    operating-system independent way in Java or C++.
+;;; For now, we only support them in Common Lisp.
+
+(defun load-preprocessed-files ((systemName STRING))
+  ;; Translate, compile, and load files, such as macro files, that
+  ;;    must be loaded (not just translated) BEFORE regular
+  ;;    translation commences.
+  ;; Note: ONLY Common Lisp is currently agile enough to do this:
+  (when (or (not (running-as-lisp?))
+            (null? (preprocessed-files (get-system-definition systemName))))
+    (return))
+  (special ((*translatorOutputLanguage* :COMMON-LISP))
+    ;; Force translation into :COMMON-LISP since this is not supported
+    ;; by other languages, and it needs to be in Lisp to work.
+    (with-system-definition systemName
+      (let ((preprocessedFiles NIL))
+        (foreach f in (preprocessed-files *currentSystemDefinition*)
+          collect (make-file-name f :stella TRUE) into preprocessedFiles)
+        (special ((*current-stella-features* (copy *current-stella-features*)))
+          (unset-stella-feature :warn-about-undefined-methods)
+          (foreach f in preprocessedFiles
+            do (translate-file f (translator-output-language) FALSE)))
+        (compile-and-load-files (preprocessed-files *currentSystemDefinition*)
+			        (translator-output-language)
+			        FALSE)
+        ;; force retranslation in case it contained class definitions
+        ;;    that need to be moved into the system-wide structs file:
+        (when (use-cl-structs?)
+          (foreach f in (preprocessed-files *currentSystemDefinition*)
+	    do (delete-file (make-file-name f :lisp TRUE))))
+        (foreach startupFn in (startup-names-from-files
+                               (preprocessed-files *currentSystemDefinition*))
+          do (verbatim
+               :common-lisp "(CL:funcall (lispify startupFn))"
+               :otherwise NULL)))) ))
+
+(defun (load-system BOOLEAN) ((systemName STRING) (language KEYWORD)
+                              &rest (options OBJECT))
+  :documentation
+  "Natively `language'-compile out-of-date translated files of system
+`systemName' and then load them into the running system (this is only
+supported/possible for Lisp at the moment).  Return true if at least one
+file was compiled. The following keyword/value `options' are recognized:
+
+`:force-recompilation?' (default false): if true, files will be compiled
+whether or not their compilations are up-to-date.
+
+`:startup?' (default true): if true, the system startup function will
+be called once all files have been loaded."
+  :public? TRUE
+  (when (not (running-as-lisp?))
+    (return FALSE))
+  (setq language (stellify language))
+  (let ((plist (new PROPERTY-LIST :the-plist (coerce-&rest-to-cons options)))
+        (forceRecompilation? FALSE)
+        (startupSystem? TRUE)
+        (translatedFile? FALSE))
+    (vet-options plist (quote (:force-recompilation? :startup?)))
+    (foreach (key value) in plist
+             do
+             (case key
+               (:force-recompilation? 
+                (setq forceRecompilation? (eql? value TRUE-WRAPPER)))
+               (:startup? (setq startupSystem? (eql? value TRUE-WRAPPER)))))
+    (with-system-definition systemName
+      (when (loaded? *currentSystemDefinition*)
+        (inform "Loading system " systemName " over top of itself." EOL))
+      (setq translatedFile? 
+	(compile-and-load-files (files-plus-system-startup
+				 (system-definition-native-files *currentSystemDefinition*))
+				language 
+				forceRecompilation?))
+      (setf (loaded? *currentSystemDefinition*) TRUE)
+      (when startupSystem?
+        (run-system-startup-function *currentSystemDefinition*)))
+    (return translatedFile?)) )
+
+(defun (compile-and-load-files BOOLEAN)
+       ((files (CONS OF STRING-WRAPPER)) (language KEYWORD) (forceRecompilation? BOOLEAN))
+  ;; Compile native code versions of 'files', and then load them.
+  ;; Returns TRUE if successful, otherwise FALSE.
+  ;; Assumes that 'file' is a relative file name.
+  ;; QUESTION: DO :JAVA AND :CPP HAVE ANALOGS OF LOADING THAT WE
+  ;;    CAN IMPLEMENT HERE OR NOT?
+  (case language
+    (:common-lisp
+     (return (cl-compile-and-load-files files TRUE forceRecompilation?)))
+    (otherwise
+     (print "'compile-and-load-files' NOT IMPLEMENTED FOR " language EOL)
+     (return FALSE))) )
+
+(defun run-system-startup-function ((system SYSTEM-DEFINITION))
+  ;; Run system startup functions that create meta-objects
+  ;;    (Stella classes and stella methods).
+  (when (not (running-as-lisp?))
+    (return))
+  (verbatim 
+    :common-lisp (cl:funcall (lispify (system-startup-function-symbol system)))
+    :otherwise NULL) )
+
+
+  ;;
+;;;;;; Creating the 'startup-system' file
+  ;;
+
+(defmethod (system-startup-function-name STRING) ((system SYSTEM-DEFINITION))
+  ;; Return the name of the system startup function.
+  (return (system-startup-function-name (name system))))
+
+(defmethod (system-startup-function-name STRING) ((systemName STRING))
+  ;; Return the name of the system startup function.
+  (return (string-upcase (concatenate "startup-" systemName "-system")) ))
+
+(defun (system-startup-function-symbol SYMBOL) ((system SYSTEM-DEFINITION))
+  ;; Return the symbol naming the system startup function.
+  (return (intern-symbol-in-module (system-startup-function-name system)
+                                   (get-cardinal-module system) TRUE)) )
+
+(defun (startup-name-from-file SYMBOL) ((file FILE-NAME))
+  ;; Open 'file', find its module, and generate a startup file
+  ;;    name for it.
+  (when (not (probe-file? (make-file-name file :stella TRUE)))
+    (error "STELLA source file " (make-file-name file :stella TRUE)
+           " does not exist"))
+  (let ((longName (make-file-name file :stella TRUE))
+        (inputStream (new INPUT-FILE-STREAM :filename longName))
+        (savedModule *module*)
+        (seenInModule? FALSE)
+        (unused? FALSE)
+        (startupFnName SYMBOL NULL))
+    (with-transient-objects
+      (foreach
+       tree in (s-expressions inputStream)
+       do (with-permanent-objects
+            (typecase tree
+              (CONS
+               (mv-setq (unused? seenInModule?)
+                        (handle-in-module-tree tree seenInModule?))
+               (ignore unused?)
+               (when seenInModule?
+                 (setq startupFnName (yield-startup-function-name file))
+                 (change-module savedModule)
+                 (free inputStream)
+                 (return startupFnName)))
+              ;; ignore atomic expressions:
+              (otherwise NULL)))))
+    (warn "Missing IN-MODULE declaration for file " file EOL)
+    (return NULL) ))
+
+(defun (startup-names-from-files (CONS OF SYMBOL))
+    ((files (CONS OF STRING-WRAPPER)))
+  ;; Return a list of startup-file names.
+  (let ((names NIL))
+    (foreach f in files
+        collect (startup-name-from-file f) into names)
+    (return names) ))
+
+(defun (system-startup-file-name STRING) ((system SYSTEM-DEFINITION))
+  ;; Return the basename of the file that calls all of the startup
+  ;;    functions for `system' (or `*currentSystemDefinition*' if
+  ;;    `system' is NULL).
+  (when (null? system)
+    (setq system *currentSystemDefinition*))
+  (if (defined? system)
+      (return "startup-system")
+    (return NULL)))
+
+(defun (system-startup-file? BOOLEAN) ((file FILE-NAME))
+  ;; Return TRUE if `file' (or `*currentFile*') is the name for the
+  ;;    startup file of the currently translated system.
+  (when (null? file)
+    (setq file *currentFile*))
+  (return (and (defined? file)
+               (eql? (file-base-name file)
+                     (system-startup-file-name NULL)))))
+
+(defun (system-started-up? BOOLEAN)
+    ((systemName STRING) (systemModuleName STRING))
+  ;; Return TRUE if the startup function of system `systemName' has been run.
+  (when (eql? (string-upcase systemName) "STELLA")
+    (return (defined? *module*)))
+  (when (null? (get-stella-module systemModuleName FALSE))
+    (return FALSE))
+  (let ((startupFunctionSymbol
+         (lookup-symbol-in-module
+          (system-startup-function-name systemName)
+          (get-stella-module systemModuleName FALSE)
+          TRUE))
+        (startupFunction
+         (choose (defined? startupFunctionSymbol)
+                 (lookup-function startupFunctionSymbol)
+                 NULL)))
+    (return
+      (and (defined? startupFunction)
+           ;; this initialization happens only in the startup function:
+           (defined? (function-code startupFunction))))))
+
+(defun (yield-startup-required-systems CONS) ((system SYSTEM-DEFINITION))
+  (let ((startupForms NIL))
+    (foreach systemName in (required-systems system)
+        collect (bquote
+                 (unless (system-started-up?
+                          & systemName
+                          & (module-full-name
+                             (get-cardinal-module
+                              (get-system-definition systemName))))
+                   (& (system-startup-function-symbol
+                       (get-system-definition systemName)))))
+        into startupForms)
+    (return
+      (bquote
+       (STARTUP-TIME-PROGN :early-inits && startupForms)))))
+                                                          
+(defun (collect-startup-forms-from-system-file (CONS OF CONS))
+    ((system SYSTEM-DEFINITION))
+  ;; Collect relevant definitional forms from the definition file of `system'
+  ;;    and return the result.
+  ;; Currently, this only collects module definitions, but conceivably, it
+  ;;    could also collect the system definitons or even the whole file.
+  (let ((systemFileName (make-system-definition-file-name (name system)))
+	(inputStream (new INPUT-FILE-STREAM :filename systemFileName))
+        (module MODULE NULL)
+        (startupForm CONS NULL)
+	(startupForms NIL))
+    (within-module *module*
+      (foreach tree in (s-expressions inputStream)
+	  do (setq startupForm NULL)
+	     (typecase tree
+	       (CONS
+		(when (eql? (value tree) (quote DEFMODULE))
+		  (evaluate tree)
+		  (setq module
+		    (get-stella-module
+		     (coerce-to-module-name (second tree) TRUE)
+		     TRUE))
+		  (when (defined? module)
+		    (setq startupForm
+		      (bquote
+		       (STARTUP-TIME-PROGN :modules
+					   & (yield-define-module module))))))
+		(when (eql? (value tree) (quote IN-MODULE))
+		  (evaluate tree)))
+	       (otherwise NULL))
+	     (when (null? startupForm)
+	       (continue))
+	  collect startupForm into startupForms))
+    (return startupForms)))
+
+(defun create-system-startup-file ((system SYSTEM-DEFINITION))
+  ;; Create a system startup file whose startup function calls all relevant
+  ;;    system startup code.
+  ;; TRICKY: To generate the appropriate function name for the system startup
+  ;;    function, the walker generates a different startup function name
+  ;;    when it translates a `startup-system.ste' file (note, that if we
+  ;;    translated the system definition file directly, we would
+  ;;    automatically get the proper system startup function name).
+  ;;    This accomplishes two things:
+  ;;    (1) We can rely on the standard startup code generation mechanism
+  ;;        to generate a proper method object for the startup function.
+  ;;    (2) We don't get a name clash between the system-generated startup
+  ;;        functions of system startup files of different systems.
+  (when (null? *currentSystemDefinition*)
+    (inform "Must be within a system environment to create startup file " EOL
+            "   for system " (name system) "." EOL)
+    (return))
+  (within-module (get-cardinal-module system)
+   (let ((file (make-file-name (system-startup-file-name system) :stella TRUE))
+         (outputStream (new OUTPUT-FILE-STREAM :filename file))
+         (startupFnNames (CONS OF SYMBOL) NIL)
+         (startupForms (CONS OF CONS) NIL))
+     ;; Collect all startup function names:
+     (foreach f in (system-definition-source-files system)
+         collect (startup-name-from-file f) into startupFnNames)
+
+     ;; output file preamble:
+     (cl-output-file-header outputStream file false)
+     (pushq startupForms
+            (bquote
+             (IN-MODULE & (module-full-name (get-cardinal-module system)))))
+
+     ;; generate a forward declaration of the system startup function
+     ;;    so it can be referenced by user code:
+     (pushq startupForms
+            (bquote (DEFUN & (system-startup-function-symbol system) ()
+                           :public? TRUE)))
+
+     ;; assemble the call sequence for all startup functions defined in
+     ;;    `system' (special-case "STELLA" due to bootstrap issues):
+     (cond
+      ((eql? (string-upcase (name system)) "STELLA")
+       (pushq startupForms
+              (bquote
+               (STARTUP-TIME-PROGN :early-inits
+                 (startup FALSE)))))
+      (otherwise
+       ;; startup required systems:
+       (when (defined? (required-systems system))
+         ;; do we need forward declarations for these also?
+         (pushq startupForms (yield-startup-required-systems system)))
+       ;; collect module definitions and other relevant forms from
+       ;;    the definition file of `system':
+       (foreach form in (collect-startup-forms-from-system-file system)
+           do (pushq startupForms form))
+       ;; generate forward declarations of all undefined startup functions
+       ;;    to support translation of a partially changed system in Lisp (the
+       ;;    signatures only become available after the startup code is run):
+       ;; KLUDGE: We don't generate real forward declarations, since that
+       ;;    causes problems for out-of-module functions, instead we generate
+       ;;    the necessary startup function objects on the fly: 
+       (foreach startupFn in startupFnNames
+           where (null? (lookup-function startupFn))
+           do (within-module (home-module startupFn)
+                (define-method-from-parse-tree
+                  (bquote (DEFUN & startupFn () :public? TRUE)))))
+       ;; assemble the startup function call sequence:
+       (let ((startupFnCalls NIL))
+         (foreach startupFn in startupFnNames
+             collect (bquote (& startupFn)) into startupFnCalls)
+         (pushq startupForms
+                (bquote
+                 (STARTUP-TIME-PROGN
+                  (foreach phase in (interval (phase-to-integer :early-inits)
+                                              (phase-to-integer :final))
+                      do (setq *startup-time-phase* phase)
+                         && startupFnCalls)
+                  (setq *startup-time-phase* 999)))))))
+
+     (special ((*printReadably?* TRUE)
+               (*printPretty?* TRUE))
+       ;; Printing parse trees instead of strings will make sure we'll get
+       ;;    symbol module information right relative to the system module:
+       (foreach form in (reverse startupForms)
+           do (print-stream outputStream form EOL EOL)))
+     (free outputStream))) )
+
+
+  ;;
+;;;;;; Definition of STELLA system
+  ;;
+
+(defun make-stella ((forceRecompilation? BOOLEAN))
+  ;; Translate, compile and load all out-of-date stella files
+  ;; If forceRecompilation? is TRUE, retranslate/recompile the entire system.
+  (make-system "STELLA" :common-lisp
+               :force-translation? forceRecompilation?
+               :development-settings? FALSE))
+
+
+  ;;
+;;;;;; Support for runtime configuration via Java-style property files
+  ;;
+
+(defun (parse-configuration-file-line STRING-WRAPPER WRAPPER) ((line STRING))
+  ;; Parse the configuration file `line' and return its property name and value.
+  ;; Return NULL for empty, commented or illegal lines.
+  ;; Assumes Java-style configuration file syntax.
+  (let ((start 0)
+        (hashPos (position line #\# 0))
+        (equalPos (position line #\= 0))
+        (end equalPos)
+        (length (length line))
+        (property STRING NULL)
+        (valueString STRING NULL)
+        (value OBJECT NULL))
+    (when (forall i in (interval 0 (1- (choose (defined? hashPos) hashPos length)))
+              always (white-space-character? (nth line i)))
+      ;; we have a commented or blank line:
+      (return NULL NULL))
+    (when (or (null? equalPos)
+              (= equalPos 0))
+      (warn "Illegal line in configuration file: " line)
+      (return NULL NULL))
+    (while (white-space-character? (nth line start))
+      (++ start))
+    (while (white-space-character? (nth line (1- end)))
+      (-- end))
+    (when (<= end start)
+      (warn "Illegal property in configuration file: " line)
+      (return NULL NULL))
+    (setq property (subsequence line start end))
+    ;; anything after the `=' is considered part of the value:
+    (setq valueString (subsequence line (1+ equalPos) length))
+    (cond ((string-equal? valueString "TRUE")
+           (setq value TRUE-WRAPPER))
+          ((string-equal? valueString "FALSE")
+           (setq value FALSE-WRAPPER))
+          (otherwise
+           (exception-case
+               ;; parse numbers:
+               (typecase (setq value (read-s-expression-from-string valueString))
+                 ((INTEGER-WRAPPER FLOAT-WRAPPER) NULL)
+                 (otherwise
+                  (setq value valueString)))
+             (READ-EXCEPTION ()
+               (setq value valueString)))))
+    (return property value)))
+
+(deftype CONFIGURATION-TABLE (KEY-VALUE-LIST OF STRING-WRAPPER WRAPPER))
+
+(defglobal *system-configuration-table* CONFIGURATION-TABLE
+           (new CONFIGURATION-TABLE))
+
+(defun (load-configuration-file CONFIGURATION-TABLE) ((file FILE-NAME))
+  :documentation
+  "Read a configuration `file' and return its content as a configuration table.
+Also enter each property read into the global system configuration table.
+Assumes Java-style property file syntax.  Each property name is represented
+as a wrapped string and each value as a wrapped string/integer/float or boolean."
+  :public? TRUE
+  (let ((configuration (new KEY-VALUE-LIST)))
+    (foreach line in (lines (new FILE-INPUT-STREAM :filename file))
+        do (mv-bind (key value)
+               (parse-configuration-file-line line)
+             (when (defined? key)
+               (insert-at configuration key value)
+               (insert-at *system-configuration-table* key value))))
+    (return configuration)))
+
+(defun (lookup-configuration-property WRAPPER)
+    ((property STRING) (defaultValue WRAPPER) (configuration CONFIGURATION-TABLE))
+  :documentation "Lookup `property' in `configuration' and return its value.
+Use the global system configuration table if `configuration' is NULL.  Return
+`defaultValue' if `property' is not defined."
+  :public? TRUE
+  (when (null? configuration)
+    (setq configuration *system-configuration-table*))
+  (let ((value (lookup configuration property)))
+    (if (defined? value)
+        (return value)
+      (return defaultValue))))
+
+(defun (set-configuration-property WRAPPER)
+    ((property STRING) (value WRAPPER) (configuration CONFIGURATION-TABLE))
+  :documentation "Set `property' in `configuration' to `value' and return it.
+Use the global system configuration table if `configuration' is NULL."
+  :public? TRUE
+  (when (null? configuration)
+    (setq configuration *system-configuration-table*))
+  (insert-at configuration property value)
+  (return value))
+
+(defun configure-stella ((file FILE-NAME))
+  :documentation "Perform STELLA run-time configuration.  If supplied, load the
+configuration file `file' first which should be supplied with a physical pathname."
+  :public? TRUE
+  (when (and (defined? file)
+             (probe-file? file))
+    (load-configuration-file file))
+  (define-logical-host-property
+    "PL" :ROOT-DIRECTORY
+    (lookup-configuration-property "PowerLoomRootDirectory" NULL NULL)))

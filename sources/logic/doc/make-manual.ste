@@ -1,0 +1,107 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                          ;
+;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 2001 - 2002            ; 
+;  University of Southern California, Information Sciences Institute       ;
+;  4676 Admiralty Way                                                      ;
+;  Marina Del Rey, California 90292                                        ;
+;                                                                          ;
+;  This software was developed under the terms and conditions of Contract  ;
+;  No. N00014-94-C-0245 between the Defense Advanced Research Projects     ;
+;  Agency and the University of Southern California, Information Sciences  ; 
+;  Institute.  Use and distribution of this software is further subject    ;
+;  to the provisions of that contract and any other agreements developed   ;
+;  between the user of the software and the University of Southern         ;
+;  California, Information Sciences Institute.  It is supplied "AS IS",    ;
+;  without any warranties of any kind.  It is furnished only on the basis  ;
+;  that any party who receives it indemnifies and holds harmless the       ;
+;  parties who furnish and originate it against any claims, demands, or    ;
+;  liabilities connected with using it, furnishing it to others or         ;
+;  providing it to a third party.  THIS NOTICE MUST NOT BE REMOVED FROM    ;
+;  THE SOFTWARE, AND IN THE EVENT THAT THE SOFTWARE IS DIVIDED, IT SHOULD  ;
+;  BE ATTACHED TO EVERY PART.                                              ;
+;                                                                          ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: make-manual.ste,v 1.8 2003/08/22 22:59:59 tar Exp
+
+;;; PowerLoom manual specification
+
+;;; USAGE: simply CL:load this file into a Lisp version of PowerLoom
+;;;    (don't translate it first) and then call `(make-powerloom-manual)'.
+;;;    Once that is done, run the Unix `make' in the `.../doc' directory.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+(startup-time-progn
+  (when (not (system-loaded? "utilities"))
+    (make-system "utilities" :common-lisp)))
+
+(defglobal *powerloom-manual-excluded-objects* CONS
+  (bquote (("PL:sources;logic;doc;excluded.texi"
+            )
+           )))
+
+(defun UTILITIES/texinfo-describe-named-description
+    ((relation NAMED-DESCRIPTION) (stream OUTPUT-STREAM))
+  ;; Texinfo documentation handler/generator for NAMED-DESCRIPTION's.
+  ;; See `utilities/manual-describe-object' for handler syntax.
+  (within-module (home-context relation)
+    (let ((type "Relation "))
+      (cond
+       ((class? relation) (setq type "Concept "))
+       ((function? relation) (setq type "Function ")))
+      (print-stream
+       stream 
+       "@deffn " type
+       (UTILITIES/yield-texinfo-bare-name (relation-name relation))
+       " "))
+    ;; List arguments:
+    (print-stream stream "(")
+    (let ((parameter-names (io-variable-names relation))
+          (parameter-types (io-variable-types relation)))
+      (cond
+       ((class? relation)
+        (let ((super (first (all-direct-superrelations relation TRUE))))
+          (when (defined? super)
+            (setq parameter-types (list (surrogate-value-inverse super))))))
+       ((function? relation)
+        (setq parameter-names (listify (but-last parameter-names)))
+        (setq parameter-types (listify (but-last parameter-types)))))
+      (let ((n-of-arguments (length parameter-names)))
+        (foreach p-name in parameter-names
+            as p-type in parameter-types
+            as i in (interval 1 NULL)
+            do (UTILITIES/texinfo-describe-type-declaration
+                p-name p-type stream)
+               (when (< i n-of-arguments)
+                 (print-stream stream " ")))
+        (print-stream stream ")")
+        (when (function? relation)
+          (print-stream stream " :-> ")
+          (UTILITIES/texinfo-describe-type-declaration
+           (last (io-variable-names relation)) 
+           (last (io-variable-types relation))
+           stream))
+        (print-stream stream EOL)
+        (UTILITIES/texinfo-describe-documentation-string
+         relation
+         (access-binary-value relation pl-kernel/@documentation)
+         stream parameter-names)
+        (print-stream stream "@end deffn" EOL)))))
+
+(defun make-powerloom-manual ()
+  ;; Hack, by generating a manual for the excluded objects, we register
+  ;;    all those functions as documented and hence exclude them in
+  ;;    the template generation phase.
+  (UTILITIES/generate-manual *powerloom-manual-excluded-objects*)
+  (UTILITIES/generate-manual-from-template
+   ;; hack: logical pathnames eat the second extension as a version number:
+   (concatenate
+     (translate-logical-pathname "PL:sources;logic;doc;manual.texi") ".in")
+   "PL:sources;logic;doc;manual.texi"))

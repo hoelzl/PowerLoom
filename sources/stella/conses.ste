@@ -1,0 +1,1159 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: conses.ste,v 1.85 2003/09/30 00:37:52 hans Exp
+
+;;; Procedures that manipulate cons lists.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; We implement the Stella analogue of Lisp lists, which we
+;;;    call "cons lists".
+
+  ;;
+;;;;;; `cons' predicates
+  ;;
+
+;;; Declare and create NIL by hand:
+(defglobal NIL CONS NULL :public? TRUE)
+(startup-time-progn :early-inits
+ (unless (defined? NIL)
+   (setq NIL (make CONS))
+   (setf (value NIL) NULL)
+   (setf (rest NIL) NIL))
+ ;; Use CL:NIL if we are using Lisp conses to implement STELLA conses:
+ (verbatim
+   :common-lisp
+   (CL:when (CL:consp NIL)
+     (setq NIL CL:NIL))
+   :otherwise NULL))
+
+(defmethod (empty? BOOLEAN) ((self CONS))
+  :documentation "Return `true' iff `self' equals `nil'."
+  :public? TRUE :globally-inline? TRUE
+  (return (eq? self NIL)) )
+
+(defmethod (non-empty? BOOLEAN) ((self CONS))
+  :documentation "Return `true' iff `self' is not equal to `nil'."
+  :public? TRUE :globally-inline? TRUE
+  (return (not (eq? self NIL))) )
+
+(defun (nil? BOOLEAN) ((x OBJECT))
+  :documentation "Return `true' iff `x' equals `nil'."
+  :public? TRUE :globally-inline? TRUE
+  (return (eq? x NIL)) )
+
+
+  ;;
+;;;;;; `cons' Lists
+  ;;
+
+(defmethod (length INTEGER) ((self CONS))
+  :documentation "Return the length of the CONS list `self'."
+  :public? TRUE
+  (let ((cons self)
+        (i 0))
+    (while (non-empty? cons)
+      (++ i)
+      (setq cons (rest cons)))
+    (return i) ))
+
+(defmethod (position INTEGER) ((self CONS) (object OBJECT) (start INTEGER))
+  :documentation "Return the position of `object' within the cons-list
+`self' (counting from zero); or return `null' if `object' does not occur within 
+`self' (uses an `eql?' test).  If `start' was supplied as non-`null', only 
+consider the sublist starting at `start', however, the returned position 
+will always be relative to the entire list."
+  :public? TRUE
+  (when (null? start)
+    (setq start 0))
+  (foreach element in (nth-rest self start)
+           as position in (interval start NULL)
+           where (eql? element object)
+           do (return position))
+  (return NULL))
+
+;;; OPTIMIZATION NOTE: WE MAY WISH TO DEFINE VERSIONS OF THIS THAT
+;;;    SUBSTITUTE A FASTER EQUALITY TEST WHEN THE TYPE OF `object'
+;;;    IS STATICALLY DETERMINABLE TO WARRANT AN `EQ?' TEST:
+(defmethod (member? BOOLEAN) ((self CONS) (object OBJECT))
+  :documentation "Return `true' iff `object' is a member of the cons list
+`self' (uses an `eql?' test)."
+  :public? TRUE
+  (if (or (null? object)
+          (standard-object? object))
+      (foreach i in self
+          where (eq? i object)
+          do (return TRUE))
+    (foreach i in self
+        where (eql? i object)
+        do (return TRUE)))
+  (return FALSE) )
+
+(defmethod (memb? BOOLEAN) ((self CONS) (object OBJECT))
+  :documentation "Return `true' iff `object' is a member of the cons list
+`self' (uses an `eq?' test)."
+  :public? TRUE
+  (foreach i in self
+           where (eq? i object)
+           do (return TRUE))
+  (return FALSE) )
+
+(defun (cons CONS) ((value OBJECT) (rest CONS))
+  :documentation "Return a cons record that points to `value' and `rest'."
+  :public? TRUE
+  (let ((cons (make CONS)))
+    (setf (value cons) value)
+    (setf (rest cons) rest)
+    (return cons) ))
+
+(defmethod (remove (LIKE self)) ((self CONS) (value OBJECT))
+  :public? TRUE
+  :documentation "Destructively remove all entries in the cons list `self' that
+match `value'.  Unless the remaining list is `nil', insure that the cons that
+heads the list is unchanged."
+  ;; Strategy: Skip removing the first cons until all other matching entries
+  ;;    have been eliminated.  Then remove the first cons if it matches.
+  ;; TO DO: UPGRADE THIS TO ALLOW PARAMETRIC TESTS -- RIGHT NOW IT USES
+  ;;    AN "eql?" TEST.
+  (let ((cons self)
+        (previousCons CONS NULL))
+    (when (non-empty? cons)
+      (when (non-empty? (rest cons))
+        (setq previousCons cons)
+        (setq cons (rest cons))
+        (while (non-empty? cons)
+          (if (eql? (value cons) value)
+            (progn
+              (setf (rest previousCons) (rest cons))
+              (setq cons (rest cons)))
+            (progn
+              (setq previousCons cons)
+              (setq cons (rest cons))))))
+      ;; now check the first cons:
+      (when (eql? (value self) value)
+        (when (empty? (rest self))
+          (return NIL))
+        ;; shift second value to first place, and remove the second cons:
+        (setq cons (rest self))
+        (setf (value self) (value cons))
+        (setf (rest self) (rest cons))))
+    (return self) ))
+
+(defmethod (remove-if (LIKE self)) ((self CONS) (test? FUNCTION-CODE))
+  :public? TRUE
+  :documentation "Destructively removes all members of the cons list
+`self' for which `test?' evaluates to `true'.  `test' takes a single 
+argument of type OBJECT and returns `true' or `false'.  Returns a cons list.
+In case the first element is removed, the return result should be
+assigned to a variable."
+  (let ((cursor self)
+        (trailer CONS NULL))
+    ;; remove all deleted members except for the first one:
+    (while (not (eql? cursor NIL))
+      (if (and (funcall test? (value cursor))
+               (defined? trailer))
+        (progn
+          ;; unlink `cursor' entry:
+          (setf (rest trailer) (rest cursor))
+          (setq cursor (rest trailer)))
+        (progn
+          (setq trailer cursor)
+          (setq cursor (rest cursor)))))
+    ;; if the first member satisfies `test?', remove it:
+    (setq cursor self)
+    (when (and (non-empty? cursor)
+               (funcall test? (value cursor)))
+      (setq trailer (rest cursor))      ; point to new head of list
+      (return trailer))
+    (return self) ))
+
+(defglobal *remove-duplicates-crossover-point* INTEGER 20
+   :documentation "Point where we switch from using a quadratic remove
+duplicates algorithm to a linear one using a hash table.  For
+an unoptimized Common Lisp, 20 is a good crossover point.")
+
+(defmethod (remove-duplicates (LIKE self)) ((self CONS))
+  :public? TRUE
+  :documentation "Destructively remove duplicates from `self' and return the
+result.  Removes all but the first occurrence of items in the list.
+Preserves the original order of the remaining members.  Runs in linear time."
+   (if (> (length self) *remove-duplicates-crossover-point*)
+       (return (remove-duplicates-from-long-list self))
+     (let ((cursor self)
+           (rest CONS NULL))
+       (while (non-empty? cursor)
+         (setq rest (rest cursor))
+         (when (member? rest (value cursor))
+           (setq rest (remove rest (value cursor)))
+           (setf (rest cursor) rest))
+         (setq cursor rest))
+       (return self) )))
+
+(defun (remove-duplicates-from-long-list (LIKE self)) ((self CONS))
+  ;; Removes duplicates in (close to) linear time using a hash strategy.
+ ;;;; IMPROVED: WORKS WITHOUT STRINGIFICATION AND MINIMAL HASHING AND WORKS
+ ;;;;    AROUND A PERFORMANCE BUG WITH ACL HASH TABLES.
+  (let ((tableSize
+         ;; we shoot for buckets with (at worst) around 5 items:
+         (ceiling (* (length self) 0.3)))
+        ;; this table consumes only about 10% of the space of `self' (assuming
+        ;;    three pointers per cons cell) which is small compared to the
+        ;;    space consumed by the buckets in a list without duplicates:
+        (table (new (ARRAY () OF CONS) :size tableSize))
+        (cursor self)
+        (item OBJECT NULL)
+        (bucket CONS NULL)
+        (bucketIndex INTEGER 0))
+    (foreach i in (interval 0 (1- tableSize))
+        do (setf (aref table i) NIL))
+    (while (non-empty? cursor)
+      (setq item (value cursor))
+      (setq bucketIndex (rem (hash-code item) tableSize))
+      (setq bucket (aref table bucketIndex))
+      (if (exists it in bucket
+            where (eql? it item))
+          (setf (value cursor) NULL)
+        (setf (aref table bucketIndex) (cons item bucket)))
+      (setq cursor (rest cursor)))
+    (return (remove self NULL))))
+
+(defmethod (concatenate CONS)
+    ((list1 CONS) (list2 CONS) &rest (otherLists CONS))
+  :public? TRUE
+  :documentation "Return a cons list consisting of the concatenation of 
+`list1', `list2', and `otherLists'.  The operation is destructive wrt all
+but the last list argument which is left intact.  The two mandatory
+parameters allow us to optimize the common binary case by not relying on
+the somewhat less efficient variable arguments mechanism."
+  (if (empty? list1)
+      (setq list1 list2)
+    (if (empty? list2)
+        (setq list2 list1)
+      (setf (rest (last-cons list1)) list2)))
+  (when (> (length otherLists) 0)
+    (foreach list in otherLists
+        where (non-empty? list)
+        do (if (non-empty? list2)
+               (setf (rest (last-cons list2)) list)
+             (setq list1 list))
+           (setq list2 list)))
+  (return list1))
+
+;; NOTHING CALLS THIS:
+(defmethod (prepend CONS) ((self CONS) (list1 CONS))
+  :documentation "Return a cons list consisting of the concatenation of
+`list1' and `self'.  A copy of `list1' is prepended to `self'.  This
+operation results in structure sharing of `self'; to avoid this, `self'
+should not be pointed to by anything other than the tail of the prepended
+copy."
+  (when (empty? list1)
+    (return self))
+  (let ((copy1 (copy-cons-list list1)))
+    (concatenate copy1 self)
+    (return copy1) ))
+
+(defmethod (reverse (LIKE self)) ((self CONS))
+  :documentation "Destructively reverse the members of the cons list `self'."
+  :public? TRUE
+  (when (empty? self) (return self))         ; empty list
+  (let ((reversedConsList self)
+        (remainingConsList CONS (rest reversedConsList))
+        (detachedCons CONS NULL))
+    (when (empty? remainingConsList) (return reversedConsList))  ;; singleton list
+    (setf (rest reversedConsList) NIL)
+    (while (non-empty? remainingConsList)
+      (setq detachedCons remainingConsList)
+      (setq remainingConsList (rest remainingConsList))
+      (setf (rest detachedCons) reversedConsList)
+      (setq reversedConsList detachedCons))
+    (return reversedConsList) ))
+
+(defmethod (substitute CONS) ((self CONS) (inValue OBJECT) (outValue OBJECT))
+  :documentation "Destructively replace each appearance of `outValue' by
+`inValue' in the cons list `self'."
+  :public? TRUE
+  (let ((cursor self))
+    (while (non-empty? cursor)
+      (when (eql? (value cursor) outValue)
+        (setf (value cursor) inValue))
+      (setq cursor (rest cursor)))
+    (return self) ))
+
+(defun (map-NULL-to-NIL CONS) ((self CONS))
+  :documentation "Return `nil' iff `self' is `null' or `self' otherwise."
+  :public? TRUE :globally-inline? TRUE
+  (return (choose (null? self) NIL self)))
+
+
+  ;;
+;;;;;; `first', `second', etc.
+  ;;
+
+(defmethod (first (LIKE (any-value self))) ((self CONS))
+  :documentation "Return the first element of `self'.  The first element
+of `self' can be set with `setf'.  Note that '(first NIL)' = `null'."
+  :public? TRUE :globally-inline? TRUE
+  (return (value self)) )
+
+(defmethod (second (LIKE (any-value self))) ((self CONS))
+  :documentation "Return the second element of `self'.  The second element
+of `self' can be set with `setf'.  Note that '(second NIL)' = `null'."
+  :public? TRUE :globally-inline? TRUE
+  (return (value (rest self))))
+
+(defmethod (third (LIKE (any-value self))) ((self CONS))
+  :documentation "Return the third element of `self'.  The third element
+of `self' can be set with `setf'.  Note that '(third NIL)' = `null'."
+  :public? TRUE :globally-inline? TRUE
+  (return (value (rest (rest self)))))
+
+(defmethod (fourth (LIKE (any-value self))) ((self CONS))
+  :documentation "Return the fourth element of `self'.  The fourth element
+of `self' can be set with `setf'.  Note that '(fourth NIL)' = `null'."
+  :public? TRUE
+  (return (value (rest (rest (rest self))))))
+
+(defmethod (fifth (LIKE (any-value self))) ((self CONS))
+  :documentation "Return the fifth element of `self'.  The fifth element
+of `self' can be set with `setf'.  Note, that '(fifth NIL)' = `null'."
+  :public? TRUE
+  (return (value (rest (rest (rest (rest self)))))))
+
+(defmethod (nth (LIKE (any-value self))) ((self CONS) (position INTEGER))
+  :documentation "Return the element of `self' at `position'.  The nth element
+of `self' can be set with `setf'.  Note, that '(nth NIL <pos>)' = `null'."
+  :public? TRUE
+  (let ((i -1))
+    (foreach value in self
+             where (eq? (++ i) position)
+             do
+             (return value))
+    (return NULL) ))
+
+(defmethod (nth-rest (LIKE self)) ((self CONS) (position INTEGER))
+  :documentation "Apply `rest' `position' times to `self'."
+  :public? TRUE
+  (when (< position 0)
+    (return NULL))
+  (let ((cursor self))
+    (foreach i in (interval 1 position)
+	do (ignore i) 
+	   (setq cursor (rest cursor))
+	   (when (empty? cursor) (return NIL)))
+    (return cursor) ))
+
+(defun (last-cons (CONS OF (LIKE (any-value self)))) ((self CONS))
+  :documentation "Return the last cons of `self'."
+  :public? TRUE
+  (while (not (eq? (rest self) NIL))
+    (setq self (rest self)))
+  (return self))
+
+(defmethod (last (LIKE (any-value self))) ((self CONS))
+  :documentation "Return the last element of `self'."
+  :public? TRUE
+  (return (value (last-cons self))))
+
+(defmethod (first-setter (LIKE (any-value self)))
+    ((self CONS) (value (LIKE (any-value self))))
+  :public? TRUE
+  (when (empty? self)
+    (warn "Can't apply first setter to empty list.")
+    (return NULL))
+  (return (setf (value self) value)) )
+
+(defmethod (second-setter (LIKE (any-value self)))
+    ((self CONS) (value (LIKE (any-value self))))
+  :public? TRUE
+  (when (empty? (rest self))
+    (warn "'second setter' applied to too short cons list.")
+    (return NULL))
+  (return (setf (value (rest self)) value)) )
+  
+(defmethod (third-setter (LIKE (any-value self)))
+    ((self CONS) (value (LIKE (any-value self))))
+  :public? TRUE
+  (let ((thirdCons (rest (rest self))))
+    (if (non-empty? thirdCons)
+      (return (setf (value thirdCons) value))
+      (progn
+        (warn "'third setter' applied to too short cons list.")
+        (return NULL))) ))
+
+(defmethod (nth-setter (LIKE (any-value self)))
+    ((self CONS) (value (LIKE (any-value self))) (position INTEGER))
+  :public? TRUE
+  (when (< position 0)
+    (warn "Can't apply nth setter to negative position " position ".")
+    (return NULL))
+  (let ((cursor self))
+    (foreach i in (interval 1 position)
+             do
+             (ignore i)
+             (setq cursor (rest cursor))
+             (when (empty? cursor)
+               (warn "'nth setter' ran off end of cons list.")
+               (return NULL)))
+    (setf (value cursor) value)
+    (return value) ))
+
+(defmethod (fourth-setter (LIKE (any-value self)))
+    ((self CONS) (value (LIKE (any-value self))))
+  :public? TRUE
+  (return (setf (nth self 3) value)) )
+
+(defmethod (fifth-setter (LIKE (any-value self)))
+    ((self CONS) (value (LIKE (any-value self))))
+  :public? TRUE
+  (return (setf (nth self 4) value)) )
+
+(defmethod (nth-rest-setter OBJECT)
+           ((self CONS) (value OBJECT) (position INTEGER))
+  :public? TRUE
+  (when (<= position 0)
+    (warn "Can't apply nth-rest setter to negative position "
+          position "."))
+  (let ((cursor self))
+    (foreach i in (interval 2 position)
+	do (ignore i)
+	   (setq cursor (rest cursor))
+	   (when (empty? cursor)
+	     (warn "'nth-rest setter' ran off end of cons list.")
+	     (return NULL)))
+    (setf (rest cursor) value)
+    (return value) ))
+  
+
+  ;;
+;;;;;; Iteration over CONS Lists
+  ;;
+
+(defmethod (allocate-iterator (CONS-ITERATOR OF (LIKE (any-value self))))
+    ((self CONS))
+  :public? TRUE
+  (let ((iterator (new CONS-ITERATOR)))
+    (setf (cons-iterator-cursor iterator) self)
+    (setf (first-iteration? iterator) TRUE)
+    (return iterator) ))
+
+(defun (terminate-cons-iterator? BOOLEAN) ((self CONS-ITERATOR))
+  :public? TRUE
+  (setf (cons-iterator-cursor self) NULL)
+  (return TRUE))
+
+(defmethod (next? BOOLEAN) ((self CONS-ITERATOR))
+  :public? TRUE
+  (if (first-iteration? self)
+    (setf (first-iteration? self) FALSE)
+    (setf (cons-iterator-cursor self) (rest (cons-iterator-cursor self))))
+  (setf (slot-value self value) (value (cons-iterator-cursor self)))
+  (return (non-empty? (cons-iterator-cursor self))) )
+
+(defmethod (empty? BOOLEAN) ((self CONS-ITERATOR) )
+  :public? TRUE
+  ;; Return `true' if `self' has no more elements.
+  (return (choose (first-iteration? self)
+                  (empty? (cons-iterator-cursor self))
+                  (empty? (rest (cons-iterator-cursor self))))))
+
+(defmethod (length INTEGER) ((self CONS-ITERATOR))
+  :documentation "Iterate over 'self', and count how many items there are."
+  :public? TRUE
+  (let ((count
+         (choose (first-iteration? self)
+                 (length (cons-iterator-cursor self))
+                 (length (rest (cons-iterator-cursor self))))))
+    ;; simulate iterator exhaustion:
+    (setf (cons-iterator-cursor self) NIL)
+    (return count)))
+
+(defmethod (member? BOOLEAN) ((self CONS-ITERATOR) (value OBJECT))
+  :public? TRUE
+  :documentation "Iterate over values of `self' and return TRUE
+if one of them is `eql?' to 'value."
+  (let ((result
+         (choose (first-iteration? self)
+                 (member? (cons-iterator-cursor self) value)
+                 (member? (rest (cons-iterator-cursor self)) value))))
+    ;; simulate iterator exhaustion:
+    (setf (cons-iterator-cursor self) NIL)
+    (return result)))
+
+(defmethod (value-setter OBJECT)
+    ((self CONS-ITERATOR) (value (LIKE (any-value self))))
+  :public? TRUE
+  (setf (value (cons-iterator-cursor self)) value)
+  (setf (slot-value self value) value)
+  (return value))
+
+(defun add-cons-to-end-of-cons-list ((self CONS) (lastCons CONS))
+  :public? TRUE
+  ;; Called by "foreach" code.
+  ;; Low-level routine that destructively attaches "lastCons" to the end
+  ;;    of the cons list "self".
+  ;; Assumes that "self" is non-null.
+  (while (non-empty? (rest self))
+    (setq self (rest self)))
+  (setf (rest self) lastCons) )
+
+(defun (but-last-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for 'CONS.but-last'.
+  :public? TRUE
+  (if (first-iteration? self)
+    (setf (first-iteration? self) FALSE)
+    (setf (iterator-cons-list self) (rest (iterator-cons-list self))))
+  (when (nil? (rest (iterator-cons-list self)))
+    (return FALSE))                     ; exit on last value
+  (setf (slot-value self value) (value (iterator-cons-list self)))
+  (return TRUE) )
+
+(defmethod (but-last (ITERATOR OF (LIKE (any-value self)))) ((self CONS))
+  :documentation "Generate all but the last element of the cons list `self'."
+  :public? TRUE
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-cons-list iterator) self)
+    (setf (first-iteration? iterator) TRUE)
+    (setf (iterator-next-code iterator)
+          (the-code :function but-last-next?))
+    (return iterator) ))
+
+
+  ;;
+;;;;;; `consify'
+  ;;
+
+(defmethod (consify (CONS OF (LIKE (any-value self)))) ((self CONS))
+  :documentation "Return `self'."
+  :public? TRUE
+  (return self) )
+
+(defmethod (consify (CONS OF (LIKE (any-value self)))) ((self LIST))
+  :documentation "Return a list of elements in `self'."
+  :public? TRUE
+  (return (the-cons-list self)) )
+
+(defmethod (consify (CONS OF (LIKE (any-value self)))) ((self KEY-VALUE-LIST))
+  :documentation "Return a list of key-value pairs in `self'."
+  :public? TRUE
+  (let ((result NIL))
+    (foreach (k v) in self
+             collect (cons k (cons v NIL)) into result)
+    (return result) ))
+
+(defmethod (consify (CONS OF (LIKE (any-value self)))) ((self VECTOR))
+  :documentation "Return a list of elements in `self'."
+  :public? TRUE
+  (let ((result NIL))
+    (foreach v in self collect v into result)
+    (return result) ))
+
+(defmethod (consify (CONS OF (LIKE (any-value self)))) ((self ITERATOR))
+  :documentation "Return a list of elements generated by `self'."
+  :public? TRUE
+  (let ((list NIL))
+    (foreach value in self do (pushq list value))
+    (return (reverse list)) ))
+
+(defmethod (consify CONS) ((self OBJECT))
+  :documentation "If `object' is a CONS, return it.  Otherwise, return
+a singleton cons list containing it."
+  :public? TRUE
+  (return (choose (cons? self) self (cons self NIL))) )
+
+
+  ;;
+;;;;;; `Deleted?' objects
+  ;;
+
+(defmethod (remove-deleted-members (LIKE self)) ((self CONS))
+  ;; Remove all members of `self' marked `deleted?'.
+  :public? TRUE
+  (let ((cursor self)
+        (trailer CONS NULL))
+    ;; remove all deleted members except for the first one:
+    (while (not (eql? cursor NIL))
+      (if (and (deleted? (value cursor))
+               (defined? trailer))
+        (progn
+          ;; unlink `cursor' entry:
+          (setf (rest trailer) (rest cursor))
+          (setq cursor (rest trailer)))
+        (progn
+          (setq trailer cursor)
+          (setq cursor (rest cursor)))))
+    ;; if the first member is marked deleted, remove it:
+    (when (and (non-empty? self)
+               (deleted? (value self)))
+      (return (rest self)))
+    (return self)))
+
+
+  ;;
+;;;;;; More cons functions
+  ;;
+
+(defun (copy-cons-list (LIKE self)) ((self CONS))
+  :documentation "Return a copy of the cons list `self'."
+  :public? TRUE
+  (when (empty? self)
+    (return NIL))
+  (let ((newConsList (cons (value self) NIL))
+        (nextCons newConsList)
+        (copyFromCons CONS NULL)
+        (previousCons CONS NULL))
+    (setq copyFromCons (rest self))
+    (while (non-empty? copyFromCons)
+      (setq previousCons nextCons)
+      (setq nextCons (cons (value copyFromCons) NIL))
+      (setf (rest previousCons) nextCons)
+      (setq copyFromCons (rest copyFromCons)))
+    (return newConsList) ))
+
+(defun (cons-list CONS) (&rest (values OBJECT))
+  :documentation "Return a cons list containing `values', in order."
+  :public? TRUE
+  (let ((list NIL))
+    (foreach v in values collect v into list)
+    (return list) ))
+
+(defun (list* CONS) (&rest (values OBJECT))
+  :documentation "Return a list of conses that make up the list `values',
+terminated by the last value rather than by `nil'.  Assumes that
+at least one value is passed in."
+  :public? TRUE
+  ;; Note: This is ridiculously slow, but it assumes that a C++
+  ;;    implementation can only extract values from a variable
+  ;;    argument list by iterating from start to finish, with no
+  ;;    way to test for termination before striking the end of the list.
+  ;;    To improve performance, the backquote code avoids this by
+  ;;    substituting `cons' for 'list*' whenever there are only two arguments.
+  (let ((headCons NIL)
+        (answer OBJECT NULL)
+        (lastCons CONS NULL))
+    (foreach v in values do (setq headCons (cons v headCons)))
+    (setq answer (reverse (rest headCons)))
+    (when (nil? answer)
+      (setq answer (value headCons))
+      (return answer))
+    (setq lastCons answer)
+    (while (non-empty? (rest lastCons))
+      (setq lastCons (rest lastCons)))
+    (setf (rest lastCons) (cast (value headCons) CONS))
+    (return answer) ))
+
+(defun (append CONS) ((consList1 CONS) (consList2 CONS))
+  :documentation "Return a cons list representing the concatenation
+of `consList1' and `consList2'.  The concatenation is NOT destructive."
+  :public? TRUE
+  (cond
+   ((empty? consList1) (return consList2))
+   ((empty? consList2) (return consList1))
+   (otherwise
+    (return (concatenate (copy-cons-list consList1) consList2)))))
+
+(defmethod (subset? BOOLEAN) ((self CONS) (otherList CONS))
+  :documentation
+  "Return true if every element of `self' also occurs in `otherList'.
+Uses an `eql?' test and a simple quadratic-time algorithm.  Note that
+this does not check whether `self' and `otherList' actually are sets."
+  :public? TRUE
+  (return (forall item in self
+	      always (member? otherList item))) )
+
+(defmethod (equivalent-sets? BOOLEAN) ((self CONS) (otherList CONS))
+  :documentation
+  "Return true if every element of `self' occurs in `otherList' and vice versa.
+Uses an `eql?' test and a simple quadratic-time algorithm.  Note that
+this does not check whether `self' and `otherList' actually are sets."
+  :public? TRUE
+  (return (and (eql? (length self) (length otherList))
+               (forall item in self
+                   always (member? otherList item)))) )
+
+(defmethod (intersection CONS) ((self CONS) (otherList CONS))
+  :documentation
+  "Return the set intersection of `self' and `otherList'.  Uses an `eql?'
+test and a simple quadratic-time algorithm.  Note that the result is only
+guaranteed to be a set if both `self' and `otherList' are sets."
+  :public? TRUE
+  (let ((list NIL))
+    (when (null? otherList)
+      (return list))
+    (foreach i in self
+        where (member? otherList i)
+        collect i into list)
+    (return list) ))
+
+(defmethod (union CONS) ((self CONS) (otherList CONS))
+  :documentation
+  "Return the set union of `self' and `otherList'.  Uses an `eql?' test
+and a simple quadratic-time algorithm.  Note that the result is only
+guaranteed to be a set if both `self' and `otherList' are sets."
+  :public? TRUE
+  (let ((list (copy-cons-list self))
+        (otherSurvivors NIL))
+    (when (null? otherList)
+      (return list))
+    (foreach i in otherList
+        where (not (member? list i))
+        collect i into otherSurvivors)
+    (return (concatenate list otherSurvivors)) ))
+
+(defmethod (difference CONS) ((self CONS) (otherList CONS))
+  :documentation
+  "Return the set difference of `self' and `otherList' (i.e., all elements
+that are in `self' but not in `otherSet').  Uses an `eql?' test and a simple
+quadratic-time algorithm.  Note that the result is only guaranteed to be a
+set if both `self' and `otherList' are sets."
+  :public? TRUE
+  (let ((list (copy-cons-list self)))
+    (when (null? otherList)
+      (return list))
+    (foreach i in otherList
+        where (member? list i)
+        do (setq list (remove list i)))
+    (return list) ))
+
+(defmethod (subtract CONS) ((self CONS) (otherList CONS))
+  :documentation
+  "Return the set difference of `self' and `otherList' by destructively
+removing elements from `self' that also occur in `otherList'.  Uses an `eql?'
+test and a simple quadratic-time algorithm.  Note that the result is only
+guaranteed to be a set if `self' is a set."
+  :public? TRUE
+  (when (null? otherList)
+    (return self))
+  (foreach i in otherList
+      where (member? self i)
+      do (setq self (remove self i)))
+  (return self) )
+
+
+
+;;; Sorting:
+
+(defmethod (sort (CONS OF (LIKE (any-value self))))
+    ((self CONS) (predicate FUNCTION-CODE))
+  :public? TRUE
+  :documentation "Perform a stable, destructive sort of `self' according to
+`predicate', and return the result.  If `predicate' has a '<' semantics, the
+result will be in ascending order.  It is not guaranteed that `self' will
+point to the beginning of the sorted result.  If `predicate' is `null', a
+suitable '<' predicate is chosen depending on the first element of `self',
+and it is assumed that all elements of `self' have the same type (supported
+element types are GENERALIZED-SYMBOL, STRING, INTEGER, and FLOAT)."
+  (when (null? predicate)
+    (setq predicate (choose-sort-predicate self)))
+  (return (help-sort-cons-list self (length self) predicate)))
+
+(defun (help-sort-cons-list CONS)
+    ((list CONS) (length INTEGER) (predicate FUNCTION-CODE))
+  ;; Sort `list' whose length is `length' according to `predicate'.
+  (when (< length 2)
+    (return list))
+  (let ((frontLength (floor (/ length 2)))
+        (temp list)
+        (back NIL))
+    ;; Avoid a method call to `nth-rest':
+    (foreach i in (interval 2 frontLength)
+        do (ignore i)
+	   (setq temp (rest temp)))
+    (setq back (rest temp))
+    (setf (rest temp) NIL)
+    (return
+      (merge-cons-lists
+       (help-sort-cons-list list frontLength predicate)
+       (help-sort-cons-list back (- length frontLength) predicate)
+       predicate))))
+
+(defun (merge-cons-lists CONS)
+    ((list1 CONS) (list2 CONS) (predicate FUNCTION-CODE))
+  ;; Destructively merge the sorted lists `list1' and `list2' according
+  ;;    to `predicate' and return the result.
+  (let ((cursor1 list1)
+        (cursor2 list2)
+        (result NIL)
+        (tail NIL)
+        (temp NIL))
+    (loop
+      (when (eql? cursor1 NIL)
+        (when (eql? tail NIL)
+          (return cursor2))
+        (setf (rest tail) cursor2)
+        (return result))
+      (when (eql? cursor2 NIL)
+        (when (eql? tail NIL)
+          (return cursor1))
+        (setf (rest tail) cursor1)
+        (return result))
+      (cond ((funcall predicate (value cursor2) (value cursor1))
+             (setq temp cursor2)
+             (setq cursor2 (rest cursor2))
+             (setq list2 cursor2))
+            (otherwise
+             (setq temp cursor1)
+             (setq cursor1 (rest cursor1))
+             (setq list1 cursor1)))
+      (if (eql? tail NIL)
+          (setq result temp)
+        (setf (rest tail) temp))
+      (setq tail temp))))
+
+(defun (generalized-symbol-less-than? BOOLEAN)
+    ((x GENERALIZED-SYMBOL) (y GENERALIZED-SYMBOL))
+  :public? TRUE
+  (return (string< (symbol-name x) (symbol-name y))))
+
+(defun (wrapped-integer-less-than? BOOLEAN)
+    ((x INTEGER-WRAPPER) (y INTEGER-WRAPPER))
+  :public? TRUE
+  (return (< (wrapper-value x) (wrapper-value y))))
+
+(defun (wrapped-float-less-than? BOOLEAN)
+    ((x FLOAT-WRAPPER) (y FLOAT-WRAPPER))
+  :public? TRUE
+  (return (< (wrapper-value x) (wrapper-value y))))
+
+(defun (wrapped-string-less-than? BOOLEAN)
+    ((x STRING-WRAPPER) (y STRING-WRAPPER))
+  :public? TRUE
+  (return (string< (wrapper-value x) (wrapper-value y))))
+
+(defun (wrapped-mutable-string-less-than? BOOLEAN)
+    ((x MUTABLE-STRING-WRAPPER) (y MUTABLE-STRING-WRAPPER))
+  :public? TRUE
+  (return (string< (wrapper-value x) (wrapper-value y))))
+
+(defun (choose-sort-predicate FUNCTION-CODE) ((self CONS))
+  ;; Choose a '<' sorting function for `self' based on the type of the
+  ;;    first element and return the result.
+  (let ((firstElement (value self)))
+    (when (null? firstElement)
+      (return NULL))
+    (typecase firstElement
+      (GENERALIZED-SYMBOL
+       (return (the-code :function generalized-symbol-less-than?)))
+      (INTEGER-WRAPPER
+       (return (the-code :function wrapped-integer-less-than?)))
+      (FLOAT-WRAPPER
+       (return (the-code :function wrapped-float-less-than?)))
+      (STRING-WRAPPER 
+       (return (the-code :function wrapped-string-less-than?)))
+      (MUTABLE-STRING-WRAPPER
+       (return (the-code :function wrapped-mutable-string-less-than?)))
+      (otherwise
+       (error "choose-sort-predicate: Don't know how to sort "
+              (primary-type firstElement) "s")))))
+
+#|
+(defun (generate-test-list CONS) ((n INTEGER))
+  (let ((result NIL))
+    (foreach i in (interval 1 n)
+        collect (wrap-literal (random n)) into result)
+    (return result)))
+
+(defglobal *test-list* CONS (generate-test-list 10000))
+(sort *test-list* NULL) ;; takes about 1 sec; Lisp takes 0.2
+|#
+
+  ;;
+;;;;;; Cons tree and parse tree functions
+  ;;
+
+(defun (search-cons-tree? BOOLEAN) ((tree OBJECT) (value OBJECT))
+  :documentation "Return `true' iff the value `value' is embedded within
+the cons tree `tree'.  Uses an `eql?' test."
+  :public? TRUE
+  (typecase tree
+    (CONS (if (nil? tree)
+              (return (nil? value))
+            (return (or (search-cons-tree? (value tree) value)
+                        (search-cons-tree? (rest tree) value)))))
+    (otherwise (return (eql? tree value)))))
+
+(defun (search-cons-tree-with-filter? BOOLEAN) 
+    ((tree OBJECT) (value OBJECT) (filter CONS))
+  :documentation "Return `true' iff the value `value' is embedded within
+the cons tree `tree'.  Uses an `eql?' test.  Does not descend into any
+cons whose first element matches an element of `filter'."
+  :public? TRUE
+  (typecase tree
+    (CONS (cond ((nil? tree)
+		 (return (nil? value)))
+		((member? filter (value tree))
+		 (return FALSE))
+		(otherwise
+		 (return (exists item in tree
+			     where (search-cons-tree-with-filter? item value filter))))))
+    (otherwise (return (eql? tree value)))))
+
+(defun (copy-cons-tree (LIKE self)) ((self OBJECT))
+  :documentation "Return a copy of the cons tree `self'."
+  :public? TRUE
+  (typecase self
+    (CONS (if (nil? self)
+              (return NIL)
+            (return (cons (copy-cons-tree (value self))
+                          (copy-cons-tree (rest self))))))
+    (otherwise (return self))))
+
+
+(defun (equal-cons-trees? BOOLEAN) ((tree1 OBJECT) (tree2 OBJECT))
+  :documentation "Return `true' iff the cons trees `tree1' and `tree2' are
+structurally equivalent.  Uses an `eql?' test."
+  :public? TRUE
+  (if (eql? tree1 tree2)
+      (return TRUE)
+    (typecase tree1
+      (CONS (typecase tree2
+              (CONS (return
+                      (and (equal-cons-trees? (value tree1) (value tree2))
+                           (equal-cons-trees? (rest tree1) (rest tree2)))))
+              (otherwise
+               (return FALSE))))
+      (otherwise
+       (return FALSE)))))
+
+(defmethod (object-equal? BOOLEAN) ((tree1 CONS) (tree2 OBJECT))
+  :documentation "Return `true' iff the cons trees `tree1' and `tree2' are
+structurally equivalent.  Uses `equal?' to test equality of subtrees."
+  :public? TRUE
+  (typecase tree2
+    (CONS
+     (while (non-empty? tree1)
+       (when (not (equal? (value tree1) (value tree2)))
+         (return FALSE))
+       (setq tree1 (rest tree1))
+       (setq tree2 (rest tree2)))
+     (return (empty? tree2)))
+    (otherwise
+     (return FALSE))))
+
+(defmethod (equal-hash-code INTEGER) ((self CONS))
+  :documentation "Return an `equal?' hash code for `self'.  Note that this
+is O(N) in the number of elements of `self'."
+  :public? TRUE
+  (let ((code 18589447)) ;; result of (hash-string "CONS" 0)
+    (loop
+      (when (empty? self)
+        (break))
+      (setq code (logxor code (safe-equal-hash-code (value self))))
+      (setq self (rest self))
+      ;; rotate right to take element ordering into account:
+      (setq code (rotate-hash-code code)))
+    (return code)))
+
+(defun (substitute-cons-tree OBJECT) ((tree OBJECT) (newValue OBJECT) (oldValue OBJECT))
+  :documentation "Destructively replace each appearance of `oldValue' by
+`newValue' in the cons tree `tree'.  Return the tree.  Uses an `eql?' test."
+  :public? TRUE
+  ;; CAUTION: Assumes that `tree' is a CONS at the top-level entry point.
+  (typecase tree
+    (CONS
+     (when (not (nil? tree))
+       (if (eql? (value tree) oldValue)
+           (setf (value tree) newValue)
+         (substitute-cons-tree (value tree) newValue oldValue))
+       (substitute-cons-tree (rest tree) newValue oldValue)))
+    (otherwise NULL))
+  (return tree) )
+
+
+  ;;
+;;;;;; print support for conses and parse trees:
+  ;;
+
+(defspecial *printPretty?* BOOLEAN TRUE
+  :documentation "If `true' conses will be pretty printed."
+  :public? TRUE)
+
+(defspecial *printReadably?* BOOLEAN FALSE
+  :documentation "If `true' conses will be printed as readable Stella code."
+  :public? TRUE)
+
+(defspecial *printLength* INTEGER NULL
+  :documentation "If non-NULL list-like data structures will print at most
+that many elements."
+  :public? TRUE)
+
+(defglobal ELIPSIS SYMBOL (quote |...|)
+  :documentation "Generates an elipsis '...' when found in a
+pretty-printed parse tree."
+  :public? TRUE)
+
+(defun print-cons ((tree CONS) (stream NATIVE-OUTPUT-STREAM)
+                   (lparen STRING) (rparen STRING))
+  ;; Print a cons `tree' just like a lisp list onto `stream'.
+  ;; Uses `lparen' and `rparen' to enclose `tree'.  Pretty-prints `tree'
+  ;;   if '*printPretty?*' is `true'.  Prints `tree' as readable Stella
+  ;;   code if '*printReadably?*' is `true'.
+  (when *printReadably?*
+    (setq lparen "(")
+    (setq rparen ")"))
+  (when *printPretty?*
+    ;; This only works for Lisp right now:
+    (pprint-cons tree stream lparen rparen)
+    (return))
+  (print-native-stream stream lparen)
+  (unless (empty? tree)
+    (print-native-stream stream (value tree))
+    (setq tree (rest tree))
+    (foreach element in tree
+        as i in (interval 2 *printLength*)
+        do (print-native-stream stream " ")
+           (print-native-stream stream element)
+           (setq tree (rest tree)))
+    (when (non-empty? tree)
+      (print-native-stream stream " ...")))
+  (print-native-stream stream rparen))
+
+(defun pprint-cons ((tree CONS) (stream NATIVE-OUTPUT-STREAM)
+                    (lparen STRING) (rparen STRING))
+  ;; Pretty-print a cons `tree' just like a lisp list onto `stream'.
+  ;; Uses `lparen' and `rparen' to enclose `tree'.
+  (verbatim
+      :common-lisp
+      "#-lispworks
+       (CL:let ((CL:*print-pretty* CL:t)
+                (CL:*print-length* (lispify *printLength*)))
+         (CL:write-string lparen stream)
+         (CL:pprint-linear stream (cons-list-to-lisp-list tree) CL-NIL)
+         (CL:write-string rparen stream))
+       #+lispworks
+        (CL:let ((*printPretty?* FALSE))
+          (print-cons tree stream lparen rparen))"
+      :otherwise
+      ;; We just print it plainly:
+      (special ((*printPretty?* FALSE))
+        (print-cons tree stream lparen rparen))))
+
+(defspecial *printPrettyCode?* BOOLEAN TRUE
+  :documentation "When `true' pretty-print Stella and translated code.
+Since (Lisp) pretty-printing is somewhat slow, turning this off speeds up
+file translation, but it also makes translated output very unreadable."
+  :public? TRUE)
+  
+(defun print-stella-code ((tree OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print `tree' as readable Stella code onto `stream'.
+  ;; Pretty-print if '*printPrettyCode?*' is `true'.
+  (special ((*printPretty?* *printPrettyCode?*)
+            (*printReadably?* TRUE))
+    (print-native-stream stream tree EOL)))
+
+(defun print-stella-definition ((tree OBJECT) (stream NATIVE-OUTPUT-STREAM))
+  :public? TRUE
+  ;; Print `tree' as readable Stella code onto `stream'.
+  ;; Pretty-print if '*printPrettyCode?*' is `true'.
+  ;; Assumes `tree' is a definition and formats it accordingly.
+  (special ((*printPretty?* *printPrettyCode?*)
+            (*printReadably?* TRUE))
+    (typecase tree
+      (CONS
+       (cond ((>= (length tree) 3)
+              (setq *printPretty?* FALSE)
+              (print-native-stream
+               stream "(" (first tree) " " (second tree) " " (third tree))
+              (setq *printPretty?* *printPrettyCode?*)
+              (foreach form in (nth-rest tree 3)
+                       do
+                       (print-native-stream stream EOL "  " form))
+              (print-native-stream stream ")"))
+             (otherwise
+              (print-native-stream stream tree))))
+      (otherwise
+       (print-native-stream stream tree)))
+    (print-native-stream stream EOL)))
+
+
+  ;;
+;;;;;; Looking for circularity
+  ;;
+
+;; Non-safe tree size:
+(defun (tree-size INTEGER) ((self OBJECT))
+  ;; Count conses in the tree `self'.
+  (typecase self
+    (CONS (if (nil? self)
+              (return 0)
+            (return (+ 1 (+ (tree-size (value self))
+                            (tree-size (rest self)))))))
+    (otherwise (return 0))))
+
+(defspecial *depthExceeded?* BOOLEAN FALSE)
+(defglobal *depthCutoff* INTEGER 33)
+
+;; IDEA: LIMIT BOTH DEPTH AND NUMBER OF DEPTH EXCEPTIONS
+;;    INDEPENDENT OF cutoff.
+;; TO DO: ADD ALREADY-VISITED LIST:
+(defun (safely-compute-tree-size INTEGER)
+       ((tree CONS) (depthCount INTEGER) (cutOff INTEGER))
+  ;; Compute tree size without breaking or looping forever.
+  (let ((count 1)
+        (value OBJECT NULL))
+    (when (> depthCount *depthCutoff*)
+      (setq *depthExceeded?* TRUE)
+      (return 1))
+    (loop
+      (setq value (value tree))
+      (when (cons? value)
+        (setq count (+ count
+                       (safely-compute-tree-size
+                        (value tree) (1+ depthCount) cutOff))))
+      (when (or (null? (rest tree))             ; catch bad link
+                (nil? (rest tree))
+                (> count cutOff))
+        (return count))
+      (setq tree (rest tree))) ))
+
+(defun (safe-tree-size INTEGER STRING) ((tree CONS))
+  (special ((*depthExceeded?* FALSE))
+     (let ((cutOff 99)
+           (size (safely-compute-tree-size tree 0 cutOff)))
+       (return size
+               (choose (or *depthExceeded?*
+                           (>= size cutOff))
+                   "CIRCULAR"
+                   "OK")))))

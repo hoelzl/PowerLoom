@@ -1,0 +1,2196 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: cl-translate.ste,v 1.135 2003/09/30 00:47:23 hans Exp
+
+;;; Stella parse tree to Common Lisp translator.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Utilities
+  ;;
+
+(defun (destructure-call-tree SYMBOL TYPE CONS) ((tree CONS))
+  ;; Destructure a call 'tree' that either calls a function, method,
+  ;;    or operator.
+  ;; Return the name of the operator, its owner (if a method), and the
+  ;;    list of arguments.
+  (case (first tree)
+    (SYS-CALL-FUNCTION
+     (return (second tree) NULL (rest (rest tree))))
+    (SYS-CALL-METHOD
+     (return (third tree) (second tree) (rest (rest (rest tree)))))
+    (otherwise
+     (return (first tree) NULL (rest tree)))))
+
+(defglobal *cl-operator-table* KEY-VALUE-LIST NULL
+  :documentation "Mapping from STELLA operators to Common-Lisp operators.")
+
+(startup-time-progn
+    ;; Need to initialize this explicitly, since during kernel startup
+    ;;    the class KEY-VALUE-LIST isn't available yet:
+    (setq *cl-operator-table*
+      (dictionary @KEY-VALUE-LIST
+                  (quote +) (quote CL:+)
+                  (quote -) (quote CL:-)
+                  (quote *) (quote CL:*)
+                  (quote /) (quote CL:/)
+                  (quote eq?) (quote CL:eql)
+                  (quote <) (quote CL:<)
+                  (quote <=) (quote CL:<=)
+                  (quote >=) (quote CL:>=)
+                  (quote >) (quote CL:>)
+                  (quote =) (quote CL:=)
+                  (quote !=) (quote CL:/=)
+                  )))
+
+
+;;; Using Lisp conses to implement STELLA conses:
+
+;;; TO DO:
+
+;;; - figure out how to link `*printPretty?*' with cl:*print-pretty* to control
+;;;      Lisp cons pretty-printing.  Currently, we avoid defining
+;;;      CL:cons.print-object to keep Lisp happy.
+;;; - there are some redefinitions when we go from a normal to a Lisp cons version,
+;;;      since one prints the empty list as `()' and the other as `CL:NIL'.
+;;; - figure out whether there is a better way to deal with the
+;;;      `(value NIL) == NULL' problem.  Right now we handle this with
+;;;      a slightly complicated `%%value' macro.  An alternative solution would
+;;;      be to change the semantics to `(value NIL) == NIL' to mirror Lisp.
+;;;      Might be hard to find all the affected places, though.
+;;; - Maybe use some Lisp functions directly to implement some of the
+;;;      stuff in `conses.ste', in particular, use `CL:cons' directly.
+;;; - Similarly, `stella-code-to-cons-tree' could be optimized (however, the
+;;;      new reader will reduce its use to incremental stuff, so it might
+;;;      not matter).
+;;; - See, whether we can make this work with vector structs.
+
+(defun (use-cl-conses? BOOLEAN) ()
+  ;; Return TRUE if STELLA conses should be implemented with Lisp conses.
+  :globally-inline? TRUE
+  (return (enabled-stella-feature? :use-common-lisp-conses)))
+
+(defun (use-defconsmethod? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if a STELLA method should be defined via `%%defconsmethod'
+  ;;    which defines auxiliary methods on CL:NIL and CL:CONS if necessary.
+  (when (and (not (method-function? method))
+             (use-cl-conses?))
+    (case (slot-owner method)
+      (@CONS (return TRUE))
+      (@STANDARD-OBJECT
+       (case (slot-owner (lookup-slot (type-class @CONS) (slot-name method)))
+         (@CONS
+          (return FALSE))
+         (otherwise
+          (return TRUE))))
+      (@OBJECT
+       (case (slot-owner (lookup-slot (type-class @CONS) (slot-name method)))
+         ((@CONS @STANDARD-OBJECT)
+          (return FALSE))
+         (otherwise
+          (return TRUE))))
+      (otherwise NULL)))
+  (return FALSE))
+
+
+;;; Structs and Vector Structs:
+
+;;; It turned out that in Allegro CL (ACL) method dispatch on standard
+;;; Common-Lisp structs was about 4.5 times slower than on class
+;;; instances, which offset all the efficiency gains for slot lookup
+;;; (in ACL struct slot access is about 4 times faster than regular
+;;; slot lookup with CLOS accessors - btw, using 'CL:slot-value' is
+;;; painfully slow).
+
+;;; To combine fast method dispatch on class instances with fast slot
+;;; lookup on structs, we can use unnamed structs of type 'CL:vector'
+;;; where the first element is used as a type field.  Instead of
+;;; creating a hierarchy of structs, we create a dummy CLOS class
+;;; hierarchy and store a prototypical instance of the appropriate
+;;; class in the type field of every vector struct.  Every method is
+;;; then translated with an extra first argument that is solely used
+;;; for method dispatch, and every method call has to retrieve the
+;;; type instance of the first argument before the method can be
+;;; called.  This slows down method calls a little bit (about a factor
+;;; 1.3 in ACL), but the speed gains for slot lookup seem to outweigh
+;;; this slowdown in most applications.
+
+(defun (use-cl-structs? BOOLEAN) ()
+  ;; Return TRUE if classes should be translated into Common-Lisp structs.
+  :globally-inline? TRUE
+  (return (enabled-stella-feature? :use-common-lisp-structs)))
+
+(defun (use-vector-structs? BOOLEAN) ()
+  ;; Return TRUE if structs of type 'CL:vector' should be used
+  ;;    instead of normal structs to translate classes.
+  ;; NOTE: It is assumed that 'use-vector-structs?' implies 'use-cl-structs?'.
+  :globally-inline? TRUE
+  (return (enabled-stella-feature? :use-common-lisp-vector-structs)))
+
+;;; If we use vector structs, we have to advise 'CL:print-object'
+;;;    to print them properly:
+(startup-time-progn :early-inits
+  (verbatim
+    :common-lisp
+    (CL:when (clsys-use-vector-structs-p)
+      (CL:defmethod CL:print-object :around ((self CL:vector) stream)
+        (CL:if (clsys-vector-struct-p self)
+            (clsys-print-vector-struct self stream)
+          (CL:call-next-method))))
+    :otherwise NULL))
+
+;;; In an instance of Stella that uses structs or CL conses,
+;;;    incrementally translated code needs to be translated in the exact
+;;;    same way in order to be executable.  This startup code tries to
+;;;    figure out dynamically what kind of translation scheme was used
+;;;    for Stella:
+(startup-time-progn
+  (let ((useStructs?
+         (verbatim :common-lisp (clsys-use-structs-p)
+                   :otherwise FALSE))
+        (useVectorStructs?
+         (verbatim :common-lisp (clsys-use-vector-structs-p)
+                   :otherwise FALSE))
+        (useClConses?
+         (verbatim :common-lisp (CL:listp NIL)
+                   :otherwise FALSE)))
+    (when useStructs?
+      (set-stella-feature :use-common-lisp-structs))
+    (when useVectorStructs?
+      (set-stella-feature :use-common-lisp-vector-structs))
+    (when useClConses?
+      (set-stella-feature :use-common-lisp-conses))))
+
+
+  ;;
+;;;;;; 'cl-translate-list-of-trees' and 'cl-translate-a-tree'
+  ;;
+
+;; While this is false, it is possible to return from a function implicitly
+;;    when we reach the last statement of the current block (where a `block'
+;;    is an (implicit) PROGN, or the clauses of an IF).  Once this is bound
+;;    to true it must not be rebound to false anymore.
+;; This mechanism allows us to avoid unnecessary RETURN-FROM's which trip
+;;    up the tail merging optimizer of Allegro-CL.
+(defspecial *needExplicitReturn?* BOOLEAN FALSE)
+
+(defun (cl-translate-list-of-trees CONS) ((trees CONS))
+  ;; Translate each parse tree in 'trees';
+  ;; Return the translated list of trees.
+  (let ((cursor trees))
+    (while (non-empty? cursor)
+      (special ((*needExplicitReturn?*
+                 (or *needExplicitReturn?*
+                     (non-empty? (rest cursor)))))
+        (setf (value cursor) (cl-translate-a-tree (value cursor))))
+      (setq cursor (rest cursor)))
+    (return trees) ))
+
+(defun (cl-translate-void-sys CONS) ((tree CONS))
+  ;; Skip over SYS operator and translate the embedded tree.
+  (let ((oTree (cl-translate-a-tree (second tree))))
+    (return oTree) ))
+
+(defun (cl-translate-typed-sys OBJECT) ((tree CONS))
+  ;; Skip over SYS operator and translate the embedded tree.
+  (let ((oTree (cl-translate-a-tree (second tree))))
+    (return oTree) ))
+
+(defun (cl-translate-bad-sys OBJECT) ((tree CONS))
+  ;; Emit a tree that complains when executed.
+  (let ((returnType (third tree)))
+    (if (eql? returnType @VOID)
+      (return (cl-translate-a-tree (yield-illegal-statement-tree)))
+      ;; return undefined variable:
+      (return (cl-translate-a-tree (yield-illegal-expression-tree))))))
+
+(defun (cl-translate-a-tree OBJECT) ((tree OBJECT))
+  ;; Translate 'tree', converting Stella constructs into Common Lisp
+  ;;    constructs.
+  (return (help-cl-translate-a-tree tree)))
+
+(defun (help-cl-translate-a-tree OBJECT) ((tree OBJECT))
+  ;; Work-horse for 'cl-translate-a-tree'.
+  ;; Extracted the functionality, so 'cl-translate-a-tree' can be "advised"
+  ;;    for debugging purposes.
+  (when (null? tree)
+    (return tree))
+  (typecase tree
+    (CONS
+     (when (nil? tree)
+       (return tree))
+     (case (first tree)
+       (VOID-SYS (return (cl-translate-void-sys tree)))
+       (TYPED-SYS (return (cl-translate-typed-sys tree)))
+       (BAD-SYS (return (cl-translate-bad-sys tree)))
+       (SETQ (return (cl-translate-setq-tree tree)))
+       (SYS-SLOT-VALUE (return (cl-translate-fixed-slot-value-tree tree)))
+       (SYS-SLOT-VALUE-SETTER
+        (return (cl-translate-fixed-slot-value-setter-tree tree)))
+       ((SYS-CALL-METHOD SYS-CALL-FUNCTION)
+        (return (cl-translate-call-method-tree tree)))
+       (PROGN (setf (value tree) (quote CL:PROGN))
+              (setf (rest tree) (cl-translate-list-of-trees (rest tree)))
+              (return tree))
+       (WITH-PROCESS-LOCK
+	   (setf (value tree) (cl-translate-global-symbol (quote WITH-PROCESS-LOCK)))
+	 (setf (second tree) (cl-translate-a-tree (second tree)))
+	 (setf (rest (rest tree)) (cl-translate-list-of-trees (rest (rest tree))))
+	 (return tree))
+       (LOOP (special ((*needExplicitReturn?* TRUE))
+               (setf (value tree) (quote CL:LOOP))
+               (setf (rest tree)
+                 (maybe-wrap-with-continue-label
+                  (cl-translate-list-of-trees (rest tree))))
+               (return tree)))
+       (SYS-FOREACH (special ((*needExplicitReturn?* TRUE))
+                      (return (cl-translate-foreach-tree tree))))
+       (LET (return (cl-translate-let-tree tree FALSE)))
+       (STARTUP-TIME-PROGN
+        (special ((*needExplicitReturn?* TRUE))
+          (return (cl-translate-startup-time-progn-tree tree))))
+       (SPECIAL (return (cl-translate-special-tree tree)))
+       (SYS-UNWIND-PROTECT (return (cl-translate-unwind-protect-tree tree)))
+       (SYS-HANDLER-CASE (return (cl-translate-handler-case-tree tree)))
+       (SYS-HANDLE-EXCEPTION (return (cl-translate-handle-exception-tree tree)))
+       (SYS-SIGNAL (return (cl-translate-signal-tree tree)))
+       ((CAST SAFE-CAST) (return (cl-translate-cast-tree tree)))
+       (RETURN (return (cl-translate-return-tree tree)))
+       (BREAK (setf (first tree) (quote CL:RETURN)) ;; loop or block exit
+              (return tree))
+       (CONTINUE (return (bquote (CL:GO :CONTINUE))))
+       (WHILE (special ((*needExplicitReturn?* TRUE))
+                (return (cl-translate-while-tree tree))))
+       ((IF CHOOSE WHEN UNLESS) (return (cl-translate-conditional-tree tree)))
+       ((AND OR NOT) (return (cl-translate-boolean-tree tree)))
+       (COND (return (cl-translate-cond-tree tree)))
+       (CASE (return (cl-translate-case-tree tree)))
+       ((EQ? > >= < <=) (return (cl-translate-operator-tree tree)))
+       (MAKE (return (cl-translate-make-tree tree)))
+       (SYS-NEW (return (cl-translate-new-tree tree)))
+       (MV-SETQ (setf (first tree) (quote CL:MULTIPLE-VALUE-SETQ))
+                (setf (third tree) (cl-translate-a-tree (third tree)))
+                (return tree))
+       (QUOTE (setf (first tree) (quote CL:QUOTE)) ; WHY IS THIS HERE?
+              (return tree))
+       ((SYS-CALL-FUNCTION-CODE SYS-CALL-METHOD-CODE)
+        (return (cl-translate-call-function-code-tree tree)))
+       (SYS-INLINE-CALL (return (cl-translate-inline-call-tree tree)))
+       (THE-CODE (return (cl-translate-the-code-tree tree)))
+       ((PRINT-STREAM PRINT-NATIVE-STREAM)
+        (return (cl-translate-print-stream-tree tree)))
+       (VERBATIM (return (cl-translate-verbatim-tree tree)))
+       ((INLINE IGNORE) (return (cl-translate-inline-tree tree)))))
+    (otherwise
+     (return (cl-translate-atomic-tree tree)))))
+
+(defmethod (cl-translate-atomic-tree OBJECT) ((tree OBJECT))
+  ;; Translation of atoms other than generalized symbols occurs
+  ;;    in the conversion from parse trees to native code.
+  (return tree) )
+
+(defmethod (cl-translate-atomic-tree OBJECT) ((tree FLOAT-WRAPPER))
+  ;; Translate a reference to the FLOAT-WRAPPER 'tree' to one that
+  ;;  guarantees it is read as type DOUBLE-FLOAT in all Lisps.
+  (let ((float-string STRING (stringify tree)))
+    (cond ((member? float-string #\e)
+	   (setq float-string (substitute float-string #\d #\e)))
+	  ((member? float-string #\E)
+	   (setq float-string (substitute float-string #\d #\E)))
+	  (otherwise
+	   (setq float-string (concatenate float-string "d0"))))
+    (return (new VERBATIM-STRING-WRAPPER :wrapper-value float-string)) ))
+
+(defmethod (cl-translate-atomic-tree OBJECT) ((tree SYMBOL))
+  ;; Translate a reference to the symbol 'tree'.
+  ;; BUG: This might generate incorrect code if a local variable has the
+  ;;      same name as a global!! (which argues for a new parse tree) 
+  (if (defined? (lookup-global-variable tree))
+      (return (cl-translate-global-symbol tree))
+    ;; Otherwise, it must be a local variable for which we
+    ;;    really never want to use a package or module prefix:
+    (return (cl-translate-local-symbol tree))))
+
+(defmethod (cl-translate-atomic-tree OBJECT) ((tree KEYWORD))
+  ;; Return a parse tree that evaluates to the keyword 'tree'.
+  (if (use-hardcoded-symbols?)
+      (let ((offset (wrap-literal (symbol-id (keywordify tree)))))
+	(return (bquote (get-kwd & offset))))
+      (return (cl-translate-global-symbol
+               (yield-symbol-constant-name tree)))))
+
+(defmethod (cl-translate-atomic-tree OBJECT) ((tree SURROGATE))
+  ;; Return a parse tree that evaluates to the surrogate 'tree'.
+  (if (use-hardcoded-symbols?)
+      (let ((offset (wrap-literal (symbol-id tree))))
+	(return (bquote (get-sgt & offset))))
+    (return (cl-translate-global-symbol
+             (yield-symbol-constant-name tree)))))
+
+(defun (cl-translate-global-symbol OBJECT) ((symbol SYMBOL))
+  ;; Translate a reference to the global name 'symbol'.
+  (let ((symbolModule (interned-in symbol)))
+    (when (eql? symbolModule *common-lisp-module*)
+      (return symbol))
+    (when (null? symbolModule)
+      (setq symbolModule *module*))
+    (return (yield-global-lisp-symbol symbolModule (symbol-name symbol)))))
+
+(defun (yield-global-lisp-symbol OBJECT)
+    ((symbolModule MODULE) (symbolName STRING))
+  ;; Yield a Lisp symbol that can be used as a translation of the global
+  ;;    Stella symbol with name 'symbolName' in module 'symbolModule'.
+  ;; Make sure to avoid name clashes with translations of name-equivalent
+  ;;    Stella symbols that reside in other modules.
+  ;; The package of the generated Lisp symbol will remain unspecified
+  ;;    if 'symbolModule' equals '*module*', or if the native package of
+  ;;    'symbolModule' equals that of '*module*'.  Otherwise, the Lisp
+  ;;    symbol will be explicitly qualified with the native package of
+  ;;    'symbolModule'.
+  ;; The name of the generated Lisp symbol will equal 'symbolName'
+  ;;    if 'symbolModule' has an explicitly specified native package
+  ;;    (it is assumed that the native package was properly chosen and
+  ;;    is sufficient to avoid name clashes).  Otherwise, the relative
+  ;;    name of the Stella symbol with respect to the closest parent
+  ;;    of 'symbolModule' that has an explicit native package will be
+  ;;    used (actually, for simplicity, currently we use the full name).
+  ;;    That way clashes with the translation of symbols in sibling
+  ;;    modules that might also wind up in the same Lisp package will
+  ;;    be avoided.
+  ;; NOTE: As an optimization we could generate actual Lisp symbols here
+  ;;    (and maybe even print them with CL:*package* bound to the right
+  ;;    thing), but that presupposes that at translation time the native
+  ;;    package does actually exist AND is setup exactly as it will be
+  ;;    at run-time.  Maybe later.
+  (let ((lispSymbolPackage
+         (choose (or (null? symbolModule)
+                     (eql? symbolModule *module*)
+                     (eql? (lisp-package symbolModule)
+                           (lisp-package *module*)))
+                 NULL
+                 (lisp-package symbolModule)))
+        (lispSymbolName
+         ;; Use 'slot-value' to disable the default:
+         (choose (defined? (slot-value symbolModule module-lisp-package))
+                 symbolName
+                 ;; What we really want here is the relative name to the
+                 ;;    closest parent that has an explicit native package:
+                 (compute-full-name symbolName symbolModule))))
+    (when (case-sensitive? symbolModule)
+      (setq lispSymbolName
+	(concatenate "|" (concatenate lispSymbolName "|"))))
+    (if (null? lispSymbolPackage)
+        (return (new VERBATIM-STRING-WRAPPER :wrapper-value lispSymbolName))
+      (return
+        (new VERBATIM-STRING-WRAPPER
+             :wrapper-value
+             (concatenate
+               lispSymbolPackage (concatenate "::" lispSymbolName)))))))
+
+(defun (cl-translate-local-symbol OBJECT) ((symbol SYMBOL))
+  ;; Translate a reference to the local symbol/variable 'symbol'.
+  (let ((symbolModule (interned-in symbol)))
+    (cond ((and (not (case-sensitive? *module*))
+                (or (null? symbolModule)
+                    (eql? symbolModule *module*)))
+           (return symbol))
+          ;; Otherwise, make sure we don't print a package/module prefix, even
+          ;;    if the local symbol was a permanent one (e.g., a /STELLA/SELF
+          ;;    used in a class constructor/accessor generator):
+          ((case-sensitive? *module*)
+           (return (new VERBATIM-STRING-WRAPPER
+                        :wrapper-value
+                        (concatenate "|" (symbol-name symbol) "|"))))
+          (otherwise
+           (return (new VERBATIM-STRING-WRAPPER
+                        :wrapper-value (symbol-name symbol)))))))
+
+(defun (cl-translate-setq-tree CONS) ((tree CONS))
+  ;; Translate a 'setq' 'tree'.
+  (setf (first tree) (quote /COMMON-LISP/SETQ))
+  (setf (second tree) (cl-translate-a-tree (second tree)))
+  (setf (third tree) (cl-translate-a-tree (third tree)))
+  (return tree))
+
+(defun (yield-struct-slot-accessor-name OBJECT)
+    ((classType TYPE) (slotName SYMBOL))
+  ;; Return the symbol '%<className>.<slotName>'.
+  (return
+    (yield-global-lisp-symbol
+     (interned-in classType)
+     (concatenate
+       "%"
+       (concatenate
+         (symbol-name classType)
+         (concatenate "." (symbol-name slotName)))))))
+
+(defun (yield-CLOS-slot-accessor-name OBJECT) ((slotName SYMBOL))
+  ;; Return the symbol '%<slotName>' which can be used
+  ;;    as the CLOS :accessor for a slot named 'slotName'.
+  (return
+    (yield-global-lisp-symbol
+     (interned-in slotName)
+     (concatenate "%" (symbol-name slotName)))))
+
+(defun (yield-slot-value-reader-tree CONS)
+    ((slotName SYMBOL) (objectRef OBJECT) (objectType TYPE))
+  ;; Yield a parse tree to read the physical slot 'slotName' on the object
+  ;;    specified by 'objectRef' which has type 'objectType'.
+  (when (and (eql? objectType @CONS)
+             (use-cl-conses?))
+    (case slotName
+      (VALUE
+       (return
+         (bquote (& (cl-translate-global-symbol (quote %%VALUE)) & objectRef))))
+      (REST
+       (return
+         (bquote (& (cl-translate-global-symbol (quote %%REST)) & objectRef))))
+      (otherwise NULL)))
+  (let ((class (type-class objectType)))
+    (cond ((or (not (use-cl-structs?))
+	       (exception-class? class)
+	       (cl-always-translate-to-clos-class? class))
+	   (return
+	     ;;(bquote (CL:SLOT-VALUE & objectRef (CL:quote & slotName)))
+	     (bquote (& (yield-CLOS-slot-accessor-name slotName) & objectRef))
+	     ;;(bquote
+	     ;; ;; This allows Lisp-specific CLOS slot access optimization:
+	     ;; (& (cl-translate-global-symbol (quote CLSYS-SVAL))
+	     ;;  & (cl-translate-global-symbol (type-to-symbol objectType))
+	     ;;  & (cl-translate-global-symbol slotName)
+	     ;;  & objectRef))
+	     ))
+	  ((use-vector-structs?)
+	   (return
+	     (bquote
+	      ;; 'CLSYS-SVAL' is a low-level slot access macro:
+	      (& (cl-translate-global-symbol (quote CLSYS-SVAL))
+		 & (wrap-literal (cl-struct-slot-offset slotName objectType))
+		 & (cl-translate-global-symbol (type-to-symbol objectType))
+		 & (cl-translate-global-symbol slotName)
+		 & objectRef))))
+	  (otherwise
+	   (return
+	     (bquote (& (yield-struct-slot-accessor-name objectType slotName)
+			& objectRef)))))))
+
+(defun (yield-slot-value-writer-tree CONS)
+    ((slotName SYMBOL) (objectRef OBJECT) (objectType TYPE) (valueRef OBJECT))
+  ;; Yield a parse tree to set the value of the physical slot 'slotName'
+  ;;    on the object specified by 'objectRef' which has type 'objectType'
+  ;;    to the value specified by 'valueRef'.
+  (return
+    (bquote
+     (/COMMON-LISP/SETF
+      & (yield-slot-value-reader-tree slotName objectRef objectType)
+      & valueRef))))
+
+(defun (true-slot-name SYMBOL) ((slotName SYMBOL) (type TYPE))
+  ;; If 'slotName' renames another slot, return that name, else
+  ;;    return 'slotName'.
+  (return
+    (slot-name (canonical-slot (lookup-slot (type-class type) slotName)))))
+
+(defun (cl-translate-fixed-slot-value-tree CONS) ((tree CONS))
+  ;; Return parse tree code that reads a CLOS slot.  'tree' has the form
+  ;;    '(SYS-SLOT-VALUE <objType> <slotName> <objRef>)'.
+  ;; Assumes that 'slot' has allocation :instance or :class.
+  (let ((objType TYPE (second tree))
+        (slotName (true-slot-name (third tree) objType))
+        (objRef (cl-translate-a-tree (fourth tree)))
+        (oTree (yield-slot-value-reader-tree slotName objRef objType)))
+    (return oTree) ))
+
+(defun (cl-translate-fixed-slot-value-setter-tree CONS) ((tree CONS))       
+  ;; Return parse tree code that writes a CLOS slot.  'tree' has the form
+  ;;    '(SYS-SLOT-VALUE-SETTER <objType> <slotName> <objRef> <valueRef>)'.
+  ;; Assumes that 'slot' has allocation :instance or :class.
+  (let ((objType TYPE (second tree))
+        (slotName (true-slot-name (third tree) objType))
+        (objRef (cl-translate-a-tree (fourth tree)))
+        (valueRef (cl-translate-a-tree (fifth tree)))
+        (oTree
+         (yield-slot-value-writer-tree slotName objRef objType valueRef)))
+    (return oTree) ))
+
+(defun (cl-translate-call-method-tree OBJECT) ((tree CONS))
+  ;; Translate a method or function call.
+  (mv-bind (operator owner arguments)
+      (destructure-call-tree tree)
+    (case operator
+      ((NTH NTH-SETTER)
+       (return (cl-translate-nth-tree tree)))
+      ((AREF AREF-SETTER)
+       (return (cl-translate-aref-tree tree)))
+      ((NULL? DEFINED?)
+       (return (cl-translate-plain-boolean-test tree FALSE)))
+      (otherwise NULL))
+    (when (or (eql? owner @ARGUMENT-LIST)
+              (eql? owner @ARGUMENT-LIST-ITERATOR))
+      (return (cl-translate-argument-list-tree tree)))
+    (when (defined? (lookup *cl-operator-table* operator))
+      (return (cl-translate-operator-tree tree)))
+    (return (cl-translate-normal-call-method-tree operator owner arguments))))
+
+(defun (method-call-type-for-vector-structs SYMBOL)
+    ((slotName SYMBOL) (owner TYPE) (function? BOOLEAN))
+  ;; Return a symbol that indicates which type of method call and translation
+  ;;    scheme has to be used with vector structs.  If we are not
+  ;;    translating into vector structs, or if nothing special has to
+  ;;    be done for a method, NORMAL-CALL is returned.
+  ;; If vector structs are used to translate Stella classes, then there are
+  ;;    three different ways in which methods have to be translated and called:
+  ;;    (1) Methods on a subtype of OBJECT that will be called on vector
+  ;;        structs need to get an extra first argument for method dispatch,
+  ;;        and in the call the class prototype has to be retrieved from
+  ;;        the struct.
+  ;;    (2) Methods on non-objects (e.g., 'STRING.length') also have to get
+  ;;        an extra argument to make their parameter lists conform with any
+  ;;        object methods of the same name, however, the first argument will
+  ;;        be used in the usual way, and a second dummy parameter will always
+  ;;        be supplied with NULL.
+  ;;    (3) 'print-object' methods can't have their parameter lists changed,
+  ;;        which means that they will be dispatched on the class prototype of
+  ;;        a vector struct, and the actual vector struct objects gets passed
+  ;;        in via the special variable '*clsys-self*'.
+  ;; 'NULL?' and 'DEFINED?' have to be treated as special cases, since their
+  ;;    parameter lists are hardwired by primal code and can't be changed by
+  ;;    the translation.  Since they don't access any object slots, they can
+  ;;    be called on the vector objects directly.
+  (when (or function?
+            (null? owner)
+            (eql? slotName (quote NULL?))
+            (eql? slotName (quote DEFINED?))
+            (symbol-common-lisp? slotName)
+            (not (use-cl-structs?))
+            (not (use-vector-structs?)))
+    (return (quote NORMAL-CALL)))
+  (if (or (and (not (subtype-of? owner @OBJECT))
+               (not (mixin? (type-class owner))))
+          (and (eql? owner @CONS)
+               (use-cl-conses?)))
+      ;; This handles literals as well as things such as LISP-CONS
+      ;;    (e.g., 'LISP-CONS.allocate-iterator'):
+      (return (quote NON-OBJECT-METHOD))
+    (if (eql? slotName (quote PRINT-OBJECT))
+        (return (quote PRINT-OBJECT))
+      (return (quote OBJECT-METHOD)))))
+
+(defun (cl-translate-normal-call-method-tree CONS)
+    ((operator SYMBOL) (owner TYPE) (arguments CONS))
+  (let ((translatedOperator
+         (cl-translate-global-symbol
+          (yield-renamed-name-if-native operator :common-lisp :function))))
+    ;; Translate a non-optimizable method or function call.
+    (case (method-call-type-for-vector-structs operator owner (null? owner))
+      ((OBJECT-METHOD PRINT-OBJECT)
+       (return (bquote (& (cl-translate-global-symbol (quote CLSYS-CALL))
+                          & translatedOperator
+                          && (cl-translate-list-of-trees arguments)))))
+      (NON-OBJECT-METHOD
+       (return (bquote (& translatedOperator
+                          & (cl-translate-a-tree (first arguments))
+                          NULL
+                          && (cl-translate-list-of-trees (rest arguments))))))
+      (otherwise
+       (return (bquote (& translatedOperator
+                          && (cl-translate-list-of-trees arguments))))))))
+
+(defun (cl-translate-nth-tree CONS) ((tree CONS))
+  ;; Translate and possibly optimize a call to 'nth'.
+  ;; TO DO: - In iterations over vectors bind the native array instead
+  ;;          of dereferencing it in every call to 'nth'.
+  (mv-bind (operator owner arguments)
+      (destructure-call-tree tree)
+    (let ((setter? (eql? operator (quote NTH-SETTER)))
+          (collection (first arguments))
+          (position (last arguments))
+          (value (choose setter?
+                         (second arguments)
+                         NULL)))
+      (case owner
+        ((@STRING @MUTABLE-STRING @NATIVE-VECTOR)
+         (when (or (eql? owner @NATIVE-VECTOR)
+                   (method-call-inlining-enabled?))
+           (setq operator (quote CL:aref))
+           (setq tree
+             (bquote (& operator
+                        & (cl-translate-a-tree collection)
+                        & (cl-translate-a-tree position))))
+           (when setter?
+             (setq tree
+               (bquote
+                (/COMMON-LISP/SETF & tree & (cl-translate-a-tree value)))))
+           (return tree)))
+        (otherwise NULL))
+      (return
+        (cl-translate-normal-call-method-tree operator owner arguments)))))
+
+(defun (cl-translate-aref-tree CONS) ((tree CONS))
+  ;; Translate a call to `aref' or `aref-setter'.
+  (mv-bind (operator owner arguments)
+      (destructure-call-tree tree)
+    (case owner
+      (@ARRAY
+       (let ((setter? (eql? operator (quote AREF-SETTER)))
+             (array (first arguments))
+             (arrayType (walked-expression-type array))
+             (indices
+              (choose setter? (rest (rest arguments)) (rest arguments)))
+             (value
+              (choose setter? (second arguments) NULL)))
+         (setq operator (quote CL:aref))
+         (setq array (cl-translate-a-tree array))
+         (setq indices (cl-translate-list-of-trees indices))
+         (when (generate-cl-type-declarations?)
+           (when (cons? array)
+             (setq array (cl-yield-typed-expression-tree array arrayType)))
+           (foreach it on indices
+               where (cons? (value it))
+               do (setf (value it)
+                    (cl-yield-typed-expression-tree (value it) @INTEGER))))
+         (setq tree (bquote (& operator & array && indices)))
+         (when setter?
+           (setq tree
+             (bquote
+              (/COMMON-LISP/SETF & tree & (cl-translate-a-tree value)))))
+         (return tree)))
+      (otherwise
+       (return
+         (cl-translate-normal-call-method-tree operator owner arguments))))))
+
+(defun (cl-translate-argument-list-tree OBJECT) ((tree CONS))
+  ;; Translate an argument-list related pseudo-method call.
+  (mv-bind (operator owner arguments)
+      (destructure-call-tree tree)
+    (ignore owner)
+    (case operator
+      (ALLOCATE-ITERATOR
+       (return
+         (cl-translate-a-tree (first arguments))))
+      (LENGTH
+       (return
+         (bquote (CL:length & (cl-translate-a-tree (first arguments))))))
+      (NEXT?
+       (return (cl-translate-a-tree (first arguments))))
+      (ARGUMENT
+       (return
+         ;; NOTE: This assumes that the iterator expression is a variable,
+         ;;    but that's ok, since that is the only thing legal in C++:
+         (bquote (CL:POP & (cl-translate-a-tree (first arguments))))))
+      (otherwise
+       (walk-error "Cannot translate call to " operator " on an `ARGUMENT-LIST'")
+       (return (bquote (& operator & (cl-translate-a-tree (first arguments)))))))))
+
+(defun (duplicate-cursor-variable? BOOLEAN)
+       ((variable SYMBOL) (iteratorBindings CONS))
+  ;; Tests for the case when an iterator variable and a cursor variable
+  ;;    have the same name (this happens when we optimize out iterator
+  ;;    objects in favor of a cursor of type @CONS)
+  ;; Return TRUE if 'variable' occurs in 'iteratorBindings'.
+  (return (exists ib in (cast iteratorBindings (CONS OF CONS))
+                  where (eq? (first ib) variable))) )
+
+(defun (cl-translate-foreach-tree CONS) ((tree CONS))
+  ;; Translate a SYS-FOREACH tree.
+  ;; Tree has the form
+  ;;    (SYS-FOREACH ((<iterVar> <type> <constructor expression>)*)
+  ;;                 ((<cursorVar> <type> <next expression>)*)
+  ;;                 <continuation test> <body>)
+  (let ((iteratorBindings (cast (second tree) (CONS OF CONS)))
+        (cursorBindings (cast (third tree) (CONS OF CONS)))
+        (continuationTest (cl-translate-boolean-test (fourth tree) FALSE))
+        (body (cl-translate-list-of-trees (nth-rest tree 4)))
+        (declarations NIL)
+        (nextAssignments NIL)
+        (typeDeclarations NIL)
+        (iteratorConstructor OBJECT NULL))
+    (when (generate-cl-type-declarations?)
+      (setq typeDeclarations
+        (cl-yield-let-variable-type-declaration-trees iteratorBindings)))
+    (foreach binding in iteratorBindings        ; collect iterator bindings
+             do
+             (setq iteratorConstructor (cl-translate-a-tree (third binding)))
+             (setf (third binding) NULL)        ; clip before gc
+             collect (bquote (& (cl-translate-local-symbol (first binding))
+                                & iteratorConstructor))
+             into declarations)
+    (when (generate-cl-type-declarations?)
+      (setq typeDeclarations
+        (concatenate
+          typeDeclarations
+          (cl-yield-let-variable-type-declaration-trees cursorBindings))))
+    (foreach binding in cursorBindings
+             do    ; collect next assigns
+             (pushq nextAssignments (cl-translate-a-tree (third binding)))
+             (setf (third binding) NULL)        ; clip before gc
+             (unless (duplicate-cursor-variable? (first binding) iteratorBindings)
+               (pushq declarations
+                      (bquote (& (cl-translate-local-symbol (first binding))
+			       & (cl-translate-a-tree
+				   (type-to-walked-null-value-tree
+				    (type-spec-to-base-type
+				     (second binding))))
+			       ))))) ;; collect cursor decls
+    (return
+     (bquote (CL:let* & declarations
+                      && (cl-yield-declare-tree typeDeclarations FALSE)
+                      (CL:LOOP WHILE & continuationTest
+                               DO && (reverse nextAssignments)
+                               && (maybe-wrap-with-continue-label body))))) ))
+
+(defun (maybe-wrap-with-continue-label CONS) ((translatedLoopBody CONS))
+  ;; Tack on a :CONTINUE label to 'translatedLoopBody'
+  ;;    (a translated list of trees) in case the body contained a
+  ;;    '(continue)' statement.
+  ;; BUG: This fails if we have nested loops where an inner loop has
+  ;;    a '(continue)' statement.
+  (if (search-cons-tree-with-filter? translatedLoopBody :CONTINUE
+				     (quote (CL:LOOP QUOTE)))
+      (return (bquote ((CL:TAGBODY && translatedLoopBody :CONTINUE))))
+    (return translatedLoopBody)))
+
+(defun (cl-translate-let-tree CONS) ((tree CONS) (special? BOOLEAN))
+  ;; Called by 'cl-translate-a-tree'.
+  ;; Translate a let statement.
+  ;; If `special?' `tree' is the result of a `special' translation
+  ;;    in which case the bound variables have to be translated as
+  ;;    global symbols.
+  ;; Note: A Stella 'let' is equivalent to a Common Lisp 'LET*'.
+  (let ((oDeclarations NIL)
+        (typeDeclarations (choose (generate-cl-type-declarations?)
+                           (cl-yield-let-variable-type-declaration-trees
+                            (second tree))
+                           NIL)))
+    (foreach d in (cast (second tree) (CONS OF CONS))
+                  ;; translate each declaration:
+        do (pushq oDeclarations
+                  (bquote (& (choose special?
+                                     (cl-translate-global-symbol (first d))
+                                     (cl-translate-local-symbol (first d)))
+                             & (cl-translate-a-tree (third d))))))
+    (setf (first tree) (quote CL:LET*))
+    (setf (second tree) (reverse oDeclarations))
+    (setf (rest (rest tree))
+      (concatenate
+        (cl-yield-declare-tree typeDeclarations FALSE)
+        (cl-translate-list-of-trees (rest (rest tree)))))
+    (return tree) ))
+
+(defun (cl-translate-special-tree CONS) ((tree CONS))
+  ;; Called by 'cl-translate-a-tree'.
+  ;; Translate a 'special' statement.
+  ;; HC: For now simply translate it into a standard CL 'let' with
+  ;; special declarations.  I don't see why specials should need all this
+  ;; extra machinery to make sure they get reset to the right thing in case
+  ;; of non-local exits, if CL already comes with a mechanism to handle that.
+  ;; Btw: The term 'special' as used by CL
+  ;; is not a very good name, since it does not reflect what is special
+  ;; about such variables.  A better name would be 'dynamic', since they
+  ;; allow dynamic scoping instead of the standard lexical scoping.
+  (let ((translatedTree (cl-translate-let-tree tree TRUE))
+        (specialVars NIL))
+    (foreach decl in (cast (second tree) (CONS OF CONS))
+        collect (first decl) into specialVars)
+    (setf (rest (rest translatedTree))
+      (cons (bquote (CL:declare (CL:special && specialVars)))
+            (rest (rest translatedTree))))
+    (return translatedTree)))
+
+(defun (cl-translate-startup-time-progn-tree CONS) ((tree CONS))
+  ;; Translate an 'startup-time-progn' statement into an 'EVAL-WHEN'.
+  (setf (value tree) (quote CL:PROGN))
+  (setf (rest tree) (cl-translate-list-of-trees (rest tree)))
+  (return
+   (bquote (CL:EVAL-WHEN (CL:LOAD CL:EVAL) & tree))) )
+
+(defun  (cl-translate-unwind-protect-tree CONS) ((tree CONS))
+  (setf (value tree) (quote CL:UNWIND-PROTECT))
+  (setf (rest tree) (cl-translate-list-of-trees (rest tree)))
+  (return tree))
+
+(defun (cl-translate-signal-tree CONS) ((tree CONS))
+  (setf (value tree) (quote CL:ERROR))
+  (setf (second tree) (cl-translate-a-tree (second tree)))
+  (setf (rest (rest tree)) NIL)
+  (return tree))
+
+(defun  (cl-translate-handler-case-tree CONS) ((tree CONS))
+  (setf (value tree) (quote CL:HANDLER-CASE))
+  (setf (rest tree) (cl-translate-list-of-trees (rest tree)))
+  (return tree))
+
+(defun  (cl-translate-handle-exception-tree CONS) ((tree CONS))
+  ;; Input: (SYS-HANDLE-EXCEPTION (var type) code...)
+  (let ((var SYMBOL (first (cast (second tree) CONS)))
+	(type TYPE-SPEC (second (cast (second tree) CONS))))
+    (setf (value tree) (cl-translate-class-name
+                        (type-to-class
+                         (type-spec-to-base-type type))))
+    (if (defined? var)
+      (setf (second tree) (bquote (& (cl-translate-local-symbol var))))
+      (setf (second tree) NIL))
+    (setf (rest (rest tree)) (cl-translate-list-of-trees (rest (rest tree))))
+    (return tree)))
+
+(defun (cast OBJECT) ((value OBJECT) (type TYPE))
+  :documentation "Perform a run-time type check, and then return `value'."
+  (when (and (>= *safety* 2)
+             (eq? *startup-time-phase* 999)
+             ;; Disable type-checking during finalization:
+             (empty? *unfinalized-classes*))
+    (safety 2 (defined? (surrogate-value type))
+            "No class defined for type " type)
+    (when (and (defined? value)
+               (not (isa? value type)))
+      (error "Run-time casting violation.  The value: " EOL value EOL
+             " is not of type " type ".")))
+  (return value) )
+
+(defun (cl-translate-cast-tree OBJECT) ((tree CONS))
+  ;; Translate a cast expression.
+  ;; Omit the cast if *safety* is less than 2.
+  (let ((expression (second tree))
+        (type (type-spec-to-base-type (third tree))))
+    (setf (second tree) (cl-translate-a-tree expression))
+    (setf (third tree) (cl-translate-a-tree type))
+    ;; Convert integer to float and vice versa similar to C++:
+    (when (subtype-of? type @FLOAT)
+      (if (isa? expression @INTEGER-WRAPPER)
+	(return (cl-translate-atomic-tree  ;; Make sure floats print properly as doubles.
+		 (wrap-literal (cast (wrapper-value (cast expression INTEGER-WRAPPER))
+				     @FLOAT))))
+	(return (bquote (CL:float & (second tree)
+				  & (new VERBATIM-STRING-WRAPPER
+					 :wrapper-value "0.0d0"))))))
+    (when (subtype-of? type @INTEGER)
+      (if (isa? expression @FLOAT-WRAPPER)
+	(return (wrap-literal (cast (wrapper-value (cast expression FLOAT-WRAPPER))
+				    @INTEGER)))
+	(return (bquote (CL:truncate & (second tree))))))
+    (when (or (< *safety* 2)
+              (eq? (first tree) (quote SAFE-CAST))
+              (null? (safe-lookup-slot (type-to-class type) (quote primary-type))))
+      (setq expression (second tree))
+      (setf (second tree) NIL)
+      (return expression))
+    (setf (first tree) (cl-translate-global-symbol (quote CAST)))
+    (return tree)))
+
+(defun (cl-translate-return-tree OBJECT) ((tree CONS))
+  ;; Translate the return value(s), wrap 'CL:VALUES' around
+  ;;    multiple values, and emit a 'CL:RETURN-FROM'.
+  ;; If we are preserving tail optimizability, then we may return
+  ;;    a value not wrapped by 'CL:RETURN-FROM.
+  (let ((returnValues (cl-translate-list-of-trees (rest tree))))
+    (when (non-empty? (rest returnValues))
+      (setq returnValues (bquote ((CL:values && returnValues)))))
+    (return
+      (choose
+       (and (not *needExplicitReturn?*)
+            (preserve-tail-merge-optimizability?))
+       (first returnValues)
+       (bquote
+        (CL:RETURN-FROM
+         & (cl-translate-global-symbol
+            (yield-renamed-name-if-native
+             (slot-name
+              (cast (the-object *currentTranslationUnit*) METHOD-SLOT))
+             :common-lisp :function))
+         && returnValues))) )))
+
+(defun (cl-translate-boolean-test OBJECT) ((tree OBJECT) (invert? BOOLEAN))
+  ;; Translate the Boolean expression 'tree'.
+  ;; Optimize the case when 'tree' begins with a Boolean operator.
+  (typecase tree
+    (CONS
+      (case (first tree)
+        (NOT
+         (let ((posTree (second tree)))
+           (return (cl-translate-boolean-test posTree (not invert?)))))
+        ((AND OR)
+         (let ((cursor (rest tree)))
+           (while (non-empty? cursor)
+             (setf (value cursor)
+               (cl-translate-boolean-test (value cursor) FALSE))
+             (setq cursor (rest cursor))))
+         (if (eq? (first tree) (quote AND))
+             (setf (first tree) (quote CL:AND))
+           (setf (first tree) (quote CL:OR)))
+         (when invert?
+           (setq tree (bquote (CL:NOT & tree))))
+         (return tree))
+        (TYPED-SYS
+         (return (cl-translate-boolean-test (second tree) invert?)))
+        (otherwise NULL)))
+    (otherwise NULL))
+  (return (cl-translate-plain-boolean-test tree invert?)))
+
+(defun (cl-translate-plain-boolean-test OBJECT) ((tree OBJECT) (invert? BOOLEAN))
+  ;; Translate the plain (i.e., not nested within another boolean operator)
+  ;;    boolean expression 'tree'.
+  ;; Invert the logic if 'invert?' is TRUE.
+  ;; Try to optimize various often-used predicates such as 'eq?',
+  ;;    'null?/defined?', etc., if the necessary optimization steps are
+  ;;    enabled.
+  ;; IMPORTANT: THOSE FUNCTIONS THAT CAN BE OPTIMIZED ALSO ALWAYS HAVE TO TAKE
+  ;;    CARE OF THE UNOPTIMIZED CASE WITHOUT CAUSING INFINITE RECURSION (I.E.,
+  ;;    THEY CAN'T JUST CALL `CL-TRANSLATE-A-TREE' IN THAT CASE!
+  (typecase tree
+    ;; Try to optimize various often-used predicates:
+    (CONS
+     (mv-bind (operator owner arguments)
+         (destructure-call-tree tree)
+       (case operator
+         ((< <= = >= >)
+          (when (optimize-boolean-tests?)
+            ;; Optimize negations by using the dual operator:
+            (when invert?
+              (case operator
+                (< (setq operator (quote >=)))
+                (<= (setq operator (quote >)))
+                (= (setq operator (quote !=)))
+                (>= (setq operator (quote <)))
+                (> (setq operator (quote <=))))
+              (setq invert? FALSE)))
+          (setq tree (bquote (& (lookup *cl-operator-table* operator)
+                                && (cl-translate-list-of-trees arguments))))
+          (if invert?
+              (return (bquote (CL:not & tree)))
+            (return tree)))
+         
+         (EQ?
+          (when (optimize-boolean-tests?)
+            ;; Optimize EQ? by using the most optimal CL equality test
+            ;;    based on the types of the arguments:
+            (let ((argType1 (walked-expression-type (first arguments)))
+                  (argType2 (walked-expression-type (second arguments))))
+              (if (and (sub-type-spec-of? argType1 @LITERAL)
+                       (sub-type-spec-of? argType2 @LITERAL))
+                  (cond ((or (eql? argType1 @STRING)
+                             (sub-type-spec-of? argType1 @BOOLEAN))
+                         (setq operator (quote CL:eq)))
+                        ((sub-type-spec-of? argType1 @NUMBER)
+                         (setq operator (quote CL:=)))
+                        (otherwise
+                         (setq operator (quote CL:eql))))
+                (setq operator (quote CL:eq)))
+              (setf (first tree) operator)))
+          (setf (rest tree) (cl-translate-list-of-trees (rest tree)))
+          (if invert?
+              (return (bquote (CL:not & tree)))
+            (return tree)))
+         
+         ((NULL? DEFINED?)
+          (when (method-call-inlining-enabled?)
+            ;; Inline NULL? and DEFINED?:
+            (case owner
+              ((@OBJECT @SECOND-CLASS-OBJECT @NATIVE-VECTOR @STRING @CODE @FLOAT)
+               (setq tree
+                 (bquote
+                  (CL:eq & (cl-translate-a-tree (first arguments))
+                         & (cl-translate-a-tree
+                            (type-to-walked-null-value-tree owner)))))
+               (case owner
+                 (@FLOAT (setf (first tree) (quote CL:=)))
+                 (otherwise NULL))
+               (if (or (and invert?
+                            (eql? operator (quote NULL?)))
+                       (and (not invert?)
+                            (eql? operator (quote DEFINED?))))
+                   (return (bquote (CL:not & tree)))
+                 (return tree)))
+              (otherwise NULL)))
+          (setq tree
+            (bquote (& (cl-translate-global-symbol operator)
+                     & (cl-translate-a-tree (first arguments)))))
+          (if invert?
+              (return (bquote (CL:not & tree)))
+            (return tree)))
+         (otherwise NULL))))
+    (otherwise NULL))
+  
+  ;; We have a non-optimizable case:
+  (setq tree (cl-translate-a-tree tree))
+  (if invert?
+      (return (bquote (CL:not & tree)))
+    (return tree)))
+
+(defun (cl-translate-while-tree CONS) ((tree CONS))
+  ;; Translate a while loop.
+  (let ((test (cl-translate-boolean-test (second tree) FALSE))
+        (body (cl-translate-list-of-trees (rest (rest tree)))))
+    (setf (rest (rest tree)) NIL)      ; clip subtree before gc
+    (return
+      (choose
+       (empty? body)
+       (bquote (CL:LOOP WHILE & test))
+       (bquote (CL:LOOP WHILE & test
+                        DO && (maybe-wrap-with-continue-label body)))) )))
+
+(defun (cl-translate-conditional-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is an IF, CHOOSE, WHEN, or UNLESS statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((operator (first tree))
+        (test (second tree))
+        (body (rest (rest tree))))
+    (setf (rest (rest tree)) NIL)       ; detach before garbage collecting
+    (case operator
+      ((IF CHOOSE)
+       (return 
+         (bquote (CL:if & (cl-translate-boolean-test test FALSE)
+                   & (cl-translate-a-tree (first body))
+                   & (cl-translate-a-tree (second body))))))
+      (WHEN
+       (return
+         (bquote (CL:when & (cl-translate-boolean-test test FALSE)
+                          && (cl-translate-list-of-trees body)))))
+      (UNLESS
+       (return
+         (bquote (CL:when & (cl-translate-boolean-test test TRUE)
+                          && (cl-translate-list-of-trees body)))))) ))
+
+(defun (cl-translate-cond-tree CONS) ((tree CONS))
+  ;; We redefine COND tree to make it compatible with STELLA's boolean
+  ;;    logic.
+  (foreach condition in (cast (rest tree) (CONS OF CONS))
+           do
+           (if (eq? (value condition) (quote OTHERWISE))
+             (setf (value condition) (quote CL:T))
+             (setf (value condition)
+                   (cl-translate-boolean-test (value condition) FALSE)))
+           (setf (rest condition)
+                 (cl-translate-list-of-trees (rest condition))))
+  (setf (value tree) (quote CL:COND))
+  (return tree) )
+
+(defun (cl-translate-case-tree CONS) ((tree CONS))
+  ;; Translate a case clause.
+  ;; If 'conditions' does not contain an 'otherwise' clause, use an ecase.
+  (let ((otherwise? FALSE))
+    (setf (second tree) (cl-translate-a-tree (second tree)))
+    (foreach cond in (cast (rest (rest tree)) (CONS OF CONS))
+             do
+             (cond
+              ((eq? (first cond) (quote OTHERWISE))
+               (setq otherwise? TRUE)
+               (setf (first cond) (quote CL:OTHERWISE)))
+              ((cons? (first cond))
+               (setf (first cond) (cl-translate-list-of-trees (first cond))))
+              (otherwise
+               (setf (first cond) (cl-translate-a-tree (first cond)))))
+             (setf (rest cond) (cl-translate-list-of-trees (rest cond))))
+    (setf (first tree)
+          (choose otherwise? (quote CL:CASE) (quote CL:ECASE)))
+    (return tree) ))
+
+(defun (cl-translate-boolean-tree CONS) ((tree CONS))
+  ;; Translate AND, OR, or NOT tree.  The resulting expression returns
+  ;;    TRUE or FALSE (not CL:t or CL:nil).
+  (return (cl-translate-boolean-test tree FALSE)))
+
+(defun (cl-translate-class-name OBJECT) ((class CLASS))
+  ;; Return the translated name for the native Lisp type representing `class'.
+  ;; If an unqualified type symbol was given as `class'es :cl-native-type,
+  ;;    the type is assumed to be in the Common Lisp package.
+  (when (use-cl-conses?)
+    (case (class-type class)
+      (@CONS (return (quote CL:CONS)))
+      (otherwise NULL)))
+  (cond ((defined? (class-cl-native-type class))
+         (let ((nativeType (class-cl-native-type class)))
+           (unless (defined? (position nativeType #\: 0))
+             (setq nativeType (concatenate "CL:" nativeType)))
+           (return (new VERBATIM-STRING-WRAPPER :wrapper-value nativeType))))
+        (otherwise
+         ;; Make sure we preserve the module information:
+         (return (cl-translate-global-symbol (class-symbol class))))))
+
+(defun (yield-struct-constructor-name OBJECT) ((class CLASS))
+  ;; Return a constructor name for a standard (non-vector) struct
+  ;;    that represents 'class'.
+  (return
+    (yield-global-lisp-symbol
+     (interned-in (class-type class))
+     (concatenate "%MAKE-" (symbol-name (class-type class))))))
+
+(defun (cl-translate-make-tree CONS) ((tree CONS))
+  ;; Translate a 'make' tree having the form '(make <className>)'.
+  (let ((class (type-class (typify (second tree))))
+        (classSymbol (cl-translate-class-name class))
+        (oTree CONS NULL))
+    (when (and (eql? classSymbol (quote CL:CONS))
+               (use-cl-conses?))
+      (return (bquote (CL:CONS CL:NIL CL:NIL))))
+    (cond ((exception-class? class)
+	   (setq oTree (bquote (CL:make-condition (CL:quote & classSymbol)
+				 & (cl-translate-global-symbol
+                                    (quote *condition-message-keyword*))
+				 & (cl-translate-a-tree (third tree))))))
+	  ((or (not (use-cl-structs?))
+	       (cl-always-translate-to-clos-class? class))
+	   (setq oTree (bquote (CL:make-instance (CL:quote & classSymbol)))))
+	  ((use-vector-structs?)
+	   (setq oTree
+	     (bquote
+               ;; 'CLSYS-MAKE' is a low-level constructor macro:
+               (& (cl-translate-global-symbol (quote CLSYS-MAKE))
+                & classSymbol
+                & (wrap-literal (1+ (length (cl-struct-slots class))))))))
+	  (otherwise
+	   (setq oTree (bquote (& (yield-struct-constructor-name class))))))
+    (return oTree) ))
+
+(defun (cl-translate-new-tree CONS) ((tree CONS))
+  ;; Translate a 'new' tree into a call to a class constructor.
+  ;; 'tree' has the form '(SYS-NEW <type-spec> <requiredArgument>*)'.
+  (when (array-type-specifier? (second tree))
+    (return (cl-translate-new-array-tree tree)))
+  (let ((typeSpec (second tree))
+        (constructorName
+         (cl-translate-global-symbol
+          (yield-constructor-name
+           (get-stella-class (choose (type? typeSpec)
+                              (cast typeSpec TYPE)
+                              (specifier-base-type
+                               (cast typeSpec PARAMETRIC-TYPE-SPECIFIER)))
+                      TRUE))))
+        (requiredArgRefs (cl-translate-list-of-trees (rest (rest tree)))))
+    (return (bquote (& constructorName && requiredArgRefs))) ))
+
+(defun (cl-translate-new-array-tree CONS) ((tree CONS))
+  ;; Translate a NEW array tree into a call to `CL:MAKE-ARRAY'.
+  (let (;(arrayType PARAMETRIC-TYPE-SPECIFIER (second tree))
+        (initialElement
+         ;; NOTE: If this is `null?' as opposed to (quote NULL) or some other
+         ;;    value, it means we don't need to initialize the array:
+         (third tree))
+        (dimensions (cl-translate-list-of-trees (rest (rest (rest tree))))))
+    ;; Disable initialization until we decide how to do that in C++ and Java:
+    (setq initialElement NULL)
+    (return
+      (bquote
+       (CL:MAKE-ARRAY
+        & (choose (= (length dimensions) 1)
+                  (first dimensions)
+                  (bquote (CL:LIST && dimensions)))
+        && (choose (defined? initialElement)
+                   (bquote (:INITIAL-ELEMENT
+                            & (cl-translate-a-tree initialElement)))
+                   NIL))))))
+
+(defun (cl-translate-operator-tree CONS) ((tree CONS))
+  ;; Translate the arguments of an operator 'tree'.  The operator is
+  ;;    either translated directly into a corresponding CL operator, or
+  ;;    it is implemented by a Stella function containing embedded
+  ;;    calls to Common Lisp functions.  The C++ equivalents are
+  ;;    operators built into C++.
+  (mv-bind (operator owner arguments)
+      (destructure-call-tree tree)
+    (ignore owner)
+    (case operator
+      ;; Do some 1+/- optimization just in case the CL compiler
+      ;;    doesn't do that automatically on its own:
+      (+ (when (and (= (length arguments) 2)
+                    (member? arguments ONE-WRAPPER))
+           (if (eql? (first arguments) ONE-WRAPPER)
+               (setq arguments (rest arguments))
+             (setf (rest arguments) NIL))
+           (setq operator (quote CL:1+))))
+      (- (when (and (= (length arguments) 2)
+                    (eql? (second arguments) ONE-WRAPPER))
+           (setf (rest arguments) NIL)
+           (setq operator (quote CL:1-))))
+      (EQ? (return (cl-translate-plain-boolean-test tree FALSE)))
+      (otherwise NULL))
+    ;; Optimize arithmetic operators:
+    (case operator
+      ((+ - * /) (setq operator (lookup *cl-operator-table* operator)))
+      (otherwise NULL))
+    (return (bquote (& (cl-translate-global-symbol operator)
+                       && (cl-translate-list-of-trees arguments))))))
+
+(defun (yield-format-arguments CONS) ((tree CONS))
+  ;; 'tree' has the form '(print-native-stream <stream> <arguments>)'.
+  ;; Return a two-element list of the form '(<format-string> <format-args>)'
+  ;;    that can be used to write '<arguments>' to '<stream>' with a statement
+  ;;    of the form '(CL:format <stream> <format-string> <format-args>)'.
+  (let ((formatString "")
+        (formatArguments NIL))
+    ;; slightly tricky: we build up the format string back to front:
+    (setf (rest (rest tree)) (reverse (rest (rest tree))))
+    (foreach arg in (rest (rest tree))
+             do
+             (cond
+              ((string? arg)            ; wrapped string?
+               (setq formatString
+                 (concatenate (wrapper-value (cast arg STRING-WRAPPER))
+                              formatString)))
+              ((eq? arg EOL)
+               (setq formatString (concatenate "~%" formatString)))
+              (otherwise
+               (setq formatString (concatenate "~A" formatString))
+               (pushq formatArguments (cl-translate-a-tree arg)))))
+    (pushq formatArguments (wrap-literal formatString))
+    (return formatArguments)))
+
+(defun (yield-print-tree CONS) ((tree CONS))
+  ;; 'tree' has the form '(print-native-stream <stream> <arguments>)'.
+  ;; Return a Lisp form that writes '<arguments>' to '<stream>'.
+  ;; Rewritten to use the new `%%print-stream' Lisp macro, which is more
+  ;;    concise/readable.  However, we keep the old logic around in case
+  ;;    we want to pass more type information to `%%print-stream'.
+  ;; NOTE: Using typed or special-purpose print functions such as
+  ;;       'CL:write-string' or 'CL:print-object' is way more efficient
+  ;;       than using the generic print dispatch via 'CL:princ'.  Using
+  ;;       'CL:format' is even worse, since it spends most of its time
+  ;;       in parsing the format string.  So, for the sake of efficiency,
+  ;;       we produce slightly less compact printing code.
+  (let ((stream (second tree))
+        (arguments (rest (rest tree)))
+        (argumentType TYPE NULL)
+        (printOperator SYMBOL NULL)
+        (compoundedString STRING NULL)
+        (printForms NIL))
+    (setq stream (cl-translate-a-tree stream))
+    ;; Using 'CL:format' turned out to be extremely inefficient:
+    ;;(return (bquote (CL:format & stream && (yield-format-arguments tree))))
+    (foreach arg in arguments
+        do (cond ((eq? arg EOL)
+                  ;(pushq printForms (bquote (CL:terpri %%stream)))
+                  ;; 'CL:write-string' seems to do more buffering than
+                  ;;    'CL:princ', thus, we need to force output at EOL:
+                  ;(pushq printForms (bquote (CL:force-output %%stream)))
+                  (pushq printForms arg)
+                  (setq compoundedString NULL))
+                 (otherwise
+                  (setq argumentType
+                    (type-spec-to-base-type (walked-expression-type arg)))
+                  (case argumentType
+                    (@STRING
+                     (setq printOperator (quote CL:write-string)))
+                    (otherwise
+                     (if (subtype-of? argumentType @OBJECT)
+                         (setq printOperator (quote print-object))
+                       (setq printOperator (quote CL:princ)))))
+                  (typecase arg
+                    (STRING
+                     ;; If we have subsequent string literals,
+                     ;;    compound them into a single one:
+                     (when (defined? compoundedString)
+                       (setq compoundedString
+                         (concatenate
+                           compoundedString (wrapper-value arg)))
+                       ;(setf (second (cast (first printForms) CONS))
+                       ;  (wrap-literal compoundedString))
+                       (setf (first printForms)
+                         (wrap-literal compoundedString))
+                       (continue))
+                     (setq compoundedString (wrapper-value arg)))
+                    (otherwise
+                     (setq compoundedString NULL)))
+                  (case (method-call-type-for-vector-structs
+                         printOperator argumentType
+                         (not (eql? printOperator (quote print-object))))
+                    (PRINT-OBJECT
+                     ;(pushq printForms
+                     ;       (cl-translate-normal-call-method-tree
+                     ;        (quote print-object)
+                     ;        argumentType (bquote (& arg %%stream))))
+                     (pushq printForms (cl-translate-a-tree arg)))
+                    (otherwise
+                     ;(pushq printForms
+                     ;       (bquote
+                     ;        (& printOperator
+                     ;           & (cl-translate-a-tree arg)
+                     ;           %%stream)))
+                     (pushq printForms (cl-translate-a-tree arg)))))))
+    (setq printForms (reverse printForms))
+    #|
+    (cond ((and (cons? stream)
+                (> (length printForms) 1))
+           ;; We have to bind the complex stream argument, since it is
+           ;;    needed more than once and might have side effects:
+           (setq printForms
+             (bquote (CL:let ((%%stream & stream))
+                       && printForms))))
+          (otherwise
+           ;; Relies on the fact that each print form has the stream
+           ;;    as its last argument:
+           (foreach printForm in printForms
+                    do (setf (value (last-cons printForm)) stream))
+           (if (> (length printForms) 1)
+               (setq printForms (bquote (CL:progn && printForms)))
+             (setq printForms (first printForms)))))
+    (return printForms)
+    |#
+    (return
+      (bquote
+       (& (cl-translate-global-symbol (quote %%PRINT-STREAM))
+          & stream
+          && printForms)))))
+
+(defun (cl-translate-print-stream-tree CONS) ((tree CONS))
+  ;; 'tree' has the form '(print-native-stream <stream> <arguments>)'.
+  ;; Return a Lisp form that writes '<arguments>' to '<stream>'.
+  (let ((stream (second tree)))
+    (cond
+     ((eq? stream :warn)
+      (return (bquote (CL:warn && (yield-format-arguments tree)))))
+     ((eq? stream :error)
+      (return (bquote (CL:error && (yield-format-arguments tree)))))
+     ((eq? stream :continuable-error)
+      ;; NOT YET IMPLEMENTED CORRECTLY ('CL:cerror' TAKES TWO FORMAT STRINGS
+      ;;    AND WE PROVIDE ONLY ONE, FOR NOW, HARDCODE THE FIRST ONE): 
+      (return (bquote (CL:cerror "Continue anyway? "
+                                 && (yield-format-arguments tree)))))
+     (otherwise (return (yield-print-tree tree))))))
+
+(defun (cl-translate-call-function-code-tree CONS) ((tree CONS))
+  ;; Translate
+  ;;   '(SYS-CALL-FUNCTION-CODE <signature> <fun> <arg1>...<argn>)' or
+  ;;   '(SYS-CALL-METHOD-CODE <signature> <method> <arg1>...<argn>)
+  ;;   trees.
+  (let ((methodCode? (eql? (first tree) (quote SYS-CALL-METHOD-CODE)))
+        (oTree (rest tree)))
+    (setf (rest oTree) (cl-translate-list-of-trees (rest oTree)))
+    (setf (first oTree)
+      (choose (and methodCode?
+                   (use-vector-structs?))
+              (quote CLSYS-METHOD-CODE-CALL)
+              (quote CL:FUNCALL)))
+    (return oTree)))
+
+(defun (cl-translate-inline-call-tree OBJECT) ((tree CONS))
+  ;; Inline a call to a function or method whose inlinable body
+  ;;    is a single verbatim expression.
+  ;; Since we are already inlining, we also declare the result type
+  ;;    to facilitate LISP inlining of various functions in the case
+  ;;    of nested arguments.
+  (let ((callTree CONS (second tree))
+        (method METHOD-SLOT (slot-from-expression-tree callTree))
+        (args (choose (eql? (first callTree) (quote SYS-CALL-FUNCTION))
+                      (nth-rest callTree 2)
+                      (nth-rest callTree 3)))
+        (translatedArgs (cl-translate-list-of-trees args))
+        (usedComplexArgs NIL)
+        (argument OBJECT NULL)
+        ;; At this point we know that we have a :COMMON-LISP option.
+        ;;    We call `walk-verbatim-tree' to handle verbatim strings:
+        (body (lookup-verbatim-tree
+               (walk-verbatim-tree (inlinable-method-body method)) NULL))
+        (parameters (method-parameter-names method))
+        (parameterTypes (method-parameter-type-specifiers method))
+        (parIndex 0)
+        (oTree NIL))
+    ;; First, try to substitute the actual parameters directly:
+    (typecase body
+      (CONS
+       (when (forall elt in body
+                 always (not (cons? elt)))
+         (setq oTree
+           (bquote (& (cl-translate-verbatim-body-symbols (first body) NIL-LIST))))
+         (foreach bArg in (rest body)
+             do (cond
+                 ((member? parameters bArg)
+                  (setq parIndex (position parameters bArg 0))
+                  (setq argument (nth translatedArgs parIndex))
+                  (when (member? usedComplexArgs argument)
+                    ;; We used a complex actual argument more than once, in
+                    ;;    which case we need to bind it to an auxiliary:
+                    (setq oTree NIL)
+                    (break))
+                  (when (cons? argument)
+                    (pushq usedComplexArgs argument)
+                    (setq argument
+                      (cl-yield-typed-expression-tree
+                       argument (nth parameterTypes parIndex))))
+                  (pushq oTree argument))
+                 (otherwise
+                  (pushq oTree
+                         (cl-translate-verbatim-body-symbols bArg NIL-LIST)))))
+         (when (non-empty? oTree)
+           (return
+             (cl-yield-typed-expression-tree (reverse oTree) (type method))))))
+      (otherwise NULL))
+    ;; Otherwise, i.e., if we need to avoid multiple argument evaluation or
+    ;;    have to deal with a complex verbatim expression, use auxiliary `let':
+    (foreach par in parameters
+        as arg in translatedArgs
+        collect (bquote (& (cl-translate-local-symbol par) & arg))
+        into oTree)
+    (return
+      (bquote
+       (CL:let & oTree
+               && (cl-yield-declare-tree
+                   (cl-yield-method-parameter-type-declaration-trees method)
+                   FALSE)
+               & (cl-yield-typed-expression-tree
+                  (cl-translate-verbatim-body-symbols
+                   (transientify-form body) parameters)
+                  (type method)))))))
+
+(defun (cl-translate-verbatim-body-symbols OBJECT)
+    ((body OBJECT) (parameters (LIST OF SYMBOL)))
+  ;; Walk `body' and translate any symbols that are not `parameters' as global
+  ;;    symbols to make sure they will be translated with proper package info
+  ;;    in case we are in some other module with different package.
+  ;; All symbols in `parameters' are translated as local symbols, since they
+  ;;    need to match the `let' variables generated above.
+  (typecase body
+    (CONS
+     (if (non-empty? body)
+         (return
+           (cons (cl-translate-verbatim-body-symbols (first body) parameters)
+                 (cl-translate-verbatim-body-symbols (rest body) parameters)))
+       (return NIL)))
+    (SYMBOL
+     (if (member? parameters body)
+         (return (cl-translate-local-symbol body))
+       (return (cl-translate-global-symbol body))))
+    (otherwise
+     (return body))))
+
+(defun (cl-translate-the-code-tree CONS) ((tree CONS))
+  ;; Return a parse tree expression that evaluates to a pointer
+  ;;    to a function or method.
+  (let ((name SYMBOL (choose (eql? (second tree) :function)
+                             (third tree)
+                             (fourth tree))))
+    (return
+      (bquote
+       (CL:function
+        & (cl-translate-global-symbol
+           (yield-renamed-name-if-native name :common-lisp :function)))))))
+
+(defun (cl-translate-verbatim-tree OBJECT) ((tree CONS))
+  ;; Return the code assigned to the :cl option inside of '(rest tree)'.
+  (let ((cursor (rest tree))
+        (verbatimCode OBJECT NULL))
+    (while (non-empty? cursor)
+      (when (eq? (value cursor) :common-lisp)
+        (setq verbatimCode (value (rest cursor)))
+        (setf (value (rest cursor)) NULL)       ; clip before gc
+        (break))                        ; exit loop
+      (setq cursor (rest (rest cursor))))
+    (return verbatimCode) ))
+
+(defun (cl-translate-inline-tree CONS) ((tree CONS))
+  ;; Translate 'inline' or 'ignore' declaration.
+  (let ((operator (first tree))
+        (body (cl-translate-list-of-trees (rest tree))))
+    (case operator
+      (INLINE (setq operator (quote CL:INLINE)))
+      (IGNORE (setq operator (quote CL:IGNORE))))
+    (return (bquote (CL:DECLARE (& operator && body)))) ))
+
+  ;;
+;;;;;; Support for type declarations
+  ;;
+
+(defun (generate-cl-type-declarations? BOOLEAN) ()
+  ;; Return TRUE if type declarations for certain function/method
+  ;;    parameters and let-variables should be generated.
+  (return (method-call-inlining-enabled?)))
+
+(defun (lookup-cl-type-from-stella-type OBJECT) ((type TYPE-SPEC))
+  ;; Return the CL type specifier corresponding to `type'.
+  ;; If CL-type declarations for `type' don't make sense, return NULL.
+  (when (or (null? type)
+            (anchored-type-specifier? type))
+    (return NULL))
+  (let ((baseType (type-spec-to-base-type type)))
+    ;; Hardcode these, since for various reasons they do not correspond
+    ;;    to the `cl-native-type's stored on the classes:
+    (case baseType
+      (@INTEGER (return (quote CL:FIXNUM)))
+      (@SHORT-INTEGER (return (quote CL:FIXNUM)))
+      (@FLOAT (return (quote CL:DOUBLE-FLOAT)))
+      (@STRING (return (quote CL:SIMPLE-STRING)))
+      (@MUTABLE-STRING (return (quote CL:SIMPLE-STRING)))
+      (@NATIVE-VECTOR (return (quote CL:SIMPLE-VECTOR)))
+      (@ARRAY
+       ;; This type poses a more difficult NULL-value problem than @STRING or
+       ;;    @NATIVE-VECTOR, since we'd need a different NULL-value for each
+       ;;    potential array type.  Alternatively, we could not declare the
+       ;;    type of such variables (or use an `(CL:or <type> CL:null)' idiom)
+       ;;    and instead use an `(%%aref ...)' macro that type-declares its
+       ;;    argument (this would also work for @NATIVE-VECTOR and @STRING):
+       (when (array-type-specifier? type)
+         (case (array-type-rank type)
+           (1 (return (quote CL:SIMPLE-VECTOR)))
+           (otherwise
+            (let ((dimensions NIL))
+              (foreach dim in (array-type-dimensions type)
+                  collect (choose (null? dim) (quote CL:*) dim)
+                  into dimensions)
+              (return (bquote (CL:ARRAY CL:T & dimensions))))))))
+      (otherwise NULL))
+    (return NULL)))
+
+(defun (cl-yield-typed-expression-tree OBJECT) ((tree OBJECT) (type TYPE-SPEC))
+  ;; Yield a `(CL:the TYPE EXPRESSION)' tree for the expression `tree'
+  ;;    and `type' if such a declaration makes sense.
+  ;; Otherwise, return `tree'.
+  (let ((clType (lookup-cl-type-from-stella-type type)))
+    (cond
+     ((defined? clType)
+      (typecase tree
+        (CONS
+         (when (and (eql? (first tree) (quote CL:the))
+                    (eql? (second tree) clType))
+           ;; avoid redundant type declaration - actually, if the types don't
+           ;;    match we probably have a problem:
+           (return tree)))
+        (otherwise NULL))
+      (return (bquote (CL:the & clType & tree))))
+     (otherwise
+      (return tree)))))
+
+(defun (cl-yield-method-parameter-type-declaration-trees CONS)
+    ((method METHOD-SLOT))
+  ;; Yield a list of type declaration trees of the form
+  ;;    `(CL:type TYPE VAR)' for the parameters of `method' for
+  ;;    which such a type declaration makes sense.
+  (let ((types NIL)
+        (clType SYMBOL NULL))
+    (foreach tSpec in (method-parameter-type-specifiers method)
+        as pName in (method-parameter-names method)
+        do (setq clType
+             (lookup-cl-type-from-stella-type
+              (compute-relative-type-spec tSpec (slot-owner method))))
+           (when (defined? clType)
+             (pushq types
+                    (bquote
+                     (CL:type & clType
+                              & (cl-translate-local-symbol pName))))))
+    (return (reverse types))))
+
+(defun (cl-yield-let-variable-type-declaration-trees CONS) ((bindingsTree (CONS OF CONS)))
+  ;; Yield a list of type declaration trees of the form
+  ;;    `(CL:type TYPE VAR)' for the let variables in `bindingsTree'
+  ;;    for which such a type declaration makes sense.
+  ;; `bindingsTree' is assumed to be of the 3-element format
+  ;;    `(VAR TYPE INIT)' as generated by the walker.
+  (let ((types NIL)
+        (clType SYMBOL NULL))
+    (foreach binding in bindingsTree
+             do
+             (let ((type (second binding)))
+               (when (defined? type)
+                 (setq clType (lookup-cl-type-from-stella-type (second binding))))
+               (when (defined? clType)
+                 (pushq types
+                        (bquote
+                         (CL:type & clType
+                                  & (cl-translate-local-symbol (first binding))))))))
+    (return (reverse types))))
+
+(defun (cl-yield-global-variable-type-declaration-tree CONS)
+    ((global GLOBAL-VARIABLE))
+  ;; Yield a type declaration tree of the form `(CL:type TYPE GLOBAL)',
+  ;;    or NULL if a type declaration doens't makes sense.
+  (let ((clType (lookup-cl-type-from-stella-type
+                 (global-variable-type-spec global))))
+    (if (defined? clType)
+        (return
+          (bquote
+           (CL:type & clType
+                    & (cl-translate-global-symbol (variable-name global)))))
+	(return NULL))))
+
+(defun (cl-yield-method-arglist-type-declarations CONS) ((method METHOD-SLOT))
+  ;; Return a list of Common Lisp type specifiers.
+  (let ((types NIL)
+	(clType SYMBOL NULL))
+    (foreach tSpec in (method-parameter-type-specifiers method)
+        do (setq clType
+             (lookup-cl-type-from-stella-type
+              (compute-relative-type-spec tSpec (slot-owner method))))
+           (if (defined? clType)
+             (pushq types clType)
+	     (pushq types (quote CL:T))))
+    (return (reverse types))))
+
+(defun (cl-yield-method-return-type-declaration OBJECT) ((method METHOD-SLOT))
+  ;; Return a single Common Lisp type specifier or a CONS of (CL:VALUES type1...)
+  (let ((types NIL)
+	(clType SYMBOL NULL))
+    (foreach tSpec in (method-return-type-specifiers method)
+        do (setq clType
+             (lookup-cl-type-from-stella-type
+              (compute-relative-type-spec tSpec (slot-owner method))))
+           (if (defined? clType)
+             (pushq types clType)
+	     (pushq types (quote CL:T))))
+    (if (empty? (rest types))
+      (return (first types))
+      (return (bquote (CL:VALUES && (reverse types)))))))
+
+(defun (cl-yield-method-type-declaration-tree CONS) ((method METHOD-SLOT))
+  ;; Yield a type declaration tree of the form
+  ;; `(CL:ftype (CL:FUNCTION (ARG1-TYPE ...) RETURN-TYPE) METHOD)',
+  ;;    or NULL if a type declaration doesn't makes sense.
+  ;;  Note that if a type definition makes sense, then we need to include
+  ;;    types for all parameters, defaulting to CL:T.
+  ;;  Multiple return values are wrapped in a CL:VALUES form.
+  (unless (method-function? method)
+    ;; only do this for functions, since method signatures might be
+    ;;    incongruent but are mapped onto the same generic function:
+    (return NULL))
+  (let ((clType (lookup-cl-type-from-stella-type (slot-base-type method))))
+    (if (defined? clType)
+        (return
+          (bquote
+           (CL:ftype
+	    (CL:FUNCTION
+	     & (cl-yield-method-arglist-type-declarations method)
+	     & (cl-yield-method-return-type-declaration method))
+	    & (cl-translate-global-symbol (slot-name method)))))
+	(return NULL))))
+
+(defun (cl-yield-declare-tree CONS) ((declarations (CONS OF CONS)) 
+                                     (include-type-checks? BOOLEAN))
+  ;; Generate a `((CL:declare DECLARATIONS...))' tree and return
+  ;;    the result or NIL if `declarations' is empty.
+  ;; The extra nesting simplifies optional inclusion in parse trees.
+  (when (empty? declarations)
+    (return NIL))
+  (let ((otherDeclarations (rest declarations))
+        (typeChecks NIL))
+    ;; If Safety is >= 2, collect type checks for everything we type declare.
+    ;; Otherwise collect conditional type checks for "dangerous"
+    ;;    types (i.e., cl:fixnum, cl:double-float, cl:string) only for MCL
+    ;;    unless safety = 0.
+    (when (and include-type-checks? (>= *safety* 1))
+      (foreach decl in declarations
+          do (when (<= *safety* 2)
+               (pushq typechecks (new VERBATIM-STRING-WRAPPER :wrapper-value "#+MCL")))
+             (pushq typechecks
+                    (bquote (cl:check-type & (third decl) & (second decl)))))
+      (setq typechecks (reverse typechecks)))
+      
+    ;; Combine multiple type declarations so there is only one per type
+    ;;    (this is somewhat quadratic, but we operate on short lists):
+    (foreach decl in declarations
+        do (when (and (defined? decl)
+                      (eql? (first decl) (quote CL:type)))
+             (foreach otherDecl in otherDeclarations
+                 where (and (defined? otherDecl)
+                            (eql? (first otherDecl) (quote CL:type))
+                            (eql? (second otherDecl) (second decl)))
+                 do (concatenate decl (rest (rest otherDecl)))
+                    (substitute otherDeclarations NULL otherDecl)))
+           (setq otherDeclarations (rest otherDeclarations)))
+    (return (bquote ((CL:declare && (remove declarations NULL))
+                     && typeChecks)))))
+
+  ;;
+;;;;;; CL-translation of translation units:
+  ;;
+
+(defun (cl-translate-unit OBJECT) ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree representing a CL definition of
+  ;;    the object stored in 'unit'.
+  (case (category unit)
+    (GLOBAL-VARIABLE
+     (return (cl-translate-define-global-variable-unit unit)))
+    (CLASS
+     (return (cl-translate-define-native-class-unit unit)))
+    ((METHOD MACRO)
+     (return (cl-translate-define-method-unit unit)))
+    (PRINT-METHOD
+     (return (cl-translate-defprint-unit unit)))
+    ((STARTUP-TIME-PROGN VERBATIM)
+     (return (cl-translate-a-tree (the-object unit))))
+    (TYPE
+     (setf (category unit) NULL)
+     (return NIL))))
+
+  ;;
+;;;;;; 'cl-translate-method-unit'
+  ;;
+
+(defun (cl-translate-method-parameters CONS) ((method METHOD-SLOT))
+  ;; Return a parse tree representing a parameter list for a Lisp method
+  ;;    or function translation of 'method'.
+  (let ((function? (method-function? method))
+        (oTree NIL)
+        (oParameter OBJECT NULL)
+        (firstParameterType OBJECT NULL))
+    (foreach parameter in (method-parameter-names method)
+             as pType in (method-parameter-type-specifiers method)
+             as i in (interval 1 NULL)
+             do
+             (setq oParameter (cl-translate-local-symbol parameter))
+             (cond
+              ;; the first argument of a method retains its type:
+              ;; TO DO: FIGURE OUT HOW OPERATORS TURN INTO MULTI-METHODS:
+              ((and (not function?)
+                    (eq? i 1))
+               ;; first parameter of a method:
+               (setq firstParameterType
+                 (cl-translate-class-name
+                  (type-to-class (type-spec-to-base-type pType))))
+               (case (method-call-type-for-vector-structs
+                      (slot-name method) (slot-owner method) function?)
+                 (OBJECT-METHOD
+                  (pushq oTree (bquote (CLSYS-SELF & firstParameterType)))
+                  (pushq oTree oParameter))
+                 (NON-OBJECT-METHOD
+                  (pushq oTree (bquote (& oParameter & firstParameterType)))
+                  (pushq oTree (bquote CLSYS-DUMMY)))
+                 (otherwise
+                  (pushq oTree (bquote (& oParameter & firstParameterType))))))
+              (otherwise
+               (pushq oTree oParameter))))
+    (when (and (method-variable-arguments? method)
+               (not (pass-variable-arguments-as-list? method)))
+      (setf (rest oTree) (bquote (CL:&rest && (rest oTree)))))
+    (return (reverse oTree))))
+
+(defun (cl-translate-define-method-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Translate a definition of a method, function, or operator into a
+  ;;    Lisp parse tree definition.
+  (let ((method METHOD-SLOT (the-object unit))
+        (methodName (slot-name method))
+        (documentation (documentation method))
+        (function? (method-function? method))
+        (bodyTree CONS (code-register unit))
+        (declarations NIL)
+	(methodDeclaration CONS NULL)
+        (oTree NIL))
+    (when (and (eql? methodName (quote PRINT-OBJECT))
+               (eql? (slot-owner method) @CONS)
+               (use-cl-conses?))
+      ;; Don't define CL:CONS.print-object to keep Lisp happy:
+      (return NULL))
+    (case (method-call-type-for-vector-structs
+           methodName (slot-owner method) function?)
+      (PRINT-OBJECT
+       (pushq bodyTree
+              (bquote (setq self
+                        & (cl-translate-global-symbol (quote *clsys-self*))))))
+      ;; NOTE: The first arg to a normal method is always considered used!
+      (NON-OBJECT-METHOD
+       (setq declarations (bquote ((CL:ignore CLSYS-DUMMY)))))
+      (otherwise NULL))
+    (when (generate-cl-type-declarations?)
+      (setq declarations
+        (concatenate
+          declarations
+          (cl-yield-method-parameter-type-declaration-trees method)))
+      (setq methodDeclaration
+        (cl-yield-method-type-declaration-tree method)))
+    (setq oTree
+      (bquote (& (choose function?
+                         (quote CL:DEFUN)
+                         (choose (use-defconsmethod? method)
+                                 (quote %%DEFCONSMETHOD)
+                                 (quote CL:DEFMETHOD)))
+                 & (cl-translate-global-symbol
+                    (yield-renamed-name-if-native
+                     methodName :common-lisp :function))
+                 & (cl-translate-method-parameters method)
+                 && (choose (defined? documentation)
+                            (bquote (& documentation))
+                            NIL)
+                 && (cl-yield-declare-tree declarations TRUE)
+                 && (cl-translate-list-of-trees bodyTree)
+                 && (choose (and (void? (type method))
+                                 (not (preserve-tail-merge-optimizability?)))
+                            (bquote (;;(CL:VALUES)
+                                     ;; Bob prefers having a value, so he can
+                                     ;;    see when evaluation is done in MCL:
+                                     :VOID))
+                            NIL))))
+    (when (method-auxiliary? method)    ; gc auxiliary method:
+      (free method))
+    (when (defined? methodDeclaration)
+      (setq oTree
+	(bquote
+         (CL:progn & oTree
+                   (CL:declaim & methodDeclaration)))))
+    (return oTree)))
+
+
+  ;;
+;;;;;; 'cl-translate-define-native-class-unit'
+  ;;
+
+;;; Definition of CLOS slots and classes
+
+(defun (yield-CLOS-slot-type-tree CONS) ((slot STORAGE-SLOT))
+  ;; Helping function for "yield-CLOS-slot-tree".
+  ;; Returns a slot options fragment for CLOS slots that have useful
+  ;;   Common Lisp types.
+  (let ((clType (lookup-cl-type-from-stella-type (slot-base-type slot))))
+    (if (defined? clType) ;; (and (generate-cl-type-declarations?))
+      (return (bquote (:TYPE & clType
+			     :INITFORM & (cl-translate-a-tree
+					  (type-to-walked-null-value-tree
+					   (slot-base-type slot))))))
+      (return NIL)) ))
+
+
+(defun (yield-CLOS-slot-tree CONS) ((slot STORAGE-SLOT))
+  ;; Helping function for "yield-CLOS-class-tree".
+  ;; Return a parse tree that defines a CLOS slot corresponding to 'slot'.
+  ;; Slot options are generated for the keywords
+  ;;    :allocation and :accessor
+  ;; If there is a :renames option, reset the slot name to the source name.
+  (let ((slotName (true-slot-name (slot-name slot) (slot-owner slot)))
+        (allocation (allocation slot))
+        (allocationForm NIL)
+        (documentation (documentation slot))
+        (documentationForm NIL))
+    ;; convert :embedded allocation to :instance allocation:
+    (case allocation
+      (:embedded (setq allocation :instance))
+      (otherwise NULL))
+    (when (defined? allocation)
+      (setq allocationForm (bquote (:ALLOCATION & allocation))))
+    (when (defined? documentation)
+      (setq documentationForm (bquote (:DOCUMENTATION & documentation))))
+    (return
+     (bquote 
+      (& (cl-translate-global-symbol slotName)
+         ;; NOTE: C++ needs explicit initialization, so we do that
+         ;;    in the constructor instead of here.
+         ;;:INITFORM NULL
+	 && (yield-CLOS-slot-type-tree slot)
+	 && documentationForm
+         && allocationForm
+         :ACCESSOR & (yield-CLOS-slot-accessor-name slotName)))) ))
+
+(defun (yield-CLOS-class-tree CONS) ((class CLASS))
+  ;; Return a form that evaluates to a CLOS class definition.
+  (let ((directSupers NIL)
+        (CLOSslotDefs NIL)
+        (documentation (documentation class)))
+    (foreach super in (class-native-supers class)
+        where (or (not (mixin? (type-class super)))
+                  (not (translate-to-single-inheritance-language?)))
+	collect (cl-translate-class-name (type-to-class super))
+        into directSupers)
+    (when (empty? directSupers)
+      (pushq directSupers
+             (cl-translate-global-symbol (quote CLSYS-ROOT-OBJECT))))
+    ;; generate slot definitions (mirror C++ slot allocation):
+    (foreach slot in (class-slots class)
+             where (and (storage-slot? slot)
+                        (native-slot? slot))
+             do
+             (when (not (eql? (native-slot-home slot class) class))
+               (when (and (defined? (slot-base-type slot))
+                          (not (defined? (type-class (slot-base-type slot)))))
+                 (warn "Can't generate a native slot named " (slot-name slot) 
+                       " for the class " (class-name class) EOL
+                       " because the slot's :type " (slot-base-type slot) 
+                       " is undefined."))
+               (continue))
+             collect (yield-CLOS-slot-tree slot)
+             into CLOSslotDefs)
+    (return
+     (bquote
+      (CL:defclass & (cl-translate-global-symbol (class-symbol class))
+        & directSupers
+        & CLOSslotDefs
+        && (choose (defined? documentation)
+                   (bquote ((:documentation & documentation)))
+                   NIL))))))
+
+(defun (compute-cl-struct-slots (LIST OF STORAGE-SLOT)) ((class CLASS))
+  ;; Compute the list of native storage slots that will be allocated
+  ;;    in a vector-struct that represents 'class'.
+  ;; Vector-struct slots are accessed by offset, which makes precomputing
+  ;;    this list necessary to compute slot offsets efficiently.
+  (let ((realSuper TYPE  ;; BUG: VRLET expansion looses the parameter type!
+         ;; There better be at most one:
+         (some super in (class-native-supers class)
+               where (not (mixin? (type-class super)))))
+        (result (choose (defined? realSuper)
+                        (compute-cl-struct-slots (type-class realSuper))
+                        NULL)))
+    (unless (defined? result)
+      (setq result (new LIST)))
+    ;; Inherit mixin slots:
+    (foreach super in (class-native-supers class)
+             where (not (eql? super realSuper))
+             do
+             (foreach slot in (class-slots (type-class super))
+                      where (and (storage-slot? slot)
+                                 (native-slot? slot))
+                      collect slot into result))
+    ;; Finally, add local storage slots of 'class':
+    (foreach slot in (class-local-slots class)
+             where (and (storage-slot? slot)
+                        (native-slot? slot))
+             collect slot into result)
+    (return result)))
+
+(defun (cl-struct-slots (LIST OF STORAGE-SLOT)) ((class CLASS))
+  ;; Return the list of native storage slots that will be allocated
+  ;;    in a CL struct that represents 'class'.
+  (let ((slots (class-cl-struct-slots class)))
+    (if (defined-list? slots)
+        (return slots)
+      (return
+        (setf (class-cl-struct-slots class)
+          (compute-cl-struct-slots class))))))
+
+(defun (cl-struct-slot-offset INTEGER) ((slotName SYMBOL) (classType TYPE))
+  ;; Return the struct-slot offset for slot 'slotName' on 'classType'.
+  (let ((slots (cl-struct-slots (type-class classType)))
+        (offset 1)) ;; slot 0 contains the name or class prototype
+    (foreach slot in slots
+             do (if (eql? (slot-name slot) slotName)
+                    (return offset)
+                  (++ offset)))
+    (walk-error "Can't find slot " slotName " on CL-struct class " classType)
+    (return NULL)))
+
+(defun (yield-struct-slot-tree CONS) ((slot STORAGE-SLOT))
+  (let ((clType (lookup-cl-type-from-stella-type (slot-base-type slot))))
+    (if (defined? clType) ;; (and (generate-cl-type-declarations?))
+      (return (bquote (& (cl-translate-local-symbol (slot-name slot))
+			 & (cl-translate-a-tree
+			    (type-to-walked-null-value-tree
+			     (slot-base-type slot)))
+			 :TYPE & clType)))
+      (return (bquote (& (cl-translate-local-symbol (slot-name slot))
+			 & (cl-translate-global-symbol (quote NULL)))))
+      ) ))
+
+(defun (yield-struct-slot-trees CONS) ((class CLASS))
+  ;; Return a list of slot definitions for a standard CL struct
+  ;;    representing 'class'.
+  (let ((structSlotDefs NIL))
+    (foreach slot in (cl-struct-slots class)
+             do
+             (when (not (eql? (native-slot-home slot class) class))
+               (when (and (defined? (slot-base-type slot))
+                          (not (defined? (type-class (slot-base-type slot)))))
+                 (warn "Can't generate a native slot named " (slot-name slot) 
+                       " for the class " (class-name class) EOL
+                       " because the slot's :type " (slot-base-type slot) 
+                       " is undefined."))
+               (continue))
+             collect (yield-struct-slot-tree slot)
+             into structSlotDefs)
+    (return structSlotDefs)))
+
+(defun (yield-struct-tree CONS) ((class CLASS))
+  ;; Return a form that evaluates to a standard Common Lisp struct definition.
+  ;; Slots are initialized to NULL, the constructor and initializer assign
+  ;;    initial values.
+  ;; NOTE: Using a standard CL struct hierarchy is somewhat space inefficient,
+  ;;    since for every slot defined on a class, we get an additional accessor
+  ;;    function for every class that inherits it.
+  ;; NOTE2: Using standard struct accessors generates a forward-reference
+  ;;    problem, since accesses to struct slots cannot be compiled before
+  ;;    the structure is actually defined.
+  (let ((super
+         ;; There better be at most one:
+         (some super in (class-native-supers class)
+             where (not (mixin? (type-class super)))))
+        (translatedSuper OBJECT NULL)
+        (documentation (documentation class)))
+    (if (defined? super)
+        (setq translatedSuper
+          (cl-translate-global-symbol (type-to-symbol super)))
+      (setq translatedSuper
+        (cl-translate-global-symbol (quote CLSYS-ROOT-STRUCT))))
+    (return
+      (bquote
+       (CL:defstruct (& (cl-translate-global-symbol (class-symbol class))
+                      (:conc-name
+                       & (yield-struct-slot-accessor-name
+                          (class-type class) (quote ||)))
+                      && (choose (defined? translatedSuper)
+                                 (bquote ((:include & translatedSuper)))
+                                 NIL)
+                      (:constructor
+                       ;; Supplying an empty constructor parameter list avoids
+                       ;; the definition of inefficient constructor functions
+                       ;; that have zillions of never-used keyword parameters:
+                       & (yield-struct-constructor-name class) ())
+                      (:copier ())
+                      (:predicate ()))
+         && (choose (defined? documentation)
+                    (bquote (& documentation))
+                    NIL)
+         && (yield-struct-slot-trees class))))))
+
+(defun (yield-vector-struct-name OBJECT) ((class CLASS))
+  ;; Return the name of the vector struct representing 'class'.
+  ;; Since vector structs have corresponding CLOS classes, we have
+  ;;    to use different names to avoid name clashes (do we really?).
+  ;; Currently not used.
+  (return
+    (yield-global-lisp-symbol
+     (interned-in (class-type class))
+     (concatenate "%" (class-name class)))))
+
+(defun (yield-vector-struct-tree CONS) ((class CLASS))
+  ;; Return a form that evaluates to a Common Lisp vector struct definition.
+  ;; Actually, we don't define a struct at all, we only define the
+  ;;    mirror class necessary for proper method dispatch.  Eventually,
+  ;;    we might want to define proper structs too, to get the appropriate
+  ;;    accessors that can be used by somebody who hooks up code to Stella.
+  (let ((super
+         ;; There better be at most one:
+         (some super in (class-native-supers class)
+             where (not (mixin? (type-class super)))))
+        (documentation (documentation class)))
+    (return
+      (bquote
+       (CL:defclass & (cl-translate-global-symbol (class-symbol class))
+         & (choose (defined? super)
+                   (bquote
+                    (& (cl-translate-global-symbol (type-to-symbol super))))
+                   NIL)
+         ()
+         && (choose (defined? documentation)
+                    (bquote ((:documentation & documentation)))
+                    NIL))))))
+
+(defun (yield-condition-tree CONS) ((class CLASS))
+  ;; Return a form that evaluates to a new condition definition.
+  ;; This is like a CLOS class definition, except that it uses
+  ;;   cl:define-condition, and doesn't allow class options.
+  ;;   This latter will have the drawback of deleting :documentation.
+  (let ((defn (yield-CLOS-class-tree class)))
+    (setf (first defn) (quote cl:define-condition))
+    (when (defined? (rest (rest (rest (rest defn)))))
+      (setf (rest (rest (rest (rest defn)))) NIL))
+    (return defn)))
+
+(defun (cl-always-translate-to-clos-class? BOOLEAN) ((CLASS class))
+  ;; Predicate which returns TRUE if 'class' should always be translated
+  ;; to a CLOS class, regardless of environment settings for the use
+  ;; of struct classes.
+  ;; Currently this would be subclasses of Native CLOS classes.
+  (return (and (not (subtype-of? (class-type class) @OBJECT))
+               (create-native-class? class)
+               (exists super in (class-all-super-classes class)
+                 where (not (create-native-class? super))))))
+
+(defun (cl-translate-define-native-class-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree defining a native class corresponding to the
+  ;;    Stella class stored in 'unit', or NULL if the class has no
+  ;;    native class.
+  (let ((class CLASS (the-object unit)))
+    (cond ((exception-class? class)
+	   (return (yield-condition-tree class)))
+	  ((or (not (use-cl-structs?))
+	       (cl-always-translate-to-clos-class? class))
+	   (return (yield-CLOS-class-tree class)))
+	  ((use-vector-structs?)
+	   (return (yield-vector-struct-tree class)))
+	  (otherwise
+	   (return (yield-struct-tree class)))) ))
+
+
+  ;;
+;;;;;; 'cl-translate-define-global-variable-unit'
+  ;;
+
+(defun (cl-translate-define-global-variable-unit CONS)
+    ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree declaring a global variable.  'unit'
+  ;;    is a translation unit containing a global variable object.
+  (let ((global GLOBAL-VARIABLE (the-object unit))
+        (name (cl-translate-global-symbol (variable-name global)))
+        (documentation (documentation global))
+        (unboundSpecial?
+         (and (variable-special? global)
+              (eq? (code-register unit) :UNBOUND-SPECIAL-VARIABLE)))
+        (initialValueTree (cl-translate-a-tree (code-register unit)))
+        (typeDeclarationTree
+         (choose (generate-cl-type-declarations?)
+                 (cl-yield-global-variable-type-declaration-tree global)
+                 NULL))
+        ;;(operator (quote CL:DEFPARAMETER))
+        (operator (quote CL:DEFVAR))
+        (oTree NIL))
+    (when (and (variable-constant? global)
+               ;; (CL:constantp initialValueTree)
+               ;; TO DO: Enable this again after we finished debugging:
+               FALSE)
+      (setq operator (quote CL:DEFCONSTANT)))
+    (setq oTree
+      (choose unboundSpecial?
+              (bquote (CL:DEFVAR & name))
+              (bquote (& operator & name & initialValueTree
+                         && (choose (defined? documentation)
+                                    (bquote (& documentation))
+                                    NIL)))))
+    (when (defined? typeDeclarationTree)
+      (setq oTree
+        (bquote
+         (CL:progn & oTree
+                   (CL:declaim & typeDeclarationTree)))))
+    (return oTree)))
+
+(defun (cl-translate-defprint-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a 'print-object' method definition.
+  (let ((class CLASS (the-object unit))
+        (body (code-register unit))
+        (extraTrees NIL))
+    (case (method-call-type-for-vector-structs
+           (quote print-object) (class-type class) FALSE)
+      (PRINT-OBJECT
+       (setq extraTrees
+         (bquote ((setq self
+                    & (cl-translate-global-symbol (quote *clsys-self*)))))))
+      (otherwise NULL))
+    (return
+      (bquote
+       (CL:defmethod CL:print-object ((self & (class-symbol class)) stream)
+         && extraTrees
+         & (cl-translate-a-tree body))))))

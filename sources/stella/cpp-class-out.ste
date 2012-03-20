@@ -1,0 +1,439 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: cpp-class-out.ste,v 1.42 2003/04/18 21:14:37 hans Exp
+
+;;; C++-specific routines for defining a C++ class based on a
+;;;    Stella class object.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Definition of C++ slots and classes
+  ;;
+
+(defun (cpp-yield-initial-null-value CONS) ()
+  ;; Return a parse tree that defines a null initial value for the
+  ;;    slot 'slot'.
+  (return (cpp-translate-a-tree NULL)) )
+					 
+(defun (cpp-yield-member-var-tree CONS) ((slot STORAGE-SLOT)
+					 (class CLASS))
+  ;; Helping function for "cpp-translate-define-native-class-unit".
+  ;; Return a parse tree that defines a C++ Member var corresponding to 'slot'.
+  ;; Slot options are generated for the keyword :allocation.
+  ;; NOTE: This function assumes that 'slot' is a most general slot, i.e.,
+  ;;    'class' is its 'native-slot-home'.
+  (let ((slotName (true-slot-name (slot-name slot) (class-type class)))
+        (slotType (choose (slot-context-sensitive? slot)
+                          @OBJECT
+                          (compute-return-type-spec slot (class-type class))))
+        (allocation (allocation slot))
+        (allocationForm CONS NIL)
+	(documentation (documentation slot))
+	(documentationForm NIL))
+
+    ;; convert :embedded allocation to :instance allocation:
+    ;; IS THIS CORRECT? -erm
+    (case allocation
+      (:embedded (setq allocationForm NIL))
+      (:instance (setq allocationForm NIL))
+      (:class (setq allocationForm (cons-list (wrap-literal "static"))))
+      (otherwise (setq allocationForm NIL)))
+    (when (defined? documentation)
+      (setq documentationForm (bquote (& documentation))))
+    (return
+     (bquote 
+      ((&& allocationForm
+           & (cpp-translate-and-pointerize-type-spec slotType)) 
+       & (cpp-translate-name slotName)
+       && documentationForm))) ))
+
+(defun (cpp-yield-parameterized-member-var-tree CONS) ((slot STORAGE-SLOT)
+						       (class CLASS))
+  ;; Helping function for "cpp-translate-define-native-class-unit".
+  ;; Return a parse tree that defines a C++ Member var corresponding to 'slot'.
+  ;; `slot' should have a type parameterized by the class parameters.
+  ;; This is used when outputting template classes.
+  (let ((slotName (true-slot-name (slot-name slot) (class-type class)))
+        (allocation (allocation slot))
+        (allocationForm CONS NIL))
+
+    ;; convert :embedded allocation to :instance allocation:
+    ;; IS THIS CORRECT? -erm
+    (case allocation
+      (:embedded (setq allocationForm NIL))
+      (:instance (setq allocationForm NIL))
+      (:class (setq allocationForm (cons-list (wrap-literal "static"))))
+      (otherwise (setq allocationForm NIL)))
+
+    (return
+     (bquote 
+      ((&& allocationForm & (cpp-translate-class-parameter-name 
+			     (get-slot-class-parameter-name slot)))
+       & (cpp-translate-name slotName)
+       NULL))) )) ;; initialValueForm is obsolete
+
+(defun (cpp-yield-static-member-allocation-tree CONS) ((slot STORAGE-SLOT)
+						       (class CLASS))
+  ;; Helping function for "cpp-translate-define-native-class-unit".
+  ;; Return a parse tree that defines the storage allocation for static
+  ;;   member vars.
+  (let ((slotName (slot-name slot))
+        (allocationForm CONS NIL)
+	(mostGeneralSlot SLOT NULL))
+
+    ;; Get most general slot so that (slot-base-type slot) is correct
+    (setq mostGeneralSlot slot)
+    (loop
+      (if (defined? (slot-direct-equivalent mostGeneralSlot))
+          (setq mostGeneralSlot (slot-direct-equivalent mostGeneralSlot))
+	(break)))	   ; exit loop when can't find more general slot
+    (return
+     (bquote 
+      ((&& allocationForm
+           & (cpp-translate-and-pointerize-type-spec
+              (compute-return-type-spec mostGeneralSlot (class-type class))))
+       & (cpp-translate-name slotName)
+       NULL))) )) ;; initialValueForm is obsolete
+
+(defun (cpp-yield-member-func-signature-tree CONS) ((method METHOD-SLOT))
+  ;; Helping function for "cpp-translate-define-native-class-unit".
+  ;; Return a parse tree that declares the signature of a C++ 
+  ;;   member function represented by 'method'.
+  ;; NOTE: THIS CODE IS SIMILAR TO "CPP-TRANSLATE-DEFMETHOD-TREE".
+  ;;   MAY WANT TO MERGE THE SIMILAR PIECES INTO A SINGLE ROUTINE.
+  ;; TODO: HANDLE INLINED FUNCTIONS
+  (setq *methodBeingWalked* method)
+  (return
+    (bquote 
+     (& (choose (method-function? method)
+                NULL
+                (cpp-translate-class-name
+                 (symbolize (slot-owner method))))
+        (& (wrap-literal "virtual")
+           & (cpp-translate-and-pointerize-type-spec
+              ;; Use most general return type of virtual method
+              ;;    (see comments in walk.ste):
+              (compute-most-general-return-type
+               method (compute-return-type-spec
+                       method (slot-owner method)))))
+        ;; NOTE: 'cpp-translate-function-name' does not prefix
+        ;;   the function name with the function's owner class.
+        & (cpp-translate-function-name method)
+        & (cpp-translate-function-parameters method)))))
+
+(defun (cpp-yield-constructor-signature-tree CONS) ((method METHOD-SLOT))
+  ;; Helping function for "cpp-translate-define-native-class-unit".
+  ;; Return a parse tree that declares the signature of a C++ 
+  ;;   constructor
+  ;; NOTE: THIS CODE IS SIMILAR TO "CPP-TRANSLATE-DEFMETHOD-TREE".
+  ;;   MAY WANT TO MERGE THE SIMILAR PIECES INTO A SINGLE ROUTINE.
+  ;; TODO: HANDLE INLINED FUNCTIONS
+  (setq *methodBeingWalked* method)
+  (return
+    (bquote 
+     (& (cpp-translate-class-name (symbolize (slot-owner method)))
+        ()
+        & (cpp-translate-constructor-name method)
+        & (cpp-translate-function-parameters method)))))
+
+(defun (cpp-yield-exception-constructor-definition CONS) ((class CLASS))
+  ;; Helping function for "cpp-translate-define-native-class-unit".
+  ;; Return a parse tree that defines the constructor for the exception
+  ;;    class `class'.
+  (let ((super
+         (some super in (class-native-supers class)
+             where (not (mixin? (type-class super))))))
+    (return
+      (bquote 
+       (CPP_FUNCTION
+        () ;; return type
+        & (cpp-translate-class-name (class-type class)) ;; name
+        (("const std::string&" "msg")) ;; parameters
+        () ;; body
+        ;; base members:
+        ((CPP_FUNCTION_CALL
+          (CPP_IDENT & (cpp-translate-class-name super))
+          (CPP_ACTUALS (CPP_IDENT "msg")))))))))
+
+(defun (slot-has-class-parameter-type? BOOLEAN) ((slot STORAGE-SLOT)
+						 (class CLASS))
+  ;; Test if the slot returns a class parameter type.  Used when outputting
+  ;;   template classes.
+  (return (and (defined? (slot-type-specifier slot))
+	       (isa? (slot-type-specifier slot) @ANCHORED-TYPE-SPECIFIER)
+	       (eql? (compute-return-type-spec slot (class-type class))
+		     @UNKNOWN))) )
+
+(defun (get-slot-class-parameter-name SYMBOL) ((slot STORAGE-SLOT))
+  ;; Return the name of the class parameter that `slot' returns.
+  ;; Assumes that slot-has-class-parameter-type? returns TRUE for this slot.
+  (return
+    (specifier-parameter-name (cast (slot-type-specifier slot) 
+				    @ANCHORED-TYPE-SPECIFIER))) )
+
+(defun (cpp-native-method? BOOLEAN) ((methodSlot METHOD-SLOT))
+  ;; Certain methods shouldn't be output in C++ because they're implemented
+  ;;   natively or always get translated inline.
+  (case (slot-name methodSlot)
+    ((DEFINED? NULL?)
+     (return TRUE))
+    (otherwise
+     (return FALSE))))
+
+(defun (cpp-get-parameterized-member-variable-definitions CONS) ((class CLASS))
+  ;; Return lists of variables that are parameterized with class parameters,
+  ;;   i.e., for template classes
+  (let ((memberVarDefs NIL))
+    (foreach slot in (class-local-slots class)
+             where (and (storage-slot? slot)
+                        (native-slot? slot)
+                        (slot-has-class-parameter-type? slot class))
+             collect (cpp-yield-parameterized-member-var-tree slot class)
+             into memberVarDefs)
+    (return memberVarDefs) ))
+
+(defun (cpp-get-member-variable-definitions CONS CONS) ((class CLASS))
+  ;; Return lists of public and private member variable
+  ;;   definitions, respectively.
+  (let ((publicMemberVarDefs NIL)
+	(protectedMemberVarDefs NIL))
+    (foreach slot in (class-slots class)
+             where (and (storage-slot? slot)
+                        (native-slot? slot)
+                        (eql? (native-slot-home slot class) class))
+             do (if (slot-public? slot)
+                    (pushq publicMemberVarDefs
+                           (cpp-yield-member-var-tree slot class))
+                  (pushq protectedMemberVarDefs
+                         (cpp-yield-member-var-tree slot class))))
+    (return (reverse publicMemberVarDefs)
+            (reverse protectedMemberVarDefs))))
+
+(defun (cpp-get-static-variable-definitions CONS) ((class CLASS))
+  ;; Return a lists of static variables on class
+  (let ((staticMemberVarDefs NIL))
+    ;; Get most-specific static members
+    (foreach slot in (class-slots class)
+             where (and (storage-slot? slot)
+			(native-slot? slot)
+			(class-slot? slot)
+                        (not (slot-hardwired? (cast slot STORAGE-SLOT)))
+			(not (slot-marked? slot))
+                        (eql? (native-slot-home slot class) class))
+             do 
+	     (pushq staticMemberVarDefs 
+		    (cpp-yield-static-member-allocation-tree
+		     slot class)))
+    (return staticMemberVarDefs) ))
+
+(defun (cpp-get-constructor-definitions CONS) ((class CLASS))
+  ;; Return a lists of constructors definitions
+  (let ((constructorDefs NIL))
+    (foreach slot in (class-slots class)
+             where (and (not (slot-marked? slot))
+			(eql? (primary-type slot) 
+			      @METHOD-SLOT)
+			(local-slot? slot class)
+		        (cpp-constructor? (cast slot METHOD-SLOT)))
+             collect (cpp-yield-constructor-signature-tree
+		      slot)
+             into constructorDefs) 
+    (return constructorDefs) ))
+
+(defun (cpp-get-method-definitions CONS CONS) ((class CLASS))
+  ;; Return a lists of public and private method definitions, respectively.
+  (let ((publicMemberFuncDefs NIL)
+	(protectedMemberFuncDefs NIL))
+    ;; generate member function (i.e. method) declarations:
+    (foreach slot in (class-local-slots class)
+        do (typecase slot
+             (METHOD-SLOT
+              (when (and (not (slot-marked? slot))
+                         (native-method? slot)
+                         (not (cpp-constructor? slot))
+                         (not (cpp-native-method? slot)))
+                (if (slot-public? slot)
+                    (pushq publicMemberFuncDefs
+                           (cpp-yield-member-func-signature-tree slot))
+                  (pushq protectedMemberFuncDefs
+                         (cpp-yield-member-func-signature-tree slot)))))
+             (otherwise NULL)))
+
+    ;; generate accessor and mixin method declarations:
+    (foreach method in (class-auxiliary-methods class)
+        do (if (slot-public? method)
+               (pushq publicMemberFuncDefs
+                      (cpp-yield-member-func-signature-tree method))
+             (pushq protectedMemberFuncDefs
+                    (cpp-yield-member-func-signature-tree method))))
+
+    (return (reverse publicMemberFuncDefs)
+            (reverse protectedMemberFuncDefs))))
+
+(defun (mark-renaming-slots VOID) ((class CLASS))
+  ;; Mark all renamed slots so we don't consider them
+  ;; NOTE: This is only used for accessor signatures: other slots use
+  ;;   `native-slot?' predicate.  This is because there can be accessors 
+  ;;   on dynamic slots.
+  (foreach slot in (class-slots class)
+      do (setf (slot-marked? slot) FALSE))
+  (foreach slot in (class-slots class)
+      where (not (slot-marked? slot))
+      do 
+	(when (and (defined? (slot-direct-equivalent slot))
+		   (not (slot-renamed? (slot-direct-equivalent slot))))
+	  ;; CAUTION: CALL TO 'mark-equivalent-slots' REPLACED BY CALL TO
+	  ;;    'mark-direct-equivalent-slot' BECAUSE THE FORMER (transitive)
+	  ;;    FUNCTION HAS BEEN ELIMINATED IN FAVOR OF THE LATTER (non-transitive)
+	  ;;    ONE THAT FIXES A BUG RELATED TO THE 'renames' OPTION: -rmm
+	  (mark-direct-equivalent-slot slot)
+	  (setf (slot-marked? slot) FALSE))) )
+
+(defun (cpp-class-has-only-native-parents? BOOLEAN) ((class CLASS))
+  ;; Return TRUE if 'class' only has realized parents that are defined with
+  ;;  native cpp classes.  Note that if the class has no parents
+  ;;  that are not abstract or mixin classes, then TRUE is also returned.
+  ;; QUESTION:  Does the mixin? test need to be there?
+  (foreach super in (class-all-super-classes class)
+      do (unless (mixin? super)
+	   (when (and (create-native-class? super)
+		      (null? (class-cpp-native-type super)))
+	     (return false))))
+  (return true))
+
+(defun (cpp-translate-define-native-class-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a form that evaluates to a native (C++) class definition.
+  (let ((class CLASS (the-object unit))
+	(baseClasses NIL)
+        (parameterizedMemberVarDefs NIL)
+	(publicMemberVarDefs NIL)
+        (protectedMemberVarDefs NIL)
+	(publicMemberFuncDefs NIL)
+	(protectedMemberFuncDefs NIL)
+	(constructorDefs NIL)
+	(parameters NIL)
+	(staticMemberVarDefs NIL))
+    (foreach super in (class-native-supers class)
+        where (or (not (mixin? (type-class super)))
+                  (not (translate-to-single-inheritance-language?)))
+        collect (cpp-translate-class-name super)
+        into baseClasses)
+
+    ;; Link to 'gc' root class if necessary:
+    (when (and (or (empty? baseClasses)
+		   (cpp-class-has-only-native-parents? class))
+               (not (mixin? class))
+               (eql? (translator-output-language) :cpp)
+               (cpp-use-garbage-collector?))
+      (pushq baseClasses (cpp-translate-name (quote gc))))
+
+    (foreach parameter in (class-parameters class)
+	     collect (cpp-translate-class-parameter-name parameter)
+	     into parameters)
+
+    ;; generate member variable definitions:
+    (mark-renaming-slots class)
+
+    (when (eql? (translator-output-language) :cpp-standalone)
+      (setq constructorDefs (cpp-get-constructor-definitions class)))
+
+    (when (cpp-output-template-classes?)
+      (setq parameterizedMemberVarDefs 
+	(cpp-get-parameterized-member-variable-definitions class)))
+    
+    (mv-setq (publicMemberVarDefs protectedMemberVarDefs)
+	     (cpp-get-member-variable-definitions class))
+
+    (mv-setq (publicMemberFuncDefs protectedMemberFuncDefs)
+	     (cpp-get-method-definitions class))
+
+    (setq staticMemberVarDefs
+      (cpp-get-static-variable-definitions class))
+
+    (return
+     (bquote
+      (CPP_CLASS 
+       & (cpp-translate-class-name (symbolize (class-type class)))
+       & parameters
+       & baseClasses
+       & staticMemberVarDefs
+       && (choose (defined? (documentation class))
+                  (bquote
+                   ((CPP_COMMENT & (wrap-literal (documentation class)))))
+                  NIL)
+       && (choose (non-empty? parameterizedMemberVarDefs)
+		  (bquote ((CPP_DECLARATIONS :PUBLIC 
+					     & parameterizedMemberVarDefs)))
+		  NIL)
+       && (choose (non-empty? publicMemberVarDefs)
+		  (bquote ((CPP_DECLARATIONS :PUBLIC 
+					     & publicMemberVarDefs)))
+		  NIL)
+       && (choose (non-empty? protectedMemberVarDefs)
+		  (bquote ((CPP_DECLARATIONS :PUBLIC 
+					     & protectedMemberVarDefs)))
+		  NIL)
+       && (choose (non-empty? constructorDefs)
+		  (bquote ((CPP_SIGNATURES :PUBLIC 
+					   & constructorDefs)))
+		  NIL)
+       && (choose (exception-class? class)
+                  (bquote
+                   ((CPP_definitions :PUBLIC
+                     (& (cpp-yield-exception-constructor-definition class)))))
+                  NIL)
+       && (choose (non-empty? publicMemberFuncDefs)
+		  (bquote ((CPP_SIGNATURES :PUBLIC 
+					   & publicMemberFuncDefs)))
+		  NIL)
+       && (choose (non-empty? protectedMemberFuncDefs)
+		  (bquote ((CPP_SIGNATURES :PUBLIC 
+					   & protectedMemberFuncDefs)))
+		  NIL) 
+       ))) ))
+
+

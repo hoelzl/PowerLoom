@@ -1,0 +1,432 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: java-translate-file.ste,v 1.30 2003/04/18 21:15:09 hans Exp
+
+;;; Translating Stella files into Java.
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+
+(defun clt () 
+  (change-module "STELLA")
+  (set-translator-output-language :common-lisp))
+
+(defun jt () 
+  (change-module "STELLA")
+  (set-translator-output-language :java))
+
+(defun jptrans ((statement OBJECT))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation "Translate `statement' to C++ and print the result."
+  (special ((*translatorOutputLanguage* *translatorOutputLanguage*)
+	    (*current-stream* STANDARD-OUTPUT))
+    (set-translator-output-language :java)
+    (incrementally-translate statement)))
+
+(defmethod (java-make-code-output-file-name FILE-NAME) ((bareFile FILE-NAME) (dontTruncate? BOOLEAN))
+  ;; Construct an absolute .java file name from 'bareFile'.
+  ;; Special don't truncate logic is used for printing file headers.
+  (safety 3 (eql? bareFile (relativize-file-name bareFile (root-source-directory))) 
+          "Absolute file where relative expected")
+  (if dontTruncate?
+    (special ((*dontTruncateFilenames?* TRUE))
+      (return (make-file-name-from-relative-path bareFile :java)))
+    (return (make-file-name-from-relative-path bareFile :java))))
+
+(defmethod (java-make-code-output-file-name FILE-NAME) ((source CLASS) (dontTruncate? BOOLEAN))
+  (let ((bareFile (java-translate-class-name (symbolize (class-type source)))))
+    (return (java-make-code-output-file-name (wrapper-value bareFile) dontTruncate?)) ))
+
+(defun (java-make-global-output-file-name FILE-NAME) ((module MODULE) (dontTruncate? BOOLEAN))
+  (return (java-make-code-output-file-name (java-yield-flotsam-class-name module)
+					   dontTruncate?)) )
+
+(defun java-output-flotsam-units-to-file ((globalsHT HASH-TABLE) 
+					  (functionHT HASH-TABLE)
+					  (codeModuleList (CONS of MODULE)))
+  (let ((functions (CONS of TRANSLATION-UNIT) nil)
+	(globals (CONS of TRANSLATION-UNIT) nil))
+    (foreach module in codeModuleList
+	do (setq globals (lookup globalsHT module))
+	   (unless (defined? globals)
+	     (setq globals nil))
+	   (setq functions (lookup functionHT module))
+	   (unless (defined? functions)
+	     (setq functions nil))
+	   (java-output-flotsam-units-to-file-for-module
+	    module NULL globals functions)) ))
+
+(defun java-output-flotsam-units-to-file-for-module ((module MODULE)
+						     (classunit TRANSLATION-UNIT)
+						     (globals (CONS of TRANSLATION-UNIT)) 
+					             (functions (CONS of TRANSLATION-UNIT)))
+  (let ((classOutputFile FILE-NAME NULL)
+        (classOutputStream OUTPUT-FILE-STREAM NULL)
+	(translation NIL)
+	(class CLASS NULL)
+	(classTranslation NIL))
+    (within-module module
+      (setq classOutputFile (java-make-global-output-file-name module FALSE))
+      (setq classOutputStream (new OUTPUT-FILE-STREAM :filename classOutputFile))
+      (when (defined? classunit)
+	(setq class (the-object classunit))
+	(inform "Translating " class "...")
+	(setq classTranslation (rest (java-translate-define-native-class class))))
+      (special ((*current-stream* classOutputStream))
+	(when (>= *translationVerbosityLevel* 1)
+	  (if (defined? classunit)
+	    (inform "    Writing " classOutputFile " ...")
+	    (inform "Writing " classOutputFile "...")))
+	(java-output-file-header 
+	 classOutputStream (java-make-global-output-file-name module TRUE))
+
+	(if (defined? classunit)
+	  (java-output-class-declaration classTranslation)
+	  (print-stream *current-stream*
+			"public class " (java-yield-flotsam-class-name module) " "))
+	(print-stream *current-stream* "{" EOL)
+      
+	(java-bump-indent)
+	
+	;; VARIABLES
+	(when (defined? classunit)
+	  (java-output-class-variable-definitions 
+	   (cast (nth classtranslation 6) CONS)))
+	(foreach global in globals
+	    do (setq translation (java-translate-unit global))
+	       (java-output-global-definition (rest translation))
+	       (setf (translation global) NULL)
+	       (setf (code-register global) NULL))
+
+	;; CONSTRUCTORS AND METHODS
+	(when (defined? classunit)
+	  (java-output-class-constructors
+	   (cast (nth classtranslation 7) (CONS OF TRANSLATION-UNIT))
+	   (java-yield-flotsam-class-name module)
+	   (and (defined? class) (exception-class? class)))
+	  (foreach statement in (cast (nth classtranslation 8) (CONS OF TRANSLATION-UNIT))
+	      do (java-output-statement (java-translate-unit statement))
+		 (setf (translation statement) NULL)
+		 (setf (code-register statement) NULL)))
+	(foreach function in functions
+	    do (java-output-method (rest (java-translate-unit function)))
+	       (setf (translation function) NULL)
+	       (setf (code-register function) NULL))
+	(java-unbump-indent)
+	(print-stream *current-stream* "}" EOL)
+	(free classOutputStream)
+	))))
+
+
+(defun java-output-file-header ((stream OUTPUT-STREAM) (fileName FILE-NAME))
+  ;; Output a Java file header for `fileName' to `stream'.
+  ;; Generate an `package' declaration for `package' and
+  ;;   also generate appropriate `import' statements.
+  (print-stream  stream "//  -*- Mode: Java -*-" EOL "//" EOL)
+  (when (defined? fileName)
+    ;; Don't write the full file name so we won't get diffs just from
+    ;;    building a release in a different directory:
+    (print-stream  stream "// " (file-name-without-directory fileName) EOL EOL))
+  (let ((package-name (java-package-prefix *module* "."))
+	(imported-packages (CONS OF STRING-WRAPPER) NIL)
+	(name STRING NULL))
+    (output-copyright-header stream)
+    (unless (or (null? package-name)
+		(string-eql? package-name ""))
+      (setq package-name (subsequence package-name 0 (- (length package-name) 1)))
+      (print-stream stream "package "  package-name ";" EOL EOL))
+    ;; No need to import, since most calls to javalib functions are
+    ;; fully qualified, except in certain Stella verbatim statements:
+    ;; TO DO:  If we move the convenience classes into the stella.utility package,
+    ;;         then we can probably do a full import of javalib into all packages.
+    (if (eq? *module* *stella-module*)
+      (print-stream stream "import " (java-stella-package) ".javalib.*;" EOL)
+      (progn
+	(when (and (null? (get-stella-class "NATIVE" FALSE))
+		   (not (inherited-class-name-conflicts? "NATIVE")))
+	  (print-stream stream "import " (java-stella-package) ".javalib.Native;" EOL))
+	(when (and (null? (get-stella-class "STELLA-SPECIAL-VARIABLE" FALSE))
+		   (not (inherited-class-name-conflicts? "STELLA-SPECIAL-VARIABLE")))
+	  (print-stream stream "import " (java-stella-package) ".javalib.StellaSpecialVariable;" EOL))))
+
+    (when (enabled-stella-feature? :minimize-java-prefixes)
+      (foreach module in (uses *module*)
+	  do (setq name (java-package-prefix module "."))
+	     (unless (or (string-eql? name package-name)
+			 (member? imported-packages name))
+	       (print-stream stream "import " name "*;" EOL)
+	       (pushq imported-packages name) ))
+      (foreach module in (all-super-contexts *module*)
+	  do (setq name (java-package-prefix module "."))
+	     (unless (or (string-eql? name package-name)
+			 (member? imported-packages name))
+	       (print-stream stream "import " name "*;" EOL)
+	       (pushq imported-packages name))))
+     (print-stream stream EOL)))
+
+(defun java-output-class-to-file ((class CLASS))
+  (within-context (home-module class)
+    (let ((classOutputFile (java-make-code-output-file-name class FALSE))
+	  (classOutputStream (new OUTPUT-FILE-STREAM :filename classOutputFile))
+	  (translation NIL))
+      (special ((*current-stream* classOutputStream))
+	(inform "Translating " class "...")
+	(setq translation (java-translate-define-native-class class))
+	(when (>= *translationVerbosityLevel* 1)
+	  (inform "    Writing " classOutputFile "..."))
+	(java-output-file-header 
+	 classOutputStream (java-make-code-output-file-name class TRUE))
+	(java-output-class (rest translation) (exception-class? class))
+	(free classOutputStream) ))))
+
+(defun java-output-class-unit-to-file ((classUnit TRANSLATION-UNIT))
+  (java-output-class-to-file (cast (the-object classUnit) CLASS)) )
+
+(defun (java-flotsam-function? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return true if `method' needs to go into the flotsam class.
+  ;; This will be true if any of the following conditions hold:
+  ;;    (1)  The method takes ZERO ARGUMENTS
+  ;;    (2)  The method's first argument is specialized on
+  ;;           a BUILT-IN TYPE
+  ;;    (3)  The method's first argument is specialized on a type
+  ;;           defined in a different module.
+  ;;  and none of these exceptions are true:
+  ;;    (e1)  The method is a constructor
+  ;;    (e2)  The method is a native method
+  ;;    (e3)  The method is a startup function
+  ;;
+  (return (and (not (method-constructor? method))
+	       (not (method-native? method))
+	       (not (method-startup-function? method))
+	       (or (zero-argument-function? method)
+		   (java-method-object-defined-on-native-type? method)
+		   (java-function-in-different-module? method)))) )
+
+(defun java-output-startup-units-to-file 
+    ((startupHT STRING-HASH-TABLE) (keyList (CONS of STRING-WRAPPER)))
+  (let ((classOutputFile FILE-NAME NULL)
+        (classOutputStream OUTPUT-FILE-STREAM NULL)
+	(startupFunctions (CONS of TRANSLATION-UNIT) NULL))
+    (special ((*current-stream* NULL))
+      (foreach className in keyList
+	  do (setq startupFunctions (lookup startupHT className))
+	     (when (and (defined? startupFunctions)
+			(not (null? startupFunctions)))
+	       ;; All methods on this class are defined in the same MODULE:
+	       (within-module (home-module (first startupFunctions))
+		 (setq classOutputFile (java-make-code-output-file-name 
+					(wrapper-value className) FALSE))
+		 (setq classOutputStream (new OUTPUT-FILE-STREAM :filename classOutputFile ))
+		 (setq *current-stream* classOutputStream)
+		 (when (>= *translationVerbosityLevel* 1)
+		   (inform "Writing " classOutputFile "..."))
+		 (java-output-file-header 
+		  classOutputStream (java-make-code-output-file-name (wrapper-value className) TRUE))
+              
+		 (print-stream *current-stream* 
+			       "public class " (wrapper-value className) " {" EOL)
+		 (java-bump-indent)
+		 (foreach function in startupFunctions
+		     do (java-output-method (rest (java-translate-unit function)))
+			(setf (translation function) NULL)
+			(setf (code-register function) NULL))
+		 (java-unbump-indent)
+		 (print-stream *current-stream* "}" EOL)
+		 (free classOutputStream))))) ))
+
+(defun java-push-into-hash-table ((HT HASH-TABLE)
+				  (key OBJECT)
+				  (object OBJECT))
+  ;;  Pushes `object' into the appropriate bucket of `HT' for `key'
+  (let ((value CONS (lookup HT key)))
+    (if (defined? value)
+	(insert-at HT key (cons object value))
+      (insert-at HT key (cons object NIL)))))
+
+(defun java-push-into-string-hash-table ((HT STRING-HASH-TABLE)
+					 (key STRING)
+					 (object OBJECT))
+  ;;  Pushes `object' into the appropriate bucket of `HT' for `key'
+  (let ((value CONS (lookup HT key)))
+    (if (defined? value)
+	(insert-at HT key (cons object value))
+      (insert-at HT key (cons object NIL)))))
+
+(defun (java-class-unit-defines-flotsam-class? BOOLEAN) ((classUnit TRANSLATION-UNIT))
+  (let ((class CLASS (the-object classUnit))
+	(module (home-module classUnit)))
+    (return (string-eql? (java-translate-class-namestring 
+			  (symbol-name (symbolize (class-type class))))
+			 (java-yield-flotsam-class-name module))) ))
+
+(defun java-output-all-units-to-file ()
+  ;; Called by 'translate-file', produce a .java file
+  ;;   by iterating over translation units.
+  (let ((startupClassName STRING-WRAPPER NULL)
+	(startupHT (new STRING-HASH-TABLE))
+	(startupClassList nil)
+	(methods nil)
+	(flotsamFunctionHT (new HASH-TABLE))
+	(globalsHT (new HASH-TABLE))
+	(codeModulesList (LIST OF MODULE) (list))
+	;; Maybe use this for adding keyword variable definitions to
+	;;   all modules encountered in this translation?
+	; (universalGlobalList (CONS OF TRANSLATION-UNIT) nil)
+	(verbatimStatements nil)
+	(classes (CONS OF TRANSLATION-UNIT) nil)
+        (codeOutputModule MODULE NULL)
+	)
+
+    ;; Setup translation of STELLAROOT variable:
+    (insert-at *java-stella-package-mapping*
+	       "STELLAROOT"
+	       (java-stella-package))
+    ;; TODO: instead of sorting translated parse trees, sort the units
+    ;;   themselves.  This will allow annotations to be output during
+    ;;   code generation.
+    ;; Reverse before sorting- classes, etc get reversed during sort.
+    (setq *translationUnits* (reverse *translationUnits*))
+    (foreach unit in *translationUnits*
+     do (case (category unit)
+          ((METHOD MACRO)
+	   (cond ((java-flotsam-function? (the-object unit))
+                  (setq codeOutputModule (home-module (the-object unit)))
+		  (java-push-into-hash-table flotsamFunctionHT
+					     codeOutputModule
+					     unit)
+		  (insert-new codeModulesList codeOutputModule))
+		 ;; BUG:  This will break if the same filename appears
+		 ;;  in more than one module, since we don't distinguish
+		 ;;  among them here.
+		 ;; SOLUTION?  Maybe do the startup functions on a per-file
+		 ;;  basis instead of keeping them around until the end?
+		 ((method-startup-function? 
+		   (cast (the-object unit) METHOD-SLOT))
+		  (setq startupClassName 
+		    (java-translate-class-namestring
+		     (method-startup-classname
+		      (cast (the-object unit) METHOD-SLOT))))
+		  (java-push-into-string-hash-table
+		   startupHT
+		   (wrapper-value startupClassName)
+		   unit)
+		  (unless (member? startupClassList startupClassName)
+		    (pushq startupClassList startupClassName)))
+		 (otherwise
+		  (pushq methods unit))))
+	  (PRINT-METHOD
+	   (pushq methods unit))
+	  (TYPE NIL)  ; Ignore for now!
+	  (VERBATIM
+	   (pushq verbatimStatements unit))
+	  (CLASS
+	   (pushq classes unit))
+	  (GLOBAL-VARIABLE
+           (setq codeOutputModule (home-module (the-object unit)))
+	   (java-push-into-hash-table globalsHT
+				      codeOutputModule
+				      unit)
+	   (insert-new codeModulesList codeOutputModule))))
+
+    (foreach classUnit in classes 
+	do (if (java-class-unit-defines-flotsam-class? classUnit)
+	     (let ((module (home-module (the-object classUnit)))
+		   (globals (CONS OF TRANSLATION-UNIT) nil)
+		   (functions (CONS OF TRANSLATION-UNIT) nil))
+	       (setq globals (lookup globalsHT module))
+	       (unless (defined? globals)
+		 (setq globals nil))
+	       (setq functions (lookup flotsamFunctionHT module))
+	       (unless (defined? functions)
+		 (setq functions nil))
+	       (java-output-flotsam-units-to-file-for-module
+		module classUnit globals functions)
+	       (remove codeModulesList module))
+	     (java-output-class-unit-to-file classUnit)))
+    
+    ;; TODO: add stuff for collecting functions, globals, etc
+    
+    (java-output-flotsam-units-to-file
+     globalsHT flotsamFunctionHT (the-cons-list codeModulesList))
+    (java-output-startup-units-to-file startupHT startupClassList)
+    
+;    (foreach method in methods
+;	do (java-output-class-to-file 
+;	    (slot-owner (cast (the-object (cast method TRANSLATION-UNIT)) METHOD-SLOT))
+;	    
+;	    ))
+    
+    ;; VERY TEMPORARY.  JUST DO THIS TO GET OUTPUT FOR TESTING:
+;    (java-output-Herrenlose-Methoden methods)
+
+    ))
+
+(defun java-initialize-file-translation ()
+  (setq *java-indent-chars* 0) )
+
+(defun java-translate-file ((fileName FILE-NAME))
+  :public? TRUE
+  ;; Translate a stella file to Java
+  (translate-file fileName :java FALSE) )
+
+(defun java-translate-file-as-part-of-system ((fileName FILE-NAME))
+  ;; Translate a stella file to Java
+  (translate-file fileName :java TRUE) )
+
+(defun java-translate-walked-system-units ((systemUnits SYSTEM-UNITS-ALIST))
+  ;; Combine all walked translation units, then translate and output them.
+  (special ((*translationUnits* (concatenate-system-units systemUnits)))
+    (when (>= *translationVerbosityLevel* 1)
+      (inform "Generating Java translations..."))
+    (java-output-all-units-to-file)
+    (clean-up-translation-units-special)))
+
+(defun java-translate-system ((systemName STRING))
+  :documentation "Translate the system `systemName' to Java."
+  :public? TRUE
+  (translate-system systemName :java
+                    :two-pass? TRUE
+                    :force-translation? TRUE
+                    :production-settings? TRUE))

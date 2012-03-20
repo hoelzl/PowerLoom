@@ -1,0 +1,1320 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: modules.ste,v 1.70 2003/04/18 21:15:21 hans Exp
+
+;;; Contexts, Modules, and Worlds.
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+
+;; TO DO: CHANGE DEFAULT TO :clear ONCE 'clear-context' HAS BEEN
+;;    IMPLEMENTED:
+(defglobal *subcontext-revision-policy* KEYWORD :clear
+  :documentation "Controls actions reflexive transitive closure of
+   subcontexts when a context is revised.
+   Values are ':destroy' -- destroy subcontexts;
+   ':clear' -- clear contents of subcontexts;
+   ':preserve' -- don't disturb subcontexts.")
+
+  ;;
+;;;;;; Qualified pathnames
+  ;;
+
+(defmethod (parent-contexts (ITERATOR OF CONTEXT)) ((self CONTEXT))
+  ;; Dummy to make sure there is a method on the abstract class 'CONTEXT'.
+  (return NULL) )
+
+(defmethod (parent-contexts (ITERATOR OF CONTEXT)) ((self MODULE))
+  ;; Return an iterator over the parents of 'self'.
+  :public? TRUE
+  (return (allocate-iterator (parent-modules self))) )
+
+(defmethod (parent-contexts (ITERATOR OF CONTEXT)) ((self WORLD))
+  ;; Return an iterator over the parents of 'self'.
+  :public? TRUE
+  (return (allocate-destructive-list-iterator
+           (cast (cons (parent-context self) NIL)
+                 (CONS OF CONTEXT)))))
+
+(defun (compute-context-or-module-from-pathname CONTEXT INTEGER)
+    ((pathName STRING) (module? BOOLEAN) (symbolName? BOOLEAN))
+  ;; Return the context (or module if 'module?' is TRUE) indicated by the
+  ;;    path 'pathName'.
+  ;; 'pathName' is assumed to contain one or more module separator characters.
+  ;; If 'symbolName?' is TRUE, 'pathName' is assumed to be a symbol
+  ;;    and the last component will be ignored.  In this case the
+  ;;    second return value indicates the start of the last component.
+  (let ((context (choose (eql? (nth pathName 0) MODULE-SEPARATOR-CHARACTER)
+                         *root-module*
+                         NULL))
+        (componentEnd (choose (defined? context) 0 -1))
+        (componentStart INTEGER NULL)
+        (lastCharPos (1- (length pathName))))
+    (while (< componentEnd lastCharPos)
+      (setq componentStart (1+ componentEnd))
+      (setq componentEnd componentStart)
+      (foreach i in (interval componentStart lastCharPos)
+          do (if (not (eql? (nth pathName i) MODULE-SEPARATOR-CHARACTER))
+                 (++ componentEnd)
+               (break)))
+      (when (and symbolName?
+                 (> componentEnd lastCharPos))
+        (return (choose (defined? context)
+                        context
+                        ;; we had a quoted `/' as in the symbol `!/=':
+                        (choose module? *module* *context*))
+                componentStart))
+      (cond
+       ((null? context)
+        ;; First time through with relative path.  Look everywhere
+        ;;    for a context matching the first name in `pathName':
+        (let ((startString
+               (subsequence pathName componentStart componentEnd)))
+          (setq context (get-stella-context-slowly startString))))
+       (otherwise
+        (setq context
+              (some child in (child-contexts context)
+                    where
+                    (and (or (not module?)
+                             (isa? child @MODULE))
+                         (or (component-match?
+                              (choose module?
+                                      (module-name (cast child MODULE))
+                                      (context-name (cast child CONTEXT)))
+                              pathName
+                              componentStart componentEnd)
+                             (and module?
+                                  (defined? (nicknames (cast child MODULE)))
+                                  (exists nickName 
+                                          in (nicknames (cast child MODULE))
+                                          where
+                                          (component-match?
+                                           nickname pathName
+                                           componentStart componentEnd)))))))))
+      (when (null? context)
+        (break)))
+    (if (null? context)
+      (signal NO-SUCH-CONTEXT-EXCEPTION "No context with name " pathName)
+      (return context NULL))))
+
+(defun (component-match? BOOLEAN)
+    ((component STRING) (string STRING) (start INTEGER) (end INTEGER))
+  ;; Return TRUE if 'component' exactly matches the portion of
+  ;;    'string' between 'start' and 'end'.
+  ;; 'start' and 'end' are assumed to be legal (non-NULL) indices
+  ;;    of 'string'.
+  (return
+    (and (eq? (length component) (- end start))
+         (forall char in component
+             as i in (interval start NULL)
+             always (eql? char (nth string i))))))
+
+(defun (compute-module-and-bare-name MODULE STRING) ((name STRING))
+  :public? TRUE
+  ;; 'name' contains one or more MODULE-SEPARATOR-CHARACTERs.
+  ;; Return two values, the module indicated by path of all but the 
+  ;;   last name, and the last name.
+  (mv-bind (module bareNameStart)
+      (compute-context-or-module-from-pathname name TRUE TRUE)
+    (return module
+            (choose (defined? bareNameStart)
+                    (subsequence name bareNameStart NULL)
+                    NULL))))
+
+(defun (qualified-name-module-name STRING) ((qualifiedName STRING))
+  ;; Return the portion of `qualifiedName' before the right-most
+  ;;    MODULE-SEPARATOR-CHARACTER, or NULL if it is not a qualified name.
+  ;; Note that for "/foo" this returns the empty string.
+  (let ((end (length qualifiedName)))
+    (foreach i in (interval 1 end)
+        where (eql? (nth qualifiedName (- end i)) MODULE-SEPARATOR-CHARACTER)
+        do (return (subsequence qualifiedName 0 (- end i))))
+    (return NULL)))
+
+(defun (qualified-name-bare-name STRING) ((qualifiedName STRING))
+  ;; Return the portion of `qualifiedName' after the right-most
+  ;;    MODULE-SEPARATOR-CHARACTER, or `qualifiedName' if it is not
+  ;;    a qualified name.
+  (let ((end (length qualifiedName)))
+    (foreach i in (interval 1 end)
+        where (eql? (nth qualifiedName (- end i)) MODULE-SEPARATOR-CHARACTER)
+        do (return (subsequence qualifiedName (1+ (- end i)) end)))
+    (return qualifiedName)))
+
+(defun (dwim-module-and-bare-name MODULE STRING) ((name STRING) (warn? BOOLEAN))
+  ;; Just like `compute-module-and-bare-name', but try to dwim a module for
+  ;;    cases where a module with the same name but different pathname exists.
+  ;; If `warn?' is TRUE, print a warning if the module had to be dwimmed
+  ;;    or couldn't be found at all.
+  (let ((module MODULE NULL)
+	(bareNameStart INTEGER NULL))
+    (exception-case
+	(mv-setq (module bareNameStart)
+	  (compute-context-or-module-from-pathname name TRUE TRUE))
+      (NO-SUCH-CONTEXT-EXCEPTION ()
+	(when (defined? bareNameStart)
+	  (let ((moduleName
+		 (qualified-name-bare-name (qualified-name-module-name name))))
+	    (exception-case
+		(setq module (get-stella-module moduleName FALSE))
+	      (NO-SUCH-CONTEXT-EXCEPTION ()
+		(setq module (get-stella-module (string-upcase moduleName) FALSE))))
+	    (when warn?
+	      (if (null? module)
+		(warn "Module " (subsequence name 0 (1- bareNameStart))
+		      " of symbol " name " does not exist.")
+		(warn "Module " (subsequence name 0 (1- bareNameStart))
+		      " of symbol " name " does not exist." EOL
+		      "    Assuming you mean " (module-full-name (cast module MODULE))
+		      ".")))))))
+    (return module
+            (choose (defined? bareNameStart)
+                    (subsequence name bareNameStart NULL)
+                    NULL))))
+
+(defun (intern-qualified-name GENERALIZED-SYMBOL) 
+    ((name STRING) (enable-case-conversion? BOOLEAN))
+  ;; 'name' contains one or more MODULE-SEPARATOR-CHARACTERs.
+  ;; 'enable-case-conversion?' will allow canonical upcasing in modules
+  ;;    that are not case-sensitive.
+  ;; Intern the unqualified portion of 'name' into the module indicated
+  ;;    by the previous module names.
+  (mv-bind (module bareName)
+      (dwim-module-and-bare-name name TRUE)
+    (when (null? module)                ; names non-existent module?
+      (if (or (null? bareName)
+              (surrogate-name? bareName))
+          (return @UNKNOWN-SURROGATE)
+        (return (quote UNKNOWN-SYMBOL))))
+    (when (string-eql? bareName "")
+      (if (or (eq? module *module*)
+              (eq? module *root-module*))
+        ;; special case the division '/' symbol;
+        ;; tricky: /foo// lands us in the root module:
+        (return
+         (intern-rigid-symbol-wrt-module "/" *stella-module* SYMBOL-SYM))
+        (progn
+          (warn "Empty symbol name encountered")
+          (return (quote UNKNOWN-SYMBOL)))))
+    (when (and enable-case-conversion?
+	       (not (case-sensitive? module)))
+      (setq bareName (string-upcase bareName)))
+    (if (surrogate-name? bareName)
+        (return (intern-rigid-symbol-wrt-module
+                 (subsequence bareName 1 NULL-INTEGER)
+                 module SURROGATE-SYM))
+      (return (intern-rigid-symbol-wrt-module
+               bareName module SYMBOL-SYM)))))
+
+
+  ;;
+;;;;;; get-stella-context, change-context
+  ;;
+
+(defun (help-get-stella-context-or-module CONTEXT) ((pathName STRING) (module? BOOLEAN))
+  ;; Helping function for `get-stella-context' and `get-stella-module'
+  (if (qualified-name? pathName)
+    (return 
+      (compute-context-or-module-from-pathname pathName module? FALSE))
+    (return (get-stella-context-slowly pathName))))
+
+(defun (get-stella-context CONTEXT) ((pathName STRING) (error? BOOLEAN))
+  :documentation "Return the context located at `pathName', or `null'
+if no such context exists.  If `error?' is `true', throw an exception
+if no context is found, otherwise silently return `null'."
+  :public? TRUE
+  (if error?
+    (return (help-get-stella-context-or-module pathName FALSE))
+    (exception-case 
+	(return (help-get-stella-context-or-module pathName FALSE))
+    (NO-SUCH-CONTEXT-EXCEPTION ()
+      (return NULL)))))
+
+(defun (get-stella-module MODULE) ((pathName STRING) (error? BOOLEAN))
+  :documentation "Return the module located at `pathName', or `null'
+if no such module exists.  The search looks at ancestors and top-most
+ (cardinal) modules.  If `error?' is `true', throw an exception if no
+ module is found."
+  :public? TRUE 
+  (when (eql? pathName (module-full-name *module*))
+    (return *module*))
+  (let ((context CONTEXT NULL))
+    (if error?
+      (setq context (help-get-stella-context-or-module pathName TRUE))
+      (exception-case 
+	  (setq context (help-get-stella-context-or-module pathName TRUE))
+	(NO-SUCH-CONTEXT-EXCEPTION ()
+	  (return NULL))))
+    (cond ((isa? context @MODULE)
+	   (return context))
+	  (error?
+	   (signal NO-SUCH-CONTEXT-EXCEPTION 
+		   "Context " context " is not a MODULE!"))
+	  (otherwise
+	   (return NULL))) ))
+
+(deftype NAME OBJECT)
+
+(defun (coerce-to-module-name STRING) ((nameSpec NAME) (warn? BOOLEAN))
+  ;; Helper function for commands that take module name arguments.
+  ;; Return a module name derived from `nameSpec', which can be a
+  ;;    generalized symbol, or a string wrapper.
+  ;; Return NULL if `nameSpec' didn't match any of the above categories,
+  ;;    and print a warning if `warn?' was TRUE.
+  ;; QUESTION: Should this be called `coerce-to-qualified-name'?
+  (typecase nameSpec
+      ((STRING-WRAPPER MUTABLE-STRING-WRAPPER)
+       (return (wrapper-value nameSpec)))
+      (KEYWORD
+       (return (symbol-name nameSpec)))
+      ((SYMBOL SURROGATE)
+       (let ((module (interned-in nameSpec)))
+         (cond ((null? module)
+                (return (symbol-name nameSpec)))
+;; USUALLY THIS MAKES THINGS WORSE RATHER THAN BETTER: -rmm
+;              ((eql? module *root-module*)
+;                (return (concatenate "/" (symbol-name nameSpec))))
+               ;; This won't be right all the time, but it is impossible
+               ;;    to determine the module component with which a symbol
+               ;;    was specified. E.g., in the LOGIC the symbol '/STELLA/BAR'
+               ;;    will have 'BAR' as its visible name; on the other hand,
+               ;;    we can't compute the full name, since then the symbol
+               ;;    'BAR' will expand into '/STELLA/BAR' which is wrong too:
+               (otherwise
+                (return (visible-name nameSpec))))))
+      (otherwise
+       (when warn?
+         (warn "Illegal module name: " nameSpec))
+       (return NULL))))
+
+(defun (coerce-to-module MODULE) ((object OBJECT) (warn? BOOLEAN))
+  :public? TRUE
+  ;; Helper function for commands that take module arguments.
+  ;; If `object' is NULL, return `*module*'.
+  ;; If `object' is already a module, return it.
+  ;; Otherwise, assume `object' is a module name, coerce it into
+  ;;    a proper module name and return the named module.
+  ;; If `warn?' print a warning for illegal names or if a module
+  ;;    with the supplied name could not be found.
+  (when (null? object)
+    (return *module*))
+  (typecase object
+    (MODULE (return object))
+    (otherwise
+     (let ((moduleName (coerce-to-module-name object warn?)))
+       (when (defined? moduleName)
+         (when (qualified-name? moduleName)
+           (return (get-stella-module moduleName warn?)))
+         ;; Name is unqualified:
+         (return (get-stella-module moduleName warn?)))
+       (return NULL)))))
+
+(defun (find-or-create-module MODULE) ((pathName STRING))
+  :documentation "Return a module located at `pathname' if one exists,
+  otherwise create one"
+  (let ((module (get-stella-module pathName FALSE)))
+    (unless (defined? module)
+      (setq module (define-module pathName NIL)))
+    (return module)))
+
+(defun (change-current-module MODULE) ((module MODULE))
+  ;; Change the current module to 'module'.
+  (setq *module* module)
+  (setq *context* module)
+  (run-hooks *change-module-hooks* module)
+  (return module) )
+
+(defun (change-current-context CONTEXT) ((context CONTEXT))
+  ;; Change the current context to 'context'.  If 'context' is not
+  ;;    a subcontext of the current module, change the current module
+  ;;    as well.
+  (when (not (eql? (base-module context) *module*))
+    (change-current-module (base-module context)))
+  (setq *context* context)
+  (return context) )
+
+(defmethod (change-context CONTEXT) ((context CONTEXT))
+  :documentation "Change the current context to be the context
+'context'."
+  :public? TRUE
+  (if (eql? context *context*)
+    (return context)
+    (return (change-current-context context))) )
+
+(defmethod (change-context CONTEXT) ((contextName STRING))
+  :documentation "Change the current context to be the context named
+'contextName'."
+  :public? TRUE
+  (let ((context (get-stella-context contextName TRUE)))
+    (if (null? context)
+      (return *context*)
+      (return (change-current-context context))) ))
+
+(defmethod (change-module MODULE) ((module MODULE))
+  :documentation "Change the current module to be the module
+'module'."
+  :public? TRUE
+  (return (change-current-module module)) )
+
+(defmethod (change-module MODULE) ((moduleName STRING))
+  :documentation "Change the current module to be the module named
+'moduleName'."
+  :public? TRUE
+  (let ((module (get-stella-module moduleName TRUE)))
+    (if (null? module)
+      (return *module*)
+      (return (change-current-module module))) ))
+
+
+  ;;
+;;;;;; Finalizing a context or module
+  ;;
+
+(defmethod (multiple-parents? BOOLEAN) ((module MODULE))
+  :documentation "Return TRUE if 'module' has more than one parent."
+  (return (non-empty? (rest (parent-modules module)))) )
+
+(defun normalize-parent-modules ((self MODULE))
+  ;; Replace '(parent-modules self)' with the most-specific direct
+  ;;    ancestors of 'module' (don't include modules that are ancestors
+  ;;    of other direct super modules).
+  ;; Generate a warning if the original parents are not all most
+  ;;    specific.
+  (when (not (multiple-parents? self))
+    (return))
+  (let ((parents (parent-modules self)))
+    ;; remove direct supers that are not most specific:
+    (foreach superModule in parents
+        do (foreach othersuperModule in parents
+               where (not (eq? othersuperModule superModule))
+               do (when (member? (all-super-contexts superModule)
+                                 otherSuperModule)
+                    ;; Don't generate a warning here to support information
+                    ;;    hiding.  For example, one should be able to define
+                    ;;    a module that inherits various parents that define
+                    ;;    relevant things without having to know the whole
+                    ;;    module super structure of each parent.
+                    (remove parents otherSuperModule))))))
+
+(defun inherit-supercontexts ((module MODULE))
+  ;; Fill the slot 'all-super-contexts' with a list of all
+  ;;    superContexts of 'module', ordered such that more specific
+  ;;    contexts always precede more general ones.
+  ;; Assumes that 'all-super-contexts' has been computed for all parents
+  ;;    of 'class'.
+  ;; Storage note: If 'class' has a single parent, then the 'all-super-contexts'
+  ;;    list shares structure with that parent's 'all-super-contexts' list.
+  (when (not (multiple-parents? module))
+    (let ((onlyParent (first (parent-modules module))))
+      (when (defined? onlyParent)
+        ;; structure share with parent list:
+        (setf (all-super-contexts module)
+          (cons onlyParent (all-super-contexts onlyParent)))
+        (return))))
+  ;; multiple parents; compute all super contexts precedence list:
+  (let ((allSuperContexts NIL)
+        (sublist CONS NULL))
+    (normalize-parent-modules module)
+    ;; do right union of reversed ancestors list:
+    (reverse (parent-modules module))
+    (foreach parent in (parent-modules module) ; reverse order traversal
+        do
+          (setq sublist NIL)
+          (foreach ancestor in (all-super-contexts parent)
+              where (not (member? allSuperContexts ancestor))
+              collect ancestor into sublist)
+          (pushq sublist parent)
+          (setq allSuperContexts (concatenate sublist allSuperContexts)))
+    ;; store the result:
+    (setf (all-super-contexts module) allSuperContexts)
+    ;; unreverse parents:
+    (reverse (parent-modules module))))
+
+(defun uninherit-supercontexts ((module MODULE))
+  ;; Clear 'all-super-contexts'.
+  (setf (all-super-contexts module) NIL))
+
+(defun inherit-used-modules ((module MODULE))
+  ;; Compute the actual set of modules used by 'module'.
+  ;; There are three cases:
+  ;; (1) 'module's uses-list contains itself, which indicates that the module
+  ;;     was defined with ':uses ()', thus, the uses-list needs to be empty.
+  ;; (2) 'module's uses-list is otherwise non-empty, which means it will use
+  ;;     exactly the list of modules specified in its :uses specification.
+  ;; (3) 'module's uses-list is empty, in which case a default set is computed;
+  ;;     by default, top-level modules use the STELLA module, and non-top-level
+  ;;     module use the union of modules used by their parents.  This allows
+  ;;     submodules to see all symbols visible from any of their parents
+  ;;     without having to know what modules are explicitly used by their
+  ;;     parent modules (e.g., handy for children of PL-USER).
+  (let ((usees (uses module)))
+    (cond 
+     ((empty? usees)
+      ;; No :uses specified, compute modules that are used by default:
+      (cond
+       ((empty? (parent-modules module))
+        ;; Use /STELLA by default:
+        (push usees *stella-module*)
+        (insert-new (used-by *stella-module*) module))
+       (otherwise
+        ;; Use everything the parents of 'module' use:
+        (foreach parent in (parent-modules module)
+            do (foreach parentUsees in (uses parent)
+                   do (insert-new usees parentUsees)
+                      (insert-new (used-by parentUsees) module)))
+        (reverse usees))))
+     ((member? usees module)
+      ;; Kludge: remove module -- placed there to prevent default usees:
+      (remove usees module))
+     (otherwise
+      ;; explicit :uses specification, use it as is:
+      NULL))))
+
+(defun uninherit-used-modules ((module MODULE))
+  ;; Revert any computation performed by 'inherit-used-modules'.
+  (let ((usees (uses module)))
+    (cond 
+     ((empty? usees)
+      ;; Prevent default usees:
+      (push usees module))
+     ((null?
+       ;; This test is a bit cheesy, since the documentation string might
+       ;;    contain the substring we are looking for, but hey:
+       (string-search (stringified-options module) ":USES " 0))
+      ;; Remove default usees:
+      (foreach usee in usees
+          do (remove (used-by usee) module))
+      (clear usees)))))
+
+(defspecial *shadowedSurrogates* (CONS OF SYMBOL) NULL
+  :documentation "Holds list of symbols representing surrogates
+to be shadowed during module finalization.")
+
+(defun finalize-module ((self MODULE))
+  ;; Compute 'all-super-contexts'; allocate a context number;
+  ;;   compute default value for '(uses self)'; shadow surrogates.
+  (inherit-supercontexts self)
+  (inherit-used-modules self)
+  (setq *context-number-counter* (+ *context-number-counter* 2))
+  (setf (context-number self) *context-number-counter*)
+  (setf (cardinal-module self) 
+        (choose (null? (parent-module self))
+                self
+                (cardinal-module (parent-module self))))
+  (setf (symbol-offset-table self) (new STRING-TO-INTEGER-HASH-TABLE))
+  (setf (surrogate-offset-table self) (new STRING-TO-INTEGER-HASH-TABLE))
+  ;; now that 'module' is UP, we can shadow any surrogates that need
+  ;;    shadowing:
+  (when (non-empty? *shadowedSurrogates*)
+    (setf (shadowed-surrogates self) (new (LIST OF SURROGATE)))
+    (special ((*module* self))
+      (foreach sym in *shadowedSurrogates*
+	  do (insert-last  (shadowed-surrogates self)
+			   (shadow-surrogate (symbol-name sym)))))))
+
+(defun finalize-world ((self WORLD))
+  ;; Compute 'all-super-contexts'.
+  ;; Allocate a context number.
+  (let ((parentContext (parent-context self)))
+    (setf (all-super-contexts self)
+          (cons parentContext (all-super-contexts parentContext)))
+    (setq *context-number-counter* (+ *context-number-counter* 2))
+    (setf (context-number self) *context-number-counter*) ))
+
+(defmethod unfinalize-module ((self MODULE))
+  ;; Garbage collect conses in '(all-super-contexts self)'.
+  ;; Unlink 'self' from parent(s).
+  ;; Decrement the context number, marking 'self' as discarded.
+  (uninherit-supercontexts self)
+  (uninherit-used-modules self)
+  (if (cardinal-module? self)
+    (remove (child-contexts *root-module*) self)
+    (foreach parent in (parent-modules self)
+             do (remove (child-contexts parent) self)))
+  (clear (parent-modules self))
+  ;; guard against decrementing NULL-INTEGER, since `self' might not yet be
+  ;;    finalized (e.g., if we discovered an identical redefinition):
+  (when (defined? (context-number self))
+    (setf (context-number self) (1- (context-number self))))
+  (setf (module-full-name self) NULL)
+  (setf (cardinal-module self) NULL)
+  (setf (symbol-offset-table self) NULL)
+  (setf (surrogate-offset-table self) NULL))
+
+(defmethod unfinalize-world ((self WORLD))
+  ;; Unlink "self" from parent, mark "self" as discarded.
+  (remove (child-contexts (parent-context self)) self)
+  ;; markd "self" as discarded:
+  (setf (context-number self) (1- (context-number self)))
+  ;; for gc safety only:
+  (setf (all-super-contexts self) NULL)
+  (setf (parent-context self) NULL) )
+
+
+  ;;
+;;;;;; Context destruction
+  ;;
+
+(defun destroy-module ((self MODULE))
+  :documentation "Destroy the module 'self', and recursively destroy
+all contexts that inherit 'self'."
+  :public? TRUE
+  (when (or (eql? self *root-module*)
+            (eql? self *stella-module*))
+    (warn "Can't destroy the root module or the STELLA module.")
+    (return))
+  (clear-context self)
+  (help-destroy-module self))
+
+(defun help-destroy-module ((self MODULE))
+  ;; Helper function for `destroy-module' which avoids unnecessary calls
+  ;;    to `clear-context'.
+  ;; Destroy bottom-up:
+  (foreach child in (copy (child-contexts self))
+      do (typecase child
+           (MODULE (help-destroy-module child))
+           (otherwise (destroy-context child))))
+  (let ((parentModule (parent-module self)))
+    (run-hooks *destroy-context-hooks* self)
+    (when (null? parentModule)
+      (setq parentModule (cardinal-module self)))
+    (when (null? parentModule)
+      (setq parentModule *stella-module*))
+    (unfinalize-module self)
+    (when (eq? self *module*)
+      (change-module parentModule))) )
+
+(defun destroy-world ((self WORLD))
+  ;; CAUTION: Destroy bottom-up so that the 'all-super-concepts'
+  ;;    links get gc'd correctly.
+  :public? TRUE
+  (safety 3 (not (deleted? self)) "Tried to destroy already deleted world.")
+  (when (non-empty? (child-contexts self))
+    (foreach child in (copy (child-contexts self))
+             where (not (deleted? child))
+             do (destroy-world child)))
+  (let ((parentContext (parent-context self)))
+    (run-hooks *destroy-context-hooks* self)
+    (unfinalize-world self)
+    (when (eq? self *context*)
+      (setq *context* parentContext))) )
+
+(defmethod destroy-context ((self MODULE))
+  :documentation "Destroy the context 'self', and recursively destroy
+all contexts that inherit 'self'."
+  :public? TRUE
+  (destroy-module self) )
+
+(defmethod destroy-context ((self WORLD))
+  :documentation "Destroy the context 'self', and recursively destroy
+all contexts that inherit 'self'."
+  :public? TRUE
+  (destroy-world self) )
+
+(defmethod destroy-context ((self STRING))
+  :documentation "Destroy the context 'self', and recursively destroy
+all contexts that inherit 'self'."
+  :public? TRUE
+  (let ((context (get-stella-context self TRUE)))
+    (unless (null? context)
+      (destroy-context context)) ))
+
+(defmethod destroy-context ((self CONTEXT))
+  :public? TRUE
+  :documentation "Make the translator happy."
+  NULL )
+
+
+  ;;
+;;;;;; Defining a context or module
+  ;;
+
+(defun link-to-parent-module
+       ((self MODULE) (parent MODULE) (insert-first? BOOLEAN))
+  ;; Doubly-link the module 'self' to its 'parent'.
+  ;; Exception: Cardinal modules don't point to the root module.
+  (when (and (not (eql? parent *root-module*))
+             (not (member? (parent-modules self) parent)))
+    (if insert-first?
+      (insert (parent-modules self) parent)
+      (insert-last (parent-modules self) parent)))
+  (insert-new (child-contexts parent) self) )
+
+(defun incorporate-module-name ((module MODULE) (name STRING))
+  ;; Called by 'define-module'.
+  ;; Parse 'name' and fill in the name and full name of 'module'.
+  ;; If the name is qualified, also link 'module' to its parent.
+  (let ((parentModule MODULE NULL)
+        (bareName STRING NULL))
+    (if (qualified-name? name)
+      (progn
+        (mv-setq (parentModule bareName) (compute-module-and-bare-name name))
+        (when (null? parentModule)
+          (warn "Bad path name " name " when defining the module " bareName)
+          (return))
+        ;; link "module" to "parentModule" ahead of included modules:
+        (if (or (and (eql? parentModule *root-module*)
+                     (non-empty? (parent-modules module)))
+                (exists includedModule in (parent-modules module)
+                    where (and (not (eql? includedModule parentModule))
+                               (subcontext? includedModule parentModule))))
+            (warn "Bad path name " name " when defining the module " bareName ","
+                  EOL "   since it points to a parent of an included module.")
+          (link-to-parent-module module parentModule TRUE)))
+      (progn
+        (when (empty? (parent-modules module))
+          (link-to-parent-module module *root-module* TRUE))
+        (setq bareName name)))
+    (setf (module-name module) bareName)
+    (setf (module-full-name module)
+          (compute-full-name "" module)) ))
+
+(defun incorporate-includes-modules ((module MODULE) (includees OBJECT))
+  ;; Helping function for 'incorporate-module-options'.
+  ;; Insert the modules named in 'includees' into '(includes module)'.
+  (typecase includees
+   (CONS
+    (foreach name in includees do (incorporate-includes-modules module name)))
+   ((STRING SYMBOL)
+    (let ((includeeModule (coerce-to-module includees TRUE)))
+      (when (defined? includeeModule)
+        (when (not (member? (parent-modules module) includeeModule))
+          (insert-last (parent-modules module) includeeModule))
+        (insert-new (child-contexts includeeModule) module))))
+   (otherwise
+    (walk-error "Illegal argument to ':includes' option" includees))) )
+
+(defun incorporate-uses-modules ((module MODULE) (usees OBJECT))
+  ;; Helping function for 'incorporate-module-options'.
+  ;; Insert the modules named in 'usees' into '(uses module)'.
+  (typecase usees
+   (CONS
+    (foreach name in usees do (incorporate-uses-modules module name))
+    (when (empty? (uses module))
+      ;; kludge: have "module" use itself to indicate that the default
+      ;;    uses module should not be included.  Finalization removes
+      ;;    the bogus usee:
+      (insert (uses module) module)))
+   ((STRING SYMBOL)
+    (let ((useeModule (coerce-to-module usees TRUE)))
+      (when (defined? useeModule)
+        (when (not (member? (uses module) useeModule))
+          (insert-last (uses module) useeModule))
+        (insert-new (used-by useeModule) module))))
+   (otherwise
+    (walk-error "Illegal argument to ':uses' option "))) )
+
+(defun incorporate-module-options ((self MODULE) (options CONS))
+  ;; Called by 'define-module'.  Incorporate each of the options into 'self'.
+  ;; Note: Modules point directly at parents and children, but they point
+  ;;    at required modules, component modules, etc. indirectly through
+  ;;    their names.
+  (let ((plist 
+         (vet-options 
+          (new PROPERTY-LIST :the-plist options)
+          (quote (:nickname :includes :uses :documentation
+		  :shadow :case-sensitive?
+		  :lisp-package :cpp-package :java-package
+		  ;; Sets the name of the Java class for flotsam functions:
+		  :java-catchall-class
+		  ;; special API handling
+		  :api?
+                  ;; prevents accidental wiping out of module:
+                  :clearable?
+                  ;; prevents cleared modules from wiping out
+                  ;;    surrogates embedded in code:
+                  :protect-surrogates?
+                  ;; prevents creation of KB objects where they don't belong:
+                  :code-only?)))))
+    (foreach 
+      (key value) in plist
+      do
+      (case (cast key KEYWORD)
+        (:includes (incorporate-includes-modules self value))
+        (:uses (incorporate-uses-modules self value))
+        (:shadow
+         ;; can't create surrogates before finalization; hold list
+         ;;    of symbols in special variable:
+         (setq *shadowedSurrogates* value))
+        (otherwise
+         (setq value (permanent-copy value))
+         (case (cast key KEYWORD)
+           (:documentation (setf (documentation self)
+                             (wrapper-value (cast value STRING-WRAPPER))))
+	   (:case-sensitive? (setf (case-sensitive? self) 
+			       (eql? value (quote TRUE))))
+	   (:api? (setf (api? self) 
+		    (eql? value (quote TRUE))))
+	   (:lisp-package (setf (module-lisp-package self)
+			    (wrapper-value (cast value STRING-WRAPPER))))
+	   (:cpp-package (setf (module-cpp-package self)
+			    (wrapper-value (cast value STRING-WRAPPER))))
+	   (:java-package (setf (java-package self)
+			    (wrapper-value (cast value STRING-WRAPPER))))
+	   (:java-catchall-class
+	    (setf (java-flotsam-class self)
+	      (wrapper-value (cast value STRING-WRAPPER))))
+           (:nickname
+            (when (null? (nicknames self))
+              (setf (nicknames self) (new LIST)))
+            (insert (nicknames self) (cast value STRING-WRAPPER)))
+           (:clearable?
+            (setf (clearable? self) (eql? value (quote TRUE))))
+           (:protect-surrogates?
+            (setf (protect-surrogates? self) (eql? value (quote TRUE))))
+           (:code-only?
+            (setf (code-only? self) (eql? value (quote TRUE))))
+           (:requires (setf (requires self) value))
+           ))))
+    (free plist) ))
+
+(defun undefine-module ((oldModule MODULE) (newModule MODULE))
+  ;; 'oldModule' has been redefined as 'newModule'.
+  ;; Detach 'oldModule' from parent and child contexts.
+  ;; Apply the subcontext revision policy to 'oldModule' and its descendants.
+  (inform "Redefining the module " (context-name oldModule))
+  (case *subcontext-revision-policy*
+    (:destroy
+     (destroy-context oldModule)
+     (return))
+    (:preserve NULL)
+    (:clear
+     (foreach c in (all-subcontexts oldModule :preorder)
+              do (clear-context c))))
+  ;; detach parent contexts:
+  (if (cardinal-module? oldModule)
+    (remove (child-contexts *root-module*) oldModule)
+    (foreach p in (parent-modules oldModule)
+             do (remove (child-contexts p) oldModule)))
+  ;; relink child contexts to 'newModule':
+  (foreach c in (child-contexts oldModule)
+           do
+           (typecase c
+             (MODULE
+              (substitute 
+               (the-cons-list (parent-modules c)) newModule oldModule))
+             (WORLD (setf (parent-context c) newModule))))
+  (setf (the-cons-list (child-contexts newModule))
+        (the-cons-list (child-contexts oldModule)))
+  (setf (the-cons-list (child-contexts oldModule)) NIL)
+  (setf (surrogate-value-inverse oldModule) NULL)
+  (free oldModule) )
+
+(defglobal *define-module-hooks* HOOK-LIST (new HOOK-LIST)
+  :documentation "HOOK-LIST called by 'define-module', applied to a
+'module' argument.")
+
+(defun (define-module MODULE) ((name STRING) (options CONS))
+  :documentation "Define or redefine a module named 'name' having the
+options 'options'.  Return the new module."
+  :public? TRUE
+  (special ((*shadowedSurrogates* NIL))
+    (let ((module MODULE NULL)
+	  (stringifiedOptions (stringify options))
+          (oldModule MODULE NULL))
+      ;; check for old module definition:
+      (setq oldModule (get-stella-module name FALSE))
+      (when (and (defined? oldModule)
+                 (identical-module-signatures? oldModule NULL stringifiedOptions))
+        ;; no change -- don't redefine module:
+        (return oldModule))
+      (setq module (new MODULE))
+      ;; tricky: because option values are strings (and lists of strings)
+      ;;    we don't have to change modules to parse the options:
+      (setf (stringified-options module) stringifiedOptions)
+      ;; parse options:
+      (incorporate-module-options module options)
+      ;; incorporate module name AFTER linking to included parents:
+      (incorporate-module-name module name)
+      (setf (base-module module) module)          ; point at self
+      (when (defined? oldModule)
+        ;; Check again for identical module redefinition, since we can
+        ;;    define the same module with different syntaxes, e.g.,
+        ;;    `(defmodule "/A/B")' vs. `(defmodule "B" :includes ("A"))'.
+        ;;    The latter case requires option processing to determine
+        ;;    the full name of the module:
+        (when (identical-module-signatures? oldModule module NULL)
+          ;; no change -- don't redefine module:
+          (unfinalize-module module)
+          (return oldModule))
+        ;; Catch error condition:
+        (when (eql? oldModule *module*)
+          (warn "Can't define a module inside of itself.")
+          (print "Skipping redefinition of module " name "." EOL)
+          (unfinalize-module module)
+          (return oldModule))
+        (undefine-module oldModule module))
+      (finalize-module module)
+      (run-hooks *define-module-hooks* module)
+      (return module) )))
+
+(defun (identical-module-signatures? BOOLEAN)
+    ((oldModule MODULE) (newModule MODULE) (newOptions STRING))
+  ;; Return TRUE if `oldModule' and `newModule' have identical signatures, i.e.,
+  ;;    they were defined with the same full name and options.
+  ;; If `newModule' is NULL, the test is performed against the option string
+  ;;    `newOptions' of a module about to be created, assuming that their
+  ;;    full names will match.
+  (when (and (defined? newModule)
+             (not (eql? (module-full-name oldModule)
+                        (module-full-name newModule))))
+    (return FALSE))
+  ;; If `newModule' is null, we assume that the names match:
+  (let ((oldOptions (stringified-options oldModule)))
+    (setq newOptions
+      (choose (null? newModule)
+              newOptions
+              (stringified-options newModule)))
+    (when (null? newOptions)
+      (return FALSE))
+    (when (eql? oldOptions newOptions)
+      (return TRUE))
+    (when (and (null? (string-search oldOptions ":INCLUDES" 0))
+               (null? (string-search newOptions ":INCLUDES" 0)))
+      (return FALSE))
+    (when (and (defined? newModule)
+               (equal-cons-trees?
+                (the-cons-list (parent-modules oldModule))
+                (the-cons-list (parent-modules newModule))))
+      (let ((oldPlist (new PROPERTY-LIST :the-plist (unstringify oldOptions)))
+            (newPlist (new PROPERTY-LIST :the-plist (unstringify newOptions))))
+        (remove-at oldPlist :INCLUDES)
+        (remove-at newPlist :INCLUDES)
+        (when (not (= (length oldPlist) (length newPlist)))
+          (return FALSE))
+        (foreach (key value) in oldPlist
+            where (not (equal-cons-trees? value (lookup newPlist key)))
+            do (return FALSE))
+        (return TRUE)))
+    (return FALSE)))
+
+(defun (define-module-from-stringified-source MODULE) 
+    ((name STRING) (stringifiedOptions STRING))
+  :public? TRUE
+  ;; Define a stella module given a stringified definition
+  (return (define-module name (unstringify stringifiedOptions))))
+
+(defun (yield-define-module CONS) ((module MODULE))
+  "Return a cons tree that (when evaluated) constructs a Stella module
+object."
+  (safety 2 (defined? (stringified-options module)))
+  ;; build new module object by unstringifying source and parsing the
+  ;;    result:
+  (return
+    (bquote (define-module-from-stringified-source
+		& (wrap-literal (module-full-name module))
+                & (yield-string-constant-tree
+		   (stringified-options module))))))
+
+(defun defmodule ((name NAME) &rest (options OBJECT))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation "Define (or redefine) a module named `name'.
+The accepted syntax is:
+	 
+  (defmodule <module-name>
+     [:documentation <docstring>]
+     [:includes {<module-name> | (<module-name>*)}]
+     [:uses {<module-name> | (<module-name>*)}]
+     [:lisp-package <package-name-string>]
+     [:java-package <package-specification-string>]
+     [:cpp-namespace <namespace-name-string>]
+     [:java-catchall-class
+     [:api? {TRUE | FALSE}]
+     [:case-sensitive? {TRUE | FALSE}]
+     [:shadow (<symbol>*)]
+     [:java-catchall-class <class-name-string>]
+     [<other-options>*])
+	
+`name' can be a string or a symbol.
+
+Modules include objects from other modules via two separate mechanisms:
+(1) they inherit from their parents specified via the `:includes' option
+and/or a fully qualified module name, and (2) they inherit from used
+modules specified via the `:uses' option.  The main difference between
+the two mechanisms is that inheritance from parents is transitive, while
+uses-links are only followed one level deep.  I.e., a module A that uses
+B will see all objects of B (and any of B's parents) but not see anything
+from modules used by B.  Another difference is that only objects declared
+as public can be inherited via uses-links (this is not yet enforced).
+Note that - contrary to Lisp - there are separate name spaces for classes,
+functions, and variables.  For example, a module could inherit the class
+`CONS' from the `STELLA' module, but shadow the function of the same name.
+
+The above discussion of `:includes' and `:uses' semantics keyed on the
+inheritance/visibility of symbols. The PowerLoom system makes another
+very important distinction: If a module 'A' is inherited directly or
+indirectly via `:includes' specification(s) by a submodule 'B', then all
+definitions and facts asserted in 'A' are visible in 'B'. This is not the
+cases for `:uses'; the `:uses' options does not impact inheritance of
+propositions at all.
+
+The list of modules specified in the
+`:includes' option plus (if supplied) the parent in the path used for
+`name' become the new module's parents. If no `:uses' option was
+supplied, the new module will use the `STELLA' module by default,
+otherwise, it will use the set of specified modules.
+If `:case-sensitive?' is supplied as TRUE, symbols in the module will be
+interned case-sensitively, otherwise (the default), they will be
+converted to uppercase before they get interned. Modules can shadow
+definitions of functions and classes inherited from parents or used
+modules. Shadowing is done automatically, but generates a warning unless
+the shadowed type or function name is listed in the `:shadow' option of
+the module definition .
+
+Examples:
+	 
+  (defmodule \"PL-KERNEL/PL-USER\"
+    :uses (\"LOGIC\" \"STELLA\")
+    :package \"PL-USER\")
+
+  (defmodule PL-USER/GENEALOGY)
+	
+The remaining options are relevant only for modules that contain STELLA
+code.  Modules used only to contain knowledge base definitions and assertions
+have no use for them:
+
+The keywords `:lisp-package', `:java-package', and `:cpp-package' specify
+the name of a native package or name space in which symbols of the module
+should be allocated when they get translated into one of Lisp, Java, or
+C++. By default, Lisp symbols are allocated in the `STELLA' package, and
+C++ names are translated without any prefixes. The rules that the STELLA
+translator uses to attach translated Java objects to classes and packages
+are somewhat complex. Use :java-package option to specify a list of
+package names (separated by periods) that prefix the Java object in this
+module.  Use :java-catchall-class to specify the name of the Java class to
+contain all global & special variables, parameter-less functions and functions 
+defined on arguments that are not classes in the current module.
+The default value will be the name of the module.
+
+When set to TRUE, the :api? option tells the PowerLoom User Manual
+generator that all functions defined in this module should be included in
+the API section. Additionally, the Java translator makes all API
+functions `synchronized'.
+"
+  (let ((moduleName (coerce-to-module-name name TRUE)))
+    (when (defined? moduleName)
+      (define-module moduleName (coerce-&rest-to-cons options)))))
+
+(defun (in-module MODULE) ((name NAME))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE :lisp-macro? TRUE
+  :documentation "Change the current module to the module named `name'."
+  (let ((moduleName (coerce-to-module-name name TRUE))
+        (module (choose (defined? moduleName)
+                        (get-stella-module moduleName FALSE)
+                        NULL)))
+    (cond ((defined? module)
+           (setq *module* module)
+           (setq *context* module))
+          (otherwise
+           (error "Illegal or undefined module: " name)))
+    (return *module*)))
+
+  ;;
+;;;;;; Worlds
+  ;;
+
+(defun (create-world WORLD) ((parentContext CONTEXT) (name STRING))
+  :documentation "Create a new world below the world or module 'parentContext'.
+Optionally, specify a name."
+  :public? TRUE
+  :inline finalize-world
+  (let ((world (new WORLD)))
+    (when (defined? name)
+      (setf (world-name world) name)
+      ;; check for sibling with same name
+      (when (exists sibling in (child-contexts parentContext)
+                    where (string-eql? (context-name sibling) name))
+        (warn "Can't create a world named " name
+              " because a sibling already has that name.")
+        (return NULL)))
+    (setf (parent-context world) parentContext)
+    (insert (child-contexts parentContext) world)
+    (setf (base-module world) (base-module parentContext))
+    (finalize-world world)
+    (return world) ))
+
+
+  ;;
+;;;;;; Push and pop world
+  ;;
+
+(defun (push-world WORLD) ()
+  :documentation "Spawn a new world that is a child of the current context,
+and change the current context to the new world."
+  :public? TRUE
+  (return (setq *context* (create-world *context* NULL))) )
+
+(defun (pop-world CONTEXT) ()
+  :documentation "Destroy the current world and change the current
+context to be its parent.  Return the current context. Nothing happens
+if there is no current world."
+  :public? TRUE
+  ;; tricky test to see if *context* is a module:
+  (when (not (eql? *context* *module*))
+    (let ((world WORLD *context*))
+      (setq *context* (parent-context world))
+      (destroy-world world)))
+  (return *context*) )
+
+
+  ;;
+;;;;;; Navigation functions
+  ;;
+
+(defun (all-subcontexts (ALL-PURPOSE-ITERATOR OF CONTEXT)) ((context CONTEXT)
+                                                (traversal KEYWORD))
+  :documentation "Return an iterator that generates all subcontexts of
+'self' (not including 'self') in the order specified by 'traversal' (one
+of :preorder, :inorder, or :postorder)."
+  (let ((contextsIterator (new ALL-PURPOSE-ITERATOR))
+        (subContexts NIL))
+    (foreach child in (child-contexts context)
+             collect child into subContexts)
+    (when (eql? traversal :postorder)
+      (setq subContexts (reverse subContexts)))
+    (setf (iterator-cons-list contextsIterator) subContexts)
+    (setf (iterator-object contextsIterator) traversal)
+    (setf (iterator-next-code contextsIterator)
+          (the-code :function all-subcontexts-next?))
+    (return contextsIterator) ))
+
+(defun (all-subcontexts-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; 'next?' function for the 'all-subcontexts' iterator.
+  (let ((traversal KEYWORD (iterator-object self))
+        (remainingContexts (iterator-cons-list self))
+        (thisContext CONTEXT NULL)
+        (subContexts NIL))
+    (when (empty? remainingContexts)
+      (setf (slot-value self value) NULL)
+      (return FALSE))
+    (setq thisContext (first remainingContexts))
+    (setq remainingContexts (rest remainingContexts))
+    (foreach child in (child-contexts thisContext)
+             ;; Avoid duplicates due to multiple inheritance:
+             where (or (eql? (pop (parent-contexts child)) thisContext)
+                       (empty? (parent-contexts child)))
+             collect child into subContexts)
+    (if (empty? subContexts)
+        (setf (iterator-cons-list self) remainingContexts)
+      (case traversal
+        (:preorder
+         (setf (rest (last-cons subContexts)) remainingContexts)
+         (setf (iterator-cons-list self) subContexts))
+        (:postorder
+         (setq subContexts (reverse subContexts))
+         (setf (rest (last-cons subContexts)) remainingContexts)
+         (setf (iterator-cons-list self) subContexts))
+        (:inorder
+         (cond ((empty? remainingContexts)
+                (setf (iterator-cons-list self) subContexts))
+               (otherwise
+                (setf (rest (last-cons remainingContexts)) subContexts)
+                (setf (iterator-cons-list self) remainingContexts))))))
+    (setf (slot-value self value) thisContext)
+    (return TRUE)))
+
+(defun (all-contexts (ITERATOR OF CONTEXT)) ()
+  :public? TRUE
+  :documentation "Return an iterator that generates all contexts."
+  (let ((iterator ALL-PURPOSE-ITERATOR
+                  (all-subcontexts *root-module* :preorder)))
+    ;; This uses knowledge about the internals of the 'all-subcontexts'
+    ;; iterator to make it start with *root-module* instead of its children:
+    (setf (iterator-cons-list iterator) (cons *root-module* NIL))
+    (return iterator)))
+
+(defun (filter-module? BOOLEAN) ((self OBJECT) (iterator ALL-PURPOSE-ITERATOR))
+  ;; Assumes that the class MODULE is final.
+  (ignore iterator)
+  (return (eql? (primary-type self) @MODULE)) )
+
+(defun (all-modules (ITERATOR OF MODULE)) ()
+  :public? TRUE
+  :documentation "Return an iterator that generates all modules."
+  (let ((contextsIterator (all-contexts))
+        (iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (first-iteration? iterator) TRUE)
+    (setf (iterator-nested-iterator iterator) contextsIterator)
+    (setf (iterator-next-code iterator)
+          (the-code :function filtered-nested-iterator-next?))
+    (setf (iterator-filter-code iterator)
+          (the-code :function filter-module?))
+    (return iterator)))
+
+(defun (all-included-modules (ITERATOR OF MODULE)) ((self MODULE))
+  :public? TRUE
+  :documentation "Generate a sequence of all modules included
+by 'self', inclusive, starting from the highest ancestor and working
+down to 'self' (which is last)."
+  (let ((copy (copy-cons-list
+               (cast (all-super-contexts self) (CONS OF MODULE)))))
+    (pushq copy self)
+    (return
+     (allocate-destructive-list-iterator (reverse copy))) ))
+
+(defun (visible-modules (ITERATOR OF MODULE)) ((from MODULE))
+  :public? TRUE
+  :documentation
+  "Return an iterator that generates all modules visible from module `from'.
+The generated modules are generated from most- to least-specific and 
+will start with the module `from'."
+  (let ((visibleModules (CONS OF MODULE) NIL))
+    (when (null? from)
+      (setq from *module*))
+    (pushq visibleModules from)
+    (foreach super in (all-super-contexts from)
+             do (pushq visibleModules super))
+    (foreach usee in (uses from)
+             do
+             (when (not (memb? visibleModules usee))
+               (pushq visibleModules usee))
+             (foreach useeSuper in (all-super-contexts usee)
+                      ;; Avoid duplicates (e.g., if siblings use each other):
+                      where (not (memb? visibleModules useeSuper))
+                      do (pushq visibleModules useeSuper)))
+    (return (allocate-destructive-list-iterator (reverse visibleModules))) ))
+
+
+  ;;
+;;;;;; Inheritance
+  ;;
+
+(defun (cardinal-module? BOOLEAN) ((self MODULE))
+  ;; Return TRUE if 'self' is a direct child of the ROOT module.
+  (return (eql? (cardinal-module self) self)) )
+
+(defun (visible-from? BOOLEAN) ((viewedContext CONTEXT) (fromContext CONTEXT))
+  :public? TRUE
+  ;; Return TRUE if 'viewedContext' is inherited by or used by 'fromContext'.
+  (return
+    (or (eql? viewedContext fromContext)
+        (memb? (all-super-contexts fromContext) viewedContext)
+        (exists usesModule in (choose (isa? fromContext @MODULE)
+                                      (uses (cast fromContext MODULE))
+                                      (uses (base-module fromContext)))
+            where (or (eql? viewedContext usesModule)
+                      (memb? (all-super-contexts usesModule)
+                             viewedContext))))))
+
+
+  ;;
+;;;;;; "clear-context"
+  ;;
+
+(startup-time-progn
+  (setf (clearable? *root-module*) FALSE)
+  (setf (clearable? *stella-module*) FALSE)
+  (setf (clearable? *common-lisp-module*) FALSE))
+
+(defun clear-one-context ((self CONTEXT))
+  ;; Destroy all objects belonging to the context 'self'.
+  (typecase self
+    (MODULE
+     (when (not (clearable? self))
+       (warn "Module " (module-full-name self) " cannot be cleared!")
+       (return))
+     (run-hooks *clear-module-hooks* self)
+     (foreach function in (all-functions self TRUE)
+         do (destroy-function function))
+     (foreach variable in (all-variables self TRUE)
+         do (destroy-variable variable))
+     (foreach class in (all-classes self TRUE)
+         do (destroy-class class))
+     (foreach surrogate in (all-surrogates self TRUE)
+         do
+         (if (protect-surrogates? self)
+           (setf (surrogate-value surrogate) NULL)
+           (unintern-surrogate surrogate)))
+     ;; if we are protecting surrogates, then we protect symbols
+     ;;    as well:
+     (unless (protect-surrogates? self)
+       (foreach symbol in (all-symbols self TRUE)
+                do (unintern-symbol symbol)))
+     (special ((*module* self))
+       (foreach it on (shadowed-surrogates self)
+	   do (setf (value it)
+		(shadow-surrogate (symbol-name (value it)))))))
+    (otherwise NULL)))
+
+(defun help-clear-context ((self CONTEXT))
+  ;; Destroy objects bottom up:
+  (foreach child in (child-contexts self)
+           do (help-clear-context child))
+  (clear-one-context self) )
+
+(defun clear-context ((self CONTEXT))
+  :public? TRUE
+  :documentation
+  "Destroy all objects belonging to 'self' or any of its subcontexts."
+  ;; Destroy objects bottom up:
+  (help-clear-context self)
+  (finalize-classes-and-slots))
+
+(defun call-clear-module (&rest (name NAME))
+  :public? TRUE :command? TRUE :evaluate-arguments? TRUE :lisp-macro? FALSE
+  :documentation
+  "Destroy all objects belonging to module `name' or any of its children.
+If no `name' is supplied, the current module will be cleared after
+confirming with the user.  Important modules such as STELLA are protected
+against accidental clearing."
+  (let ((arglist (coerce-&rest-to-cons name))
+        (module (coerce-to-module (first arglist) TRUE)))
+    (when (defined? module)
+      (when (or (non-empty? arglist)
+                (y-or-n? (concatenate
+                           "Really clear module "
+                           (concatenate (module-full-name module) "? "))))
+        (clear-context module)))))
+
+(defun clear-module (&rest (name NAME))
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  :documentation
+  "Destroy all objects belonging to module `name' or any of its children.
+If no `name' is supplied, the current module will be cleared after
+confirming with the user.  Important modules such as STELLA are protected
+against accidental clearing."
+  (if (= (length name) 0)
+      (call-clear-module)
+    (call-clear-module (first (coerce-&rest-to-cons name)))))

@@ -1,0 +1,1057 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: foreach.ste,v 1.42 2003/04/18 21:14:54 hans Exp
+
+;;; STELLA Loop package.
+;;;   Includes code for exists, forall, and select operators.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; STELLA foreach loops are headed by the keyword 'FOREACH'.  They
+;;; are first converted into the more manageable prefix syntax, headed
+;;; by the keyword 'PREFIX-FOREACH'.  Then the prefix form is
+;;; transformed into the SYS-FOREACH form, which is the form output
+;;; by the walker.  Below are grammars for each form:
+;;;
+;;; (FOREACH <cursor clauses> [where clause]
+;;;          [do clause] [<collect clause> <into clause>])
+;;; (PREFIX-FOREACH <cursors clause> [where clause] 
+;;;                 [do clause] [collect-into clause])
+;;; (SYS-FOREACH (<iterator initializer>*) (<value assignment>*)
+;;;              <continuation test> <body>)
+;;; <iterator initializer> ::= (<variable> <type> <walked expression>)
+;;; <value assignment> ::= (<variable> <type> <walked expression>)
+;;; <continuation test> ::= <walked boolean expression>)
+;;; <body> ::= <walked statement>*
+;;;
+;;; IDEA: Joins (COMMA clauses) have been eliminated by the transformation
+;;;    from 'PREFIX-FOREACH' to 'SYS-FOREACH' (eliminated by a query 
+;;;    optimizer).
+;;; COLLECT and INTO variables are represented as <iterator initializer>
+;;;    clauses (initialized to NULL).
+
+
+#|
+
+(toggle)
+
+(xptrans
+ (let ((list CONS (cons-list 1 2 3)))
+   (foreach x in list do (print x EOL))))
+
+(eval
+ (let ((list CONS (cons-list 1 2 3)))
+   (foreach x in list do (print x EOL))))
+
+(xptrans
+ (let ((list LIST (list 1 2 3)))
+   (foreach x in list do (print x EOL))))
+(eval
+ (let ((list LIST (list 1 2 3)))
+   (foreach x in list do (print x EOL))))
+
+|#
+
+  ;;
+;;;;;; Walk FOREACH Statement
+  ;;
+
+(defun (extract-one-in-clause CONS CONS) ((tail CONS))
+  ;; Verify that 'tail' is headed by  '<symbol> IN <term>', remove
+  ;;    the three terms and return two values, the list '(IN <symbol> <term>)'
+  ;;    and the remainder of 'tail'.
+  (let ((variable (first tail))
+        (operator (second tail))
+        (clause tail))
+    (unless (and (or (symbol? variable)
+                     (cons? variable))
+                 (member? (quote (IN ON ISA)) operator)
+                 (defined? (third tail)))
+      (walk-error "Illegal syntax where 'IN', 'ON', or 'ISA' clause expected:"
+                  EOL "   " tail)
+      (return NULL NIL))
+    (setf (first clause) operator)      ; swap operator and variable to
+    (setf (second clause) variable)     ;    obtain prefix syntax
+    (setq tail (rest (rest (rest tail))))
+    (setf (rest (rest (rest clause))) NIL)      ; cut 'clause' from 'tail'
+    (return clause tail) ))
+
+(defun (extract-one-generator-term CONS CONS) ((tail CONS))
+  ;; Extract IN clauses separated by 'AS' from 'tail' and
+  ;;    convert them from infix to prefix.  Return a single
+  ;;    IN clause or a PARALLEL clause, together with the residue.
+  (let ((inClause CONS NULL)
+        (residue CONS NULL)
+        (parallelTerms CONS NULL))
+    (mv-setq (inClause residue) (extract-one-in-clause tail))
+    (when (not (eq? (first residue) (quote AS)))
+      (return inClause residue))
+    (setq parallelTerms (bquote (& inClause AS)))
+    (while (eq? (first residue) (quote AS))
+      (setq residue (rest residue))     ; skip over AS
+      (mv-setq (inClause residue) (extract-one-in-clause residue))
+      (pushq parallelTerms inClause))
+    (return (reverse parallelTerms) residue) ))
+
+(defun (extract-generators-clause CONS CONS) ((tail CONS))
+  :public? TRUE
+  ;; Extract clauses separated by 'AS' and 'COMMA', and
+  ;;    convert them from infix to prefix (with AS having the
+  ;;    higher precedence).  Return generators and residue.
+  (let ((generatorTerm CONS NULL)
+        (residue CONS NULL)
+        (generatorsClause CONS NULL))
+    (mv-setq (generatorTerm residue) (extract-one-generator-term tail))
+    (when (not (eq? (first residue) (quote COMMA)))
+      (return generatorTerm residue))
+    (setq generatorsClause (bquote (& generatorTerm COMMA)))
+    (while (eq? (first residue) (quote COMMA))
+      (mv-setq (generatorTerm residue)
+        (extract-one-generator-term (rest residue)))
+      (pushq generatorsClause generatorTerm))
+    (return (reverse generatorsClause) residue) ))
+
+(defun (extract-option-and-residue OBJECT CONS) ((option SYMBOL) (tail CONS))
+  :public? TRUE
+  ;; If the head of 'tail' equals 'option', return its argument,
+  ;;    together with a second value representing the third and successive
+  ;;    values.
+  ;; Otherwise, return NULL and NULL.
+  (when (not (eq? (first tail) option))
+    (return NULL tail))
+  (let ((argument OBJECT NULL)
+        (residue CONS NULL))
+    (setq argument (second tail))
+    (setq residue (rest (rest tail)))
+    (return argument residue) ))
+
+(defun (extract-do-clause CONS CONS) ((tail CONS))
+  ;; Convert 'DO <action>*' into '(DO <action>*)' if DO is the head of
+  ;;    'tail', and also return the residue.
+  (when (not (eq? (first tail) (quote DO)))
+    (return NULL tail))
+  (let ((doClause tail)                 ; skip over DO symbol
+        (lastDoCons CONS NULL))
+    (setq tail (rest tail))
+    (while (and (non-empty? tail)         ; skip over action statements
+                (not (eq? (first tail) (quote COLLECT))))
+      (setq lastDoCons tail)
+      (setq tail (rest tail)))
+    (if (null? lastDoCons)
+      (progn
+        (walk-error "Missing arguments to DO separator")
+        (setf (rest doClause)
+              (cons-list (walk-dont-call-me-tree NIL @VOID))))
+      (setf (rest lastDoCons) NIL))       ; separate DO clause from residue
+    (return doClause tail) ))
+
+(defun (foreach-to-prefix-foreach-tree CONS) ((foreachTree CONS))
+  ;; Convert from infix Stella parse tree to canonical prefix parse tree.
+  (let ((generatorsClause CONS NULL)
+        (filterClause OBJECT NULL)
+        (doClause CONS NULL)
+        (collectClause OBJECT NULL)
+        (intoClause OBJECT NULL)
+        (residue (cast (rest foreachTree) CONS)) ; start at generators clause
+        (oTree CONS NULL))
+    (mv-setq (generatorsClause residue)
+             (extract-generators-clause residue))
+    (when (null? generatorsClause)
+      ;; Return a legal PREFIX-FOREACH tree:
+      (return
+        (bquote
+         (PREFIX-FOREACH (IN x NIL) (DO & (walk-dont-call-me-tree oTree @VOID))))))
+    (mv-setq (filterClause residue)
+             (extract-option-and-residue (quote WHERE) residue))
+    (when (defined? filterClause)
+      (setq filterClause (bquote (WHERE & filterClause))))
+    (mv-setq (doClause residue)
+             (extract-do-clause residue))
+    (mv-setq (collectClause residue)
+             (extract-option-and-residue (quote COLLECT) residue))
+    (mv-setq (intoClause residue)
+             (extract-option-and-residue (quote INTO) residue))
+    (when (or (defined? collectClause) (defined? intoClause))
+      (setq collectClause
+            (bquote (COLLECT-INTO & collectClause & intoClause))))
+    (setq oTree
+          (bquote
+           (PREFIX-FOREACH
+            & generatorsClause
+            && (choose (defined? filterClause) (cons filterClause NIL) NIL)
+            && (choose (defined? doClause) (cons doClause NIL) NIL) 
+            && (choose (defined? collectClause) (cons collectClause NIL) NIL))))
+    ;; tricky: we create 'oTree' before checking for syntax errors, so that
+    ;;    we can easily discard all of the pieces if we are bailing out.
+    (when (or (and (defined? collectClause) (null? intoClause))
+              (and (defined? intoClause) (null? collectClause)))
+      (walk-error "Missing COLLECT or INTO clause in")
+      ;; Return a legal PREFIX-FOREACH tree:
+      (return
+        (bquote
+         (PREFIX-FOREACH (IN x NIL) (DO & (walk-dont-call-me-tree oTree @VOID))))))
+    (when (non-empty? residue)
+      (walk-error "Extra expressions at the end of foreach statement:")
+      ;; Return a legal PREFIX-FOREACH tree:
+      (return
+        (bquote
+         (PREFIX-FOREACH (IN x NIL) (DO & (walk-dont-call-me-tree oTree @VOID))))))
+    (return oTree) ))
+
+(defun (walk-foreach-tree CONS TYPE-SPEC) ((tree CONS))
+  ;; Convert a Stella (infix) foreach tree into a Stella (prefix) equivalent.
+  (special ((*nofSpecialsAtLoopEntry* (length *specialVariableStack*)))
+    (case (first tree)
+      (FOREACH (return (walk-prefix-foreach-tree
+                        (foreach-to-prefix-foreach-tree tree))))
+      (EXISTS (return (walk-exists-tree tree)))
+      (FORALL (return (walk-forall-tree tree)))
+      (SOME (return (walk-some-tree tree)))
+      ((SETOF SET-OF) (return (walk-setof-tree tree)))) ))
+
+
+  ;;
+;;;;;; Walk PREFIX-FOREACH Statement
+  ;;
+
+(defun (walk-collection-tree OBJECT TYPE-SPEC) ((tree OBJECT)
+                                                (dontOptimize? BOOLEAN))
+  ;; Walk 'tree' (which is assumed to be the collection argument of a
+  ;;    'foreach' statement such as '(foreach x in <tree> ...)'), and
+  ;;    return the (not necessarily) walked tree and its type.
+  ;; Special-case collection trees such as '(interval 0 10)', since
+  ;;    in that case we want to leave the walking of the arguments
+  ;;    to the optimizer.  If 'dontOptimize?' is TRUE, no such
+  ;;    special-casing will be done.
+  ;; The primary purpose of this function is to determine the type of
+  ;;    the collection, the walking of 'tree' is nothing more than
+  ;;    a side-effect, since collection trees get rewalked by
+  ;;    'walk-cursors-tree'.
+  ;; NOTE: This function can't handle VRLET's in collection expressions,
+  ;;    it (wrongly) assumes that those have been moved out already.
+  (typecase tree
+    (CONS (when (and (not dontOptimize?)
+                     (eql? (first tree) (bquote INTERVAL))
+                     (eq? (length tree) 3))
+            (return tree @INTEGER-INTERVAL)))
+    (otherwise NULL))
+  (return (walk-expression-tree tree @UNKNOWN (quote FOREACH) FALSE)))
+
+(defun (yield-IN-cursor-clauses CONS CONS OBJECT) ((inTree CONS)
+                                                   (dontOptimize? BOOLEAN))
+  ;; Process a single IN-clause of a 'foreach' statement such as
+  ;;    '(foreach <variable> in <expression> ...)', and optimize the
+  ;;    iteration if possible, unless 'dontOptimize?' is TRUE.
+  ;; 'inTree' has the form '(IN <variable> <expression>)' or
+  ;;                       '(IN (<keyvar> <valuevar>) <expression>)'.
+  ;; Return a list of iterator clauses, a list of value clauses, and
+  ;;    a continuation test (see 'walk-cursors-tree' for a description
+  ;;    of the format).
+  (let ((varTree (second inTree))
+        (keyVar SYMBOL NULL)
+        (valueVar SYMBOL NULL)
+        (collectionBaseType TYPE NULL))
+    ;; Determine the type of the collection:
+    (mv-bind (collectionTree collectionType)
+        (walk-collection-tree (third inTree) dontOptimize?)
+      (setf (third inTree) NULL)        ; clip expression for later gc
+      (setq collectionBaseType (type-spec-to-base-type collectionType))
+      (when (and dontOptimize?
+                 (not (safe-subtype-of?
+                       collectionBaseType @ABSTRACT-ITERATOR)))
+        ;; Avoid optimization by allocating an iterator:
+        (mv-setq (collectionTree collectionType)
+          (walk-collection-tree
+           (bquote (allocate-iterator & collectionTree)) TRUE))
+        (setq collectionBaseType (type-spec-to-base-type collectionType)))
+      ;; Handle different variable specifications:
+      (typecase varTree
+        (CONS
+         (when (not (eq? (length varTree) 2))
+           (walk-error "Illegal number of variables in IN clause: " inTree)
+           (return NIL NIL (quote FALSE)))
+         (setq keyVar (first varTree))
+         (setq valueVar (second varTree)))
+        (otherwise
+         (setq valueVar varTree)))
+      ;; Yield clauses depending on the collection type:
+      (case collectionBaseType
+        (@INTEGER-INTERVAL
+         (return (yield-IN-cursor-clauses-for-INTEGER-INTERVAL
+                  collectionTree collectionType keyVar valueVar)))
+        (@ARGUMENT-LIST
+         (return (yield-IN-cursor-clauses-for-ARGUMENT-LIST
+                  collectionTree collectionType keyVar valueVar)))
+        (otherwise
+         (if (use-vector-style-iteration? collectionBaseType)
+             (return (yield-IN-cursor-clauses-for-VECTOR
+                      collectionTree collectionType keyVar valueVar))
+           (return (yield-IN-cursor-clauses-for-general-collection
+                    collectionTree collectionType keyVar valueVar))))))))
+
+(defun (use-vector-style-iteration? BOOLEAN) ((collectionType TYPE))
+  ;; Return TRUE if `collectionType' is some kind of vector that can
+  ;;    be iterated over with direct array access.
+  (return (or (eql? collectionType @STRING)
+              (eql? collectionType @MUTABLE-STRING)
+              (safe-subtype-of? collectionType @VECTOR)
+              ;; Temporary kludge to pick up literal vectors like FLOAT-VECTOR:
+              (and (safe-subtype-of? collectionType @SEQUENCE-MIXIN)
+                   (defined? (safe-lookup-slot (type-class collectionType)
+                                               (quote the-array)))))))
+
+(defun (yield-IN-cursor-clauses-for-general-collection CONS CONS OBJECT)
+    ((collectionTree OBJECT) (collectionType TYPE-SPEC)
+     (keyVar SYMBOL) (valueVar SYMBOL))
+  ;; Process a single IN-clause of a 'foreach' statement such as
+  ;;    '(foreach <varTree> in <collectionTree> ...)', where the
+  ;;    collection is either a kind of list or an iterator.
+  ;; Optimize the iteration for CONS, LIST, KV-CONS, KEY-VALUE-LIST
+  ;;    and PROPERTY-LIST collections.
+  ;; Return a list of iterator clauses, a list of value clauses, and
+  ;;    a continuation test (see 'walk-cursors-tree' for a description
+  ;;    of the format).
+  (let ((collectionBaseType (type-spec-to-base-type collectionType))
+        (iteratorVar (local-gensym "ITER"))
+        (iteratorClauses NIL)
+        (valueClauses NIL)
+        (continuationTest OBJECT NULL)
+        (keyTree NIL)
+        (valueTree NIL)
+        (bumpTrees NIL))
+
+    ;; Wrap collection tree and reduce similar cases to primitive cases:
+    (case collectionBaseType
+      (@LIST
+       (setq iteratorClauses
+         (bquote ((& iteratorVar @CONS (the-cons-list & collectionTree)))))
+       (setq collectionBaseType @CONS))
+      (@KEY-VALUE-LIST
+       (setq iteratorClauses
+         (bquote ((& iteratorVar @KV-CONS (the-kv-list & collectionTree)))))
+       (setq collectionBaseType @KV-CONS))
+      (@PROPERTY-LIST
+       (setq iteratorClauses
+         (bquote ((& iteratorVar @CONS (the-plist & collectionTree))))))
+      ((@CONS @KV-CONS)
+       (setq iteratorClauses
+         (bquote ((& iteratorVar & collectionBaseType & collectionTree)))))
+      (otherwise
+       (unless (safe-subtype-of? collectionBaseType @ABSTRACT-ITERATOR)
+         (setq collectionTree
+           (bquote (allocate-iterator & collectionTree))))
+       (setq iteratorClauses
+         ;; We don't need the exact type, since iterator clauses get rewalked:
+         (bquote ((& iteratorVar @ABSTRACT-ITERATOR & collectionTree))))
+       (setq collectionBaseType @ABSTRACT-ITERATOR)))
+
+    ;; Determine key tree, value tree, bump tree, and continuation test:
+    (when (defined? keyVar)
+      (setq keyTree (bquote (key & iteratorVar))))
+    (setq valueTree (bquote (value & iteratorVar)))
+    (case collectionBaseType
+      (@CONS
+       (setq bumpTrees (bquote ((setq & iteratorVar (rest & iteratorVar)))))
+       (setq continuationTest (bquote (not (nil? & iteratorVar)))))
+      (@KV-CONS
+       (setq bumpTrees (bquote ((setq & iteratorVar (rest & iteratorVar)))))
+       (setq continuationTest (bquote (defined? & iteratorVar))))
+      (@PROPERTY-LIST
+       (when (defined? keyVar)
+         (setq keyTree (bquote (value & iteratorVar))))
+       (setq valueTree (bquote (value (rest & iteratorVar))))
+       (setq bumpTrees
+         (bquote ((setq & iteratorVar (rest (rest & iteratorVar))))))
+       (setq continuationTest (bquote (not (nil? & iteratorVar)))))
+      (@ABSTRACT-ITERATOR
+       (setq bumpTrees NIL)
+       (setq continuationTest (bquote (next? & iteratorVar)))))
+
+    (pushq valueClauses
+           (bquote (& valueVar
+                      & (extract-parameter-type
+                         collectionType (quote ANY-VALUE))
+                      & (optimize-progn
+                         (bquote
+                          (progn (setq & valueVar & valueTree)
+                                 && bumpTrees))))))
+
+    ;; Handle key variables:
+    (when (defined? keyVar)
+      (mv-bind (keyType parameterExists?)
+          (extract-parameter-type collectionType (quote ANY-KEY))
+        (cond (parameterExists?
+               (pushq valueClauses
+                      (bquote (& keyVar
+                                 & keyType
+                                 (setq & keyVar & keyTree)))))
+              (otherwise
+               (walk-error
+                "Illegal key variable specified for keyless collection "
+                collectionType)
+               (return NIL NIL (quote FALSE))))))
+
+    (return iteratorClauses valueClauses continuationTest)))
+
+(defun (yield-IN-cursor-clauses-for-INTEGER-INTERVAL CONS CONS OBJECT)
+    ((collectionTree CONS) (collectionType TYPE-SPEC)
+     (keyVar SYMBOL) (valueVar SYMBOL))
+  ;; Optimize a single INTEGER-INTERVAL IN-clause of a 'foreach' statement
+  ;;    such as '(foreach <valueVar> in (interval 0 10) ...)'.
+  ;; Return a list of iterator clauses, a list of value clauses, and
+  ;;    a continuation test (see 'walk-cursors-tree' for a description
+  ;;    of the format).
+  (ignore collectionType)
+  (when (defined? keyVar)
+    (walk-error "Illegal key variable specified for INTEGER-INTERVAL")
+    (return NIL NIL (quote FALSE)))
+  (let ((upperBound (third collectionTree))
+        ;; NOTE: We can optimize the case where we know the upper bound was
+        ;;    supplied as the constant NULL, but we still have to handle the
+        ;;    case where it might evaluate to NULL - bummer:
+        (knownUnbounded?
+         (or (eql? upperBound (quote NULL))
+             (eql? upperBound
+                   (quote NULL-INTEGER))))
+        (knownBounded?
+         (and (not knownUnbounded?)
+	      ;; We walk the expression tree to allow for macro expansion, 
+	      ;; particularly of the PHASE-TO-INTEGER macro:
+              (or (isa? (walk-expression-tree (copy-cons-tree upperBound)
+                                              @INTEGER (quote FOREACH) FALSE)
+			@NUMBER-WRAPPER)
+                  (and (cons? upperBound)
+                       ;; special-case a few operators with defined results:
+                       (member? (quote (+ - * / 1+ 1- ++ -- length))
+                                (first (cast upperBound CONS)))))))
+        (iteratorVar (local-gensym "ITER"))
+        (upperBoundVar (choose knownUnbounded?
+                               NULL
+                               (local-gensym "UPPER-BOUND")))
+        (unboundedVar (choose (or knownUnbounded? knownBounded?)
+                              NULL
+                              (local-gensym "UNBOUNDED?"))))
+    (return
+      (bquote ((& iteratorVar
+                  @INTEGER
+                  & (second collectionTree))
+               && (choose knownUnbounded?
+                          NIL
+                          (bquote
+                           ((& upperBoundVar @INTEGER & upperBound))))
+               && (choose (or knownUnbounded? knownBounded?)
+                          NIL
+                          (bquote
+                           ((& unboundedVar
+                               @BOOLEAN
+                               (null? & upperBoundVar)))))))
+      (bquote ((& valueVar
+                  @INTEGER
+                  (progn (setq & valueVar & iteratorVar)
+                         (++ & iteratorVar)))))
+      (choose knownUnbounded?
+              (bquote TRUE)
+              (choose knownBounded?
+                      (bquote (<= & iteratorVar & upperBoundVar))
+                      (bquote (or & unboundedVar
+                                  (<= & iteratorVar & upperBoundVar))))))))
+
+(defun (yield-IN-cursor-clauses-for-VECTOR CONS CONS OBJECT)
+    ((collectionTree OBJECT) (collectionType TYPE-SPEC)
+     (keyVar SYMBOL) (valueVar SYMBOL))
+  ;; Optimize a single VECTOR or STRING IN-clause of a 'foreach' statement
+  ;;    such as '(foreach <valueVar> in "Foo" ...)'.
+  ;; Return a list of iterator clauses, a list of value clauses, and
+  ;;    a continuation test (see 'walk-cursors-tree' for a description
+  ;;    of the format).
+  (when (defined? keyVar)
+    (walk-error "Illegal key variable specified for " collectionType)
+    (return NIL NIL (quote FALSE)))
+  (let ((vectorVar (local-gensym "VECTOR"))
+        (indexVar (local-gensym "INDEX"))
+        (lengthVar (local-gensym "LENGTH")))
+    (return
+      (bquote ((& vectorVar & collectionType & collectionTree)
+               (& indexVar @INTEGER 0)
+               (& lengthVar @INTEGER (length & vectorVar))))
+      (bquote ((& valueVar
+                  & (choose (or (eql? collectionType @STRING)
+                                (eql? collectionType @MUTABLE-STRING))
+                            @CHARACTER
+                            (extract-parameter-type
+                             collectionType (quote ANY-VALUE)))
+                  (progn (setq & valueVar (nth & vectorVar & indexVar))
+                         (++ & indexVar)))))
+      (bquote (< & indexVar & lengthVar)))))
+
+(defun (yield-IN-cursor-clauses-for-ARGUMENT-LIST CONS CONS OBJECT)
+    ((collectionTree OBJECT) (collectionType TYPE-SPEC)
+     (keyVar SYMBOL) (valueVar SYMBOL))
+  ;; Handle a single ARGUMENT-LIST IN-clause of a 'foreach' statement.
+  ;; If the argument list is listified (e.g., for Java) generate the proper
+  ;;    iteration code depending on the listification type (usually @CONS).
+  ;;    This involves some type trickery, since the type of the collection
+  ;;    variable is really ARGUMENT-LIST.
+  ;; Otherwise, rely on the Lisp and C++ translators to generate the right
+  ;;    mapping onto the native variable arguments mechanism (they key in on
+  ;;    calls to `ARGUMENT-LIST.allocate-iterator', etc. and handle those
+  ;;    specially).
+  ;; Return a list of iterator clauses, a list of value clauses, and
+  ;;    a continuation test (see 'walk-cursors-tree' for a description
+  ;;    of the format).
+  (when (defined? keyVar)
+    (walk-error "Illegal key variable specified for " collectionType)
+    (return NIL NIL (quote FALSE)))
+  (when (not (pass-variable-arguments-as-list? *methodBeingWalked*))
+    (let ((iteratorType
+           (new PARAMETRIC-TYPE-SPECIFIER
+                :specifier-base-type @ARGUMENT-LIST-ITERATOR
+                :specifier-parameter-types
+                (list (extract-parameter-type collectionType (quote ANY-VALUE))))))
+      (return
+        (yield-IN-cursor-clauses-for-general-collection
+         ;; "Hand-walk" the collection tree to yield an ARGUMENT-LIST-ITERATOR,
+         ;;    since calling `allocate-iterator' on an ARGUMENT-LIST is
+         ;;    officially illegal:
+         (sys-tree
+          (bquote (SYS-CALL-METHOD @ARGUMENT-LIST-ITERATOR allocate-iterator
+                                   & (walk-without-type-tree collectionTree)))
+          iteratorType)
+         iteratorType
+         keyVar
+         valueVar))))
+  (let ((listifiedType
+         (yield-listified-variable-arguments-type *methodBeingWalked*))
+        (elementType (extract-parameter-type collectionType (quote ANY-VALUE))))
+    (mv-bind (iteratorClauses valueClauses continuationTest)
+        ;; Use the standard IN-cursor mechanism pretending that the argument list
+        ;;    collection is really of `listifiedType'.  This will automatically
+        ;;    do the right thing if we decide to use vectors for listification.
+        (yield-IN-cursor-clauses-for-general-collection
+         (sys-tree collectionTree listifiedType) listifiedType keyVar valueVar)
+      (when (sub-type-spec-of? elementType @LITERAL)
+        ;; If the argument list elements are literals, we have to fix up the
+        ;;    type of the value variable to ensure proper unwrapping:
+        (foreach clause in (cast valueClauses (CONS OF CONS))
+            where (eql? (first clause) valueVar)
+            do (setf (second clause) elementType)
+               (break)))
+      (return iteratorClauses valueClauses continuationTest))))
+
+(defun (yield-ON-cursor-clauses CONS CONS OBJECT) ((onTree CONS))
+  ;; Process a single ON-clause of a 'foreach' statement such as
+  ;;    '(foreach <variable> ON <expression> ...)'.  Since ON-clauses
+  ;;    always bind <variable> to an iterator no optimization needs
+  ;;    to be performed.
+  ;; Return a list of iterator clauses, a list of value clauses, and
+  ;;    a continuation test (see 'walk-cursors-tree' for a description
+  ;;    of the format).
+  (let ((iteratorVar (second onTree)))
+    (when (not (symbol? iteratorVar))
+      (walk-error "Illegal ON clause with non-atomic variable: " onTree)
+      (return NIL NIL (quote FALSE)))
+    (mv-bind (collectionTree collectionType)
+        (walk-collection-tree (third onTree) TRUE)
+      (when (sub-type-spec-of? collectionType @ARGUMENT-LIST)
+        (walk-error "ON iteration not supported for ARGUMENT-LISTs: " onTree)
+        (return NIL NIL (quote FALSE)))
+      (setf (third onTree) NULL)        ; clip expression for later gc
+      ;; Make sure we always allocate an iterator:
+      (when (not (safe-subtype-of? (type-spec-to-base-type collectionType)
+                                   @ABSTRACT-ITERATOR))
+        (setq collectionTree
+          (bquote (allocate-iterator & collectionTree))))
+      (return (bquote ((& iteratorVar @ABSTRACT-ITERATOR & collectionTree)))
+              NIL
+              (bquote (next? & iteratorVar))))))
+
+(defun (collect-cursor-clauses CONS CONS OBJECT) ((cursorsTree CONS)
+                                                  (dontOptimize? BOOLEAN))
+  ;; Helping function for 'walk-cursors-tree'.
+  ;; Process all IN and ON clauses encoded in 'cursorsTree', and
+  ;;    combine the results.  This handles parallel iteration via
+  ;;    AS clauses.
+  ;; Don't optimize iteration if 'dontOptimize?' is TRUE.
+  ;; Return a (combined) list of iterator clauses, a (combined) list of
+  ;;    value clauses, and (combined) continuation test (see
+  ;;    'walk-cursors-tree' for a description of the format).
+  (case (first cursorsTree)
+    (IN (return (yield-in-cursor-clauses cursorsTree dontOptimize?)))
+    (ON (return (yield-on-cursor-clauses cursorsTree)))
+    (AS (let ((allIteratorClauses NIL)
+              (allValueClauses NIL)
+              (continuationTests NIL))
+          (foreach clause in (rest cursorsTree)
+                   do (mv-bind (iteratorClauses valueClauses continuationTest)
+                          (collect-cursor-clauses clause dontOptimize?)
+                        (setq allIteratorClauses
+                          (concatenate allIteratorClauses iteratorClauses))
+                        (setq allValueClauses
+                          (concatenate allValueClauses valueClauses))
+                        (pushq continuationTests continuationTest)))
+          (return allIteratorClauses
+                  allValueClauses
+                  (choose (eq? (length continuationTests) 1)
+                          (first continuationTests)
+                          (bquote
+                           ;; Remove dummy tests for unbound intervals:
+                           (AND && (remove (reverse continuationTests)
+                                           (quote TRUE))))))))))
+
+(defun (walk-cursors-tree CONS CONS OBJECT) ((cursorsTree CONS)
+                                             (dontOptimize? BOOLEAN))
+  ;; Helping function for 'walk-prefix-foreach-tree'.
+  ;; Process 'cursorsTree' from a PREFIX-FOREACH statement and return
+  ;;    (1) a list of iterator clauses, where each clause has the form
+  ;;        of a LET-binding, i.e., '(<var> <type> <expression>)',
+  ;;    (2) a list of value clauses, where each clause has the form
+  ;;        '(<cursorVar> <type> <next expression>), and
+  ;;    (3) a continuation test, which is a boolean-valued expression.
+  ;; If 'dontOptimize?' is TRUE, no optimization will be performed, i.e.,
+  ;;    all iteration will be performed via iterators.
+  ;; This function walks all initialization expressions in iterator
+  ;;    clauses, all next-expressions of value clauses, and the
+  ;;    continuation test, thus, the clauses collected via
+  ;;    'collect-cursor-clauses' do not have to contain any walked
+  ;;    code (even some collection expression will have been walked
+  ;;    already by 'walk-collection-tree').
+  ;; NOTE: If we ever want to handle VRLETs in collection expressions,
+  ;;    they should be handled here.
+  (mv-bind (iteratorClauses valueClauses continuationTest)
+      (collect-cursor-clauses cursorsTree dontOptimize?)
+    ;; Do some pseudo-LET processing here, i.e., push all bound variables
+    ;;    onto the type table before any dependent code gets walked:
+    (foreach clause in (cast iteratorClauses (CONS OF CONS))
+             do
+             (mv-bind (iteratorTree iteratorType)
+                 ;; Walk iterator expressions and auxiliaries:
+                 (walk-expression-tree
+                  (third clause) (second clause) (quote FOREACH) FALSE)
+               ;; This will re-establish a narrower type if necessary:
+               (setf (second clause) iteratorType)
+               (setf (third clause)
+                 (coerce-a-tree iteratorTree iteratorType iteratorType)))
+             (push-variable-binding (first clause) (second clause)))
+    (foreach clause in (cast valueClauses (CONS OF CONS))
+             do
+             (push-variable-binding (first clause) (second clause))
+             ;; Walk next-expressions:
+             (setf (third clause) (walk-without-type-tree (third clause))))
+    ;; Walk the continuation test:
+    (setq continuationTest (walk-without-type-tree continuationTest))
+    ;; Pop bindings:
+    (foreach i in (interval 1 (+ (length iteratorClauses)
+                                 (length valueClauses)))
+             do
+             (ignore i)
+             (pop-variable-binding))
+    (return iteratorClauses valueClauses continuationTest)))
+
+(defun (yield-collect-into-list-code CONS)
+       ((collectVariable SYMBOL) (intoVariable OBJECT) (collectTree OBJECT))
+  ;; Return slightly optimized version of 'yield-collect-code'.
+  (return
+   (bquote
+    ((if (null? & collectVariable)
+       ;; first time through loop; the cursor is not yet initialized:
+       (progn
+         ;; tricky: point cursor at newly-allocated cons, and then
+         ;; add the cons to the end of the current list, so that
+         ;; subsequent iterations start at the end of the list:   
+         (setq & collectVariable (cons & collectTree NIL))
+         (if (empty? (the-cons-list & intoVariable))
+           (setf (the-cons-list & intoVariable) & collectVariable)
+           (add-cons-to-end-of-cons-list
+            (the-cons-list & intoVariable) & collectVariable)))
+       ;; 'collectVariable' points to the last cons in the collection.
+       ;; the code adds a new cons to the end of the list:
+       (progn
+         (setf (rest & collectVariable)
+               (cons & (copy-cons-tree collectTree) NIL))
+         (setq & collectVariable (rest & collectVariable))))))) )
+
+(defun (yield-collect-into-cons-code CONS)
+       ((collectVariable SYMBOL) (intoVariable OBJECT) (collectTree OBJECT))
+  ;; Return slightly optimized version of 'yield-collect-code'.
+  (return
+   (bquote
+    ((if (null? & collectVariable)
+       ;; first time through loop; the cursor is not yet initialized:
+       (progn
+         ;; tricky: point cursor at newly-allocated cons, and then
+         ;; add the cons to the end of the current list, so that
+         ;; subsequent iterations start at the end of the list:   
+         (setq & collectVariable (cons & collectTree NIL))
+         (if (nil? & intoVariable)
+           (setq & intoVariable & collectVariable)
+           (add-cons-to-end-of-cons-list & intoVariable & collectVariable)))
+       ;; 'collectVariable' points to the last cons in the collection.
+       ;; the code adds a new cons to the end of the list:
+       (progn
+         (setf (rest & collectVariable)
+               (cons & (copy-cons-tree collectTree) NIL))
+         (setq & collectVariable (rest & collectVariable))))))) )
+
+(defun (yield-collect-code CONS)
+       ((collectVariable SYMBOL) (intoVariable OBJECT) (collectTree OBJECT))
+  ;; Helping function for 'walk-collect-into-tree'.
+  ;; Return code that performs a collection operation within a foreach loop.
+  ;; COLLECT-INTO only applies to iterations over lists and cons-lists.
+  ;; The code uses 'collectVariable' as a cursor that points to the end of
+  ;;    a cons list (possibly embedded within a list) and destructively
+  ;;    appends values to that list, bumping the cursor once each loop.
+  (let ((intoVariableType 
+         (type-spec-to-base-type (lookup-variable-type intoVariable))))
+    (cond
+     ((subtype-of? intoVariableType @LIST)
+      (return (yield-collect-into-list-code
+               collectVariable intoVariable collectTree)))
+     ((subtype-of? intoVariableType @CONS)
+      (return (yield-collect-into-cons-code
+               collectVariable intoVariable collectTree)))
+     ((eq? intoVariableType @UNKNOWN)
+      (return
+       (bquote
+        ((if (null? & collectVariable)
+           ;; first time through loop; the cursor is not yet initialized:
+           (progn
+             ;; tricky: point cursor at newly-allocated cons, and then
+             ;; add the cons to the end of the current list, so that
+             ;; subsequent iterations start at the end of the list:   
+             (setq & collectVariable (cons & collectTree NIL))
+             (cond
+              ((nil? & intoVariable)
+               ;; assume its an empty CONS-LIST:
+               (setq & intoVariable & collectVariable))
+              ((cons? & intoVariable)       ; a CONS-LIST:
+               (add-cons-to-end-of-cons-list
+                & intoVariable & collectVariable))
+              (otherwise             ; assume its a LIST:
+               (if (empty? (the-cons-list & intoVariable))
+                 (setf (the-cons-list & intoVariable) & collectVariable)
+                 (add-cons-to-end-of-cons-list
+                  (the-cons-list & intoVariable) & collectVariable)))))
+           ;; 'collectVariable' points to the last cons in the collection.
+           ;; the code adds a new cons to the end of the list:
+           (progn
+             (setf (rest & collectVariable)
+                   (cons & (copy-cons-tree collectTree) NIL))
+             (setq & collectVariable (rest & collectVariable))))))))
+     (otherwise
+      (walk-error "Can't collect into a datatype other than LIST or CONS.")
+      (return (walk-dont-call-me-tree collectTree @VOID)))) ))
+
+(defun (walk-prefix-collect-into-tree CONS CONS)
+       ((collectIntoTree CONS) (iterators CONS) (valueBindings CONS) (doCode CONS))
+  ;; Called by 'walk-prefix-foreach-tree'.
+  ;; Return two values, representing collect into varibale bindings
+  ;;    concatenated onto 'iterators', and collection code concatenated 
+  ;;    to the end of 'doCode'.
+  (let ((collectTree (second collectIntoTree))
+        (intoTree (third collectIntoTree))
+        (collectVariable (local-gensym "COLLECT"))
+        (collectIntoBindings (bquote ((& collectVariable @CONS NULL))))
+        (collectCode CONS NULL)
+        (intoVariable SYMBOL NULL)
+        (intoVariableType TYPE-SPEC NULL))
+    (if (symbol? intoTree)
+      (progn
+        (setq intoVariable (cast intoTree SYMBOL))
+        (setq collectCode
+              (yield-collect-code collectVariable intoVariable collectTree)))
+      (progn
+        (foreach d in (cast valueBindings (CONS OF CONS))
+                 do (push-variable-binding (first d) (second d)))
+        (mv-setq (intoTree intoVariableType)
+          (walk-expression-tree intoTree NULL (quote FOREACH) FALSE))
+        (foreach d in valueBindings do (ignore d) (pop-variable-binding))
+        (setq intoVariable (local-gensym "INTO"))
+        (pushq collectIntoBindings
+               (cons-list intoVariable intoVariableType intoTree))
+        (push-variable-binding intoVariable intoVariableType)
+        (setq collectCode
+              (yield-collect-code collectVariable intoVariable collectTree))
+        (pop-variable-binding)))
+    (return
+     (concatenate iterators collectIntoBindings)
+     (concatenate doCode collectCode)) ))
+
+(defun (wrap-where-test CONS) ((whereTest OBJECT) (actions CONS))
+  ;; If 'whereTest' is non-null, wrap it around the 'actions' code.
+  ;; Return a list of actions.
+  (if (defined? whereTest)
+    (return (bquote ((when & whereTest && actions))))
+    (return actions)) )
+
+(defun (walk-prefix-foreach-body CONS)
+    ((iteratorClauses CONS) (valueClauses CONS)
+     (whereTest OBJECT) (doActions CONS))
+  ;; Helping function for 'walk-prefix-foreach-tree'.
+  ;; Return a list of walked statements from 'doClause', possibly
+  ;;    wrapped by a conditional 'whereTest'.
+  ;; Note: We need 'iteratorClauses' because, although 'doActions' does not
+  ;;    reference any iteration variables, it may reference collect-into
+  ;;    variables embedded within 'iteratorClauses'.
+  (let ((oTree CONS NULL))
+    (foreach c in (cast iteratorClauses (CONS OF CONS))
+        do (push-variable-binding (first c) (second c))
+           (setf (first c) (true-variable-name (first c))))
+    (foreach c in (cast valueClauses (CONS OF CONS))
+        do (push-variable-binding (first c) (second c))
+           (setf (first c) (true-variable-name (first c))))
+    (setq oTree (walk-list-of-trees (wrap-where-test whereTest doActions)))
+    (foreach c in valueClauses
+        do (ignore c) (pop-variable-binding))
+    (foreach c in iteratorClauses
+        do (ignore c) (pop-variable-binding))
+    (return oTree) ))
+
+(defun (walk-prefix-foreach-tree CONS TYPE-SPEC) ((tree CONS))
+  ;; Walk a prefix foreach tree.  'tree' has the form '(PREFIX-FOREACH
+  ;;    <cursorsClause> [<whereClause>] [doClause] [collectIntoClause])'.
+  ;; Return a tree of the form '(SYS-FOREACH (<iterator initializer>*)
+  ;;    (<cursor assignment>*) <continuation test> <body>)'.
+  (let ((tail (CONS OF CONS) NULL)
+        (iteratorClauses CONS NULL)
+        (valueClauses CONS NULL)
+        (continuationTest OBJECT NULL)
+        (whereTest OBJECT NULL)
+        (doActions NIL))
+    ;; gc strategy: place subtrees into local variables, clip subtrees 
+    ;;    off of tree, and then gc tree.
+    (mv-setq (iteratorClauses valueClauses continuationTest)
+      (walk-cursors-tree (second tree) FALSE))
+    (setf (second tree) NULL)           ; clip out value binding clause
+    (setq tail (cast (rest (rest tree)) (CONS OF CONS)))
+    (when (eq? (first (first tail)) (quote WHERE))
+      (setq whereTest (second (first tail)))
+      (setf (second (first tail)) NULL)   ; clip out WHERE test
+      (setq tail (rest tail)))
+    (when (eq? (first (first tail)) (quote DO))
+      (setq doActions (rest (first tail)))
+      (setf (rest (first tail)) NIL)  ; clip out DO actions
+      (setq tail (rest tail)))
+    (when (non-empty? tail)             ; fold in COLLECT INTO code:
+      (mv-setq (iteratorClauses doActions)
+               (walk-prefix-collect-into-tree 
+                (first tail) iteratorClauses valueClauses doActions))
+      (setf (first tail) NULL))          ; clip out COLLECT-INTO tree
+    (return
+     (bquote (SYS-FOREACH
+              & iteratorClauses & valueClauses
+              & continuationTest
+              && (walk-prefix-foreach-body
+                  iteratorClauses valueClauses whereTest doActions)))
+     @VOID) ))
+
+
+  ;;
+;;;;;; "walk-exists-tree" and "walk-forall-tree"
+  ;;
+
+(defun (walk-exists-tree CONS TYPE-SPEC) ((tree CONS))
+  ;; Compute EXISTS expression using a FOREACH statement.
+  ;; TO DO: CONSIDER MAKING THIS A MACRO.
+  (let ((found? (local-gensym "FOUND?"))
+        (oTree (bquote
+                (vrlet ((& found? FALSE))
+                  (foreach && (rest tree)
+                           do
+                           (setq & found? TRUE)
+                           (break))
+                  & found?))))
+    (return (walk-a-cons-tree oTree)) ))
+
+(defun (walk-forall-tree CONS TYPE-SPEC) ((tree CONS))
+  ;; Compute FORALL expression using a FOREACH statement.
+  ;; TO DO: CONSIDER MAKING THIS A MACRO.
+  ;; 'tree' has the form '(FORALL <iterators> WHERE <whereTest> ALWAYS <alwaysTest>)'.
+  ;; BUG: FAILS TO TEST FOR UNEQUAL LENGTH SEQUENCES WHEN AN 'AS'
+  ;;    OCCURS IN THE ITERATORS CLAUSE.
+  (let ((always? (local-gensym "ALWAYS?"))
+        (iteratorsAndWhere CONS NIL)
+        (alwaysTest CONS NIL)
+        (preCursor CONS NIL)           ; cons before 'cursor'
+        (cursor tree))
+    ;; cut the ALWAYS test off of the end of 'tree':
+    (while (non-empty? cursor)
+      (when (eq? (first cursor) (quote ALWAYS))
+        (setq alwaysTest (first (rest cursor)))         ; save ALWAYS test
+        (setf (rest precursor) NIL)    ; cut off ALWAYS clause
+        (break))                        ; exit loop, we found the ALWAYS test
+      (setq preCursor cursor)           ; keep looking for the ALWAYS
+      (setq cursor (rest cursor)))
+    (setq iteratorsAndWhere (rest tree))
+    (return
+      (cast (bquote
+             (vrlet ((& always? TRUE))
+               (foreach && iteratorsAndWhere
+                        do
+                        (when (not & alwaysTest)
+                          (setq & always? FALSE)
+                          (break)))
+;; TEST FOR UNEQUAL LENGTH 'as' SEQUENCES GOES HERE               
+               & always?))
+            CONS)
+     @BOOLEAN) ))
+
+(defun (walk-some-tree CONS TYPE-SPEC) ((tree CONS))
+  ;; Compute SOME expression using a FOREACH statement.
+  ;; TO DO: CONSIDER MAKING THIS A MACRO.
+  (let ((valueVar (local-gensym "VALUE"))
+        (iterationVar (second tree)) 
+        (oTree CONS NULL))
+    ;; walk the sequence expression just so we can extract its type:
+    (mv-bind ((sequenceRef OBJECT)
+              (sequenceType TYPE-SPEC))
+             (walk-a-tree (fourth tree))
+      (setf (fourth tree) sequenceRef)          ; don't lose subtree
+      (setq oTree
+            (bquote
+             (vrlet ((& valueVar
+                        & (extract-parameter-type sequenceType (quote any-value))
+                        NULL))
+               (foreach && (rest tree)
+                        do
+                        (setq & valueVar & iterationVar)
+                        (break))
+               & valueVar)))
+      (return (walk-a-cons-tree oTree)) )))
+
+(defun (extract-setof-nested-iterator-tree CONS) ((iteratorClauses CONS))
+  ;; Helping function for 'walk-setof-tree'.
+  ;; Return the allocate iterator subtree within 'iteratorClauses'
+  ;;    and gc the rest.
+  ;; TO DO: UPGRADE TO HANDLE MULTIPLE CLAUSES.
+  (let ((iterClauses (cast iteratorClauses (CONS OF CONS)))
+        (subTree (third (first iterClauses))))
+    (setf (third (first iterClauses)) NULL)         ; clip off subTree
+    (when (non-empty? (rest iterClauses))
+      (walk-error "Too many iterators in 'setof' expression"))
+    (return subTree) ))
+
+(defun (yield-setof-next-function-name SYMBOL) ((valueClauses CONS) (whereTest CONS))
+  ;; Helping function for 'walk-setof-tree'.
+  ;; Define a gensym next? function that repeatedly calls a nested iterator
+  ;;    and applies 'whereTest' to each value it produces.
+  ;; Return the name of the new function.  
+  ;; TO DO: UPGRADE TO HANDLE PLURAL 'valueClauses'.
+  (let ((onlyValueClause CONS (first valueClauses))
+        (valueVariable (first onlyValueClause))
+        (valueType (second onlyValueClause))
+        (nextFunctionName SYMBOL NULL))
+    (setq nextFunctionName (gensym "SETOF-NEXT-P"))
+    ;; This will push a proper translation unit onto
+    ;; *translationUnits* without creating a signature:
+    (walk-auxiliary-tree
+     (bquote
+      (defun (& nextFunctionName BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+        (let ((nestedIterator (iterator-nested-iterator self))
+              (& valueVariable & valueType NULL))
+          (while (next? nestedIterator)
+            (setq & valueVariable (value nestedIterator))
+            (when & whereTest
+                  (setf (value self) & valueVariable)
+                  (return TRUE)))
+          (return FALSE)))))
+    (return nextFunctionName) ))
+
+(defun (walk-setof-tree CONS TYPE-SPEC) ((tree CONS))
+  ;; Return a tree that evaluates a 'setof' expression.
+  ;; 'tree' has the form '(SET-OF <iterators> WHERE <whereTest>)'.
+  ;; The return form allocates an ALL-PURPOSE iterator and initializes
+  ;;    it with a nested iterator and filter function that together
+  ;;    compute the set.
+  ;; A gensym function is produced (usually) that performs the filtering.
+  (setq tree (foreach-to-prefix-foreach-tree tree))
+  (let ((iteratorsSubTree CONS (second tree))
+        (iteratorVariable (local-gensym "ITER"))
+        (tail (CONS OF CONS) NULL)
+        (iteratorClauses CONS NULL)
+        (valueClauses CONS NULL)
+        (continuationTest OBJECT NULL)
+        (whereTest OBJECT NULL))
+    ;; gc strategy: place subtrees into local variables, clip subtrees 
+    ;;    off of tree, and then gc tree.
+    (setf (second tree) NULL)            ; clip out value bindings clause
+    (when (member? (quote (ON AS)) (first iteratorsSubTree))
+      (walk-error "Illegal reserved word " (first iteratorsSubTree)
+                  " in 'setof' expression."))
+    (mv-setq (iteratorClauses valueClauses continuationTest)
+             (walk-cursors-tree iteratorsSubTree TRUE))
+    (ignore continuationTest)
+    (setq tail (cast (rest (rest tree)) (CONS OF CONS))) ; skip to WHERE clause
+    (when (and (non-empty? tail)
+               (eq? (first (first tail)) (quote WHERE)))
+      (setq whereTest (second (first tail)))
+      (setf (second (first tail)) NULL)   ; clip out WHERE test
+      (setq tail (rest tail)))
+    (when (non-empty? tail)
+      (walk-error "Illegal 'setof' expression.  Syntax is " EOL
+                  "   (SETOF <iterators> WHERE <boolean expression>)"))
+    (return
+     (bquote
+      (vrlet ((& iteratorVariable (new ALL-PURPOSE-ITERATOR)))
+        (setf (iterator-nested-iterator & iteratorVariable)
+              & (extract-setof-nested-iterator-tree iteratorClauses))
+        (setf (iterator-next-code & iteratorVariable)
+              (the-code :function & (yield-setof-next-function-name
+                                     valueClauses whereTest)))
+        & iteratorVariable))
+     @ALL-PURPOSE-ITERATOR) ))
+
+#|
+(ptrans
+ (setq y
+  (setof x in (class-direct-supers (get-stella-class "CLASS" TRUE))
+         where (foo? x))))
+
+;; WORKS!!!:
+(eval
+ (setq y
+       (setof x in (list 2 3 4) where (> x 2))))
+
+|#

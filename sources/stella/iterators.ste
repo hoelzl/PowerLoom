@@ -1,0 +1,858 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: iterators.ste,v 1.40 2003/07/16 03:19:12 hans Exp
+
+;;; Default and General purpose iterator routines.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Default iterators methods
+  ;;
+
+(defmethod (allocate-iterator (LIKE self)) ((self ABSTRACT-ITERATOR))
+  :documentation "Iterator objects return themselves when asked
+for an iterator (they occupy the same position as a collection
+within a 'foreach' statement)."
+  :public? TRUE
+  (return self) )
+
+;; NOTE: 'length' SHOULD BE IMPLEMENTED ONLY BY ITERATOR CLASSES
+;;    THAT CAN COMPUTE IT WITHOUT USING UP THE ITERATOR:
+(defmethod (length INTEGER) ((self ABSTRACT-ITERATOR))
+  :documentation "Iterate over 'self', and count how many
+items there are.  Bad idea if 'self' iterates over an infinite
+collection, since in that case it will run forever.'"
+  :public? TRUE
+  (let ((count 0))
+    (foreach i on self do (++ count))
+    (return count) ))
+
+(defmethod (pop (LIKE (any-value self))) ((self ITERATOR))
+  :public? TRUE
+  :documentation "Return the first item of the sequence represented by 'self',
+or NULL if it is empty.  Destructively uses up the first iteration element."
+  (if (next? self)
+    (return (value self))
+    (return NULL)) )
+
+;; CAUTION: WE ASSUME THAT 'next?' CAN BE INVOKED SAFELY *AFTER*
+;;    THE ITERATOR IS EXHAUSTED:
+(defmethod (advance (LIKE self)) ((self ITERATOR) (n INTEGER))
+  :public? TRUE
+  :documentation "Return 'self' after skipping over the first
+'n' elements in the (remainder of the) iteration."
+  (while (and (> n 0)
+              (next? self))
+    (-- n))
+  (return self) )
+
+;; CAUTION: THIS WILL CAUSE A BREAK IF EXISTING CODE CALLS 'empty?'
+;;    ON ITERATORS THAT DON'T DEFINE THIS METHOD:
+(defmethod (empty? BOOLEAN) ((self ITERATOR))
+  :public? TRUE
+  :documentation "Return TRUE if the sequence represented by 'self'
+has no elements.  Side-effect free."
+  (error "Missing 'empty?' method")
+  ; (return NULL)
+  )
+
+(defmethod (member? BOOLEAN) ((self ITERATOR) (value OBJECT))
+  :public? TRUE
+  :documentation "Iterate over values of 'self', returning TRUE
+if one of them is 'eql' to 'value."
+  (if (or (null? value)
+          (standard-object? value))
+      (foreach m in self
+          where (eq? m value)
+          do (return TRUE))
+    (foreach m in self
+        where (eql? m value)
+        do (return TRUE)))
+  (return FALSE) )
+
+
+  ;;
+;;;;;; Destructive list iterators
+  ;;
+
+;;; A destructive list iterator destroys its list after iterating
+;;;    over it. This iterator is useful when a temporary list result
+;;;    must be generated during the initialization of an iterator,
+;;;    e.g., the temporary might represent a list with duplicates removed.
+;;; A 'foreach' (or other iteration) loop is expected to free the
+;;;    iterator upon termination.
+
+(defmethod (next? BOOLEAN) ((self DESTRUCTIVE-LIST-ITERATOR))
+  :public? TRUE
+  (let ((cursor (list-iterator-cursor self)))
+    (when (empty? cursor)
+      (return FALSE))
+    (setf (slot-value self value) (value cursor)) 
+    (setf (list-iterator-cursor self) (rest cursor))
+    (return TRUE)))
+
+(defmethod (empty? BOOLEAN) ((self DESTRUCTIVE-LIST-ITERATOR) )
+  ;; Return TRUE if 'self' has no more elements.
+  :public? TRUE
+  (return (empty? (list-iterator-cursor self))))
+
+(defun (terminate-destructive-list-iterator? BOOLEAN)
+    ((self DESTRUCTIVE-LIST-ITERATOR))
+  (setf (the-cons-list self) NIL)
+  (setf (list-iterator-cursor self) NIL)
+  (return TRUE))
+
+(defmethod insert ((self DESTRUCTIVE-LIST-ITERATOR) 
+                   (value (LIKE (any-value self))))
+  :documentation "Add 'value' to the front of the list 'self'."
+  :public? TRUE
+  (setf (list-iterator-cursor self)
+    (setf (the-cons-list self) (cons value (the-cons-list self)))))
+
+(defmethod (allocate-destructive-list-iterator
+            (ITERATOR OF (LIKE (any-value self))))
+    ((self CONS))
+  :public? TRUE
+  ;; Return a newly-created destructive list iterator to iterate over 'self'.
+  ;; 'self' will be freed upon termination of the iterator.
+  (let ((iterator (new DESTRUCTIVE-LIST-ITERATOR)))
+    (setf (the-cons-list iterator) self)
+    (setf (list-iterator-cursor iterator) self)
+    (return iterator) ))
+
+(defmethod (allocate-destructive-list-iterator
+            (ITERATOR OF (LIKE (any-value self))))
+    ((self LIST))
+  :public? TRUE
+  ;; Return a newly-created destructive list iterator to iterate over 'self'.
+  ;; 'self' will be freed upon termination of the iterator.
+  (let ((iterator (allocate-destructive-list-iterator (the-cons-list self))))
+    (setf (the-cons-list self) NIL)
+    (free self)
+    (return iterator) ))
+
+
+  ;;
+;;;;;; All Purpose Iterators
+  ;;
+
+(defmethod (next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  :documentation "Apply the stored 'next?' function to 'self'."
+  :public? TRUE
+  (return (funcall (iterator-next-code self) self)) )
+
+(defmethod (empty? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Return TRUE if the sequence represented by 'self' has no elements.
+  ;; Coded only if the allocator of 'self' included an 'empty?' function.
+  :public? TRUE
+  (when (null? (iterator-empty-code self))
+    (error "Missing 'empty?' method"))
+  (return (funcall (iterator-empty-code self))) )
+
+(defmethod (terminate-all-purpose-iterator? BOOLEAN)
+    ((self ALL-PURPOSE-ITERATOR))
+  ;; Free nested iterator stored within 'self'.
+  :public? TRUE
+  (when (defined? (iterator-nested-iterator self))
+    (free (iterator-nested-iterator self)))
+  (return TRUE))
+
+;;; Functions that facilitate the construction of specialized iterators
+;;;    based upon an all-purpose iterator.
+
+(defun (filtered-nested-iterator-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Repeatedly call the nested iterator and apply the filter code 
+  ;;    until the filter succeeds, or you run out of values.
+  (let ((nestedIterator (iterator-nested-iterator self))
+        (value OBJECT NULL))
+    (while (next? nestedIterator)
+      (setq value (slot-value nestedIterator value))
+      (when (funcall (iterator-filter-code self) value self)
+        (setf (slot-value self value) value)
+        (return TRUE)))
+    (return FALSE) ))
+
+(defun (iterator-cons-list-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Iterates over a list stored within 'self'.
+  (let ((cursor (iterator-cons-list self)))
+    (when (empty? cursor)
+      (return FALSE))
+    (setf (slot-value self value) (value cursor)) 
+    (setf (iterator-cons-list self) (rest cursor))
+    (return TRUE)))
+
+(defun (iterator-cons-list-empty? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Return TRUE if 'self' has no more elements.
+  (return (empty? (iterator-cons-list self))) )
+
+(defun (filtered-concatenated-iterator-next? BOOLEAN)
+    ((self ALL-PURPOSE-ITERATOR))
+  ;; Call the nested concatenated iterators until one of them returns
+  ;;    a value or there are no more iterators.
+  ;; If 'self' has a non-NULL filter, apply it to the generated values
+  ;;    simlar to 'filtered-nested-iterator-next?'.
+  (let ((nestedIterator (iterator-nested-iterator self))
+        (filterCode (iterator-filter-code self))
+        (value OBJECT NULL))
+    (loop
+      (while (next? nestedIterator)
+        (setq value (slot-value nestedIterator value))
+        (when (choose (defined? filterCode)
+                      (funcall filterCode value self)
+                      TRUE)
+          (setf (slot-value self value) value)
+          (return TRUE)))
+      (setq nestedIterator (value (iterator-cons-list self)))
+      (setf (iterator-cons-list self) (rest (iterator-cons-list self)))
+      (if (null? nestedIterator)
+          (break)
+        (setf (iterator-nested-iterator self) nestedIterator)))
+    (return FALSE)))
+
+(defmethod (concatenate ALL-PURPOSE-ITERATOR)
+    ((iterator1 ITERATOR) (iterator2 ITERATOR)
+     &rest (otherIterators ITERATOR))
+  :documentation "Return an iterator that first generates all values of
+`iterator1', then those of `iterator2', and then those of all `otherIterators'.
+The generated values can be filtered by supplying a filter function to the
+resulting iterator."
+  :public? TRUE
+  (let ((iteratorList (cons iterator2 NIL)))
+    (foreach iterator in otherIterators
+        collect iterator into iteratorList)
+    (return
+      (new ALL-PURPOSE-ITERATOR
+           :iterator-nested-iterator iterator1
+           :iterator-cons-list iteratorList
+           :iterator-next-code
+           (the-code :function filtered-concatenated-iterator-next?)))))
+
+#|
+
+;; IDEA CODE:
+(defmethod (object-options (ITERATOR OF KEYWORD SLOT)) ((self OBJECT))
+  ;; Return an iterator that produces <keyword, storage slot> pairs
+  ;;    that define the public options available to define objects of
+  ;;    the same class as 'self'.
+  ;; BUG: DOESN'T HANDLE ITERATOR SLOTS YET.
+  (let ((iterator (new ALL-PURPOSE-ITERATOR))
+        (primaryClass (primary-class self)))
+    (setf (iterator-nested-iterator iterator) (public-slots primaryClass))
+    (setf (iterator-next-code iterator)
+          (the-code next-object-options?))
+    (return iterator) ))
+
+(defun (next-object-options? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  (let ((nestedIterator (iterator-nested-iterator self))
+        (slot SLOT NULL))
+    (while (next? nestedIterator)
+      (setq slot (value nestedIterator))
+      (when (storage-slot? slot)
+        (setf (key self)
+              (intern-keyword (symbol-name (slot-name slot))))
+        (setf (value self) slot)
+        (return TRUE))
+      (when (defined? (method-storage-slot slot))
+        (setf (key self)
+              (intern-keyword (symbol-name (slot-name slot))))
+        (setf (value self)
+              (lookup-slot (type-class (slot-owner slot)) 
+                           (method-storage-slot slot)))        
+        (return TRUE)))
+    (return FALSE) ))
+
+(eval (foreach (k v) in (object-options (type-class @CLASS))
+               do (print k " " v)))
+
+
+|#
+
+  ;;
+;;;;;; Interval Iterators
+  ;;
+
+;; TO DO: CONSIDER ADDING THE CONSTANT 'INFINITY', AND
+;;    USING IT TO INDICATE NO UPPER BOUND:
+
+(defmethod initialize-integer-interval-iterator 
+           ((self INTEGER-INTERVAL-ITERATOR))
+  (setf (interval-cursor self) (lower-bound self))
+  (setf (first-iteration? self) TRUE) )
+
+(defmethod (next? BOOLEAN) ((self INTEGER-INTERVAL-ITERATOR))
+  (if (first-iteration? self)
+    (setf (first-iteration? self) FALSE)
+    (setf (interval-cursor self) (+ (interval-cursor self) 1)))
+  (let ((upperBound (upper-bound self)))
+    (setf (slot-value self value) (interval-cursor self))
+    (return (or (null? upperBound)
+                (<= (interval-cursor self) upperBound))) ))
+
+;; REWRITE TO HANDLE INFINITE BOUNDS (NOT USED YET):
+;(defmethod (member? BOOLEAN) ((self INTEGER-INTERVAL-ITERATOR) (value INTEGER))
+;  ;; Assumes that the lower-bound and upper bounds are finite.
+;  (return (and (>= value (lower-bound self))
+;               (<= value (upper-bound self)))) )
+
+(defun (interval INTEGER-INTERVAL-ITERATOR)
+       ((lowerBound INTEGER) (upperBound INTEGER))
+  :public? TRUE
+  (return (new INTEGER-INTERVAL-ITERATOR 
+               :lower-bound lowerBound :upper-bound upperBound)) )
+
+(defmethod (reverse REVERSE-INTEGER-INTERVAL-ITERATOR)
+           ((self INTEGER-INTERVAL-ITERATOR))
+  :public? TRUE
+  (return (reverse-interval (lower-bound self) (upper-bound self))) )
+
+(defun initialize-reverse-integer-interval-iterator 
+           ((self REVERSE-INTEGER-INTERVAL-ITERATOR))
+  (setf (interval-cursor self) (upper-bound self))
+  (setf (first-iteration? self) TRUE) )
+
+(defmethod (next? BOOLEAN) ((self REVERSE-INTEGER-INTERVAL-ITERATOR))
+  :public? TRUE
+  (if (first-iteration? self)
+    (setf (first-iteration? self) FALSE)
+    (setf (interval-cursor self) (1- (interval-cursor self))))
+  (let ((lowerBound (lower-bound self)))
+    (setf (slot-value self value) (interval-cursor self))
+    (return (or (null? lowerBound)
+                (>= (interval-cursor self) lowerBound))) ))
+
+;; REWRITE TO HANDLE INFINITE BOUNDS (NOT USED YET):
+;(defmethod (member? BOOLEAN) ((self REVERSE-INTEGER-INTERVAL-ITERATOR) (value INTEGER))
+;  ;; Assumes that the lower-bound and upper bounds are finite.
+;  (return (and (>= value (lower-bound self))
+;               (<= value (upper-bound self)))) )
+
+(defun (reverse-interval REVERSE-INTEGER-INTERVAL-ITERATOR)
+       ((lowerBound INTEGER) (upperBound INTEGER))
+  :documentation "Create a reverse interval object."
+  (return (new REVERSE-INTEGER-INTERVAL-ITERATOR 
+               :lower-bound lowerBound :upper-bound upperBound)) )
+
+
+  ;;
+;;;;;; String Iterators
+  ;;
+
+(defmethod (allocate-iterator STRING-ITERATOR) ((self STRING))
+  :public? TRUE
+  ;; Allocate an iterator to iterate over 'self'.
+  (let ((iterator (new STRING-ITERATOR :the-string self)))
+    (setf (cursor iterator) 0)
+    (setf (end iterator) (length self))
+    (return iterator)))
+
+(defmethod (next? BOOLEAN) ((self STRING-ITERATOR))
+  :public? TRUE
+  ;; Access the next character of the string stored within 'self'.
+  (let ((pos (cursor self)))
+    (when (< pos (end self))
+      (setf (slot-value self value)
+        (nth (the-string self) pos))
+      (setf (cursor self) (+ pos 1))
+      (return TRUE))
+    (return FALSE)))
+
+
+  ;;
+;;;;;; 'all-symbols' and 'all-functions'
+  ;;
+
+(defun (allocate-all-meta-objects-iterator ITERATOR)
+       ((arraySize INTEGER) (nextCode FUNCTION-CODE)
+        (module MODULE) (local? BOOLEAN))
+  :public? TRUE
+  ;; Generic code for constructing an iterator of all symbols, functions,
+  ;;    etc.  Called by 'all-symbols', 'all-functions', 'all-surrogates',
+  ;;    'all-classes'.
+  (let ((iterator (new ALL-PURPOSE-ITERATOR))
+	(modulesList NIL))
+    (setf (iterator-integer iterator) 0)
+    (setf (iterator-second-integer iterator) arraySize)
+    (when (defined? module)
+      (if local?
+          (pushq modulesList module)
+	(foreach mod in (visible-modules module)
+	    collect mod into modulesList)))
+    (setf (iterator-cons-list iterator) modulesList)
+    (setf (iterator-next-code iterator) nextCode)
+    (return iterator) ))
+
+(defun (selected-meta-object? BOOLEAN)
+    ((self ALL-PURPOSE-ITERATOR) (objectModule MODULE))
+  :public? TRUE
+  ;; Assume that `objectModule' is the home module of one of the
+  ;;    meta-objects generated by the meta-objects iterator `self'.
+  ;; Return TRUE if `objectModule' is one of the selected modules.
+  ;; Testing for a matching module is the most expensive operation
+  ;;    in most of the meta-object iterators below.  Making this
+  ;;    as efficient as possible is very important.
+  (let ((modules (iterator-cons-list self)))
+    (if (nil? modules)
+        (return TRUE)
+      (if (nil? (rest modules))
+          ;; Optimize the one-elememt case (we use an `if' here
+          ;;    so the `eql?' test gets properly optimized):
+          (if (eql? objectModule (first modules))
+              (return TRUE)
+            (return FALSE))
+        (return (memb? modules objectModule))))))
+
+(defun (all-symbols-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all symbols.
+  :public? TRUE
+  (let ((cursor (iterator-integer self))
+        (symbol SYMBOL NULL))
+    (while (< cursor (iterator-second-integer self))
+      (setq symbol (nth *symbol-array* cursor))
+      (when (and (defined? symbol)
+                 (selected-meta-object? self (interned-in symbol)))
+        (setf (slot-value self value) symbol)
+        (setf (iterator-integer self) (+ cursor 1))
+        (return TRUE))
+      (setq cursor (+ cursor 1)))
+    (return FALSE) ))
+
+(defun (all-symbols (ITERATOR OF SYMBOL)) ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all symbols visible from 'module'.
+If 'local?', return only symbols interned in 'module'.
+If 'module' is null, return all symbols interned everywhere."
+  :public? TRUE
+  (return 
+   (allocate-all-meta-objects-iterator
+    (1+ (top-symbol-offset *symbol-array*))
+    (the-code :function all-symbols-next?)
+    module local?)) )
+
+(defun (filter-public-slot? BOOLEAN) ((self SLOT) (iterator ALL-PURPOSE-ITERATOR))
+  ;; `Plugin' filter for slots, used by `filter-slot?'.
+  (ignore iterator)
+  (return (slot-public? self)))
+
+(defun (filter-private-slot? BOOLEAN)
+    ((self SLOT) (iterator ALL-PURPOSE-ITERATOR))
+  ;; `Plugin' filter for slots, used by `filter-slot?'.
+  (ignore iterator)
+  (return (not (slot-public? self))))
+
+(defun (filter-method-slot? BOOLEAN)
+    ((self SLOT) (iterator ALL-PURPOSE-ITERATOR))
+  ;; `Plugin' filter for slots, used by `filter-slot?'.
+  (ignore iterator)
+  (return (method-slot? self)))
+
+(defun (filter-public-method-slot? BOOLEAN)
+    ((self SLOT) (iterator ALL-PURPOSE-ITERATOR))
+  ;; `Plugin' filter for slots, used by `filter-slot?'.
+  (ignore iterator)
+  (return (and (slot-public? self)
+               (method-slot? self))))
+
+(defun (filter-non-external-slot? BOOLEAN) ((self SLOT) 
+					    (iterator ALL-PURPOSE-ITERATOR))
+  ;; `Plugin' filter for slots, used by `filter-slot?'.
+  (ignore iterator)
+  (return (not (slot-external? self))))
+
+(defun (filter-non-parameter-slot? BOOLEAN) ((self SLOT) 
+					    (iterator ALL-PURPOSE-ITERATOR))
+  ;; `Plugin' filter for slots, used by `filter-slot?'.
+  (ignore iterator)
+  (return (not (member? (class-parameters (type-class (slot-owner self)))
+			(slot-name self)))))
+
+(defun (filter-non-auxiliary-slot? BOOLEAN) ((self SLOT) 
+					     (iterator ALL-PURPOSE-ITERATOR))
+  ;; `Plugin' filter for slots, used by `filter-slot?'.
+  (ignore iterator)
+  (return (not (slot-auxiliary? self))))
+
+(defun (filter-slot? BOOLEAN) ((self SLOT) (iterator ALL-PURPOSE-ITERATOR))
+  ;; General-purpose slot filter: return the result
+  ;;   of testing all filters that were set up at iterator creation
+  ;;   time
+  (return
+    (forall filter in 
+	  (cast (iterator-object iterator) (CONS OF FUNCTION-CODE-WRAPPER))
+	always (funcall filter self iterator))))
+
+(defun (all-functions-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all functions.
+  ;; BUG: FIX THIS TO ALSO WORK FOR FUNCTIONS THAT INHERIT THEIR
+  ;;      NAME SYMBOL FROM A PARENT MODULE.
+  (let ((cursor (iterator-integer self))
+        (symbol SYMBOL NULL)
+        (function METHOD-SLOT NULL))
+    (while (< cursor (iterator-second-integer self))
+      (setq symbol (nth *symbol-array* cursor))
+      (when (and (defined? symbol)
+                 ;; Use `lookup-function-home-module' here, since the symbol
+                 ;;    module might be incorrect (be careful to not expand
+                 ;;    function stubs that we don't really need):
+                 (selected-meta-object?
+                  self (lookup-function-home-module symbol)))
+        (setq function (lookup-function symbol))
+        (when (and (defined? function)
+                   (or (null? (iterator-filter-code self))
+                       (funcall (iterator-filter-code self) function self)))
+          (setf (slot-value self value) function)
+          (setf (iterator-integer self) (+ cursor 1))
+          (return TRUE)))
+      (setq cursor (+ cursor 1)))
+    (return FALSE) ))
+
+(defun (all-functions (ITERATOR OF FUNCTION)) ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all functions visible from 'module'.
+If 'local?', return only functions bound to symbols interned in 'module'.
+If 'module' is null, return all functions defined everywhere."
+  :public? TRUE
+  (return 
+   (allocate-all-meta-objects-iterator
+    (1+ (top-symbol-offset *symbol-array*))
+    (the-code :function all-functions-next?)
+    module local?)) )
+
+(defun (all-public-functions (ITERATOR OF FUNCTION)) ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all functions visible from 'module'.
+If 'local?', return only functions bound to symbols interned in 'module'.
+If 'module' is null, return all functions defined everywhere."
+  :public? TRUE
+  (let ((iterator ALL-PURPOSE-ITERATOR (all-functions module local?)))
+    (setf (iterator-filter-code iterator) (the-code :function filter-public-slot?))
+    (return iterator)) )
+
+(defun (all-variables-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all variables.
+  ;; BUG: FIX THIS TO ALSO WORK FOR VARIABLES THAT INHERIT THEIR
+  ;;      NAME SYMBOL FROM A PARENT MODULE.
+  (let ((cursor (iterator-integer self))
+        (symbol SYMBOL NULL)
+        (variable GLOBAL-VARIABLE NULL))
+    (while (< cursor (iterator-second-integer self))
+      (setq symbol (nth *symbol-array* cursor))
+      (when (and (defined? symbol)
+                 (selected-meta-object? self (interned-in symbol)))
+        (setq variable (lookup *global-variable-lookup-table* symbol))
+        (when (and (defined? variable)
+                   ;; Check whether the variable object lives in the same
+                   ;;    module as its name:
+                   (selected-meta-object? self (home-module variable))
+                   (or (null? (iterator-filter-code self))
+                       (funcall (iterator-filter-code self) variable self)))
+          (setf (slot-value self value) variable)
+          (setf (iterator-integer self) (+ cursor 1))
+          (return TRUE)))
+      (setq cursor (+ cursor 1)))
+    (return FALSE) ))
+
+(defun (all-variables (ITERATOR OF GLOBAL-VARIABLE))
+    ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all variables visible from 'module'.
+If 'local?', return only variables bound to symbols interned in 'module'.
+If 'module' is null, return all variables defined everywhere."
+  :public? TRUE
+  (return 
+   (allocate-all-meta-objects-iterator
+    (1+ (top-symbol-offset *symbol-array*))
+    (the-code :function all-variables-next?)
+    module local?)) )
+
+    
+#|
+(eval (foreach fn in (all-classes NULL FALSE) do (print fn EOL)))
+(eval (length (all-functions NULL TRUE)))
+(eval (length (all-public-functions NULL TRUE)))
+|#
+
+(defun (all-surrogates-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all surrogates.
+  (let ((cursor (iterator-integer self))
+        (surrogate SURROGATE NULL))
+    (while (< cursor (iterator-second-integer self))
+      (setq surrogate (nth *surrogate-array* cursor))
+      (when (and (defined? surrogate)
+                 (selected-meta-object? self (interned-in surrogate)))
+        (setf (slot-value self value) surrogate)
+        (setf (iterator-integer self) (+ cursor 1))
+        (return TRUE))
+      (setq cursor (+ cursor 1)))
+    (return FALSE) ))
+
+(defun (all-surrogates (ITERATOR OF SURROGATE)) ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all surrogates visible from 'module'.
+If 'local?', return only surrogates interned in 'module'.
+If 'module' is null, return all surrogates interned everywhere."
+  :public? TRUE
+  (return 
+   (allocate-all-meta-objects-iterator
+    (1+ (top-symbol-offset *surrogate-array*))
+    (the-code :function all-surrogates-next?)
+    module local?)) )
+
+(defun (all-classes-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all classes.
+  (let ((cursor (iterator-integer self))
+        (surrogate SURROGATE NULL)
+        (value OBJECT NULL))
+    (while (< cursor (iterator-second-integer self))
+      (setq surrogate (nth *surrogate-array* cursor))
+      (when (and (defined? surrogate)
+                 (selected-meta-object? self (interned-in surrogate)))
+        (setq value (surrogate-value surrogate))
+        (when (and (defined? value)
+                   (stella-class? value)
+                   ;; skip class synonyms:
+                   (eql? (class-type (safe-cast value CLASS)) surrogate))
+          (setf (slot-value self value) value)
+          (setf (iterator-integer self) (+ cursor 1))
+          (return TRUE)))
+      (setq cursor (+ cursor 1)))
+    (return FALSE) ))
+
+(defun (all-classes (ITERATOR OF CLASS)) ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all classes visible from 'module'.
+If 'local?', return only classes interned in 'module'.
+If 'module' is null, return all classes interned everywhere."
+  :public? TRUE
+  (return
+   (allocate-all-meta-objects-iterator
+    (1+ (top-symbol-offset *surrogate-array*))
+    (the-code :function all-classes-next?)
+    module local?)) )
+
+(defun (slots-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for the generator of all slots.
+  (let ((slot SLOT NULL))
+    (loop
+      (while (setq? slot (first (iterator-cons-list self)))
+        (setf (iterator-cons-list self) (rest (iterator-cons-list self)))      
+        (when (or (null? (iterator-filter-code self))
+                  (funcall (iterator-filter-code self) slot self))
+          (setf (slot-value self value) slot)
+          (return TRUE)))
+      ;; ran out of slot candidates
+      (when (not (next? (iterator-nested-iterator self)))
+        ;; ran out of classes
+        (return FALSE))
+      ;; install a new list of slots and try again:
+      (setf (iterator-cons-list self)
+            (the-cons-list
+             (class-local-slots
+              (cast (value (iterator-nested-iterator self)) CLASS))))) ))
+
+(defun (all-slots (ITERATOR OF SLOT)) ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all slots visible from 'module'.
+If 'local?', return only methods interned in 'module'.
+If 'module' is null, return all methods interned everywhere."
+  :public? TRUE
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-next-code iterator) (the-code :function slots-next?))
+    (setf (iterator-nested-iterator iterator) (all-classes module local?))
+    (setf (iterator-cons-list iterator) NIL)
+    (return iterator) ))
+
+(defun (all-methods (ITERATOR OF METHOD-SLOT))
+    ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all methods visible from 'module'.
+If 'local?', return only methods interned in 'module'.
+If 'module' is null, return all methods interned everywhere."
+  :public? TRUE
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-next-code iterator) (the-code :function slots-next?))
+    (setf (iterator-nested-iterator iterator) (all-classes module local?))
+    (setf (iterator-filter-code iterator)
+      (the-code :function filter-method-slot?))
+    (setf (iterator-cons-list iterator) NIL)
+    (return iterator) ))
+
+(defun (all-public-methods (ITERATOR OF METHOD-SLOT))
+    ((module MODULE) (local? BOOLEAN))
+  :documentation "Iterate over all public methods visible from 'module'.
+If 'local?', return only methods interned in 'module'.
+If 'module' is null, return all methods interned everywhere."
+  :public? TRUE
+  (let ((iterator ALL-PURPOSE-ITERATOR (all-slots module local?)))
+    (setf (iterator-filter-code iterator)
+      (the-code :function filter-public-method-slot?))
+    (return iterator) ))
+
+(defun (class-methods-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all methods attached to a class
+  (let ((slot SLOT NULL))
+    (while (setq? slot (first (iterator-cons-list self)))
+        (setf (iterator-cons-list self) (rest (iterator-cons-list self)))      
+        (when (and (method-slot? slot)
+                   (or (null? (iterator-filter-code self))
+                       (funcall (iterator-filter-code self) slot self)))
+          (setf (slot-value self value) slot)
+          (return TRUE)))
+    (return FALSE)))
+
+(defun (class-methods (ITERATOR OF METHOD-SLOT)) 
+    ((class CLASS) (filters (CONS OF FUNCTION-CODE-WRAPPER)))
+  ;; Iterate over all methods attached to 'class'.
+  ;; `filters' is a list of filter functions to apply to each slot
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-next-code iterator) (the-code :function 
+						  class-methods-next?))
+    (setf (iterator-cons-list iterator) (the-cons-list (class-local-slots class)))
+    (setf (iterator-object iterator) filters)
+    (setf (iterator-filter-code iterator)
+      (the-code :function filter-slot?))
+    (return iterator)))
+
+(defun (public-class-methods (ITERATOR OF METHOD-SLOT)) ((class CLASS))
+  :documentation "Iterate over all private methods attached to 'class'."
+  :public? TRUE
+  (return (class-methods
+	   class
+	   (bquote ( & (wrap-literal 
+			(the-code :function filter-public-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-external-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-auxiliary-slot?)))))))
+
+(defun (private-class-methods (ITERATOR OF METHOD-SLOT)) ((class CLASS))
+  :documentation "Iterate over all private methods attached to 'class'."
+  :public? TRUE
+  (return (class-methods
+	   class
+	   (bquote ( & (wrap-literal 
+			(the-code :function filter-private-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-external-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-auxiliary-slot?)))))))
+
+(defun (class-storage-slots-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all methods attached to a class
+  (let ((slot SLOT NULL))
+    (while (setq? slot (first (iterator-cons-list self)))
+        (setf (iterator-cons-list self) (rest (iterator-cons-list self)))      
+        (when (and (storage-slot? slot)
+                   (or (null? (iterator-filter-code self))
+                       (funcall (iterator-filter-code self) slot self)))
+          (setf (slot-value self value) slot)
+          (return TRUE)))
+    (return FALSE)))
+
+(defun (class-storage-slots (ITERATOR OF STORAGE-SLOT)) 
+    ((class CLASS)
+     (filters (CONS OF FUNCTION-CODE-WRAPPER))) 
+  ;; Iterate over all storage slots attached to 'class'.
+  ;; `filters' is a list of filter functions to apply to each slot
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-next-code iterator) (the-code :function 
+						  class-storage-slots-next?))
+    (setf (iterator-cons-list iterator) (the-cons-list (class-local-slots class)))
+    (setf (iterator-object iterator) filters)
+    (setf (iterator-filter-code iterator)
+      (the-code :function filter-slot?))
+    (return iterator)))
+
+(defun (class-tables-next? BOOLEAN) ((self ALL-PURPOSE-ITERATOR))
+  ;; Helping function for generator of all methods attached to a class
+  (let ((slot SLOT NULL))
+    (while (setq? slot (first (iterator-cons-list self)))
+        (setf (iterator-cons-list self) (rest (iterator-cons-list self)))      
+        (when (and (isa? slot @TABLE)
+                   (or (null? (iterator-filter-code self))
+                       (funcall (iterator-filter-code self) slot self)))
+          (setf (slot-value self value) slot)
+          (return TRUE)))
+    (return FALSE)))
+
+(defun (class-tables (ITERATOR OF TABLE)) 
+    ((class CLASS)
+     (filters (CONS OF FUNCTION-CODE-WRAPPER))) 
+  ;; Iterate over all storage slots attached to 'class'.
+  ;; `filters' is a list of filter functions to apply to each slot
+  (let ((iterator (new ALL-PURPOSE-ITERATOR)))
+    (setf (iterator-next-code iterator) (the-code :function 
+						  class-tables-next?))
+    (setf (iterator-cons-list iterator) (the-cons-list (class-local-slots class)))
+    (setf (iterator-object iterator) filters)
+    (setf (iterator-filter-code iterator)
+      (the-code :function filter-slot?))
+    (return iterator)))
+
+(defun (public-class-storage-slots (ITERATOR OF STORAGE-SLOT)) ((class CLASS))
+  :documentation "Iterate over all public storage-slots attached to 'class'."
+  :public? TRUE
+  (return (class-storage-slots
+	   class
+	   (bquote ( & (wrap-literal 
+			(the-code :function filter-public-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-parameter-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-external-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-auxiliary-slot?)))))))
+
+(defun (private-class-storage-slots (ITERATOR OF STORAGE-SLOT)) ((class CLASS))
+  :documentation "Iterate over all private storage-slots attached to 'class'."
+  :public? TRUE
+  (return (class-storage-slots
+	   class
+	   (bquote ( & (wrap-literal 
+			(the-code :function filter-private-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-parameter-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-external-slot?))
+		       & (wrap-literal 
+			  (the-code :function filter-non-auxiliary-slot?)))))))
+
+#|
+(eval (foreach m in (all-methods NULL FALSE) do (print m EOL)))
+(eval (foreach m in (all-public-methods NULL FALSE) do (print m EOL)))
+|#

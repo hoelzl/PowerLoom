@@ -1,0 +1,135 @@
+# Makefile for system #$(SYSTEM-NAME)
+# Uses various constructs only supported by GNU make!
+
+# Template version: Makefile-default.in,v 1.5 2003/02/11 01:42:37 hans Exp
+
+# TO DO:
+# - `make' shouldn't remake the system if the library exists (and is younger
+#   than all of the source files) but some/all object files are missing.  That
+#   would allow us to remove the object files after building to save space.
+
+SYSTEMS-ROOT = #$(SYSTEMS-ROOT)
+STELLA-ROOT = #$(STELLA-ROOT)
+
+# g++ settings:
+CXX    = g++
+CC     = gcc
+CFLAGS = -w -g -O2
+
+# Should be one of `static' or `dynamic'.  Dynamic linking under CygWin
+# doesn't seem to work (easily), so we force static linking there:
+LINK-MODE = $(shell if [ `uname | grep CYGWIN` ]; \
+                   then echo static; \
+                   else echo dynamic; fi)
+
+# Comment GC-SWITCHES and GC-LIBS (or reset them from the `make' command line)
+# to not use the garbage collector.  This also requires a recompilation of
+# all systems using and required by this one with the same settings.
+GC-DIR = $(STELLA-ROOT)/cpp-lib/gc
+GC-SWITCHES = -DSTELLA_USE_GC
+GC-CFLAGS = $(GC-SWITCHES) -I$(GC-DIR)/include
+GC-LIBS = -lgc $(shell if [ $(LINK-MODE) = dynamic ]; then echo -ldl; fi)
+GC-LIB-DIR = $(GC-DIR)/.libs
+GC-LDFLAGS = -L$(GC-LIB-DIR)
+
+override INCLUDE += -I$(SYSTEMS-ROOT)
+
+LDFLAGS = # -pg
+OTHER-LIBS = -lm
+
+# Leave this as is if one of the system source files has a `defmain' entry.
+# Otherwise, or if you want to use your own `main' function, supply the .cc
+# file here that defines `main':
+MAIN =    #$(MAIN-NAME)
+PROG =    #$(PROGRAM-NAME)
+
+LIB-DIR  = $(SYSTEMS-ROOT)/lib
+# Would need .dll for dynamic libraries under Windows: 
+LIB-TYPE = $(shell if [ $(LINK-MODE) = dynamic ]; \
+                   then echo .so; \
+                   else echo .a; fi)
+LIB-FILE = $(LIB-DIR)/lib#$(SYSTEM-NAME)$(LIB-TYPE)
+LIB      = -L$(LIB-DIR) -l#$(SYSTEM-NAME)
+
+# Linker flags to generate a shared library.
+# The incantation below works with g++ on Linux and SunOS.
+LIB-SHARED-FLAGS = $(shell if [ `uname` = "SunOS" ]; \
+                           then echo -Xlinker -G; \
+                           else echo -shared; fi)
+
+# For dynamic linking, tell the runtime linker where the libraries are via an
+# rpath option; we use a relative and an absolute location to be able to move
+# around a bit (for the absolute version we have to worry about spaces, etc.);
+# if everything fails we can still set LD_LIBRARY_PATH at runtime:
+RPATH  = $(LIB-DIR):$(shell cd $(LIB-DIR); pwd):$(GC-LIB-DIR):$(shell cd $(GC-LIB-DIR); pwd)
+# Linker flags to define shared library path (covers Linux and SunOS):
+RPATH-FLAGS = $(shell if [ `uname` = "SunOS" ]; \
+                      then echo -Xlinker -R -Xlinker \'$(RPATH)\'; \
+                      else echo -Xlinker -rpath -Xlinker \'$(RPATH)\'; fi)
+
+LIB-SRCS =   #$(SYSTEM-FILES)
+LIB-OBJS =   $(LIB-SRCS:.cc=.o)
+
+PROG-SRCS =  $(MAIN)
+PROG-OBJS =  $(MAIN:.cc=.o)
+
+HEADERS =  $(PROG-SRCS:.cc=.hh) $(LIB-SRCS:.cc=.hh)
+
+# Assumes each system has an associated <system>.{so,a} file in $(LIB-DIR):
+REQUIRED-SYSTEMS = #$(REQUIRED-SYSTEMS)
+REQUIRED-LIBS =    -L$(LIB-DIR) $(REQUIRED-SYSTEMS:%=-l%)
+
+
+all: $(PROG)
+lib: $(LIB-FILE)
+
+$(PROG): $(PROG-OBJS) $(LIB-FILE) update-required-systems
+	$(CXX) -$(LINK-MODE) $(LDFLAGS) $(GC-LDFLAGS) $(RPATH-FLAGS) \
+	       $(PROG-OBJS) -o $(PROG) \
+	       $(LIB) $(REQUIRED-LIBS) $(GC-LIBS) $(OTHER-LIBS)
+
+$(LIB-FILE): $(LIB-OBJS) $(LIB-DIR) update-required-systems
+	if [ $(LINK-MODE) = dynamic ]; \
+	then $(CXX) $(LIB-SHARED-FLAGS) $(LDFLAGS) $(GC-LDFLAGS) $(LIB-OBJS) \
+                    -o $(LIB-FILE) $(REQUIRED-LIBS) $(GC-LIBS) $(OTHER-LIBS); \
+	else ar r $(LIB-FILE) $(LIB-OBJS); \
+             ranlib $(LIB-FILE); \
+	fi
+
+$(LIB-DIR):
+	mkdir -p $(LIB-DIR)
+
+# We don't know dependencies of required systems, so make sure they are up-to-date:
+update-required-systems:
+	for system in $(REQUIRED-SYSTEMS) ; do \
+	  cd $(SYSTEMS-ROOT)/$${system} ; \
+	  $(MAKE) $(MFLAGS) CC=$(CC) CXX=$(CXX) LINK-MODE=$(LINK-MODE) lib; \
+	done
+
+#
+# Default rules
+# 
+
+.cc.o: $(HEADERS)
+	$(CXX) $(CFLAGS) $(GC-CFLAGS) $(OTHER-CFLAGS) -c $(INCLUDE) $<
+
+#
+# Manual
+#
+
+.PHONY: manual
+
+manual:
+	cd doc; $(MAKE) $(MFLAGS) all
+
+#
+# Cleaning up
+#
+
+.PHONY: clean extraclean
+
+clean:
+	/bin/rm -f *.o core \#*
+
+extraclean: clean
+	/bin/rm -f $(LIB-FILE) $(PROG) *~ .*~ \#* .\#*

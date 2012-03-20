@@ -1,0 +1,384 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: cl-translate-file.ste,v 1.60 2003/04/18 21:14:27 hans Exp
+
+;;; Translating Stella files into Common-Lisp.
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+
+(defun lptrans ((statement OBJECT))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation "Translate `statement' to Common-Lisp and print the result."
+  (help-lptrans statement))
+
+;; for backwards compatibility:
+(defun ptrans ((statement OBJECT))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation "Translate `statement' to Common-Lisp and print the result."
+  (help-lptrans statement))
+
+(defun help-lptrans ((statement OBJECT))
+  ;; Does all the work for `lptrans'.
+  (special ((*translatorOutputLanguage* *translatorOutputLanguage*)
+            (*printPrettyCode?* TRUE))
+    (set-translator-output-language :common-lisp)
+    (let ((declaration? (declaration-tree? statement))
+          (translation (incrementally-translate statement)))
+      (cond ((and declaration?
+                  (cons? translation)
+                  (eql? (first (cast translation CONS)) (quote CL:PROGN)))
+             (foreach elt in (rest (cast translation CONS))
+                 as i in (interval 1 NULL)
+                 do (if (= i 1)
+                        (print-stella-definition elt STANDARD-OUTPUT)
+                      (print-stella-code elt STANDARD-OUTPUT))))
+            (otherwise
+             (print-stella-code translation STANDARD-OUTPUT))))))
+
+(defun (auxiliary-variable-unit? BOOLEAN) ((unit TRANSLATION-UNIT))
+  (return (and (auxiliary? unit)
+               (eql? (category unit) (quote GLOBAL-VARIABLE)))))
+
+(defun cl-output-one-unit ((unit TRANSLATION-UNIT)
+                           (stream NATIVE-OUTPUT-STREAM))
+  ;; Output the translation of 'unit' to 'stream'.
+  (let ((translation (translation unit)))
+    (when (null? translation)
+      (inform  unit " has a NULL translation.")
+      (return))
+    (when (defined? (category unit))
+      (unless (auxiliary-variable-unit? unit)
+	(print-native-stream stream EOL))
+      (when (defined? (annotation unit))
+	(print-native-stream stream ";;; " (annotation unit) EOL EOL))
+      ;; Special handling of top-level CL:PROGN forms.  These
+      ;; are normally introduced when declarations are added
+      (if (and (isa? translation @CONS)
+	       (eq? (first (cast translation CONS)) (quote CL:progn)))
+	(foreach form in (rest (cast translation CONS))
+	    do (print-stella-definition form stream))
+	(print-stella-definition translation stream))
+      ;; Remember that we already output this unit:
+      (setf (category unit) NULL))))
+
+(defun cl-output-all-units-to-file ((sourceFile FILE-NAME))
+  (let ((outputFile (make-file-name sourceFile :lisp FALSE))
+        (outputStream (new OUTPUT-FILE-STREAM :filename outputFile))
+        (nativeOutputStream (native-stream outputStream)))
+    (when (>= *translationVerbosityLevel* 1)
+      (inform "Writing " outputFile "..."))
+    (output-file-header outputStream outputFile)
+    (print-native-stream
+     nativeOutputStream ";;; Auxiliary variables:" EOL EOL)
+    (foreach unit in *translationUnits*
+             where (auxiliary-variable-unit? unit)
+             do (cl-output-one-unit unit nativeOutputStream))
+    (cl-output-forward-declarations nativeOutputStream)
+    (when (and (use-cl-structs?)
+               (not (use-vector-structs?)))
+      ;; Move structure definitions up-front, so accessors will be
+      ;;    available as soon as possible:
+      (foreach unit in *translationUnits*
+               where (eql? (category unit) (quote CLASS))
+               do (cl-output-one-unit unit nativeOutputStream)))
+    (foreach unit in *translationUnits*
+             where (not (auxiliary-variable-unit? unit))
+             do (cl-output-one-unit unit nativeOutputStream))
+    (free outputStream)))
+
+(defun cl-output-file-header ((stream OUTPUT-STREAM) (file FILE-NAME) (ensurePackage? BOOLEAN))
+  ;; Output a Lisp file header to `stream'.
+  ;; Generate an `in-package' declaration for `package'.
+  ;; If `ensurePackage?' is true generate a Lisp form that creates
+  ;;    `package' if necessary.
+  (let ((package (lisp-package *module*)))
+    (print-stream
+     stream ";;; -*- Mode: Lisp; Package: "
+     package "; Syntax: COMMON-LISP; Base: 10 -*-" EOL EOL)
+    (when (defined? file)
+      ;; Don't write the full file name so we won't get diffs just from
+      ;;    building a release in a different directory:
+      (print-stream stream ";;; " (file-name-without-directory file) EOL EOL))
+    (special ((*translatorOutputLanguage* :common-lisp))
+      (output-copyright-header stream))
+    (unless (or (string-eql? package "STELLA")
+                (not ensurePackage?))
+      ;; Make sure the package at least exists:
+      (cl-output-ensure-package-definition stream package)
+      (print-stream stream EOL))
+    (cl-output-in-package-declaration stream package)
+    (print-stream stream EOL)))
+
+(defun cl-output-ensure-package-definition ((stream OUTPUT-STREAM)
+                                            (package STRING))
+  ;; Output a Lisp statement to ensure that `package' is defined.
+  (print-stream
+   stream
+   "(CL:EVAL-WHEN (CL:COMPILE CL:LOAD CL:EVAL)" EOL
+   "  (CL:UNLESS (CL:FIND-PACKAGE \"" package "\")" EOL
+   "     (CL:DEFPACKAGE \"" package "\" (:USE))))" EOL))
+
+(defun cl-output-in-package-declaration ((stream OUTPUT-STREAM)
+                                         (package STRING))
+  ;; Output an IN-PACKAGE declaration for `package' to `stream'.
+  (print-stream stream "(CL:IN-PACKAGE \"" package "\")" EOL))
+
+(defun cl-output-forward-declarations ((stream NATIVE-OUTPUT-STREAM))
+  ;; Find forward-referenced global variables in the current list
+  ;;    of translation units and ouput special declarations for them
+  ;;    onto 'stream'.
+  (let ((definedVariables (new LIST))
+        (forwardReferencedVariables (new LIST)))
+    ;; Since auxiliaries are moved to the front, they are all defined:
+    (foreach
+     unit in *translationUnits*
+     where (auxiliary-variable-unit? unit)
+     do (push definedVariables (the-object unit)))
+    (foreach
+     unit in *translationUnits*
+     where (not (auxiliary-variable-unit? unit))
+     do
+     (when (eql? (category unit) (quote GLOBAL-VARIABLE))
+       (push definedVariables (the-object unit)))
+     (foreach variable in (referenced-globals unit)
+              ;; This membership test is not too fast, but unless we have
+              ;;    large numbers of variables this doesn't pose a problem:
+              where (and (not (member? definedVariables variable))
+                         (not (member? forwardReferencedVariables variable)))
+              do (push forwardReferencedVariables variable)))
+    (foreach it on forwardReferencedVariables
+             do (setf (value it)
+                  (variable-name (cast (value it) GLOBAL-VARIABLE))))
+    (when (non-empty? forwardReferencedVariables)
+      (print-native-stream stream EOL ";;; Forward declarations:" EOL EOL)
+      (print-stella-definition
+       (bquote
+        (CL:declaim
+         (CL:special && (cl-translate-list-of-trees
+                         (the-cons-list forwardReferencedVariables)))))
+       stream))
+    (free definedVariables)
+    (free forwardReferencedVariables)))
+
+(defun cl-translate-file ((file FILE-NAME) (relative? BOOLEAN))
+  :documentation "Translate a Stella `file' to Common-Lisp.  If
+`relative?', concatenate root directory to `file'."
+  :public? TRUE
+  (when relative?
+    (setq file (make-file-name file :stella TRUE)))
+  (translate-file file :common-lisp FALSE) )
+
+(defun cl-translate-walked-system-units ((systemUnits SYSTEM-UNITS-ALIST))
+  ;; Combine all walked translation units, then translate and output them.
+  ;;    `systemUnits' is the result of walking the files of the current system.
+  (special ((*currentFile* NULL)
+            (*translationUnits* NULL))
+    (let ((classUnits (new LIST))
+          (useCLStructs? (use-cl-structs?))
+          (fileName STRING NULL))
+      (foreach (file units) in systemUnits
+          do (setq *currentFile* (file-base-name file))
+             (cond (useCLStructs?
+                    (setq *translationUnits* (new LIST))
+                    ;; remove class units, since they go into a separate file:
+                    (foreach unit in units
+                        do (if (eql? (category unit) (quote CLASS))
+                               (push classUnits unit)
+                             (push *translationUnits* unit)))
+                    (reverse *translationUnits*))
+                   (otherwise
+                    (setq *translationUnits* units)))
+             (within-module (compute-file-units-module units)
+               ;; for now, this mirrors the old functionality:
+               (translate-and-output-units-to-file file "Common Lisp"))
+             (clean-up-translation-units-special))
+      (when useCLStructs?
+        ;; we always have to do this, even if we didn't collect any classes
+        ;;    into `classUnits', since a class might have been deleted:
+        (when (>= *translationVerbosityLevel* 1)
+          (inform "Collecting CL structure class definitions..."))
+        (foreach file in (files-plus-system-startup
+                          (system-definition-source-files
+                           *currentSystemDefinition*))
+            where (null? (lookup systemUnits
+                                 (setq fileName
+                                   (make-file-name file :stella TRUE))))
+            ;; we didn't translate the file in the step above, scan it for
+            ;;    class definitions:
+            do (setq *translationUnits* (new LIST))
+               (setq *currentFile* (file-base-name fileName))
+               (setq *translationUnits* (new LIST))
+               (operate-on-file fileName :FINALIZE)
+               (foreach unit in *translationUnits*
+                   where (and (eql? (category unit) (quote CLASS))
+                              (create-native-class? (cast (the-object unit) CLASS))
+                              (not (mixin? (cast (the-object unit) CLASS))))
+                   collect unit into classUnits)
+               (clean-up-translation-units-special))
+        (cl-output-system-cl-structs-file classUnits)))))
+
+(defun (sort-cl-struct-classes (LIST OF CLASS)) ((unsortedClasses (LIST OF CLASS)))
+  ;; Topologically sort `unsortedClasses' so that when translated to a file
+  ;;    each class's parents will be defined before the class gets defined.
+ (let ((classTable (new (HASH-TABLE OF SURROGATE BOOLEAN-WRAPPER)))
+       (roots (LIST OF CLASS) (list))
+       (sortedClasses (list)))
+   (foreach class in unsortedClasses
+       do (insert-at classTable (class-type class) TRUE))
+   (foreach class in unsortedClasses
+       where (not (exists super in (class-direct-supers class)
+                    where (defined? (lookup classTable super))))
+       collect class into roots)
+   (while (non-empty? roots)
+     (push sortedClasses (first roots))
+     (foreach sub in (class-direct-subs (pop roots))
+         where (defined? (lookup classTable sub))
+         do (push roots (type-class sub))))
+   (return (reverse sortedClasses))))
+
+(defun (cl-yield-struct-class-file-name FILE-NAME) ((systemName STRING))
+  ;; Yield the basename of the system-wide struct class file for
+  ;;    system `systemName'.
+  (return (concatenate (string-downcase systemName) "-system-structs")))
+
+(defun cl-output-system-cl-structs-file ((classUnits (LIST OF TRANSLATION-UNIT)))
+  ;; Output the CL-struct definitions for all classes in `classUnits' to the
+  ;;    system-wide CL-structs file of the current system.
+  ;; This file needs to be available before the compilation of any other Lisp files
+  ;;    to make sure struct slot access macros are defined before they are used.
+  (let ((outputFile
+         (make-file-name
+          (cl-yield-struct-class-file-name (name *currentSystemDefinition*))
+          :lisp TRUE))
+        (outputStream (new OUTPUT-FILE-STREAM :filename outputFile))
+        (classes (new (LIST OF CLASS)))
+        (currentModule *module*)
+        (package STRING NULL)
+        (ensuredPackages (list)))
+    (foreach unit in classUnits
+        collect (the-object unit) into classes)
+    (setq classes (sort-cl-struct-classes classes))
+    ;; steal some functionality from `cl-output-all-units-to-file':
+    (when (>= *translationVerbosityLevel* 1)
+      (inform "Writing " outputFile "..."))
+    (within-module *module*
+      (if (non-empty? classes)
+          (setq *module* (home-module (first classes)))
+        (setq *module*
+          (get-stella-module (cardinal-module *currentSystemDefinition*) TRUE)))
+      (setq currentModule *module*)
+      (cl-output-file-header outputStream outputFile TRUE)
+      (foreach unit in classUnits
+          as class in classes
+          do (setf (the-object unit) class)
+             (setf (annotation unit) NULL)
+             (setq *module* (home-module class))
+             (when (not (eql? *module* currentModule))
+               (setq currentModule *module*)
+               (setq package (lisp-package *module*))
+               (unless (member? ensuredPackages package)
+                 (push ensuredPackages package)
+                 (print-stream outputStream EOL)
+                 (cl-output-ensure-package-definition outputStream package))
+               (print-stream outputStream EOL)
+               (cl-output-in-package-declaration outputStream package))
+             (setf (translation unit)
+               (cl-translate-define-native-class-unit unit))
+             ;; Only output the structure definition; all other class-related
+             ;;    definitions go in the file that defined the class:
+             (cl-output-one-unit unit outputStream)))
+    (free outputStream)))
+
+(defun cl-translate-system ((system-name STRING))
+  :documentation "Translate a Stella system named `system-name' to Common Lisp."
+  :public? TRUE
+  (translate-system system-name :common-lisp
+                    :two-pass? TRUE
+                    :force-translation? TRUE
+                    :production-settings? TRUE))
+
+(defun (cl-compile-and-load-files BOOLEAN)
+       ((files (CONS OF STRING-WRAPPER)) (relative? BOOLEAN) (forceRecompilation? BOOLEAN))
+  ;; Compile (if necessary) and load the translated Stella file 'file'.
+  ;; If 'relative?', add root directory prefix to file.
+  ;; Tricky: Use this let to get the proper keyword offset to pass into
+  ;;         the verbatim Lisp code.  The Lisp code has to all be in the 
+  ;;         verbatim because of the need to wrap the forms.
+  (let ((lispkey :lisp)
+	(binarykey :lisp-binary)
+	(translatedFile? FALSE))
+    (verbatim
+	:common-lisp "  (with-redefinition-warnings-suppressed
+      (with-undefined-function-warnings-suppressed
+          (CL:proclaim CL-USER::*stella-compiler-optimization*)
+	  (CL:loop for file in files
+		   as translatedfile = (make-file-name (unwrap-string file) lispkey relative?)
+		   as binaryfile = (make-file-name (unwrap-string file) binarykey relative?)
+		   when (Cl:or (CL-USER::stella-need-to-compile?
+				translatedFile binaryFile)
+			       forceRecompilation?)
+		   do (CL:compile-file translatedFile :output-file binaryFile)
+	           do (CL:load binaryFile))))
+      (CL:setq translatedFile? TRUE)"
+	:otherwise NULL)
+    (return translatedFile?)))
+
+  ;;
+;;;;;; Translation of STELLA system
+  ;;
+
+(defun cl-translate-stella ((productionSettings? BOOLEAN))
+  ;; Translate the complete Stella system to Common-Lisp in a single pass.
+  (translate-system "stella" :common-lisp 
+                    :force-translation? TRUE
+                    :production-settings? productionSettings?) )
+
+(defun cl-retranslate-stella ((productionSettings? BOOLEAN))
+  ;; Translate the complete Stella system to Common-Lisp in two passes.
+  (translate-system "stella" :common-lisp 
+                    :two-pass? TRUE
+                    :force-translation? TRUE
+                    :production-settings? productionSettings?) )

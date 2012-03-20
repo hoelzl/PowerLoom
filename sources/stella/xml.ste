@@ -1,0 +1,1657 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: xml.ste,v 1.16 2003/07/16 03:22:39 hans Exp
+
+;;; Stream tokenizers and the Stella reader.  
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+;;; TO DO:
+;;;  This code currently ignores DTD information at the head of the file and
+;;;  thus will not correctly handle any attributes (including xmlns attributes)
+;;;  that have default values specified.
+;;;
+
+  ;;
+;;;;;; XML Constants
+  ;;
+
+(defconstant *xml-urn* STRING "http://www.w3.org/XML/1998/namespaces")
+(defconstant *html-v4-0-urn* STRING "http://www.w3.org/TR/REC-html40")
+
+
+
+  ;;
+;;;;;; XML Element and Attribute Classes
+  ;;
+
+(defclass XML-OBJECT (STANDARD-OBJECT)
+  :public-slots
+  ((name :type STRING)
+   (surface-form :type STRING)   ;; This may be redundant.
+   )
+  )
+
+(defclass XML-ELEMENT (XML-OBJECT)
+  :public-slots
+  ((namespace-name :type STRING)
+   (namespace-uri :type STRING)
+   (element-dictionary :type (KEY-VALUE-LIST OF STRING-WRAPPER XML-ATTRIBUTE))
+  ; (attribute-defaults :type (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)) ; future DTD
+   )
+  :print-form
+  (print-native-stream stream "<" (surface-form self) ">")
+  )
+
+#|
+<rdf:RDF
+  xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  xmlns:dc="http://purl.org/metadata/dublin_core#">
+  ...>
+
+  would produce an XML-ELEMENT with
+
+  name = "RDF"
+  namespace-name = "rdf"
+  namespace = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  surface-form = "rdf:RDF"
+
+|#
+
+(defclass XML-ATTRIBUTE (XML-OBJECT)
+  :abstract? TRUE
+  :public-slots
+  ((name :type STRING)
+   (surface-form :type STRING))   ;; This may be redundant.
+  :print-form
+  (print-native-stream stream "<" (surface-form self) ">")
+  )
+
+(defclass XML-LOCAL-ATTRIBUTE (XML-ATTRIBUTE)
+  :public-slots
+  ((parent-element :type XML-ELEMENT)))
+
+(defclass XML-GLOBAL-ATTRIBUTE (XML-ATTRIBUTE)
+  :public-slots
+  ((namespace-name :type STRING)
+   (namespace-uri :type STRING)))
+
+(defclass XML-PROCESSING-INSTRUCTION (XML-OBJECT)
+  :public-slots
+  ((data :type STRING))
+  :print-form
+  (if (null? (data self))
+    (print-native-stream stream "<?" (surface-form self) ">")
+    (print-native-stream stream "<?" (surface-form self) " " (data self) ">")))
+
+(defclass XML-DECLARATION (XML-OBJECT)
+  :public-slots
+  ((data :type STRING))
+  :print-form
+  (if (null? (data self))
+    (print-native-stream stream "<!" (surface-form self) ">")
+    (print-native-stream stream "<!" (surface-form self) " " (data self) ">")))
+
+(defclass XML-DOCTYPE-DECLARATION (XML-DECLARATION)
+  :print-form
+  (if (null? (data self))
+    (print-native-stream stream "<!" (surface-form self) ">")
+    (print-native-stream stream "<!" (surface-form self) " ...>")))
+
+(defclass XML-SPECIAL (XML-OBJECT)
+  :public-slots
+  ((data :type STRING))
+  :print-form
+  (print-native-stream stream "<!" (surface-form self) ">"))
+
+(defclass XML-COMMENT (XML-OBJECT)
+  :print-form
+  (if (null? (surface-form self))
+    (print-native-stream stream "<!-- -->")
+    (print-native-stream stream "<!-- " (length (surface-form self))
+			 " chars -->")))
+
+(defglobal *xml-element-null-namespace-table*
+    (STRING-HASH-TABLE OF STRING XML-ELEMENT)
+    (new (STRING-HASH-TABLE OF STRING XML-ELEMENT))
+  :documentation 
+  "Hash Table for interning XML elements that don't appear in any namespace.")
+
+(defglobal *xml-element-hash-table*
+    (STRING-HASH-TABLE OF STRING (STRING-HASH-TABLE OF STRING XML-ELEMENT))
+    (new (STRING-HASH-TABLE OF STRING (STRING-HASH-TABLE OF STRING XML-ELEMENT)))
+  :documentation "Hash Table mapping URI's (for namespaces) to a Hash Table
+for interning XML elements.")
+
+(defglobal *xml-global-attribute-hash-table*
+    (STRING-HASH-TABLE OF STRING (STRING-HASH-TABLE OF STRING XML-ATTRIBUTE))
+    (new (STRING-HASH-TABLE OF STRING (STRING-HASH-TABLE OF STRING XML-ATTRIBUTE)))
+  :documentation "Hash Table mapping URI's (for namespaces) to a Hash Table
+for interning XML global attributes.")
+
+
+  ;;
+;;;;;; Support Functions for Namespaces and XML Elements
+  ;;
+
+
+(defun reset-xml-hash-tables ()
+  :public? TRUE
+  :documentation "Resets Hashtables used for interning XML elements and global
+attribute objects.  This will allow garbage collection of no-longer used
+objects, but will also mean that newly parsed xml elements and global attributes
+will not be eq? to already existing ones with the same name."
+  (setq *xml-element-null-namespace-table*
+    (new (STRING-HASH-TABLE OF STRING XML-ELEMENT)))
+  (setq *xml-element-hash-table*
+    (new (STRING-HASH-TABLE OF STRING (STRING-HASH-TABLE OF STRING XML-ELEMENT))))
+  (setq *xml-global-attribute-hash-table*
+    (new (STRING-HASH-TABLE OF STRING (STRING-HASH-TABLE OF STRING XML-ATTRIBUTE)))))
+
+
+(defun (make-namespace-table (KV-CONS OF STRING-WRAPPER STRING-WRAPPER)) ()
+  ;; By definition, see http://www.23.org/TR/REC-xml-names Section 4.
+  (return (kv-cons "xml" *xml-urn* NULL)))
+
+
+(defun (make-xmlns-attribute XML-ATTRIBUTE) ((name STRING))
+  (let ((colon-position (position name #\: 0)))
+    (if (null? colon-position)
+      (return (new XML-GLOBAL-ATTRIBUTE
+		   :name ""
+		   :namespace-name "xmlns"
+		   ; :namespace ????
+		   :surface-form name))
+      (return (new XML-GLOBAL-ATTRIBUTE
+		   :name (subsequence name (+ colon-position 1) NULL)
+		   :namespace-name "xmlns"
+		   ; :namespace ????
+		   :surface-form name))) ))
+
+(defun (make-xml-element-internal XML-ELEMENT) 
+    ((name STRING) (namespace-name STRING) (namespace STRING) (surface-form STRING))
+  (let ((ns-hash-table (STRING-HASH-TABLE OF STRING XML-ELEMENT) NULL)
+	(element XML-ELEMENT NULL))
+    (cond ((defined? namespace)
+	   (setq ns-hash-table 
+	     (lookup *xml-element-hash-table* namespace))
+	   (when (null? ns-hash-table)
+	     (setq ns-hash-table (new (STRING-HASH-TABLE OF STRING XML-ELEMENT)))
+	     (insert-at *xml-element-hash-table* namespace ns-hash-table)))
+	  (otherwise
+	   (setq ns-hash-table *xml-element-null-namespace-table*)))
+    (setq element (lookup ns-hash-table name))
+    (when (null? element)
+      (setq element (new XML-ELEMENT
+			 :name name
+			 :namespace-name namespace-name
+			 :namespace-uri namespace
+			 :surface-form surface-form
+			 :element-dictionary (new (KEY-VALUE-LIST OF STRING-WRAPPER
+								  XML-ATTRIBUTE))))
+      (insert-at ns-hash-table name element))
+    (return element) ))
+
+(defun (make-xml-element XML-ELEMENT) 
+    ((name STRING) (namespace-name STRING) (namespace STRING))
+  :public? TRUE
+  :documentation "Creates and interns an XML element object `name' using `namespace-name'
+to refer to  `namespace'.  If `namespace' is `null', then the element will
+be interned in the null namespace.   `namespace' must otherwise be a URI."
+  (if (or (null? namespace-name)
+	  (string-eql? namespace-name ""))
+    (return (make-xml-element-internal name "" namespace name))
+    (return (make-xml-element-internal name namespace-name namespace
+				       (concatenate namespace-name ":" name)))))
+
+(defun (make-xml-element-respecting-namespace XML-ELEMENT) 
+    ((name STRING) (namespace-table (KV-CONS OF STRING-WRAPPER STRING-WRAPPER)))
+  (let ((colon-position (position name #\: 0))
+	(ns-part "")
+	(raw-name "")
+	(namespace-uri STRING null))
+    (if (null? colon-position)
+      (setq raw-name name)
+      (progn
+	(setq ns-part (subsequence name 0 colon-position))
+	(setq raw-name (subsequence name (+ colon-position 1) NULL))))
+    (setq namespace-uri (unwrap-string (lookup namespace-table ns-part)))
+    ;; Namespace specified but not defined.
+    (when (and (null? namespace-uri)
+	       (not (string-eql? ns-part "")))
+      (error "Undefined Namespace for Element: " ns-part))
+    (return (make-xml-element-internal raw-name ns-part namespace-uri name)) ))
+
+(defun (make-xml-global-attribute-internal XML-GLOBAL-ATTRIBUTE)
+    ((name STRING) (namespace-name STRING) (namespace-uri STRING) (surface-form STRING))
+  (when (or (null? namespace-uri)
+	    (null? namespace-name)
+	    (string-eql? namespace-uri "")
+	    (string-eql? namespace-name ""))
+    (error "namespace-name and namespace must be specified"))
+  (let ((ns-hash-table (lookup *xml-global-attribute-hash-table* namespace-uri))
+	(attribute XML-ATTRIBUTE NULL))
+    (when (null? ns-hash-table)
+      (setq ns-hash-table (new (STRING-HASH-TABLE OF STRING XML-ATTRIBUTE)))
+      (insert-at *xml-global-attribute-hash-table* namespace-uri ns-hash-table))
+    (setq attribute (lookup ns-hash-table name))
+    (when (null? attribute)
+      (setq attribute (new XML-GLOBAL-ATTRIBUTE
+			   :name name
+			   :namespace-name namespace-name
+			   :namespace-uri namespace-uri
+			   :surface-form surface-form))
+      (insert-at ns-hash-table name attribute))
+    (return attribute) ))
+
+(defun (make-xml-global-attribute XML-GLOBAL-ATTRIBUTE) 
+    ((name STRING) (namespace-name STRING) (namespace STRING))
+  :public? TRUE
+  :documentation
+  "Creates and interns an XML global attribute object with `name' using 
+`namespace-name' to refer to  `namespace'.  `namespace'must be a URI."
+  (return (make-xml-global-attribute-internal name namespace-name namespace
+					      (concatenate name ":" namespace-name))))
+
+(defun (make-xml-global-attribute-respecting-namespace XML-GLOBAL-ATTRIBUTE)
+    ((name STRING) (namespace-name STRING) (surface-form STRING)
+     (namespace-table (KV-CONS OF STRING-WRAPPER STRING-WRAPPER)))
+  (let ((namespace-uri (lookup namespace-table namespace-name)))
+    (when (null? namespace-uri)
+      (error "Undefined Namespace for Attribute!"))
+    (return (make-xml-global-attribute-internal 
+	     name namespace-name namespace-uri surface-form)) ))
+
+(defun (make-xml-local-attribute XML-LOCAL-ATTRIBUTE)
+    ((name STRING) (element XML-ELEMENT))
+  :public? TRUE
+  :documentation
+  "Make an XML-LOCAL-ATTRIBUTE named `name' associated with `element'"
+  (let ((dictionary (element-dictionary element))
+	(attribute (lookup dictionary name)))
+    (when (null? attribute)
+      (setq attribute (new XML-LOCAL-ATTRIBUTE
+			   :name name
+			   :parent-element element
+			   :surface-form name))
+      (insert-at (element-dictionary element) name attribute))
+    (return attribute)))
+
+(defun (make-xml-attribute-respecting-namespace XML-ATTRIBUTE)
+    ((name STRING) (element XML-ELEMENT)
+     (namespace-table (KV-CONS OF STRING-WRAPPER STRING-WRAPPER)))
+  (let ((colon-position (position name #\: 0)))
+    (if (null? colon-position)
+      (return (make-xml-local-attribute name element))
+      (return (make-xml-global-attribute-respecting-namespace
+	       (subsequence name (+ colon-position 1) NULL)
+	       (subsequence name 0 colon-position)
+	       name
+	       namespace-table))) ))
+
+(defun (xmlns-attribute? BOOLEAN) ((name STRING))
+  ;; Return `true' if `key' is an XMLNS keyword.
+  (let ((colon-position (position name #\: 0)))
+    (if (null? colon-position)
+      (return (eql? name "xmlns"))
+      (return (eql? (subsequence name 0 colon-position) "xmlns")))))
+
+(defun (extract-xmlns-name STRING) ((keyname STRING))
+  ;; Returns the XMLNS name component of `keyname', which will have
+  ;; the form "xmlns:<keyname>"
+  (let ((colon-position (position keyname #\: 0)))
+    (if (null? colon-position)
+      (return "")
+      (return (subsequence keyname (+ colon-position 1) NULL)))))
+
+
+  ;;
+;;;;;; Simple, non-validating XML tokenizer and parser.
+  ;;
+
+;;; TO DO:
+
+;;; - handle removal of leading/trailing whitespace in attribute values (XHTML)
+;;; - possibly, this should go into a separate file or even system; it's small
+;;;   so we'll keep it here for now.
+;;; - handle parsing of !DOCTYPE declarations (they can contain nested
+;;;   declarations which need to be parsed).
+
+(defglobal *XML-tokenizer-table-definition* CONS
+  (bquote
+     ((:start
+       :include :skip-whitespace)
+
+      (:skip-whitespace
+       ! (#\space #\tab #\linefeed #\return) :skip-whitespace
+       ! "<" :open-tag
+       :eof :eof
+       * :otherwise :content)
+
+      ;; Content between tags:
+      (:content
+       ! "<" :open-tag
+       :eof :eof
+       :otherwise :content)
+
+      ;; Tag dispatch:
+      (:open-tag
+       * ">" :start-tag-end            ;; illegal, but tolerate it
+       ! "/" :open-end-tag
+       "?" :open-PI-tag
+       "!" :open-declaration-tag
+       ;; not sure whether this is legal, but just be tolerant:
+       (#\space #\tab #\linefeed #\return) :open-tag
+       * :otherwise :start-tag)
+
+      ;; Regular tags:
+      (:start-tag
+       * ">" :start-tag-end
+       ! "/" :open-empty-tag-end
+       ! (#\space #\tab #\linefeed #\return) :skip-to-attribute-name
+       ;; too tolerant, but will do for now:
+       :otherwise :start-tag)
+
+      ;; PI tags are "processing instruction" (or meta) tags such as
+      ;;    `<?xml version=1.0>':
+      (:open-PI-tag
+       * :any :start-PI-tag)
+      (:start-PI-tag
+       ! "?" :open-PI-tag-end
+       * (#\space #\tab #\linefeed #\return) :PI-tag-data
+       ;; too tolerant, but will do for now:
+       :otherwise :start-PI-tag)
+      ;; PI tag data can be anything but a `?>' string:
+      (:PI-tag-data
+       "?" (:PI-tag-data-or-end :PI-tag-data)
+       :otherwise :PI-tag-data)
+      (:PI-tag-data-or-end
+       * ">" :empty-tag-end
+       :otherwise :PI-tag-data)
+      (:open-PI-tag-end
+       * ">" :empty-tag-end            ;; treat it like an empty tag end
+       :otherwise :error)
+
+      ;; End tags:
+      (:open-end-tag
+       ! ">" :end-tag-end
+       ;; probably too tolerant, but will do for now:
+       * :otherwise :end-tag)
+      (:end-tag
+       ! ">" :end-tag-end
+       ;; probably too tolerant, but will do for now:
+       :otherwise :end-tag)
+
+      ;; Attributes:
+      (:skip-to-attribute-name
+       * ">" :start-tag-end
+       ! "/" :open-empty-tag-end
+       ! (#\space #\tab #\linefeed #\return) :skip-to-attribute-name
+       ;; too tolerant, but will do for now:
+       * :otherwise :attribute-name)
+      (:attribute-name
+       * ">" :start-tag-end
+       ! "/" :open-empty-tag-end
+       ! (#\= #\space #\tab #\linefeed #\return) :skip-to-attribute-value
+       :otherwise :attribute-name)
+      (:skip-to-attribute-value
+       * ">" :start-tag-end
+       ! "/" :open-empty-tag-end
+       ;; slightly sloppy - would allow multiple `='s:
+       (#\= #\space #\tab #\linefeed #\return) :skip-to-attribute-value
+       * "'" :single-quoted-attribute-value
+       * "\"" :double-quoted-attribute-value
+       ;; too tolerant, only [a-zA-Z0-9.:_-] are legal
+       * :otherwise :unquoted-attribute-value)
+      (:single-quoted-attribute-value
+       "'" :quoted-attribute-value
+       :otherwise :single-quoted-attribute-value)
+      (:double-quoted-attribute-value
+       "\"" :quoted-attribute-value
+       :otherwise :double-quoted-attribute-value)
+      (:quoted-attribute-value
+       :include :skip-to-attribute-name)
+      (:unquoted-attribute-value
+       * ">" :start-tag-end
+       ! "/" :open-empty-tag-end
+       ! (#\space #\tab #\linefeed #\return) :skip-to-attribute-name
+       ;; too tolerant, only [a-zA-Z0-9.:_-] are legal
+       :otherwise :unquoted-attribute-value)
+
+      ;; Declarations:
+      (:open-declaration-tag
+       "-" :start-tag-or-comment
+       "[" :open-special-tag
+       ;; too tolerant:
+       * :otherwise :start-declaration-tag)
+      (:start-declaration-tag
+       * ">" :empty-tag-end
+       * (#\space #\tab #\linefeed #\return) :declaration-tag-data
+       ;; too tolerant, but will do for now:
+       :otherwise :start-declaration-tag)
+      ;; we don't try to parse the declaration tag data, since the legal syntax
+      ;;    depends on the tag, and we wouldn't know what to do with it anyway.
+      (:declaration-tag-data
+       * ">" :empty-tag-end
+       * "[" :declaration-tag-markup-data-start
+       "'" :single-quoted-declaration-tag-data
+       "\"" :double-quoted-declaration-tag-data
+       :otherwise :declaration-tag-data)
+      ;; try to be smart about quoted strings - could there be other constructs
+      ;;    where a non-terminating `>' could legally occur?
+      (:single-quoted-declaration-tag-data
+       "'" :declaration-tag-data
+       :otherwise :single-quoted-declaration-tag-data)
+      (:double-quoted-declaration-tag-data
+       "\"" :declaration-tag-data
+       :otherwise :double-quoted-declaration-tag-data)
+      (:declaration-tag-markup-data-start
+       "]" :declaration-tag-markup-data
+       :otherwise :declaration-tag-markup-data-start)
+      (:declaration-tag-markup-data
+       * ">" :empty-tag-end
+       :otherwise :error)
+
+      ;; `special-tag' covers CDATA sections and conditionals:
+      (:open-special-tag
+       * :any :start-special-tag)
+      (:start-special-tag
+       * "[" :special-tag-data
+       :otherwise :start-special-tag)
+      (:special-tag-data
+       "]" :special-tag-data-or-end
+       :otherwise :special-tag-data)
+      (:special-tag-data-or-end
+       "]" (:special-tag-data-or-end2 :special-tag-data)
+       :otherwise :special-tag-data)
+      (:special-tag-data-or-end2
+       * ">" :data-tag-end
+       :otherwise :special-tag-data)
+
+      ;; Comments:
+      (:start-tag-or-comment
+       "-" :comment-body
+       * :otherwise :start-tag)        ;; we'll lose the `!-' prefix here....
+      (:comment-body
+       "-" :end-comment-or-comment
+       :otherwise :comment-body)
+      (:end-comment-or-comment
+       "-" :end-comment-or-comment2
+       :otherwise :comment-body)
+      (:end-comment-or-comment2
+       ">" :comment
+       :otherwise :error)              ;;  `--' in comment body is illegal
+      (:comment :include :start)
+
+      ;; tag ends:
+      (:start-tag-end :include :start)
+      (:data-tag-end :include :start)
+      (:end-tag-end :include :start)   ;; could use `:start-tag-end' instead
+      (:open-empty-tag-end
+       * ">" :empty-tag-end
+       :otherwise :error)
+      (:empty-tag-end :include :start)
+
+      (:error :include :start)
+      )))
+
+(defglobal *XML-tokenizer-table* TOKENIZER-TABLE NULL)
+
+(startup-time-progn
+  ;; need to initialize here due to bootstrap issues:
+  (setq *XML-tokenizer-table*
+    (parse-tokenizer-definition *xml-tokenizer-table-definition*)))
+
+(defun (tokenize-XML-expression TOKENIZER-TOKEN BOOLEAN)
+    ((stream INPUT-STREAM) (tokenList TOKENIZER-TOKEN)
+     (regionTagName STRING) (skipToRegion? BOOLEAN))
+  ;; Tokenize one balanced XML-expression by reading from `stream'
+  ;;    and return the result.  Return TRUE as the second value on EOF.
+  ;; If `tokenList' was supplied as non-NULL, reuse it as much as possible
+  ;;    (the end of the token list is indicated by a NULL token type).
+  ;;    Reusing of the `tokenList' is achieved by attaching it
+  ;;    to the stream state, and by having a contract that says it's
+  ;;    only good until the next call to `tokenize-xml-expression'.
+  ;; If `regionTagName' is non-NULL the behavior depends on the value of
+  ;;    `skipToRegion?': if it is true, skip all tokens until a start token
+  ;;    with content `regionTagName' is found, gather all its attributes, and
+  ;;    return a token list only representing the region tag and attributes.
+  ;;    If it is false and the first token encountered is an end tag
+  ;;    with content `regionTagName', immediately return with a NULL result.
+  ;;    This can be used to only read XML-expressions that occur within a region
+  ;;    delimited by `regionTagName'.
+  (let ((parenBalance 0)
+        (startTag STRING NULL)
+        (currentTag STRING NULL)
+        (regionTagFound? (or (null? regionTagName)
+                             (not skipToRegion?)))
+        (endOfFile? TRUE)
+        (tokenType KEYWORD NULL)
+        (tokenContent STRING NULL)
+        (tokenCursor tokenList))
+    (when (null? tokenList)
+      (setq tokenList (new TOKENIZER-TOKEN))
+      (setq tokenCursor tokenList))
+    (with-tokenizer *xml-tokenizer-table* stream
+      (loop
+        (get-next-token FALSE)
+        (when (end-of-tokens?)
+          (setq endOfFile? TRUE)
+          (when (= parenBalance 0)
+              (break))
+          (save-tokenizer-stream-state)
+          (signal-read-error "XML Expression ended prematurely"))
+        (setq endOfFile? FALSE)
+        (setq tokenType (get-token-type))
+        (cond (regionTagFound? NULL)
+              ((and (eql? tokenType :START-TAG)
+                    (eql? (get-token-text FALSE) regionTagName))
+               (setq regionTagFound? TRUE))
+              (otherwise
+               ;; skip any tags including those that would cause errors:
+               (continue)))
+        (case tokenType
+          ((:START-TAG :START-PI-TAG :START-DECLARATION-TAG :START-SPECIAL-TAG)
+           (setq tokenContent (get-token-text FALSE))
+           ;; save this for the benefit of :EMPTY-TAG-END:
+           (setq currentTag tokenContent)
+           (when (null? startTag)
+             (setq startTag tokenContent))
+           (when (eql? tokenContent startTag)
+             (++ parenBalance)))
+          (:START-TAG-END
+           (setq tokenContent ">")
+           (when (and (defined? regionTagName)
+                      skipToRegion?)
+             ;; We've found the region start and collected all its attributes;
+             ;;    force a return:
+             (-- parenBalance))
+           (setq currentTag NULL))
+          ((:END-TAG :EMPTY-TAG-END :DATA-TAG-END)
+           (cond ((eql? tokenType :END-TAG)
+                  (setq tokenContent (get-token-text FALSE))
+                  (setq currentTag tokenContent))
+                 (otherwise
+                  (setq tokenContent ">")))
+           (when (or (eql? currentTag startTag)
+                     (and (defined? regionTagName)
+                          (not skipToRegion?)
+                          (eql? currentTag regionTagName)))
+             (-- parenBalance))
+           (setq currentTag NULL))
+          (:ATTRIBUTE-NAME
+           (setq tokenContent (get-token-text FALSE)))
+          (:QUOTED-ATTRIBUTE-VALUE
+           (setq tokenContent (unescape-html-string (get-token-text FALSE 1 -1)))
+           (setq tokenType :ATTRIBUTE-VALUE))
+          (:UNQUOTED-ATTRIBUTE-VALUE
+           (setq tokenContent (unescape-html-string (get-token-text FALSE)))
+           (setq tokenType :ATTRIBUTE-VALUE))
+          (:PI-TAG-DATA
+           (setq tokenContent (get-token-text FALSE 0 -1)))
+          ((:DECLARATION-TAG-DATA :DECLARATION-TAG-MARKUP-DATA)
+           (setq tokenContent (get-token-text FALSE)))
+          (:SPECIAL-TAG-DATA
+           (setq tokenContent (get-token-text FALSE 1 -2)))
+          (:CONTENT
+           (setq tokenContent (unescape-html-string (get-token-text FALSE)))
+           ;; remove trailing whitespace - this could be optimized by
+           ;;    trimming directly in the tokenizer buffer:
+           (let ((cursor (length tokenContent)))
+             (foreach i in (interval 0 NULL)
+                 where (not (white-space-character?
+                             (nth tokenContent (-- cursor))))
+                 do (when (> i 0)
+                      (setq i (- i))
+                      (setq tokenContent (get-token-text FALSE 0 i)))
+                    (break))))
+          (:ERROR
+           (save-tokenizer-stream-state)
+           (signal-read-error "Illegal XML syntax: " tokenContent))
+          (otherwise
+           (save-tokenizer-stream-state)
+           (signal-read-error "Illegal XML syntax: " tokenContent
+                              " in state " tokenType)))
+        (setf (type tokenCursor) tokenType)
+        (setf (content tokenCursor) tokenContent)
+        (when (null? (next tokenCursor))
+          (setf (next tokenCursor) (new TOKENIZER-TOKEN)))
+        (setq tokenCursor (next tokenCursor))
+        (when (= parenBalance 0)
+          (break))
+        (when (< parenBalance 0)
+          (cond ((and (defined? regionTagName)
+                      (not skipToRegion?)
+                      (eql? (content tokenList) regionTagName)
+                      (eql? (next tokenList) tokenCursor))
+                 ;; The first tag we encountered was a region end tag:
+                 (setq tokenList NULL)
+                 (break))
+                (otherwise
+                 (save-tokenizer-stream-state)
+                 (signal-read-error "Unmatched end tag encountered: "
+                                    tokenContent)))))
+      ;; mark the end of the token list:
+      (setf (type tokenCursor) NULL)
+      (save-tokenizer-stream-state)
+      (if endOfFile?
+          (return NULL TRUE)
+        (return tokenList FALSE)))))
+
+(defun (process-attribute-list CONS)
+    ((reverseAttributeList CONS)
+     (element XML-ELEMENT)
+     (namespace-table (KV-CONS OF STRING-WRAPPER STRING-WRAPPER)))
+  ;; Helping function for "XML-token-list-to-s-expression", which takes
+  ;; and processes a (reversed order) attribute and value list to create
+  ;; the appropriate items.  The form of reverseAttributeList is
+  ;; (attribute-value attribute-parse-token ...)
+  ;; Returns the list reversed to proper order and with attribute names
+  ;; replaced by attribute objects
+  (when (empty? reverseAttributeList)
+    (return NIL))
+  (let ((attributeList NIL)
+	(consCell CONS NULL)
+	(attributeName STRING NULL))
+    (while (non-empty? reverseAttributeList)
+      ;; hand-cons for speed:
+      (setq consCell (make CONS))
+      (setf (value consCell) (first reverseAttributeList))
+      (setq reverseAttributeList (rest reverseAttributeList))
+      (setf (rest consCell) attributeList)
+      (setq  attributeList consCell)
+
+      (setq attributeName
+        (content (cast (first reverseAttributeList) TOKENIZER-TOKEN)))
+      (setq reverseAttributeList (rest reverseAttributeList))
+      ;; hand-cons for speed:
+      (setq consCell (make CONS))
+      (if (xmlns-attribute? attributeName)
+	(setf (value consCell) (make-xmlns-attribute attributeName))
+	(setf (value consCell) (make-xml-attribute-respecting-namespace
+				attributeName element namespace-table)))
+      (setf (rest consCell) attributeList)
+      (setq attributeList consCell))
+    (return attributeList)))
+  
+
+;; Does this always return a CONS?
+(defun (XML-token-list-to-s-expression OBJECT) ((tokenList TOKENIZER-TOKEN))
+  :documentation "Convert the XML `tokenList' into a representative s-expression
+and return the result.  Every XML tag is represented as a cons-list starting
+with the tag as its header, followed by a possibly empty list of keyword
+value pairs representing tag attributes, followed by a possibly empty list of
+content expressions which might themselves be XML expressions.  For example,
+the expression
+
+    <a a1=v1 a2='v2'> foo <b a3=v3/> bar </a>
+
+becomes
+
+   (<a> (<a1> \"v1\" <a2> \"v2\") \"foo\" (<b> (<a3> \"v3\")) \"bar\")
+
+when represented as an s-expression.  The tag names are subtypes of XML-OBJECT
+such as XML-ELEMENT, XML-LOCAL-ATTRIBUTE, XML-GLOBAL-ATTRIBUTE, etc.
+?, ! and [ prefixed tags are encoded as their own subtypes of XML-OBJECT, namely
+XML-PROCESSING-INSTRUCTION, XML-DECLARATION, XML-SPECIAL, XML-COMMENT, etc.
+CDATA is an XML-SPECIAL tag with a name of CDATA.
+
+The name is available using class accessors."
+  :public? TRUE
+  ;; TO DO: MAKE THIS MORE ROBUST WITH RESPECT TO ILL-FORMED EXPRESSIONS, E.G.,
+  ;;    IF SOME OF THE SUBEXPRESSIONS AREN'T PROPERLY BALANCED.  RIGHT NOW,
+  ;;    IT SIGNALS (THE WRONG) EXCEPTION IF THIS HAPPENS.
+  (let ((parsedTree CONS NULL)
+        ;; Generate CONS-trees without recursive calls:
+        (parsedTreeStack (CONS OF CONS) NIL)
+        (parsedToken OBJECT NULL)
+	(tagName STRING NULL)
+	(element XML-ELEMENT NULL)
+	(xmlns-name STRING NULL)
+	(colon-position 0)
+	(attributeList NIL)
+        (consCell CONS NULL)
+        (tokenType KEYWORD NULL)
+	(namespace-table (make-namespace-table))
+	(ns-stack NIL))
+    (loop
+      (setq tokenType (type tokenList))
+      (case tokenType
+	(:START-TAG
+	 (when (defined? parsedTree)
+           (pushq parsedTreeStack parsedTree))
+	 (pushq ns-stack namespace-table)
+	 (setq parsedTree NIL)
+	 ;; We have to defer actually creating the element tag until
+	 ;; after processing the attributes, because they potentially
+	 ;; set up the XML namespaces for interpreting the tags.
+	 (setq tagName (content tokenList))
+	 (setq tokenList (next tokenList))
+	 (continue))
+        ((:START-PI-TAG :START-DECLARATION-TAG :START-SPECIAL-TAG)
+         (when (defined? parsedTree)
+           (pushq parsedTreeStack parsedTree))
+	 (setq parsedTree NIL)
+	 (setq tagName NULL)
+         (case tokenType
+           (:START-PI-TAG
+	    (setq parsedToken (new XML-PROCESSING-INSTRUCTION
+				   :name (content tokenList)
+				   :surface-form (content tokenList))))
+           (:START-DECLARATION-TAG
+	    (setq parsedToken (new XML-DECLARATION
+				   :name (content tokenList)
+				   :surface-form (content tokenList))))
+           (:START-SPECIAL-TAG
+	    (setq parsedToken (new XML-SPECIAL
+				   :name (content tokenList)
+				   :surface-form (content tokenList))))))
+        (:START-TAG-END
+	 (if (defined? tagName)
+	   (progn			; Element tag
+	     (setq element
+	       (make-xml-element-respecting-namespace tagName namespace-table))
+	     ;; hand-cons for speed:
+	     (setq consCell (make CONS))
+	     (setf (value consCell) element)
+	     (setf (rest consCell) parsedTree)
+	     (setq parsedTree consCell)
+     	     (setq parsedToken 
+	       (process-attribute-list attributeList element namespace-table)))
+	   (setq parsedToken		; Special, PI or declaration tag
+	     (choose (empty? attributeList)
+		     NIL
+		     (reverse attributeList))))
+	 (setq attributeList NIL))
+        ((:EMPTY-TAG-END :DATA-TAG-END)
+	 (if (defined? tagName)
+	   (progn			; Element tag
+	     (setq element 
+	       (make-xml-element-respecting-namespace tagName namespace-table))
+	     ;; hand-cons for speed:
+	     (setq consCell (make CONS))
+	     (setf (value consCell) element)
+	     (setf (rest consCell) parsedTree)
+	     (setq parsedTree consCell)
+     	     (setq parsedToken 
+	       (process-attribute-list attributeList element namespace-table)))
+	   (setq parsedToken		; Special, PI or declaration tag
+	     (choose (empty? attributeList)
+		     NIL
+		     (reverse attributeList))))
+
+	 ;; Attributes added in
+	 ;; hand-cons for speed:
+	 (setq consCell (make CONS))
+	 (setf (value consCell) parsedToken)
+	 (setf (rest consCell) parsedTree)
+	 (setq parsedTree consCell)
+	 (setq attributeList NIL)
+	 (setq tagName NULL)
+         (cond ((empty? parsedTreeStack)
+		;; we read a complete XML expression, return it:
+		(setq parsedTree (reverse parsedTree))
+                (break))
+               (otherwise
+                (when (eq? tokenType :EMPTY-TAG-END)
+		  ;; Clean up namespaces
+		  (setq namespace-table (first ns-stack))
+		  (setq ns-stack (rest ns-stack)))
+		;; Continue processing enclosing tag
+                (let ((parentTree parsedTreeStack))
+                  (setq parsedTreeStack (rest parsedTreeStack))
+                  (setf (rest parentTree) (first parentTree))
+                  (setf (first parentTree) (reverse parsedTree))
+                  (setq parsedTree parentTree)
+                  (setq tokenList (next tokenList))
+                  (continue)))))
+	(:END-TAG
+         (cond ((empty? parsedTreeStack)
+                ;; we read a complete XML expression, return it:
+		(setq parsedTree (reverse parsedTree))
+                (break))
+               (otherwise
+		;; Clean up namespaces
+		(setq namespace-table (first ns-stack))
+		(setq ns-stack (rest ns-stack))
+		;; Continue processing enclosing tag
+                (let ((parentTree parsedTreeStack))
+                  (setq parsedTreeStack (rest parsedTreeStack))
+                  (setf (rest parentTree) (first parentTree))
+                  (setf (first parentTree) (reverse parsedTree))
+                  (setq parsedTree parentTree)
+                  (setq tokenList (next tokenList))
+                  (continue)))))
+        (:CONTENT
+         (setq parsedToken (make STRING-WRAPPER))
+         (setf (wrapper-value (cast parsedToken STRING-WRAPPER))
+           (content tokenList)))
+        (:ATTRIBUTE-NAME
+	 ;; hand-cons for speed:
+	 (setq consCell (make CONS))
+	 ;; Just store token for later processing.  This way we
+	 ;; don't have to create a STRING-WRAPPER to hold the name.
+	 (setf (value consCell) tokenList)
+	 (setf (rest consCell) attributeList)
+	 (setq  attributeList consCell)
+
+	 ;; TO DO: should xmlns stuff go into the tokenizer instead?
+	 ;; Set up xml namespace
+	 (when (xmlns-attribute? (content tokenList))
+	   (setq xmlns-name (content tokenList))
+	   ;; Read ahead to get the next item, and process it here.
+	   ;; Alternately one could set a flag and process it in the
+	   ;;  :ATTRIBUTE-VALUE clause, but it seems simpler to fold
+	   ;;  it in right here.
+	   (setq tokenList (next tokenList))
+	   (unless (eq? (type tokenList) :ATTRIBUTE-VALUE)
+	     (signal-read-error "Illegal XMLNS syntax, namespace value is "
+				(content tokenList) " of type " (type tokenList)))
+	   (setq colon-position (position xmlns-name #\: 0))
+	   (cond ((defined? colon-position)
+		  (setq namespace-table
+		    (kv-cons (subsequence xmlns-name (+ colon-position 1) NULL)
+			     (content tokenList)
+			     namespace-table)))
+		 ;; Remove (shadow) default namespace
+		 ((string-eql? (content tokenList) "")
+		  (setq namespace-table
+		    (kv-cons "" NULL namespace-table)))
+		 ;; Establish default namespace
+		 (otherwise
+		  (setq namespace-table
+		    (kv-cons ""
+			     (content tokenList)
+			     namespace-table))))
+	    (setq parsedToken (make STRING-WRAPPER))
+	    (setf (wrapper-value (cast parsedToken STRING-WRAPPER))
+	      (content tokenList))
+	    ;; hand-cons for speed:
+	    (setq consCell (make CONS))
+	    (setf (value consCell) parsedToken)
+	    (setf (rest consCell) attributeList)
+	    (setq  attributeList consCell))
+
+	 (setq tokenList (next tokenList))
+	 (continue))
+        ((:ATTRIBUTE-VALUE :PI-TAG-DATA :DECLARATION-TAG-DATA :SPECIAL-TAG-DATA
+	  :DECLARATION-TAG-MARKUP-DATA)
+         (setq parsedToken (make STRING-WRAPPER))
+         (setf (wrapper-value (cast parsedToken STRING-WRAPPER))
+           (content tokenList))
+	 ;; hand-cons for speed:
+	 (setq consCell (make CONS))
+	 (setf (value consCell) parsedToken)
+	 (setf (rest consCell) attributeList)
+	 (setq  attributeList consCell)
+	 (setq tokenList (next tokenList))
+	 (continue))
+        (otherwise
+         (signal-read-error "Illegal XML syntax: " (content tokenList)
+                            " of type " tokenType)))
+      (cond
+       ((defined? parsedTree)
+        ;; hand-cons for speed:
+        (setq consCell (make CONS))
+        (setf (value consCell) parsedToken)
+        (setf (rest consCell) parsedTree)
+        (setq parsedTree consCell)
+        (setq tokenList (next tokenList)))
+       (otherwise
+        (break))))
+    (if (null? parsedTree)
+        (return parsedToken)
+      (return parsedTree))))
+
+;; Does this always return a CONS?
+(defun (read-XML-expression OBJECT BOOLEAN)
+    ((stream INPUT-STREAM) (start-tag OBJECT))
+  :documentation "Read one balanced XML expression from `stream' and return
+its s-expression representation (see `xml-token-list-to-s-expression').  If
+`startTagName' is non-`null', skip all tags until a start tag matching `start-tag'
+is encountered.  XML namespaces are ignored for outside of the start tag.
+Use s-expression representation to specify `start-tag', e.g., '(KIF (:version \"1.0\"))'.
+The tag can be an XML element object, a symbol, a string or a cons.  If the tag is a cons
+the first element can also be (name namespace) pair.
+
+Return `true' as the second value on EOF.
+
+CHANGE WARNING:  It is anticipated that this function will change to
+ a) Properly take XML namespaces into account and
+ b) require XML element objects instead of strings as the second argument.
+This change will not be backwards-compatible."
+  :public? TRUE
+  (let ((iter (xml-expressions stream start-tag))
+	(result OBJECT NULL)
+	(eof? FALSE))
+    (if (next? iter)
+      (setq result (value iter))
+      (setq eof? TRUE))
+    (when (or (eql? stream STANDARD-INPUT)
+              (defined? (echo-stream stream)))
+      ;; When reading from an interactive stream, eat the white-space character
+      ;;    that immediately followed/terminated the s-expression to avoid that
+      ;;    it stays in the buffer and is picked up by a subsequent read:
+      (eat-next-character-if-whitespace stream))
+    (return result eof?)))
+
+(defclass XML-EXPRESSION-ITERATOR (STREAM-ITERATOR)
+  :documentation "Iterator that yields XML expressions from an input stream.
+If the value of `region-tag' is non-`null', only XML expressions enclosed within
+matching region tags will be returned (there can be multiple such regions).
+What is a match is determined by `region-match-function'.  Usually, region tags
+will/should be at the top level, but this is not necessarily so and also not
+enforced by the iterator."
+  :parameters ((any-value :type OBJECT))
+  :public? TRUE
+  :slots ((region-tag :type CONS) ;; use s-exp representation to specify a tag
+          (region-match-function
+           :type FUNCTION-CODE
+           :initially (the-code :function xml-region-matches?))))
+
+(defmethod (next? BOOLEAN) ((self XML-EXPRESSION-ITERATOR))
+  ;; Return the next XML expression from a stream.
+  ;; Close the stream on EOF.
+  :public? TRUE
+  (let ((stream (the-stream self))
+        (firstIteration? (first-iteration? self))
+        (tokenList
+         (choose firstIteration?
+                 NULL
+                 (token-list (tokenizer-state stream))))
+        (regionTag (region-tag self))
+        (regionTagName
+         (choose (defined? regionTag)
+                 (name (cast (first regionTag) XML-ELEMENT))
+                 NULL))
+        (skipToRegion? FALSE)
+        (eof? FALSE))
+    (when firstIteration?
+      (setf (first-iteration? self) FALSE)
+      (when (defined? regionTag)
+        (setq skipToRegion? TRUE)))
+    (loop
+      (mv-setq (tokenList eof?)
+        (tokenize-xml-expression
+         stream tokenList regionTagName skipToRegion?))
+      (when eof?
+        (when (and (defined? regionTag)
+                   (not skipToRegion?))
+          (signal-read-error "EOF encountered before the end of the current "
+                             regionTagName " region"))
+        (setf (slot-value self value) NULL)
+        (close-stream stream)
+        (setf (the-stream self) NULL)
+        (return FALSE))
+      (when (null? tokenList)
+        ;; we encountered the end of the current region:
+        (setq skipToRegion? TRUE)
+        (setq tokenList (token-list (tokenizer-state stream)))
+        (continue))
+      (when firstIteration?
+        ;; save the token list for later reuse:
+        (setf (token-list (tokenizer-state stream)) tokenList)
+        (setq firstIteration? FALSE))
+      (cond
+       ((and skipToRegion?
+             (defined? regionTag))
+        ;; We read a region start tag, see whether its attributes match:
+        (let ((lastToken tokenList)
+              (emptyTag? FALSE))
+          ;; First, see whether it is an empty tag or not:
+          (while (defined? (type (next lastToken)))
+            (setq lastToken (next lastToken)))
+          (if (eql? (type lastToken) :EMPTY-TAG-END)
+              (setq emptyTag? TRUE)
+            ;; pretend to be an empty tag for easy conversion:
+            (setf (type lastToken) :EMPTY-TAG-END))
+          (when (not (funcall (region-match-function self)
+                              (region-tag self)
+                              (xml-token-list-to-s-expression tokenList)))
+            ;; it didn't match, simply skip it:
+            (setq skipToRegion? TRUE)
+            (continue))
+          (setq skipToRegion? FALSE)
+          (when emptyTag?
+            ;; there won't be a closing tag, reset `regionTag':
+            (setq regionTag NULL)
+            (setq regionTagName NULL)
+            (setf (region-tag self) NULL))
+          (continue)))
+       (otherwise
+        (setf (slot-value self value)
+          (xml-token-list-to-s-expression tokenList))
+        (return TRUE))))))
+
+(defun (XML-region-matches? BOOLEAN) ((regionSpec CONS) (regionTag CONS))
+  ;; Return true if `regionTag' matches the region specification `regionSpec'.
+  ;; They match if they have the same tag name, and if each attribute of
+  ;;    `regionSpec' has a matching attribute in `regionTag', i.e., the
+  ;;    attributes specified in `regionSpec' have to be a subset of the
+  ;;    attributes encountered in `regionTag'.
+  (if (eql? (first regionSpec) (first regionTag))
+    (let ((specAttributes PROPERTY-LIST NULL)
+	  (tagAttributes PROPERTY-LIST NULL)
+	  (specAttributeSource CONS (second regionSpec)))
+      (if (and (defined? specAttributeSource)
+	       (non-empty? specAttributeSource))
+	(setq specAttributes
+	  (new PROPERTY-LIST :the-plist (cast (second regionSpec) CONS)))
+	(return TRUE))
+      (setq tagAttributes
+	(new PROPERTY-LIST :the-plist (cast (second regionTag) CONS)))
+      (foreach (key value) in specAttributes
+	  where (not (eql? (lookup tagAttributes key) value))
+	  do (return FALSE))
+      (return TRUE))
+    (return FALSE)))
+
+(defun (coerce-to-xml-element XML-ELEMENT) ((regionTag OBJECT))
+  ;; Helping function for XML-expressions.  It coerces regionTag into an
+  ;; XML-ELEMENT.
+  (typecase regionTag
+    (SYMBOL
+     (return (make-xml-element (symbol-name regionTag) "" NULL)))
+    (XML-ELEMENT
+     (return regionTag))
+    (STRING-WRAPPER
+     (return (make-xml-element regionTag "" NULL)))
+    (CONS
+     (if (empty? (rest regionTag))
+       (return (coerce-to-xml-element (first regionTag)))
+       (let ((name (first regionTag))
+	     (namespace STRING-WRAPPER (second regionTag)))
+	 (typecase name
+	   (SYMBOL
+	    (return (make-xml-element (symbol-name name) "" namespace)))
+	   (XML-ELEMENT
+	    (return name))
+	   (STRING-WRAPPER
+	    (return (make-xml-element name "" namespace)))) )))) )
+
+(defun (XML-expressions XML-EXPRESSION-ITERATOR)
+    ((stream INPUT-STREAM) (regionTag OBJECT))
+  :documentation "Return an XML-expression-iterator (which see) reading from
+`stream'.  `regionTag' can be used to define delimited regions from which
+expressions should be considered. Use s-expression representation to specify
+`regionTag', e.g., '(KIF (:version \"1.0\"))'.  The tag can be an XML element
+object, a symbol, a string or a cons.  If the tag is a cons the first element
+can also be (name namespace) pair."
+  :public? TRUE
+  (let ((iterator (new XML-EXPRESSION-ITERATOR :the-stream stream)))
+    (when (defined? regionTag)
+      (typecase regionTag
+	(CONS
+	 (cond ((empty? regionTag)
+		NULL)
+	       ((null? (rest regionTag))
+		(setf (region-tag iterator)
+		  (bquote (& (coerce-to-xml-element (first regionTag)) ()))))
+	       ((null? (rest (rest regionTag)))
+		(setf (region-tag iterator) 
+		  (bquote (& (coerce-to-xml-element (first regionTag))
+			     & (second regionTag)))))
+	       (otherwise
+		(setf (region-tag iterator)
+		  (bquote (& (coerce-to-xml-element (first regionTag))
+			   & (rest regionTag)))))))
+	(otherwise
+	 (setf (region-tag iterator) 
+	   (bquote (& (coerce-to-xml-element regionTag) ()))))))
+    (return iterator)))
+
+  ;;
+;;;;;; TYPE AND ELEMENT MATCHING FUNCTIONS
+  ;;
+
+
+(defun (xml-cdata? BOOLEAN) ((item OBJECT))
+  :public? TRUE
+  :documentation "Return `true' if `item' is an XML CDATA tag object"
+  (typecase item
+    (XML-SPECIAL
+     (return (string-eql? (name item) "CDATA")))
+    (otherwise
+     (return FALSE))))
+
+(defun (xml-element? BOOLEAN) ((item OBJECT))
+  :public? TRUE
+  :documentation "Return `true' if `item' is an XML element object"
+  (return (isa? item @XML-ELEMENT)))
+
+(defun (xml-attribute? BOOLEAN) ((item OBJECT))
+  :public? TRUE
+  :documentation "Return `true' if `item' is an XML attribute object"
+  (return (isa? item @XML-ATTRIBUTE)))
+
+(defun (xml-declaration? BOOLEAN) ((item OBJECT))
+  :public? TRUE
+  :documentation "Return `true' if `item' is an XML declaration object"
+  (return (isa? item @XML-DECLARATION)))
+
+(defun (xml-cdata-form? BOOLEAN) ((form OBJECT))
+  :public? TRUE
+  :documentation "Return `true' if `form' is an CONS headed by a CDATA tag"
+  (return (and (isa? form @CONS)
+	       (xml-cdata? (cast (first (cast form CONS)) XML-OBJECT)))))
+
+
+(defun (get-xml-tag XML-ELEMENT) ((expression CONS))
+  :public? TRUE :globally-inline? TRUE
+  :documentation "Return the XML tag object of an XML `expression'."
+  (return (first expression)))
+
+(defun (get-xml-attributes CONS) ((expression CONS))
+  :public? TRUE :globally-inline? TRUE
+  :documentation 
+  "Return the list of attributes of an XML `expression' (may be empty)."
+  (return (second expression)))
+
+(defun (get-xml-content CONS) ((expression CONS))
+  :public? TRUE :globally-inline? TRUE
+  :documentation
+  "Return the list of content elements of an XML `expression' (may be empty)."
+  (return (rest (rest expression))))
+
+(defun (get-xml-cdata-content STRING) ((form CONS))
+  :public? TRUE :globally-inline? TRUE
+  :documentation
+  "Return the CDATA content of a CDATA `form'.  Does NOT make sure that `form'
+actually is a CDATA form, so bad things can happen if it is given wrong input."
+  (return (unwrap-string (first (cast (second form) CONS)))))
+
+
+(defmethod (xml-element-match? BOOLEAN) ((tag XML-ELEMENT)
+					 (name STRING)
+					 (namespace STRING))
+  :public? TRUE :globally-inline? TRUE
+  :documentation "Returns `true' if `tag' is an XML element with the name `name'
+in namespace `namespace'.  Note that `namespace' is the full URI, not an abbreviation.
+Also, `namespace' may be `null', in which case `tag' must not have a namespace
+associated with it."
+  (return (and (eql? (name tag) name)
+	       (eql? (namespace-uri tag) namespace))))
+
+(defmethod (xml-attribute-match? BOOLEAN) ((attribute XML-ATTRIBUTE)
+					   (name STRING)
+					   (namespace STRING))
+  :public? TRUE ;:abstract? TRUE
+  :documentation
+  "Return `true' if `attribute' is an XML attribute with name `name'
+in namespace `namespace'.  Note that `namespace' is the full URI, not an
+abbreviation.  Also, `namespace' may be `null', in which case `attribute'
+must not have a namespace associated with it."
+  (ignore name namespace)
+  (return FALSE))
+
+(defmethod (xml-attribute-match? BOOLEAN) ((attribute XML-GLOBAL-ATTRIBUTE)
+					   (name STRING)
+					   (namespace STRING))
+  :public? TRUE
+  :documentation
+  "Return `true' if `attribute' is a global  XML attribute with name `name'
+in namespace `namespace'.  Note that `namespace' is the full URI, not an
+abbreviation.  Also, `namespace' may be `null', in which case `attribute'
+must not have a namespace associated with it."
+  (return (xml-global-attribute-match? attribute name namespace)))
+
+(defmethod (xml-attribute-match? BOOLEAN) ((attribute XML-LOCAL-ATTRIBUTE)
+					   (name STRING)
+					   (namespace STRING))
+  :public? TRUE
+  :documentation
+  "Return `true' if `attribute' is a local XML attribute with name `name'.
+Note that `namespace' must be `null' and that the `attribute's parent element
+element is not considered by the match.  To take the parent element into
+account use `xml-local-attribute-match?'."
+  (return (and (null? namespace)
+               (eql? (name attribute) name))))
+
+(defun (xml-global-attribute-match? BOOLEAN) ((attribute XML-GLOBAL-ATTRIBUTE)
+					      (name STRING)
+					      (namespace STRING))
+  :globally-inline? TRUE
+  (return (and (string-eql? (name attribute) name)
+	       (eql? (namespace-uri attribute) namespace))))
+
+(defun (xml-local-attribute-match? BOOLEAN) ((attribute XML-LOCAL-ATTRIBUTE)
+					     (name STRING)
+					     (element-name STRING)
+					     (element-namespace STRING))
+  :public? TRUE :globally-inline? TRUE
+  :documentation
+  "Return true if `attribute' is a local attribute with `name' and whose
+parent element matches `element-name' and `element-namespace'."
+  (return (and (string-eql? (name attribute) name)
+               (xml-element-match? (parent-element attribute)
+                                   element-name element-namespace))))
+
+(defun (xml-lookup-attribute STRING) ((attributes CONS)
+                                      (name STRING)
+                                      (namespace STRING))
+  :documentation
+  "Find the XML attribute in `attributes' with `name' and `namespace' and
+return its value.  Note that it is assumed that all `attributes' come from
+the same known tag, hence, the parent elements of any local attributes are
+not considered by the lookup."
+  :public? TRUE
+  (while (non-empty? attributes)
+    (when (xml-attribute-match? (cast (first attributes) XML-ATTRIBUTE)
+                                name namespace)
+      (return (unwrap-string (first (rest attributes)))))
+    (setq attributes (rest (rest attributes))))
+  (return NULL))
+
+
+  ;;
+;;;;;; XML TAG-CASE
+  ;;
+
+
+(defun (expand-xml-tag-case CONS) ((item SYMBOL) (clauses (CONS OF CONS)))
+  (let ((output-clauses NIL)
+	(key OBJECT NULL))
+    (foreach clause in clauses
+	do (setq key (first clause))
+	   (typecase key
+	     (CONS 
+	      (cond ((empty? (rest key))
+		     (pushq output-clauses
+			    (bquote ((xml-element-match? & item
+							 & (first key)
+							 NULL)
+				     && (rest clause)))))
+		    ((eq? (second key) :ANY)
+		     (pushq output-clauses
+			    (bquote ((string-eql? (name & item) & (first key))
+				     && (rest clause)))))
+		    (otherwise
+		     (pushq output-clauses
+			    (bquote ((xml-element-match? & item
+							 & (first key)
+							 & (second key))
+				     && (rest clause))))) ))
+	     (SYMBOL
+	      (if (eq? key (quote otherwise))
+		(pushq output-clauses clause)
+		(pushq output-clauses
+		       (bquote ((xml-element-match? & item
+						    & (symbol-name key)
+						    NULL)
+				&& (rest clause))))))
+	     (STRING-WRAPPER
+	      (pushq output-clauses 
+		     (bquote ((xml-element-match? & item
+						  & key
+						  NULL)
+			      && (rest clause)))))))
+    (return
+      (bquote (cond && (reverse output-clauses)))) ))
+
+(defmacro xml-tag-case ((item OBJECT) &body (clauses CONS))
+  :public? TRUE
+  :documentation "A case form for matching `item' against XML element tags.  Each
+element of `clauses' should be a clause with the form
+  (\"tagname\" ...)     or
+  ((\"tagname\" \"namespace-uri\") ...)
+The clause heads can optionally be symbols instead of strings.  The key forms the
+parameters to the method `xml-element-match?', with a missing namespace argument
+passed as NULL.
+
+The namespace argument will be evaluated, so one can use bound variables in
+place of a fixed string.   As a special case, if the namespace argument is
+:ANY, then the test will be done for a match on the tag name alone."
+  (if (isa? item @SYMBOL)
+    (return (expand-xml-tag-case item clauses))
+    (let ((var (local-gensym "ITEM")))
+      (return (bquote (let ((& var XML-ELEMENT & item))
+			& (expand-xml-tag-case var clauses)))))))
+
+  ;;
+;;;;;; XML OUTPUT
+  ;;
+
+
+(defun print-XML-non-element-attributes ((stream OUTPUT-STREAM) (attributes CONS))
+  (foreach item in attributes
+      do (typecase item
+	   (XML-ATTRIBUTE
+	    (print-stream stream " " (surface-form item) "="))
+	   (STRING-WRAPPER
+	    (print-stream stream "\"" (wrapper-value item) "\"")))))
+
+(defun print-XML-element-attributes ((stream OUTPUT-STREAM) (attributes CONS))
+  (foreach item in attributes
+      do (typecase item
+	   (XML-ATTRIBUTE
+	    (print-stream stream " " (surface-form item) "="))
+	   (STRING-WRAPPER
+	    (print-stream stream "\"" (wrapper-value item) "\"")))))
+
+(defun print-XML-expression ((stream OUTPUT-STREAM) (xml-expression CONS) (indent INTEGER))
+  :documentation "Prints `xml-expression' on `stream'.  Indentation begins with the
+value of `indent'.  If this is the `null' integer, no indentation is
+performed.  Otherwise it should normally be specified as 0 (zero) for
+top-level calls.
+
+It is assumed that the `xml-expression' is a well-formed CONS-list
+representation of an XML  form.  It expects a form like that form
+returned by `read-XML-expression'.
+
+Also handles a list of xml forms such as that returned by `XML-expressions'.
+In that case, each of the forms is indented by `indent' spaces."
+  :public? TRUE
+  ;; Handle getting a list of xml expressions as well.
+  (when (isa? (first xml-expression) @CONS)
+    (foreach exp in xml-expression do (print-xml-expression stream exp indent))
+    (return))
+  (let ((tag XML-OBJECT (first xml-expression))
+	(attributes CONS (second xml-expression))
+	(tagname (surface-form tag))           ; Was (name tag)
+	; (previous-item-was-keyword? FALSE)
+	(previous-item-was-string? FALSE)
+	(in-content-field? FALSE))
+    (when (defined? indent)
+      (print-spaces stream indent))
+    (typecase tag
+      (XML-PROCESSING-INSTRUCTION
+       (print-stream stream "<?" tagname)
+       (print-xml-non-element-attributes stream attributes)
+       (print-stream stream "?>" EOL))
+      (XML-DECLARATION
+       (print-stream stream "<!" tagname)
+       (print-xml-non-element-attributes stream attributes)
+       (print-stream stream ">" EOL))
+      (XML-SPECIAL  ;; Note: This only really applies to CDATA sections!!
+       (print-stream stream "<![" tagname "[")
+       (print-xml-non-element-attributes stream attributes)
+       (print-stream stream "]]>" EOL))
+      (XML-ELEMENT
+       (cond ((empty? (rest xml-expression))
+	      (print-stream stream "<" tagname "/>"))
+	     (otherwise
+	      (print-stream stream "<" tagname)
+	      (print-xml-element-attributes stream (second xml-expression))
+	      (setq previous-item-was-string? FALSE)
+              (when (defined? indent)
+                (++ indent 2))
+	      (foreach item in (rest (rest xml-expression))
+		  do (typecase item
+		       (CONS
+			(unless in-content-field?
+			  (print-stream stream ">" EOL)
+			  (setq in-content-field? TRUE))
+			(print-XML-expression stream item indent)
+			(print-stream stream EOL)
+			(setq previous-item-was-string? FALSE))
+		       (STRING-WRAPPER
+			(unless in-content-field?
+			  (print-stream stream ">")
+			  (setq in-content-field? TRUE))
+			(when previous-item-was-string?
+			  (print-stream stream " "))
+			(print-stream stream (wrapper-value item))
+			(setq previous-item-was-string? TRUE))))
+	      (if in-content-field?
+		(progn
+                  (when (defined? indent)
+                    (-- indent 2))
+		  (unless previous-item-was-string?
+                    (print-spaces stream indent))
+		  (print-stream stream "</" tagname ">"))
+		(print-stream stream "/>")
+		))))) ))
+
+
+#|
+;;;
+;;; Some ideas for an indenting printer, and one that emits its own
+;;; namespace forms
+;;;
+
+
+(defun print-xml ((stream OUTPUT-STREAM) (xml-expression CONS))
+  ;; Print out a reconstituted form of `xml-expression' on `stream'
+  (help-print-xml stream xml-expression 0 (new KEY-VALUE-LIST)))
+
+;; Needs upgrading to handle tags other than XML-ELEMENTS, in particular
+;; XML-SPECIAL, XML-DECLARATION and XML-PROCESSING-INSTRUCTION:
+(defun help-print-xml ((stream OUTPUT-STREAM)
+		       (xml-expression CONS)
+		       (indent INTEGER) 
+		       (inverse-namespace-table (KEY-VALUE-LIST OF STRING-WRAPPER
+								   STRING-WRAPPER)))
+  (let ((tag XML-OBJECT (first xml-expression))
+	(attributes CONS (second xml-expression))
+	(content (rest (rest xml-expression)))
+	(number-of-namespace-entries 0))
+    (print-spaces stream indent)
+    (print-stream stream "<" (surface-form tag))
+    (setq number-of-namespace-entries
+      (emit-attributes stream tag attributes inverse-namespace-table))
+    (cond ((empty? content)
+	   (print-stream stream "/>" EOL))
+	  ((and (empty? (rest content))
+		(isa? (first content) @STRING-WRAPPER)
+		(<= (length attributes) 2)  ; one attribute-value pair
+		(< (length (wrapper-value (cast (first content) STRING-WRAPPER))) 40))
+	   (print-stream stream
+			 ">"
+			 (wrapper-value (cast (first content) STRING-WRAPPER))
+			 "<" (surface-form tag) "/>" EOL))
+	  (otherwise
+	   (print-stream stream ">" EOL)
+	   (++ indent 2)
+	   (foreach item in content
+	       do (typecase item
+		    (CONS
+		     (help-print-xml item stream indent inverse-namespace-table))
+		    (STRING-WRAPPER
+		     (print-spaces stream indent)
+		     (print-stream stream (wrapper-value item) EOL))
+		    (otherwise
+		     (print-spaces stream indent)
+		     (print-stream stream item EOL))))
+	   (-- indent 2)
+	   (print-spaces stream indent)
+	   (print-stream stream "<" (surface-form tag) "/>" EOL)))
+		     
+    (foreach i in (interval 1 number-of-namespace-entries)
+	do (pop inverse-namespace-table))
+    (return)))
+
+;; The code that is commented used to be needed when xmlns attributes were not
+;; being stored as normal attributes in our forms.  Since they are now stored
+;; as normal attributes, we don't need to handle them specially.
+(defun (emit-attributes INTEGER) ((stream OUTPUT-STREAM)
+				  (tag XML-ELEMENT) 
+				  (attributes CONS)
+				  (inverse-namespace-table
+				   (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+  (let ((new-namespace-entries 0)
+	(attribute XML-ATTRIBUTE NULL)
+	(value STRING-WRAPPER NULL))
+    ;(when (maybe-emit-namespace? (namespace-uri tag) (namespace-name tag) inverse-namespace-table stream) (++ new-namespace-entries))
+    (while (non-empty? attributes)
+      (setq attribute (first attributes))
+      (setq attributes (rest attributes))
+      (setq value (first attributes))
+      (setq attributes (rest attributes))
+      (typecase attribute
+	(XML-LOCAL-ATTRIBUTE
+	 (print-stream stream " " (name attribute) "=\"" (wrapper-value value) "\""))
+	(XML-GLOBAL-ATTRIBUTE
+	 ;(when (maybe-emit-namespace? (namespace-uri attribute) (namespace-name attribute) inverse-namespace-table stream) (++ new-namespace-entries))
+	 (print-stream stream " " (surface-form attribute)
+		       "=\"" (wrapper-value value) "\""))))
+    (return new-namespace-entries)))
+
+;; Not used right now:
+(defun (maybe-emit-namespace? BOOLEAN) ((namespace STRING)
+					(namespace-name STRING)
+					(inverse-namespace-table 
+					 (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER))
+					(stream OUTPUT-STREAM))
+  (when (and (defined? namespace)
+	     (not (eql? (lookup inverse-namespace-table
+				namespace-name)
+			namespace)))
+    (if (eql? namespace-name "")
+      (print-stream stream " xmlns=\"")
+      (print-stream stream " xmlns:" namespace-name "=\""))
+    (print-stream stream namespace "\"")
+    (kv-push inverse-namespace-table namespace-name namespace)
+    (return TRUE))
+  (return FALSE))
+
+|#
+
+  ;;
+;;;;;; Testing
+  ;;
+
+#|
+(defun test-tokenize-xml-file ((file FILE-NAME))
+  (let ((stream (new FILE-INPUT-STREAM :filename file)))
+    (foreach token in (new STREAM-TOKENIZER
+                           :stream stream
+                           :table *xml-tokenizer-table*)
+        do (print (type token) " " "`" (content token) "'" " "))
+    (free stream)))
+
+(defun test-read-xml-file ((file FILE-NAME) (startTagName STRING))
+  (let ((stream (new FILE-INPUT-STREAM :filename file)))
+    (loop
+      (exception-case
+          (when (null? (read-xml-expression stream startTagName))
+            (break))
+        (READ-EXCEPTION (e) NULL)))
+    (free stream)))
+
+(defun test-xml-expressions ((file FILE-NAME) (regionTag CONS))
+  ;; For example, call this like this
+  ;;     (test-xml-expressions "logFile.xml" (unstringify "(|logfile|)"))
+  ;; to read the entries of a CoABS Grid log file.
+  ;; In Lisp on the IBM TP770, this parses about 1Meg/sec.
+  (let ((expressions
+         (XML-expressions (new FILE-INPUT-STREAM :filename file) regionTag))
+        (counter 0))
+    (loop
+      (exception-case
+          (if (next? expressions)
+              (++ counter)
+            (break))
+        (READ-EXCEPTION (e) NULL)))
+    (print "Read " counter " well-formed expressions." EOL)))
+|#
+
+
+
+    
+#|
+;; More interesting TESTS:
+
+(defun (read-and-transform-xml OBJECT) ((filename STRING))
+  (let ((in (new FILE-INPUT-STREAM :filename filename)))
+    (return
+       (Read-XML-expression in NULL))))
+
+(read-and-transform-xml "/home/tar/stella/rdf/dc-example1.xml")
+(read-and-transform-xml "nitro.isi.edu:tar:stella:rdf:dc-example1.xml")
+
+;; =>
+(<rdf:RDF>
+ (<xmlns:rdf> |L|"http://www.w3.org/1999/02/22-rdf-syntax-ns#" <xmlns:dc>
+  |L|"http://purl.org/metadata/dublin_core#")
+ (<rdf:Description> (<about> |L|"http://www.dlib.org")
+  (<dc:Title> () |L|"D-Lib Program - Research in Digital Libraries")
+  (<dc:Description> () |L|"The D-Lib program supports the community of people
+     with research interests in digital libraries and electronic
+     publishing.")
+  (<dc:Publisher> () |L|"Corporation For National Research Initiatives")
+  (<dc:Date> () |L|"1995-01-07")
+  (<dc:Subject> ()
+   (<rdf:Bag> () (<rdf:li> () |L|"Research; statistical methods")
+    (<rdf:li> () |L|"Education, research, related topics")
+    (<rdf:li> () |L|"Library use Studies")))
+  (<dc:Type> () |L|"World Wide Web Home Page") (<dc:Format> () |L|"text/html")
+  (<dc:Language> () |L|"en")))
+
+
+;; ==================
+
+(read-and-transform-xml "/home/tar/stella/rdf/book-example.xml")
+(read-and-transform-xml "nitro.isi.edu:tar:stella:rdf:book-example.xml")
+
+;; => 
+(<section> (<xmlns> |L|"urn:com:books-r-us")
+ (<title> () |L|"Book-Signing Event")
+ (<signing> () 
+  (<author> (<title> |L|"Mr" <name> |L|"Vikram Seth"))
+  (<book> (<title> |L|"A Suitable Boy" <price> |L|"$22.95"))))
+
+;; ==================
+
+(read-and-transform-xml "/home/tar/stella/rdf/reservation-example.xml")
+(read-and-transform-xml "nitro.isi.edu:tar:stella:rdf:reservation-example.xml")
+
+;; => 
+(<RESERVATION> (<xmlns:HTML> |L|"http://www.w3.org/TR/REC-html40")
+ (<NAME> (<HTML:CLASS> |L|"largeSansSerif") |L|"Layman, A")
+ (<SEAT> (<CLASS> |L|"Y" <HTML:CLASS> |L|"largeMonotype") |L|"33B")
+ (<HTML:A> (<HREF> |L|"/cgi-bin/ResStatus") |L|"Check Status")
+ (<DEPARTURE> () |L|"1997-05-24T07:55:00+1"))
+
+;;  *****************
+
+(defun (read-xml-expressions CONS) ((filename STRING))
+  (let ((in (new FILE-INPUT-STREAM :filename filename))
+	(results NIL))
+    (unwind-protect 
+	(setq results (collect item in (xml-expressions in NULL)))
+      (free in))
+    (return results)))
+|#
+

@@ -1,0 +1,1154 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: memoize.ste,v 1.13 2003/09/30 00:41:14 hans Exp
+
+;;; Memoization support
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+
+;;; TO DO:
+;;; - implement more elaborate timestamp scheme that allows memo tables
+;;;   to lazily check a list of timestamp surrogates.
+;;; - unify timestamp handling with the one used for `inferable?' and
+;;;   disjointness computations in PowerLoom
+;;; - right now we have size limited (MRU) as well as unlimited memo tables -
+;;;   should we get rid of the unlimited kind?
+
+(defclass MEMOIZATION-TABLE (STANDARD-OBJECT)
+  :documentation "Table that maps argument values onto computed results for
+one individual memoization site."
+  :slots ((hash-table
+           :type (INTEGER-HASH-TABLE OF INTEGER (CONS OF CONS))
+           :documentation "The table holding the memoized values.
+We use an integer table, since we explicitly compute a hash code by combining
+hash codes of argument values.")
+          (table-name
+           :type SURROGATE
+           :documentation "The surrogate used to point to this table.
+Used at the memoization site for quick memo table lookup.")
+          (current-timestamp
+           :type CONS
+           :documentation "Marker value used to indicate valid memoized entries.
+This marker changes everytime one of the `timestamps' gets bumped.")
+          (timestamps
+           :type (CONS OF KEYWORD) :initially NIL
+           :documentation "Names of timestamps that trigger invalidation of
+memoized entries when they get bumped.")))
+
+(defglobal *all-memoization-tables* (LIST OF MEMOIZATION-TABLE) (new LIST)
+  :documentation "Holds all currently active memoization tables for timestamp
+maintenance and clearance purposes.")
+
+;; switch for debugging and benchmarking (SHOULD THIS BE AN ENVIRONMENT FEATURE?):
+(defglobal *memoization-enabled?* BOOLEAN TRUE)
+
+(defun enable-memoization ()
+  :command? TRUE :public? TRUE
+  :documentation "Enable memoization and use of memoized expression results."
+  (setq *memoization-enabled?* TRUE))
+
+(defun disable-memoization ()
+  :command? TRUE :public? TRUE
+  :documentation "Enable memoization and use of memoized expression results."
+  (setq *memoization-enabled?* FALSE))
+
+(defconstant MEMOIZED-NULL-VALUE SYMBOL
+             (new SYMBOL
+                  :symbol-name "MEMOIZED-NULL-VALUE"
+                  :home-context NULL)
+  :documentation "Used by memoization to indicate that a NULL value
+was cached.  Needed to distinguish between an undefined value and a
+cached NULL.")
+
+;;; for benchmarking:
+(defglobal *total-memoization-lookups* INTEGER 0)
+(defglobal *failed-memoization-lookups* INTEGER 0)
+
+
+;;; For maximum efficiency we use specialized functions for the 1-to-4 argument
+;;;    case to avoid having to cons up an argument tuple for hashing and
+;;;    comparison.  For those functions, the first unused argument parameter
+;;;    is indicated by using MEMOIZED-NULL-VALUE as a sentinel (testing for that
+;;;    is cheaper than using an argument count).
+;;; For 5 arguments and above, we use general purpose functions indicated with
+;;;    an `N' suffix.
+
+;;; Argument hashing:
+
+(defun (hash-memoized-arguments INTEGER)
+    ((arg1 OBJECT) (arg2 OBJECT) (arg3 OBJECT) (arg4 OBJECT) (eqVector INTEGER))
+  ;; Specialized argument hash function for the 1-to-4-argument case.
+  ;; Generate a suitable hash code for the argument tuple `(arg1 ... arg4)'
+  ;;    and return the result (it is important that different permutations of
+  ;;    the same arguments are properly hashed apart).
+  ;; If less than four arguments are used, the first unused argument must be
+  ;;    bound to MEMOIZED-NULL-VALUE, all remaining arguments will be ignored.
+  ;; `eqVector' is a bit vector representing which argument is a proper
+  ;;    object and can be hashed with the cheaper `object-hash-code' function.
+  ;;    If it is <0, all arguments are assumed to be proper objects.
+  (let ((hashCode 0))
+    (cond
+     ((< eqVector 0)
+      ;; we can use `object-hash-code' on all arguments:
+      (when (null? arg1)
+        (setq arg1 MEMOIZED-NULL-VALUE))
+      (setq hashCode (object-hash-code arg1))
+      (loop
+        ;; we use `MEMOIZED-NULL-VALUE' as a sentinel instead of an argcount:
+        (when (eql? arg2 MEMOIZED-NULL-VALUE)
+          (break))
+        (when (null? arg2)
+          (setq arg2 MEMOIZED-NULL-VALUE))
+        ;; Since XOR is commutative, we rotate right to make
+        ;;    the tuple hash code depend on the argument order:
+        (setq hashCode (rotate-hash-code hashCode))
+        (setq hashCode (logxor hashCode (object-hash-code arg2)))
+        (when (eql? arg3 MEMOIZED-NULL-VALUE)
+          (break))
+        (when (null? arg3)
+          (setq arg3 MEMOIZED-NULL-VALUE))
+        (setq hashCode (rotate-hash-code hashCode))
+        (setq hashCode (logxor hashCode (object-hash-code arg3)))
+        (when (eql? arg4 MEMOIZED-NULL-VALUE)
+          (break))
+        (when (null? arg4)
+          (setq arg4 MEMOIZED-NULL-VALUE))
+        (setq hashCode (rotate-hash-code hashCode))
+        (setq hashCode (logxor hashCode (object-hash-code arg4)))
+        (break)))
+     (otherwise
+      ;; use `object-hash-code' for those args indicated by `eqVector':
+      (when (null? arg1)
+        (setq arg1 MEMOIZED-NULL-VALUE))
+      (setq hashCode
+        (choose (= (logand eqVector 1) 0)
+                (hash-code arg1)
+                (object-hash-code arg1)))
+      (loop
+        ;; we use `MEMOIZED-NULL-VALUE' as a sentinel instead of an argcount:
+        (when (eql? arg2 MEMOIZED-NULL-VALUE)
+          (break))
+        (when (null? arg2)
+          (setq arg2 MEMOIZED-NULL-VALUE))
+        ;; Since XOR is commutative, we roatate right to make
+        ;;    the tuple hash code depend on the argument order:
+        (setq hashCode (rotate-hash-code hashCode))
+        (setq hashCode
+          (logxor hashCode
+                  (choose (= (logand eqVector 2) 0)
+                          (hash-code arg2)
+                          (object-hash-code arg2))))
+        (when (eql? arg3 MEMOIZED-NULL-VALUE)
+          (break))
+        (when (null? arg3)
+          (setq arg3 MEMOIZED-NULL-VALUE))
+        (setq hashCode (rotate-hash-code hashCode))
+        (setq hashCode
+          (logxor hashCode
+                  (choose (= (logand eqVector 4) 0)
+                          (hash-code arg3)
+                          (object-hash-code arg3))))
+        (when (eql? arg4 MEMOIZED-NULL-VALUE)
+          (break))
+        (when (null? arg4)
+          (setq arg4 MEMOIZED-NULL-VALUE))
+        (setq hashCode (rotate-hash-code hashCode))
+        (setq hashCode
+          (logxor hashCode
+                  (choose (= (logand eqVector 8) 0)
+                          (hash-code arg4)
+                          (object-hash-code arg4))))
+        (break))))
+    (return hashCode)))
+
+(defun (hash-memoized-argumentsN INTEGER) ((tuple CONS) (eqVector INTEGER))
+  ;; Specialized argument hash function for the N-argument case.
+  ;; See `hash-memoized-arguments'.
+  (let ((hashCode 0))
+    (cond
+     ((< eqVector 0)
+      ;; we can use `object-hash-code' on all arguments:
+      (foreach arg in tuple
+          do (when (null? arg)
+               (setq arg MEMOIZED-NULL-VALUE))
+             ;; Since XOR is commutative, we rotate right to make
+             ;;    the tuple hash code depend on the argument order:
+             (setq hashCode (rotate-hash-code hashCode))
+             (setq hashCode (logxor hashCode (object-hash-code arg)))))
+     (otherwise
+      ;; use `object-hash-code' for those args indicated by `eqVector':
+      (foreach arg in tuple
+          do (when (null? arg)
+               (setq arg MEMOIZED-NULL-VALUE))
+             ;; Since XOR is commutative, we rotate right to make
+             ;;    the tuple hash code depend on the argument order:
+             (setq hashCode (rotate-hash-code hashCode))
+             (setq hashCode
+               (logxor hashCode
+                       (choose (= (logand eqVector 1) 0)
+                               (hash-code arg)
+                               (object-hash-code arg))))
+             (setq eqVector (shift-right eqVector 1)))))
+    (return hashCode)))
+
+
+;;; Creating and accessing memoized entries:
+
+(defun (make-memoized-value-entry (CONS OF CONS))
+    ((value OBJECT) (arg1 OBJECT) (arg2 OBJECT) (arg3 OBJECT) (arg4 OBJECT))
+  ;; Specialized memoization entry creator for the 1-to-4-argument case.
+  ;; Create a memoization entry that maps the arguments `arg1' to `arg4' onto
+  ;;    the result `value'.
+  ;; If less than four arguments are used, the first unused argument must be
+  ;;    bound to MEMOIZED-NULL-VALUE, all remaining arguments will be ignored.
+  (let ((entry NIL)
+        (cursor NIL)
+        (cell NIL))
+    (setq entry (make CONS))
+    (setf (value entry) value)
+    (setq cell (make CONS))
+    (setf (rest entry) cell)
+    (setf (value cell) arg1)
+    (when (eql? arg2 MEMOIZED-NULL-VALUE)
+      (setf (rest cell) NIL)
+      (return entry))
+    ;; NOTE: We need the extra variable, since
+    ;;          `(setf (rest cursor) (setq cursor (make CONS)))'
+    ;;       won't do the right thing in C++:
+    (setq cursor cell)
+    (setq cell (make CONS))
+    (setf (rest cursor) cell)
+    (setf (value cell) arg2)
+    (when (eql? arg3 MEMOIZED-NULL-VALUE)
+      (setf (rest cell) NIL)
+      (return entry))
+    (setq cursor cell)
+    (setq cell (make CONS))
+    (setf (rest cursor) cell)
+    (setf (value cell) arg3)
+    (when (eql? arg4 MEMOIZED-NULL-VALUE)
+      (setf (rest cell) NIL)
+      (return entry))
+    (setq cursor cell)
+    (setq cell (make CONS))
+    (setf (rest cursor) cell)
+    (setf (value cell) arg4)
+    (setf (rest cell) NIL)
+    (return entry)))
+
+(defun (make-memoized-value-entryN (CONS OF CONS)) ((value OBJECT) (args CONS))
+  ;; Specialized memoization entry creator for the N-argument case.
+  ;; See `make-memoized-value-entry'.
+  :globally-inline? TRUE
+  (return (cons value args)))
+
+(defun (find-memoized-value-entry CONS) ((bucket (CONS OF CONS))
+                                         (arg1 OBJECT) (arg2 OBJECT)
+                                         (arg3 OBJECT) (arg4 OBJECT)
+                                         (eqVector INTEGER)
+                                         (deleteEntry? BOOLEAN))
+  ;; Specialized memoization entry finder for the 1-to-4-argument case.
+  ;; Try to find a memoized entry in `bucket' with arguments `arg1' ... `arg4'
+  ;;    and return the result (or NULL if no entry could be found).
+  ;; Assumes a `bucket' of the form
+  ;;       (<timestamp> <entry1> ... <entryN>)
+  ;;    where each element is a CONS.
+  ;; If less than four arguments are used, the first unused argument must be
+  ;;    bound to MEMOIZED-NULL-VALUE, all remaining arguments will be ignored.
+  ;; `eqVector' is a bit vector representing which argument is a proper
+  ;;    object and can be compared with a cheap EQ? test.  If it is <0, all
+  ;;    arguments are assumed to be proper objects.
+  ;; If `deleteEntry?' is true, the found entry will be destructively removed
+  ;;    from `bucket' (this supports MRU memoization).
+  (let ((entries (rest bucket))
+        (args NIL)
+        (result CONS NULL))
+    (cond ((< eqVector 0)
+           ;; we can use an EQ? test on all arguments:
+           (while (non-empty? entries)
+             (setq args (rest (value entries)))
+             (when (eq? (first args) arg1)
+               (when (eql? arg2 MEMOIZED-NULL-VALUE)
+                 (setq result (value entries))
+                 (break))
+               (setq args (rest args))
+               (when (eq? (first args) arg2)
+                 (when (eql? arg3 MEMOIZED-NULL-VALUE)
+                   (setq result (value entries))
+                   (break))
+                 (setq args (rest args))
+                 (when (eq? (first args) arg3)
+                   (when (eql? arg4 MEMOIZED-NULL-VALUE)
+                     (setq result (value entries))
+                     (break))
+                   (setq args (rest args))
+                   (when (eq? (first args) arg4)
+                     (setq result (value entries))
+                     (break)))))
+             (setq entries (rest entries))))
+          (otherwise
+           ;; we have to look at the `eqVector' and use EQL? if necessary:
+           (let ((arg OBJECT NULL))
+             (while (non-empty? entries)
+               (setq args (rest (value entries)))
+               (setq arg (first args))
+               (when (or (eq? arg arg1)
+                         (and (= (logand eqVector 1) 0)
+                              ;; hand-inline EQL? test here:
+                              (defined? arg)
+                              (defined? arg1)
+                              (object-eql? arg arg1)))
+                 (when (eql? arg2 MEMOIZED-NULL-VALUE)
+                   (setq result (value entries))
+                   (break))
+                 (setq args (rest args))
+                 (setq arg (first args))
+                 (when (or (eq? arg arg2)
+                           (and (= (logand eqVector 2) 0)
+                                (defined? arg)
+                                (defined? arg2)
+                                (object-eql? arg arg2)))
+                   (when (eql? arg3 MEMOIZED-NULL-VALUE)
+                     (setq result (value entries))
+                     (break))
+                   (setq args (rest args))
+                   (setq arg (first args))
+                   (when (or (eq? arg arg3)
+                             (and (= (logand eqVector 4) 0)
+                                  (defined? arg)
+                                  (defined? arg3)
+                                  (object-eql? arg arg3)))
+                     (when (eql? arg4 MEMOIZED-NULL-VALUE)
+                       (setq result (value entries))
+                       (break))
+                     (setq args (rest args))
+                     (setq arg (first args))
+                     (when (or (eq? arg arg4)
+                               (and (= (logand eqVector 8) 0)
+                                    (defined? arg)
+                                    (defined? arg4)
+                                    (object-eql? arg arg4)))
+                       (setq result (value entries))
+                       (break)))))
+               (setq entries (rest entries))))))
+    (when (and deleteEntry?
+               (defined? result))
+      ;; cut out the entry we found (move the first remaining entry to
+      ;;    the now free position):
+      (setf (value entries) (value (rest bucket)))
+      (when (empty? (setf (rest bucket) (rest (rest bucket))))
+        ;; we hit the last entry:
+        (setf (rest bucket) NIL)))
+    (return result)))
+
+(defun (find-memoized-value-entryN CONS) ((bucket (CONS OF CONS))
+                                          (tuple CONS)
+                                          (eqVector INTEGER)
+                                          (deleteEntry? BOOLEAN))
+  ;; Specialized memoization entry finder for the N-argument case.
+  ;; See `find-memoized-value-entry'.
+  (let ((entries (rest bucket))
+        (result CONS NULL))
+    (cond ((< eqVector 0)
+           ;; we can use an EQ? test on all arguments:
+           (while (non-empty? entries)
+             (when (forall entryArg in (rest (value entries))
+                       as inputArg in tuple
+                       always (eq? entryArg inputArg))
+               (setq result (value entries))
+               (break))
+             (setq entries (rest entries))))
+          (otherwise
+           ;; we have to look at the `eqVector' and use EQL? if necessary:
+           (while (non-empty? entries)
+             (setq result (value entries))
+             (foreach entryArg in (rest result)
+                 as inputArg in tuple
+                 do (cond ((or (eq? entryArg inputArg)
+                               (and (= (logand eqVector 1) 0)
+                                    (eql? entryArg inputArg)))
+                           (setq eqVector (shift-right eqVector 1)))
+                          (otherwise
+                           (setq result NULL)
+                           (break))))
+             (if (defined? result)
+                 (break)
+               (setq entries (rest entries))))))
+    (when (and deleteEntry?
+               (defined? result))
+      ;; cut out the entry we found (move the first remaining entry
+      ;;    to the now free position):
+      (setf (value entries) (value (rest bucket)))
+      (when (empty? (setf (rest bucket) (rest (rest bucket))))
+        ;; we hit the last entry:
+        (setf (rest bucket) NIL)))
+    (return result)))
+
+
+;;; Memoized value lookup:
+
+(defun (lookup-memoized-value CONS) ((memoTable MEMOIZATION-TABLE)
+                                     (arg1 OBJECT) (arg2 OBJECT)
+                                     (arg3 OBJECT) (arg4 OBJECT)
+                                     (eqVector INTEGER))
+  ;; Specialized lookup function for the 1-to-4-argument case.
+  ;; Lookup a memoized value for `argX's in `memoTable' and return a reference
+  ;;    to it.  If no value has been memoized yet, create a new reference.
+  ;; The reference is a CONS whose value slot points at the memoized
+  ;;    value.  If the value is NULL, it can be set to the computed value at
+  ;;    the memoization site without having to hash a second time.
+  ;; If the value is MEMOIZED-NULL-VALUE, it indicates that we memoized a
+  ;;    NULL value.
+  ;; If less than four arguments are used, the first unused argument must
+  ;;    be bound to MEMOIZED-NULL-VALUE, all remaining arguments will be
+  ;;    ignored.
+  ;; `eqVector' is a bit vector representing which argument is a proper
+  ;;    object and can be tested/hashed with a cheap EQ? test/hash.  If it
+  ;;    is <0, all arguments are assumed to be proper objects.
+  (let ((hashTable (hash-table memoTable))
+        (timeStamp CONS NULL)
+        (hashCode 0)
+        (entry NIL)
+        (bucket (CONS OF CONS) NIL))
+    (when (null? hashTable)
+      (setq hashTable (new INTEGER-HASH-TABLE))
+      (setf (hash-table memoTable) hashTable)
+      (setf (current-timestamp memoTable) (cons NULL NIL)))
+    (setq timeStamp (current-timestamp memoTable))
+
+    (setq hashCode (hash-memoized-arguments arg1 arg2 arg3 arg4 eqVector))
+
+    ;; lookup a memoized value:
+    ;(++ *total-memoization-lookups*)
+    (setq bucket (lookup hashTable hashCode))
+    (when (defined? bucket)
+      (cond
+       ((eql? (first bucket) timeStamp)
+        (setq entry
+          (find-memoized-value-entry
+           bucket arg1 arg2 arg3 arg4 eqVector FALSE))
+        (when (defined? entry)
+          (return entry)))
+       (otherwise
+        ;; timestamp has been bumped, discard old entries:
+        (setf (value bucket) timeStamp)
+        (setf (rest bucket) NIL))))
+    ;(++ *failed-memoization-lookups*)
+    
+    ;; build a new entry with a value slot initialized to NULL:
+    (setq entry (make-memoized-value-entry NULL arg1 arg2 arg3 arg4))
+    (if (defined? bucket)
+        ;; insert destructively instead of hashing again:
+        (setf (rest bucket) (cons entry (rest bucket)))
+      (insert-at hashTable hashCode (cons timeStamp (cons entry NIL))))
+    (return entry)))
+
+(defun (lookup-memoized-valueN CONS) ((memoTable MEMOIZATION-TABLE)
+                                      (args CONS)
+                                      (eqVector INTEGER))
+  ;; Specialized lookup function for the N-argument case.
+  ;; See `lookup-memoized-value1'.
+  (let ((hashTable (hash-table memoTable))
+        (timeStamp CONS NULL)
+        (hashCode 0)
+        (entry NIL)
+        (bucket (CONS OF CONS) NIL))
+    (when (null? hashTable)
+      (setq hashTable (new INTEGER-HASH-TABLE))
+      (setf (hash-table memoTable) hashTable)
+      (setf (current-timestamp memoTable) (cons NULL NIL)))
+    (setq timeStamp (current-timestamp memoTable))
+
+    (setq hashCode (hash-memoized-argumentsN args eqVector))
+    
+    ;; lookup a memoized value:
+    ;(++ *total-memoization-lookups*)
+    (setq bucket (lookup hashTable hashCode))
+    (when (defined? bucket)
+      (cond
+       ((eql? (first bucket) timeStamp)
+        (setq entry
+          (find-memoized-value-entryN bucket args eqVector FALSE))
+        (when (defined? entry)
+          (return entry)))
+       (otherwise
+        ;; timestamp has been bumped, discard old entries:
+        (setf (value bucket) timeStamp)
+        (setf (rest bucket) NIL))))
+    ;(++ *failed-memoization-lookups*)
+
+    ;; build a new entry with a value slot initialized to NULL:
+    (setq entry (cons NULL args))
+    (if (defined? bucket)
+        ;; insert destructively instead of hashing again:
+        (setf (rest bucket) (cons entry (rest bucket)))
+      (insert-at hashTable hashCode (cons timeStamp (cons entry NIL))))
+    (return entry)))
+
+  ;;
+;;;;;; MRU memoization tables
+  ;;
+
+;;; MRU memoization tables are size limited and only keep the most recently
+;;;    used memoized entries around.  Less recently used entries are discarded
+;;;    and have to be recomputed when needed again.
+
+(defclass MRU-MEMOIZATION-TABLE (MEMOIZATION-TABLE)
+  :slots ((mru-buckets-vector :type (VECTOR OF (CONS OF CONS)))
+          (lru-buckets-vector :type (VECTOR OF (CONS OF CONS)))
+          ;; use a separate slot for the array to save the indirection:
+          (mru-buckets :type (NATIVE-VECTOR OF (CONS OF CONS)))
+          (lru-buckets :type (NATIVE-VECTOR OF (CONS OF CONS)))
+          (mru-timestamp :type CONS)
+          (lru-timestamp :type CONS)
+          (nof-buckets :type INTEGER)
+          (free-entries :type INTEGER)
+          (max-entries :type INTEGER)))
+
+(defun initialize-MRU-bucket-tables ((memoTable MRU-MEMOIZATION-TABLE))
+  ;; Initialize the bucket tables of `memoTable'.
+  (setf (nof-buckets memoTable)
+    ;; somewhat generous, but we want short collision chains:
+    (pick-hash-table-size-prime (max-entries memoTable)))
+  (setf (mru-buckets-vector memoTable)
+    (new VECTOR :array-size (nof-buckets memoTable)))
+  (setf (lru-buckets-vector memoTable)
+    (new VECTOR :array-size (nof-buckets memoTable)))
+  (setf (mru-buckets memoTable) (the-array (mru-buckets-vector memoTable)))
+  (setf (lru-buckets memoTable) (the-array (lru-buckets-vector memoTable)))
+  (setf (free-entries memoTable) (max-entries memoTable))
+  (setf (current-timestamp memoTable) (cons NULL NIL))
+  (setf (mru-timestamp memoTable) (current-timestamp memoTable))
+  (setf (lru-timestamp memoTable) (current-timestamp memoTable)))
+
+(defun (lookup-mru-memoized-value CONS) ((memoTable MRU-MEMOIZATION-TABLE)
+                                         (arg1 OBJECT) (arg2 OBJECT)
+                                         (arg3 OBJECT) (arg4 OBJECT)
+                                         (eqVector INTEGER))
+  ;; Specialized MRU lookup function for the 1-to-4-argument case.
+  ;; See `lookup-memoized-value'.
+  (let ((mruBuckets (mru-buckets memoTable))
+        (lruBuckets NATIVE-VECTOR NULL)
+        (mruBucket (CONS OF CONS) NIL)
+        (lruBucket (CONS OF CONS) NIL)
+        (mruTimeStamp CONS NULL)
+        (hashCode 0)
+        (bucketIndex 0)
+        (entry CONS NULL))
+    
+    (when (null? mruBuckets)
+      (initialize-MRU-bucket-tables memoTable)
+      (setq mruBuckets (mru-buckets memoTable)))
+
+    (setq mruTimeStamp (mru-timestamp memoTable))
+    (when (not (eql? (current-timestamp memoTable) mruTimeStamp))
+      ;; Memo table timestamp has been bumped, discard all memoized
+      ;;    entries by bumping bucket table timestamps:
+      (setq mruTimeStamp (current-timestamp memoTable))
+      (setf (mru-timestamp memoTable) mruTimeStamp)
+      (setf (lru-timestamp memoTable) mruTimeStamp)
+      (setf (free-entries memoTable) (max-entries memoTable)))
+
+    (setq hashCode (hash-memoized-arguments arg1 arg2 arg3 arg4 eqVector))
+    
+    ;; lookup a memoized value - try most recently used entries first
+    ;;    (any valid entry on the MRU side has been used more recently
+    ;;    than any valid entry on the LRU side):
+    ;(++ *total-memoization-lookups*)
+    (setq bucketIndex (hashmod hashCode (nof-buckets memoTable)))
+    (setq mruBucket (nth mruBuckets bucketIndex))
+    (when (defined? mruBucket)
+      (cond
+       ((eql? (first mruBucket) mruTimeStamp)
+        (setq entry
+          (find-memoized-value-entry
+           mruBucket arg1 arg2 arg3 arg4 eqVector FALSE))
+        (when (defined? entry)
+          (return entry)))
+       (otherwise
+        ;; timestamp has been bumped, discard old entries - keep the bucket
+        ;;    header, since it will be reused immediately:
+        (setf (value mruBucket) mruTimeStamp)
+        (setf (rest mruBucket) NIL))))
+
+    ;; nothing on the MRU side, try old (less recently used) entries:
+    (setq lruBuckets (lru-buckets memoTable))
+    (setq lruBucket (nth lruBuckets bucketIndex))
+    (when (defined? lruBucket)
+      (cond
+       ((eql? (first lruBucket) (lru-timestamp memoTable))
+        (setq entry
+          (find-memoized-value-entry
+           lruBucket arg1 arg2 arg3 arg4 eqVector TRUE)))
+       (otherwise
+        ;; timestamp has been bumped, discard old entries:
+        (setf (rest lruBucket) NIL))))
+
+    (when (null? entry)
+      ;; build a new entry with a value slot initialized to NULL:
+      ;(++ *failed-memoization-lookups*)
+      (setq entry (make-memoized-value-entry NULL arg1 arg2 arg3 arg4)))
+    (if (defined? mruBucket)
+        ;; insert destructively:
+        (setf (rest mruBucket) (cons entry (rest mruBucket)))
+      (setf (nth mruBuckets bucketIndex)
+        (cons mruTimeStamp (cons entry NIL))))
+    
+    (when (= (-- (free-entries memoTable)) 0)
+      ;; We've accumulated `max-entries' on the MRU side; discard the LRU
+      ;;    side (by bumping the timestamp) and switch bucket tables:
+      (setf (mru-buckets memoTable) lruBuckets)
+      (setf (lru-buckets memoTable) mruBuckets)
+      (setf (mru-timestamp memoTable) (cons NULL NIL))
+      (setf (current-timestamp memoTable) (mru-timestamp memoTable))
+      (setf (lru-timestamp memoTable) mruTimeStamp)
+      (setf (free-entries memoTable) (max-entries memoTable)))
+    (return entry)))
+
+(defun (lookup-mru-memoized-valueN CONS)
+    ((memoTable MRU-MEMOIZATION-TABLE) (args CONS) (eqVector INTEGER))
+  ;; Specialized MRU lookup function for the N-argument case.
+  ;; See `lookup-memoized-value'.
+  (let ((mruBuckets (mru-buckets memoTable))
+        (lruBuckets NATIVE-VECTOR NULL)
+        (mruBucket (CONS OF CONS) NIL)
+        (lruBucket (CONS OF CONS) NIL)
+        (mruTimeStamp CONS NULL)
+        (hashCode 0)
+        (bucketIndex 0)
+        (entry CONS NULL))
+    
+    (when (null? mruBuckets)
+      (initialize-MRU-bucket-tables memoTable)
+      (setq mruBuckets (mru-buckets memoTable)))
+
+    (setq mruTimeStamp (mru-timestamp memoTable))
+    (when (not (eql? (current-timestamp memoTable) mruTimeStamp))
+      ;; Memo table timestamp has been bumped, discard all memoized
+      ;;    entries by bumping bucket table timestamps:
+      (setq mruTimeStamp (current-timestamp memoTable))
+      (setf (mru-timestamp memoTable) mruTimeStamp)
+      (setf (lru-timestamp memoTable) mruTimeStamp)
+      (setf (free-entries memoTable) (max-entries memoTable)))
+
+    (setq hashCode (hash-memoized-argumentsN args eqVector))
+    
+    ;; lookup a memoized value - try most recently used entries first
+    ;;    (any valid entry on the MRU side has been used more recently
+    ;;    than any valid entry on the LRU side):
+    ;(++ *total-memoization-lookups*)
+    (setq bucketIndex (hashmod hashCode (nof-buckets memoTable)))
+    (setq mruBucket (nth mruBuckets bucketIndex))
+    (when (defined? mruBucket)
+      (cond
+       ((eql? (first mruBucket) mruTimeStamp)
+        (setq entry (find-memoized-value-entryN mruBucket args eqVector FALSE))
+        (when (defined? entry)
+          (return entry)))
+       (otherwise
+        ;; timestamp has been bumped, discard old entries - keep the bucket
+        ;;    header, since it will be reused immediately:
+        (setf (value mruBucket) mruTimeStamp)
+        (setf (rest mruBucket) NIL))))
+
+    ;; nothing on the MRU side, try old (less recently used) entries:
+    (setq lruBuckets (lru-buckets memoTable))
+    (setq lruBucket (nth lruBuckets bucketIndex))
+    (when (defined? lruBucket)
+      (cond
+       ((eql? (first lruBucket) (lru-timestamp memoTable))
+        (setq entry (find-memoized-value-entryN lruBucket args eqVector TRUE)))
+       (otherwise
+        ;; timestamp has been bumped, discard old entries:
+        (setf (rest lruBucket) NIL))))
+
+    (when (null? entry)
+      ;; build a new entry with a value slot initialized to NULL:
+      ;(++ *failed-memoization-lookups*)
+      ;;; SPECIFIC TO LOOKUP ARGUMENT SIGNATURE:
+      (setq entry (cons NULL args)))
+    (if (defined? mruBucket)
+        ;; insert destructively:
+        (setf (rest mruBucket) (cons entry (rest mruBucket)))
+      (setf (nth mruBuckets bucketIndex)
+        (cons mruTimeStamp (cons entry NIL))))
+    
+    (when (= (-- (free-entries memoTable)) 0)
+      ;; We've accumulated `max-entries' on the MRU side; discard the LRU
+      ;;    side (by bumping the timestamp) and switch bucket tables:
+      (setf (mru-buckets memoTable) lruBuckets)
+      (setf (lru-buckets memoTable) mruBuckets)
+      (setf (mru-timestamp memoTable) (cons NULL NIL))
+      (setf (current-timestamp memoTable) (mru-timestamp memoTable))
+      (setf (lru-timestamp memoTable) mruTimeStamp)
+      (setf (free-entries memoTable) (max-entries memoTable)))
+    (return entry)))
+
+
+  ;;
+;;;;;; Top level
+  ;;
+
+(defun initialize-memoization-table ((memoTableSurrogate SURROGATE)
+                                     (options STRING))
+  ;; Create a new memoization table, initialize it according to `options'
+  ;;    and link it with `memoTableSurrogate'.
+  ;; `options' are assumed to be syntactically correct.
+  (let ((theOptions (new PROPERTY-LIST :the-plist (unstringify options)))
+        (oldTable (surrogate-value memoTableSurrogate))
+        (size INTEGER-WRAPPER (lookup theOptions :max-values))
+        (table
+         (choose (defined? size)
+                 (new MRU-MEMOIZATION-TABLE :max-entries size)
+                 (new MEMOIZATION-TABLE))))
+    (setf (table-name table) memoTableSurrogate)
+    (when (defined? (lookup theOptions :timestamps))
+      (setf (timestamps table) (lookup theOptions :timestamps)))
+    (remove *all-memoization-tables* oldTable)
+    (insert *all-memoization-tables* table)
+    (setf (surrogate-value memoTableSurrogate) table)))
+
+(defun clear-all-memoization-tables ()
+  ;; Clear all currently active memoization tables.  Useful to reclaim storage.
+  (foreach table in *all-memoization-tables*
+      do (setf (surrogate-value (table-name table)) NULL))
+  (clear *all-memoization-tables*))
+
+(defun clear-memoization-tables ((timestampName KEYWORD))
+  ;; Clear the hashtable of all active memo tables that specify `timestampName'
+  ;;    as one of their timestamp triggers.
+  (foreach table in *all-memoization-tables*
+      where (exists ts in (timestamps table)
+              where (eql? ts timestampName))
+      do (typecase table
+           (MRU-MEMOIZATION-TABLE
+            (when (defined? (mru-buckets-vector table))
+              (clear (mru-buckets-vector table)))
+            (when (defined? (lru-buckets-vector table))
+              (clear (lru-buckets-vector table)))
+            (setf (free-entries table) (max-entries table)))
+           (otherwise
+            (setf (hash-table table) NULL)))))
+
+(defun bump-memoization-timestamp ((timestampName KEYWORD))
+  ;; Bump the timestamp of all active memo tables that specify `timestampName'
+  ;;    as one of their timestamp triggers.
+  ;; NOTES:
+  ;; - We don't reinitialize the hash/bucket tables to keep clearance cost low.
+  ;;   For MRU tables that's fine, for unlimited tables the assumption is that
+  ;;   over time obsolete entries will clear out, but that won't always be the
+  ;;   case.  Calling `clear-memoization-tables' can remedy this.
+  ;; - If we have many tables and lots of bumping, it might be better to have
+  ;;   a lazy scheme where we bump the appropriate timestamp pointed at by a
+  ;;   timestamp surrogate, and the memotables also point at these timestamp
+  ;;   surrogates and check them whenever a lookup occurs.  Using a global
+  ;;   timestamp that advances whenever any timestamp advances could be used
+  ;;   to guard some of the timestamp checking overhead.
+  (foreach table in *all-memoization-tables*
+      where (exists ts in (timestamps table)
+              where (eql? ts timestampName))
+      do (setf (current-timestamp table) (cons NULL NIL))))
+
+(defun (make-memoization-table-surrogate SURROGATE) ((memoName SYMBOL))
+  ;; Create a memo table surrogate with name `memoName' (or an appropriate
+  ;;    gensyme if `memoName' is NULL) and return the result.
+  ;; If we ever use surrogates to point to timestamps, all these surrogates
+  ;;    should probably go into a special module.
+  (when (null? memoName)
+    (setq memoName
+      (choose
+       (defined? *methodBeingWalked*)
+       (local-gensym
+        (concatenate
+          (symbol-name (slot-name *methodBeingWalked*)) "-MEMO-TABLE"))
+       (gensym "MEMO-TABLE"))))
+  (return (surrogatify memoName)))
+
+(defun (parse-memoize-options PROPERTY-LIST) ((options CONS))
+  ;; Parse and validate memoize `options' and return the result.
+  (let ((givenOptions (new PROPERTY-LIST :the-plist options))
+        (parsedOptions (new PROPERTY-LIST)))
+    (foreach (key value) in givenOptions
+        do (case key
+             (:timestamps
+              (when (not (cons? value))
+                (setq value (cons value NIL)))
+              (if (not (forall ts in (cast value CONS)
+                           always (keyword? ts)))
+                  (walk-error "Illegal :timestamp value in memoize: " value)
+                (insert-at parsedOptions key value)))
+             (:name
+              (if (not (isa? value @GENERALIZED-SYMBOL))
+                  (walk-error "Illegal :name value in memoize: " value)
+                (insert-at parsedOptions key
+                           (make-memoization-table-surrogate
+                            (intern-derived-symbol
+                             value
+                             (symbol-name (cast value @GENERALIZED-SYMBOL)))))))
+             (:max-values
+              (if (not (integer? value))
+                  (walk-error "Illegal :max-values value in memoize: " value)
+                (insert-at parsedOptions key value)))
+             (otherwise
+              (walk-error "Illegal memoize option: " key))))
+    (return parsedOptions)))
+
+(defmacro memoize ((inputArgs CONS) &body (body CONS))
+  :documentation "Compute the value of an expression and memoize it relative to
+   the values of `inputArgs'.
+`inputArgs' should characterize the complete set of values upon which
+   the computation of the result depended.
+Calls to `memoize' should be of the form
+
+      (memoize (<arg>+) {:<option> <value>}* <expression>)
+
+   and have the status of an expression.
+   The following options are supported:
+
+      :timestamps   A single or list of keywords specifying the names of
+                    timestamps which when bumped should invalidate all
+                    entries currently memoized in this table.
+      :name         Names the memoization table so it can be shared by other
+                    memoization sites.  By default, a gensymed name is used.
+                    CAUTION: IT IS ASSUMED THAT ALL ENTRIES IN A MEMOZATION
+                    TABLE DEPEND ON THE SAME NUMBER OF ARGUMENTS!!
+      :max-values   The maximum number of values to be memoized.  Only the
+                    `:max-values' most recently used values will be kept
+                    in the memoization table, older values will be discarded
+                    and recomputed if needed.  Without a `:max-values'
+                    specification, the memoization table will grow
+                    indefinitely.
+
+PERFORMANCE NOTES: For most efficient lookup, input arguments that vary the most
+should be listed first.  Also, arguments of type STANDARD-OBJECT (and all its
+subtypes) can be memoized more efficiently than arguments of type OBJECT or
+wrapped literals (with the exception of BOOLEANs)."
+  :public? TRUE
+  (let ((memoName SURROGATE NULL)
+        (memoTableVar (local-gensym "MEMO-TABLE"))
+        (memoEntryVar (local-gensym "MEMOIZED-ENTRY"))
+        (memoValueVar (local-gensym "MEMOIZED-VALUE"))
+        (nofInputs (length inputArgs))
+        (options PROPERTY-LIST NULL)
+        (lookupFunction OBJECT NULL)
+        (lookupTree NIL)
+        (allEq? TRUE)
+        (eqVector 0))
+
+    ;; parse and validate options:
+    (setq body (cons NIL body))
+    (setq options (parse-memoize-options (extract-options body NULL)))
+    (setq body (rest body))
+    (setq memoName (lookup options :name))
+    (when (null? memoName)
+      (setq memoName (make-memoization-table-surrogate NULL)))
+    (foreach it on inputArgs
+        as index in (interval 0 NULL)
+        do (mv-bind (walkedArg type)
+               (walk-a-tree (value it))
+             (cond
+              ((or (sub-type-spec-of? type @STANDARD-OBJECT)
+                   (sub-type-spec-of? type @BOOLEAN-WRAPPER)
+                   (sub-type-spec-of? type @BOOLEAN))
+               ;; We have an argument that can be tested with EQ? or hashed
+               ;;    with `object-hash-code' (which is much faster since it
+               ;;    does not involve any method calls); only do this for the
+               ;;    first 12 arguments to avoid overflows:
+               (when (< index 12)
+                 (setq eqVector (logor eqVector (shift-left 1 index)))))
+              (otherwise
+               ;; at least one argument needs to be tested with EQL?:
+               (setq allEq? FALSE)))
+             (setf (value it) (sys-tree walkedArg type))))
+    
+    ;; Assemble the appropriate lookup form:
+    (setq lookupFunction
+      (choose (null? (lookup options :max-values))
+              (choose (<= nofInputs 4)
+                      (quote lookup-memoized-value)
+                      (quote lookup-memoized-valueN))
+              ;; otherwise, use an MRU table:
+              (choose (<= nofInputs 4)
+                      (quote lookup-mru-memoized-value)
+                      (quote lookup-mru-memoized-valueN))))
+    (case nofInputs
+      (0 (walk-error "Missing memoization input argument specification")
+         (return (walk-dont-call-me-tree body @OBJECT)))
+      (1 (setq lookupTree
+           (bquote (& lookupFunction & memoTableVar
+                    & (first inputArgs)
+                    MEMOIZED-NULL-VALUE NULL NULL
+                   & (choose allEq? -1 eqVector)))))
+      (2 (setq lookupTree
+           (bquote (& lookupFunction & memoTableVar
+                    & (first inputArgs)
+                    & (second inputArgs)
+                    MEMOIZED-NULL-VALUE NULL
+                    & (choose allEq? -1 eqVector)))))
+      (3 (setq lookupTree
+           (bquote (& lookupFunction & memoTableVar
+                    & (first inputArgs)
+                    & (second inputArgs)
+                    & (third inputArgs)
+                    MEMOIZED-NULL-VALUE
+                    & (choose allEq? -1 eqVector)))))
+      (4 (setq lookupTree
+           (bquote (& lookupFunction & memoTableVar
+                    & (first inputArgs)
+                    & (second inputArgs)
+                    & (third inputArgs)
+                    & (fourth inputArgs)
+                    & (choose allEq? -1 eqVector)))))
+      (otherwise
+       (setq lookupTree
+         (bquote (& lookupFunction & memoTableVar
+                  (cons-list && inputArgs)
+                  & (choose allEq? -1 eqVector))))))
+
+    ;; Put it all together:
+    (return
+      (bquote
+       (vrlet ((& memoTableVar MEMOIZATION-TABLE
+                  (surrogate-value & memoName))
+               (& memoEntryVar CONS NULL)
+               (& memoValueVar OBJECT NULL))
+         (when (null? & memoTableVar)
+           ;; first time around, initialize the table:
+           (initialize-memoization-table
+            & memoName & (stringify (the-plist options)))
+           (setq & memoTableVar (surrogate-value & memoName)))
+         (when *memoization-enabled?*
+           (setq & memoEntryVar & lookupTree)
+           (setq & memoValueVar (first & memoEntryVar)))
+         (cond
+          ((defined? & memoValueVar)
+           ;; A value has been memoized, see if it is NULL:
+           (when (eql? & memoValueVar MEMOIZED-NULL-VALUE)
+             (setq & memoValueVar NULL)))
+          (otherwise
+           ;; No value has been memoized; compute it and  memoize it:
+           (setq & memoValueVar && body)
+           (when *memoization-enabled?*
+             (setf (value & memoEntryVar)
+               (choose (null? & memoValueVar)
+                       MEMOIZED-NULL-VALUE
+                       & memoValueVar)))))
+         & memoValueVar)))))
+
+
+  ;;
+;;;;;; Memoizable iterators
+  ;;
+
+;;; TO DO:
+
+;;; - make this thread safe; however, since memoization tables also aren't
+;;;   thread safe, allocating them as thread locals might fix both issues
+;;;   at the same time.
+
+(defclass MEMOIZABLE-ITERATOR (ITERATOR)
+  :documentation
+  "Iterator class with value buffering that can be used to memoize some
+`base-iterator' without having to generate all its values first.  The
+memoized iterator needs to be cloned to allow multiple iterations over
+the collection represented by the memoized iterator.  Use the following
+idiom to memoize some arbitrary iterator and return a properly cloned value:
+	 
+ (clone-memoized-iterator
+   (memoize (...) <options>*
+            (new MEMOIZABLE-ITERATOR
+                 :base-iterator <base-iterator>)))
+	
+This will ensure that <base-iterator> is exhausted exactly once even if
+there are multiple clones for the same memoized value, and that each value
+is generated as late as absolutely possible.  THIS IS NOT YET THREAD SAFE!"
+  :public? TRUE
+  :slots ((base-iterator
+           :type ITERATOR :required? TRUE
+           :documentation "This slot is only needed to pass the base iterator
+to the constructor.  Once `self' is initialized it will be cleared.")
+          (iterator-and-values
+           :type CONS :initially NULL
+           :documentation "Holds the base iterator and the values generated
+so far.  This slot is structure shared between the memoized iterator and
+all its clones to make sure everybody sees any new values generated by
+any one of the clones, and that everybody can see when the base iterator
+is exhausted.")
+          (cursor
+           :type CONS :initially NULL
+           :documentation "Trailing cursor to the list of values generated
+so far.  Once the end of the list is reached this slot is used to add new
+values to the end of `iterator-and-values'."))
+  :initializer initialize-memoizable-iterator)
+
+(defmethod initialize-memoizable-iterator ((self MEMOIZABLE-ITERATOR))
+  ;; Initialize `self' by properly setting up `iterator-and-values' and
+  ;;    `cursor'.  This should only be done for the initially memoized
+  ;;    iterator, clones should be generated via `clone-memoized-iterator'.
+  (let ((iterAndValues (cons (base-iterator self) NIL)))
+    (setf (iterator-and-values self) iterAndValues)
+    (setf (cursor self) iterAndValues)
+    (setf (base-iterator self) NULL)))
+
+(defun (clone-memoized-iterator (ITERATOR OF (LIKE (any-value self))))
+    ((self MEMOIZABLE-ITERATOR))
+  :documentation "Clone the memoized iterator `self' so it can be used to
+iterate over the collection represented by `self', while allowing to iterate
+over it multiple times via multiple clones."
+  :public? TRUE
+  (let ((iterAndValues (iterator-and-values self)))
+    (cond ((defined? (value iterAndValues))
+           (let ((child (make MEMOIZABLE-ITERATOR)))
+             (setf (first-iteration? child) TRUE)
+             (setf (iterator-and-values child) iterAndValues)
+             (setf (cursor child) iterAndValues)
+             (return child)))
+          (otherwise
+           (return (allocate-iterator (rest iterAndValues)))))))
+
+(defmethod (allocate-iterator (ITERATOR OF (LIKE (any-value self))))
+    ((self MEMOIZABLE-ITERATOR))
+  :documentation "Alias for `clone-memoized-iterator'."
+  :public? TRUE
+  (return (clone-memoized-iterator self)))
+
+(defmethod (next? BOOLEAN) ((self MEMOIZABLE-ITERATOR))
+  :documentation "Generate the next value of the memoized iterator `self' (or
+one of its clones) by either using one of the values generated so far or by
+generating and saving the next value of the `base-iterator'."
+  :public? TRUE
+  (let ((iterator ITERATOR NULL)
+        (cursor (cursor self))
+        (values (rest cursor)))
+    (when (non-empty? values)
+      (setf (slot-value self value) (first values))
+      (setf (cursor self) values)
+      (return TRUE))
+    (setq iterator (first (iterator-and-values self)))
+    (when (defined? iterator)
+      (when (next? iterator)
+        (setf (slot-value self value) (value iterator))
+        (setf (rest cursor) (cons (slot-value self value) NIL))
+        (setf (cursor self) (rest cursor))
+        (return TRUE))
+      (setf (first (iterator-and-values self)) NULL))
+    (return FALSE)))
+
+#|
+
+  ;;
+;;;;;; Memoization experiments
+  ;;
+
+(defun (test-memoize1 INTEGER) ((arg INTEGER))
+  (return (memoize (arg) :max-values 10 :timestamps :test (1+ arg))))
+
+(defun (test-memoize2 INTEGER) ((arg1 INTEGER) (arg2 INTEGER))
+  (return (memoize (arg1 arg2) :timestamps :test :name :foo (+ arg1 arg2))))
+
+(defun (test-memoize3 INTEGER) ((arg1 INTEGER) (arg2 INTEGER) (arg3 INTEGER))
+  (return
+    (memoize (arg1 arg2 arg3)
+             :timestamps :test
+             (+ arg1 arg2 arg3))))
+
+(defun (test-memoize4 INTEGER) ((arg1 INTEGER) (arg2 INTEGER)
+                                (arg3 INTEGER) (arg4 INTEGER))
+  (return
+    (memoize (arg1 arg2 arg3 arg4)
+             :timestamps :test
+             (+ arg1 arg2 arg3 arg4))))
+
+(defun (test-memoize5 INTEGER) ((arg1 INTEGER) (arg2 INTEGER)
+                                (arg3 INTEGER) (arg4 INTEGER) (arg5 INTEGER))
+  (return
+    (memoize (arg1 arg2 arg3 arg4 arg5)
+             :timestamps :test
+             (+ arg1 arg2 arg3 arg4 arg5))))
+
+(defun (test-memoize-null OBJECT) ((arg1 OBJECT) (arg2 OBJECT))
+  (return (memoize (arg1 arg2)
+                   :timestamps :test
+                   (choose (null? arg2) arg1 NULL))))
+
+;; We are alreay memoizing `test-property?', but we could conceivably memoize
+;;    this too and have it depend on the less volatile :meta-kb-update timestamp:
+
+(defun (test-total? BOOLEAN) ((self DESCRIPTION)) 
+  (return
+   (memoize (self *context*)
+            :timestamps :meta-kb-update
+            (test-property? self PL-KERNEL/@total))))
+
+(defun time-memoize ((instances CONS) (n INTEGER))
+  (foreach i in (interval 1 n)
+      do (foreach inst in instances
+             do (test-isa? inst PL-KERNEL/@CLASS))))
+
+(defun print-memotable-stats ((table MRU-MEMOIZATION-TABLE))
+  (let ((mruTimeStamp (mru-timestamp table))
+        (lruTimeStamp (lru-timestamp table))
+        (buckets 0)
+        (totalLength 0)
+        (maxLength 0))
+    (foreach bu in (mru-buckets-vector table)
+        where (and (defined? bu)
+                   (eq? mruTimeStamp (first bu)))
+        do (++ buckets)
+           (when (> (1- (length bu)) maxLength)
+             (setq maxLength (1- (length bu))))
+           (++ totalLength (1- (length bu))))
+    (foreach bu in (lru-buckets-vector table)
+        where (and (defined? bu)
+                   (eq? lruTimeStamp (first bu)))
+        do (++ buckets)
+           (when (> (1- (length bu)) maxLength)
+             (setq maxLength (1- (length bu))))
+           (++ totalLength (1- (length bu))))
+    (print buckets " buckets" EOL
+           "max bucket length = " maxLength EOL
+           "avg bucket length = " (/ totalLength (* 1.0 buckets)) EOL)))
+|#

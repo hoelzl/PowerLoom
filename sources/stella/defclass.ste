@@ -1,0 +1,2000 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: defclass.ste,v 1.81 2003/04/18 21:14:46 hans Exp
+
+;;; Support for defining STELLA classes.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; 'yield-define-stella-class'
+  ;;
+
+(defun (type-to-null-value-tree OBJECT) ((type TYPE))
+  ;; Return a parse tree for the null value corresponding to the type 'type'.
+  (let ((class (type-to-class type)))
+    (when (and (defined? class)
+               (or (subtype-of? type @LITERAL)
+                   (subtype-of? type @SECOND-CLASS-OBJECT)))
+      ;; Literals and other native objects are supposed to have their
+      ;;    null value defined as an :initial-value on the class:
+      (let ((nullValue (initial-value class)))
+        (when (defined? nullValue)
+          (return (transientify-form nullValue)))))
+    (return (bquote NULL))))
+
+(defun (type-to-walked-null-value-tree OBJECT) ((type TYPE))
+  ;; Just like `type-to-null-value-tree' but also walks the result
+  ;;    before it gets returned.  This is sometimes necessary for
+  ;;    more complex NULL values, e.g., if they are defined via
+  ;;    `verbatim' clauses.
+  (let ((nullValue (type-to-null-value-tree type)))
+    (if (eql? nullValue (bquote NULL))
+        (return nullValue)
+      (return (walk-expression-tree nullValue type (quote NULL) FALSE)))))
+  
+(defun (yield-cons-list-from-sequence CONS) ((sequence SEQUENCE))
+  ;; Return a newly-formed cons-list containing the values in
+  ;;    'sequence'.
+  (let ((list NIL))
+    (foreach item in sequence collect item into list)
+    (return list) ))
+
+(defun (yield-define-stella-class CONS) ((class CLASS))
+  :documentation "Return a cons tree that (when evaluated) constructs
+a Stella class object."
+  (safety 2 (defined? (class-stringified-source class)))
+  ;; build new class object by unstringifying source and parsing the result:
+  (return
+   (bquote (define-class-from-stringified-source
+             & (wrap-literal (name class))
+             & (yield-string-constant-tree
+                (class-stringified-source class))))) )
+
+  ;;
+;;;;;; Utility functions for creating native class definitions
+  ;;
+
+(defun (create-native-class? BOOLEAN) ((class CLASS))
+  ;; Return TRUE if the definition of 'class' implies the creation
+  ;;    of a native (C++/CLOS) class.
+  (let ((classNativeType STRING NULL))
+    (case (translator-output-language)
+      (:common-lisp (setq classNativeType (class-cl-native-type class)))
+      (:idl (setq classNativeType (class-idl-native-type class)))
+      (:java (setq classNativeType (class-java-native-type class)))
+      ((:cpp :cpp-standalone)
+       (setq classNativeType (class-cpp-native-type class))))
+    (return
+     (not (or (subtype-of? (class-type class) @SECOND-CLASS-OBJECT)
+              (subtype-of? (class-type class) @NON-OBJECT)
+              (defined? classNativeType)
+              (not (primitive? class)))))))
+
+(defun (exception-class? BOOLEAN) ((CLASS class))
+  ;; Predicate which returns TRUE if 'class' is an EXCEPTION class.
+  ;; Currently this would be subclasses of the class NATIVE-EXCEPTION.
+  (return (subtype-of? (class-type class) @NATIVE-EXCEPTION)))
+
+(defun warn-about-multiple-parents ((class CLASS))
+  ;; Issue a warning if 'class' is defined via illegal multiple inheritance.
+  ;; NOTE: A primitive subclass of a DEFINED class might implicitly get
+  ;;       multiple NATIVE parents if the defined class has multiple parents.
+  (when (and (multiple-parents? class)
+             (create-native-class? class))
+    (case (translator-output-language)
+      ((:cpp-standalone :idl) NULL)
+      ((:common-lisp :cpp :java)
+       (let ((nofSupers 0)
+             (nofMixinSupers 0))
+         (foreach super in (class-native-supers class)
+                  do
+                  (++ nofSupers)
+                  (when (mixin? (type-class super))
+                    (++ nofMixinSupers)))
+         (when (> (- nofSupers nofMixinSupers) 1)
+           (walk-error "Class " (class-name class) " illegally inherits "
+                       (- nofSupers nofMixinSupers)
+                       " native non-mixin classes")))))))
+
+(defun warn-about-non-direct-supers ((class CLASS))
+  ;; Issue a warning if 'class' has multiple parents and not all of them
+  ;;    are most specific.
+  (when (and (multiple-parents? class)
+             (create-native-class? class))
+    (let ((directSupers (class-direct-supers class)))
+      (foreach super in directSupers
+          where (exists otherSuper in directSupers
+                    where (and (not (eql? super otherSuper))
+                               (subtype-of? otherSuper super)))
+          do (walk-error "Bad list of supers defined for class "
+                         (class-name class) "." EOL
+                         " The class " (symbol-name super)
+                         " is not a direct superclass")
+             (return)))))
+
+(defun (space-saver-slot-allocation? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if the allocation for 'slot' is :dynamic or :bit.
+  ;; Bit vector storage is allocated if the slot has type BOOLEAN and
+  ;;    :allocation is NULL.
+  (cond
+   ((eq? (allocation slot) :dynamic)
+    (when (defined? (slot-initial-value slot))
+      (warn "Dynamic slot " (slot-name slot) " should not have an"
+            EOL "   initial value (or it shouldn't be dynamic)."))
+    (return TRUE))
+   ;; BIT VECTORS NOT YET IMPLEMENTED:
+   ((or (eq? (allocation slot) :bit)
+        (and (eq? (type slot) @BOOLEAN)
+             (null? (slot-allocation slot))))
+    (return TRUE))
+   (otherwise (return FALSE))) )
+
+(defun (dynamic-slot? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE iff 'slot' has :dynamic allocation.
+  :globally-inline? TRUE
+  (return (eql? (allocation slot) :dynamic)))
+
+(defun (class-slot? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE iff 'slot' has :class allocation.
+  :globally-inline? TRUE
+  (return (eql? (allocation slot) :class)))
+
+(defun (redundant-slot? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if 'slot' is directly equivalent to another
+  ;;    slot having the same owner.
+  (let ((equivSlot (slot-direct-equivalent slot)))
+    (return
+      (and (defined? equivSlot)
+           (eq? (slot-renames slot) (slot-name equivSlot))))))
+
+(defun (native-slot? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if 'slot' will be implemented by a
+  ;;    native storage slot of the target language.
+  (return
+   (and (not (abstract? slot))
+        (not (slot-hardwired? slot))
+        (not (space-saver-slot-allocation? slot))
+        (not (redundant-slot? slot)))))
+
+(defun (native-method? BOOLEAN) ((slot METHOD-SLOT))
+  ;; Return TRUE if 'slot' will be implemented by a
+  ;;    native method in the target language.
+  (return
+    (and (not (abstract? slot))
+         (not (method-contains-unknown-type? slot)))))
+
+(defun (mixin-slot? BOOLEAN) ((self SLOT))
+  ;; Return TRUE if `self' is a storage slot defined on a mixin class.
+  (let ((owner (slot-owner self)))
+    (return
+      (and (storage-slot? self)
+           (defined? owner)
+           (defined? (type-class owner))
+           (mixin? (type-class owner))))))
+
+(defun (mixin-method? BOOLEAN) ((self SLOT))
+  ;; Return TRUE if `self' is a method defined on a mixin class.
+  (let ((owner (slot-owner self)))
+    (return
+      (and (method-slot? self)
+           (not (method-function? (cast self METHOD-SLOT)))
+           (defined? owner)
+           (defined? (type-class owner))
+           (mixin? (type-class owner))))))
+
+(defun (canonical-slot STORAGE-SLOT) ((slot STORAGE-SLOT))
+  ;; Computes the slot at the base of a renaming chain for 'slot'.
+  (let ((canonicalSlot slot))
+    (while (and (defined? (slot-direct-equivalent canonicalSlot))
+                (eq? (slot-name (slot-direct-equivalent canonicalSlot))
+                     (slot-renames canonicalSlot)))
+      (setq canonicalSlot (slot-direct-equivalent canonicalSlot)))
+    (return canonicalSlot)))
+
+(defun (unknown-type? BOOLEAN) ((type TYPE))
+  ;; Return TRUE if the native representation of 'type' is unknown.
+  (return (or (eql? type @UNKNOWN)
+              (null? (type-to-class type))
+              (eql? (type-to-class type) (type-to-class @UNKNOWN))
+              ;; Example: 'LITERAL-WRAPPER.wrapper-value' has type
+              ;;   LITERAL which does not have a native representation.
+              (and (subtype-of? type @NON-OBJECT)
+                   ;; Should we check for 'xx-native-type' instead?
+                   (abstract? (type-to-class type))))))
+
+(defun (slot-has-unknown-type? BOOLEAN) ((slot STORAGE-SLOT) (class CLASS))
+  ;; Return TRUE if the type of 'class.slot' is unknown.
+  (return
+    (unknown-type?
+     (type-spec-to-base-type
+      (compute-return-type-spec slot (class-type class))))))
+
+(defun (native-storage-slot-home CLASS) ((slot STORAGE-SLOT) (class CLASS))
+  ;; Assume 'slot' is a native storage slot defined on 'class'.
+  ;; Return the class that actually hosts the definition of 'slot'
+  ;;    in the target language (either 'class' or one of its supers).
+  ;; If the slot at the root of the slot-inheritance chain for 'slot'
+  ;;    has a known type, the owner class of the root slot will be returned.
+  ;; Otherwise, the most general class (starting from 'class') for which
+  ;;    the most specific superslot of 'slot' with unknown type
+  ;;    still has a known type will be returned.
+  ;; If no such class exists, NULL will be returned.
+  (let ((slotWithKnownType STORAGE-SLOT NULL))
+    (loop
+      (when (unknown-type? (type slot))
+        (break))
+      (setq slotWithKnownType slot)
+      (setq class (type-to-class (slot-owner slot)))
+      (if (and (defined? (slot-direct-equivalent slot))
+               ;; Catch dynamic slots shadowed by native slots:
+               (native-slot? (slot-direct-equivalent slot)))
+          (setq slot (slot-direct-equivalent slot))
+        (break)))
+    (when (defined? slotWithKnownType)
+      (return class))
+    ;; Slots with unknown type are inherited down on the most general
+    ;;    subclass of their owner for which their type becomes defined.
+    ;; Example: ITERATOR.value is inherited from ABSTRACT-ITERATOR.value
+    ;;    where it has UNKNOWN type.
+    (when (slot-has-unknown-type? slot class)
+      (return NULL))
+    (foreach super in (class-all-super-classes class)
+             do (if (slot-has-unknown-type? slot super)
+                    (return class)
+                  (setq class super)))
+    (return class)))
+
+(defun (native-slot-home CLASS) ((slot SLOT) (class CLASS))
+  ;; Assume 'slot' is a native storage or method slot visible on `class'.
+  ;; Return the class which will host its definition in the native language,
+  ;;    or NULL if no such class exists.
+  ;; If `slot' is a mixin slot, inherit it down to the most general
+  ;;    non-mixin parent of `class' that inherits `slot'.
+  (let ((nativeSlotHome
+         (choose (storage-slot? slot)
+                 (native-storage-slot-home slot class)
+                 (type-class (slot-owner slot))))
+        (candidate class)
+        (visibleSlot SLOT NULL))
+    (unless (and (defined? nativeSlotHome)
+                 (mixin? nativeSlotHome)
+                 (translate-to-single-inheritance-language?))
+      (return nativeSlotHome))
+    ;; 'slot' is inherited from a mixin class but can't be allocated
+    ;;    there in the native target language.  Find the most general
+    ;;    parent of 'class' that is not a mixin but inherits 'nativeSlotHome':
+    (when (mixin? candidate)
+      (return NULL))
+    (setq visibleSlot (lookup-slot class (slot-name slot)))
+    (when (and (not (eql? slot visibleSlot))
+               (subtype-of? (slot-owner visibleSlot) (slot-owner slot)))
+      ;; `slot' is shadowed by a more specific one or one with owner precedence:
+      (return NULL))
+    ;; NOTE: This is inefficient but should be ok for now:
+    (foreach superClass in (class-all-super-classes class)
+             where (and (not (mixin? superClass))
+                        (member? (class-all-super-classes superClass)
+                                 nativeSlotHome))
+             do (setq candidate superClass))
+    (return candidate)))
+
+(defun (method-contains-unknown-type? BOOLEAN) ((method METHOD-SLOT))
+  ;; Test if a method contains an unknown type in its signature.
+  (when (exists rType in (method-return-type-specifiers method)
+            where (unknown-type?
+                   (type-spec-to-base-type
+                    (compute-relative-type-spec rType (slot-owner method)))))
+    (return TRUE))
+  (foreach pType in (method-parameter-type-specifiers method)
+      do (when (unknown-type?
+                (type-spec-to-base-type
+                 (compute-relative-type-spec pType (slot-owner method))))
+           (return TRUE)))
+  (return FALSE) )
+
+(defun (method-contains-anchored-type? BOOLEAN) ((method METHOD-SLOT))
+  ;; Check for anchored types in the method parameters or return type.
+  ;;   If any exist, and the method's class is abstract, return TRUE.
+  (when (abstract? (type-class (slot-owner method)))
+    (when (and (defined? (slot-type-specifier method))
+	       (isa? (slot-type-specifier method) @ANCHORED-TYPE-SPECIFIER))
+      (return TRUE))
+    (foreach pType in (method-parameter-type-specifiers method)
+	where (isa? pType @ANCHORED-TYPE-SPECIFIER)
+	do (return TRUE)))
+  (return FALSE) )
+    
+
+  ;;
+;;;;;; Constructor and destructor functions
+  ;;
+
+;;; Note: The constructor function for a CLOS class "FOO" is named "NEW-FOO",
+;;;    unlike C++ where the constructor is named "FOO".
+;;;    Destructors are methods, named "FREE", unlike C++ where the
+;;;    destructor is named "~FOO". 
+
+;;; Recycling support: 
+
+;;;    If a ':recycle-method' is specified in a class 
+;;;    definition, instances of the class will be recycled according to
+;;;    the specified method.  Currently supported methods are ':free-list',
+;;;    ':sweep-list' (a sweep list chains up all objects ever created in a
+;;;    list so they can be reclaimed in a unit operation), and 
+;;;    ':free-and-sweep-list' which combines both methods.  A call to 'free'
+;;;    puts an object back on the free list, 'free's all component objects,
+;;;    and clears all slots.  A call to 'sweep' reclaims all objects at once
+;;;    and marks them as unused (this means that they better not be part of
+;;;    any permanent data structures anymore).  Apropriate 'free' and/or
+;;;    'sweep' methods will be defined automatically depending on the value
+;;;    of ':recycle-method'.  If the recycled class contains at least one
+;;;    slot that can hold objects of that class, then it will be used to
+;;;    chain up objects on the free list instead of using a separate list.
+;;;    If a sweep list is requested, an extra 'next-sweep-list-object' slot
+;;;    will be defined automatically to hold the sweep chain.
+
+(defun (yield-recycle-list-name SYMBOL) ((class CLASS))
+  ;; Return the name for the global variable pointing to the
+  ;;    recycle list for `class'.
+  (return
+   (intern-derived-symbol
+    (class-type class)
+    (concatenate "*RECYCLE-LIST-FOR-" (class-name class) "-S*"))))
+
+(defun (recycle-slot STORAGE-SLOT) ((class CLASS))
+  ;; Return a slot of 'class' that can hold its instances.
+  ;;    If such a slot exists we don't need an extra list to store
+  ;;    recycled objects, since we can chain them up directly.
+  ;; Slots whose type matches 'class' exactly are preferred over
+  ;;    slots whose type is a supertype.
+  (let ((instanceType (class-type class))
+        (recycleSlot STORAGE-SLOT NULL))
+    (foreach slot in (class-slots class)
+             do (typecase slot
+                  (STORAGE-SLOT
+                   (when (and (not (eql? (slot-name slot)
+                                         (quote next-sweep-list-object)))
+                              (native-slot? slot))
+                     (when (eql? instanceType (slot-base-type slot))
+                       ;; We have an exact match, return it:
+                       (return slot))
+                     (when (and
+                            ;; Bootstrap kludge:
+                            (defined? (type-class (slot-base-type slot)))
+                            (subtype-of? instanceType (slot-base-type slot)))
+                       ;; We have a candidate, remember it:
+                       (setq recycleSlot slot))))
+                  (otherwise NULL)))
+    (return recycleSlot)))
+
+(defun (use-free-list? BOOLEAN) ((class CLASS))
+  ;; Return TRUE if instances of 'class' should be recycled with
+  ;;    help of a free list.
+  (return (or (eql? (class-recycle-method class) :free-list)
+              (eql? (class-recycle-method class) :free-and-sweep-list))))
+
+(defun (use-sweep-list? BOOLEAN) ((class CLASS))
+  ;; Return TRUE if instances of 'class' should be recycled with
+  ;;    help of a sweep list.
+  (return (or (eql? (class-recycle-method class) :sweep-list)
+              (and (eql? (class-recycle-method class) :free-and-sweep-list)
+                   ;; During recycle list debugging we want maximal activity of
+                   ;;    the sweep list which would be reduced by a sweep list:
+                   (not (or (translate-with-recycle-list-debugging?)
+                            (recycle-list-debugging-enabled?)))))))
+
+(defun (decided-to-recycle? BOOLEAN) ((class CLASS))
+  ;; Return TRUE if instances of 'class' should be automatically
+  ;;    recycled.
+  (return (and (not (or (class-abstract? class)
+                        (defined? (class-creator class))))
+               (or (use-free-list? class)
+                   (use-sweep-list? class)))))
+
+(defun (compute-recycled-item-size INTEGER) ((class CLASS))
+  ;; Compute the (approximate) number of object slots occupied by a
+  ;;    recycled/able item on a free or sweep list.
+  (let ((size INTEGER NULL))
+    (when (defined? class)
+      ;; account for object overhead:
+      (case (translator-output-language)
+        (:common-lisp
+         ;; these are Allegro-CL numbers, other Lisps might be better:
+         (cond ((or (use-cl-structs?)
+                    (use-vector-structs?))
+                (setq size 4))
+               (otherwise
+                (setq size 10))))
+        ;; not really sure about these:
+        (:cpp (setq size 1))
+        (:java (setq size 2)))
+      (foreach slot in (class-slots class)
+          where (and (storage-slot? slot)
+                     (native-slot? slot)
+                     (not (and (defined? (slot-direct-equivalent slot))
+                               (native-slot? (slot-direct-equivalent slot)))))
+          do (++ size))
+      (when (and (use-free-list? class)
+                 (null? (recycle-slot class)))
+        ;; add overhead for free list:
+        (++ size 2)))
+    (return size)))
+
+(defun (yield-recycle-list-definitions CONS) ((class CLASS))
+  ;; Return a list of recycle-list variable definitions needed
+  ;;    to recycle instances of 'class'.
+  (if (decided-to-recycle? class)
+      (return
+        (bquote ((defglobal & (yield-recycle-list-name class)
+                            (RECYCLE-LIST OF & (class-symbol class))
+                   (create-recycle-list
+                    & (class-type class)
+                    & (compute-recycled-item-size class))))))
+    (return NIL)))
+
+;; All con/destructor helper functions below assume that the new/old
+;; instance gets/was assigned to a properly typed variable named 'self':
+
+(defun (yield-make-trees CONS) ((class CLASS))
+  ;; Return a list of trees that create a 'class' instance by calling 'make'.
+  (return (bquote ((setq self (make & (class-symbol class)))))))
+
+(defun (yield-constructor-name SYMBOL) ((class CLASS))
+  ;; Return the name of the constructor function for the class named
+  ;;    'className'.
+  (return (intern-derived-symbol
+           (class-type class) (concatenate "NEW-" (class-name class)))))
+
+(defun (yield-creation-trees CONS) ((class CLASS))
+  ;; Return a list of trees that create an instance of 'class'.
+  (cond
+   ((defined? (class-creator class))
+    (when (eq? (class-creator class) (yield-constructor-name class))
+      (warn "Illegal creator name " (class-creator class) " for the class " EOL
+            (class-name class) ".  Using the default creator.")
+      (return (yield-make-trees class)))
+    (return (bquote ((setq self (& (class-creator class)))))))
+   ((decided-to-recycle? class)
+    (return (yield-creation-or-reuse-trees class)))
+   (otherwise
+    (return (yield-make-trees class)))) )
+
+(defun (yield-terminate-object-trees CONS) ((class CLASS))
+  ;; Return a list of statements that terminate an instance of 'class'.
+  ;;   'class' is assumed to have a defined :recycle-method.
+  ;; Call a 'class' terminator if it was defined, and generate calls to
+  ;;   'free' on the values of all slots that are components of 'class'.
+  ;; For classes with sweep lists, termination of recylced objects is
+  ;;   performed in the constructor (terminating everything in 'sweep'
+  ;;   might cause too much of an interruption).
+  ;; For classes with free lists, termination of objects is performed
+  ;;   in calls to 'free' to make recycled space available as soon as
+  ;;   possible.  If a terminator is defined on such a class, objects
+  ;;   will only be freed if the terminator returned TRUE.
+  ;; For classes with free and sweep lists some objects might be
+  ;;   terminated twice.
+  ;; We do not have to reset any slots to NULL, since the constructor
+  ;;   has to initialize all of them anyway.
+  (let ((trees NIL)
+        (terminator (terminator class)))
+    (foreach slot in (class-slots class)
+             do (typecase slot
+                  (STORAGE-SLOT
+                   (when (component? slot)
+                     (pushq trees
+                            (bquote
+                             (when (defined? (& (slot-name slot) self))
+                               (free (& (slot-name slot) self)))))))
+                  (otherwise NULL)))
+    (when (defined? (lookup-slot class (quote dynamic-slots)))
+      ;; TO DO: Avoid initialization of 'dynamic-slots' in the
+      ;;        constructor if the object is a recycled one.
+      (pushq trees (bquote (clear (dynamic-slots self)))))
+    (when (defined? terminator)
+      (if (use-sweep-list? class)
+          (pushq trees (bquote (& terminator self)))
+        (pushq trees (bquote (unless (& terminator self)
+                               (return))))))
+    (return (concatenate
+              (reverse trees)
+              (yield-initial-value-assignments class :FORCE-NULL-VALUE)))))
+
+(defun (yield-creation-or-reuse-trees CONS) ((class CLASS))
+  ;; Return a list of trees that create an instance of 'class' from
+  ;;    a recycle or sweep list.  If no recycled instances are available,
+  ;;    a new instance will be allocated.
+  (let ((useFreeList? (use-free-list? class))
+        (useSweepList? (use-sweep-list? class)))
+    (cond ((and useFreeList? useSweepList?)
+           (return (yield-creation-or-reuse-trees-from-free-or-sweep-list class)))
+          (useFreeList?
+           (return (yield-creation-or-reuse-trees-from-free-list class)))
+          (useSweepList?
+           (return (yield-creation-or-reuse-trees-from-sweep-list class)))
+	  (otherwise
+	   (error "Assuming CLASS uses at least one of Free-list or sweep-list")))))
+
+(defun (yield-creation-or-reuse-trees-from-free-list CONS) ((class CLASS))
+  ;; Return a list of trees that create an instance of 'class' from
+  ;;    a recycle list.  If no recycled instances are available,
+  ;;    a new instance will be allocated.
+  (let ((recycleSlot (recycle-slot class))
+        (recycleSlotResetTree
+         (choose (defined? recycleSlot)
+                 (yield-initial-value-assignment recycleSlot :NULL-VALUE-ONLY)
+                 NULL))
+        (recycleList (yield-recycle-list-name class)))
+    (setq recycleList (yield-recycle-list-name class))
+    (return
+      (bquote
+       ((when (and *recycling-enabled?*
+                   (defined? & recycleList))
+          (setq self
+            & (choose
+               (defined? recycleSlot)
+               (bquote (recycled-items & recycleList))
+               (bquote (pop (list-of-recycled-items & recycleList))))))
+        (cond
+         ((defined? self)
+          ;; Success, bump the free list if necessary:
+          && (choose
+              (defined? recycleSlot)
+              (bquote
+               ((setf (recycled-items & recycleList)
+                  (slot-value self & (slot-name recycleSlot)))))
+              NIL)
+          ;; Reset recycle slot if necessary:
+          && (choose
+              (defined? recycleSlotResetTree)
+              (bquote (& recycleSlotResetTree))
+              NIL)
+          (-- (current-length & recycleList))
+          && (yield-unregister-recycled-item-trees))
+         (otherwise
+          && (yield-make-trees class)
+          && (yield-initial-value-assignments class :NULL-VALUE-ONLY))))))))
+
+(defun (yield-creation-or-reuse-trees-from-sweep-list CONS) ((class CLASS))
+  ;; Return a list of trees that create an instance of 'class' from
+  ;;    a sweep list.  If no recycled instances are available,
+  ;;    a new instance will be allocated.
+  (let ((recycleList (yield-recycle-list-name class)))
+    (setq recycleList (yield-recycle-list-name class))
+    (return
+      (bquote
+       ((cond
+         ((and *recycling-enabled?*
+               (defined? & recycleList))
+          (setq self (unused-items & recycleList))
+          (cond
+           ((defined? self)
+            (setf (unused-items & recycleList)
+              (next-sweep-list-object (unused-items & recycleList))))
+           (otherwise
+            && (yield-make-trees class)
+            && (yield-initial-value-assignments class :NULL-VALUE-ONLY)
+            (setf (next-sweep-list-object self) (all-items & recycleList))
+            (setf (all-items & recycleList) self)
+            (++ (current-length & recycleList))
+            (when (= (-- *recycle-lists-maintenance-timer*) 0)
+              (maintain-recycle-lists)))))
+         (otherwise
+          ;; duplicates some code, but sweep lists should be pretty rare:
+          && (yield-make-trees class)
+          && (yield-initial-value-assignments class :NULL-VALUE-ONLY))))))))
+
+(defun (yield-creation-or-reuse-trees-from-free-or-sweep-list CONS) ((class CLASS))
+  ;; Return a list of trees that create an instance of 'class' from
+  ;;    a recycle or sweep list.  If no recycled instances are available,
+  ;;    a new instance will be allocated.
+  (let ((recycleSlot (recycle-slot class))
+        (recycleSlotResetTree
+         (choose (defined? recycleSlot)
+                 (yield-initial-value-assignment recycleSlot :NULL-VALUE-ONLY)
+                 NULL))
+        (recycleList (yield-recycle-list-name class)))
+    (setq recycleList (yield-recycle-list-name class))
+    (return
+      (bquote
+       ((cond
+         ((and *recycling-enabled?*
+               (defined? & recycleList))
+          ;; First try to pop the free list:
+          (setq self
+            & (choose
+               (defined? recycleSlot)
+               (bquote (recycled-items & recycleList))
+               (bquote (pop (list-of-recycled-items & recycleList)))))
+          (cond
+           ((defined? self)
+            ;; Success, bump the free list if necessary:
+            && (choose
+                (defined? recycleSlot)
+                (bquote
+                 ((setf (recycled-items & recycleList)
+                    (slot-value self & (slot-name recycleSlot)))))
+                NIL)
+            ;; Reset recycle slot if necessary:
+            && (choose
+                (defined? recycleSlotResetTree)
+                (bquote (& recycleSlotResetTree))
+                NIL))
+           (otherwise
+            ;; Next, try the sweep list:
+            (setq self (unused-items & recycleList))
+            (cond
+             ((defined? self)
+              (setf (unused-items & recycleList)
+                (next-sweep-list-object (unused-items & recycleList))))
+             (otherwise
+              && (yield-make-trees class)
+              && (yield-initial-value-assignments class :NULL-VALUE-ONLY)
+              (setf (next-sweep-list-object self) (all-items & recycleList))
+              (setf (all-items & recycleList) self)
+              (++ (current-length & recycleList))
+              (when (= (-- *recycle-lists-maintenance-timer*) 0)
+                (maintain-recycle-lists)))))))
+         (otherwise
+          ;; duplicates some code, but sweep lists should be pretty rare:
+          && (yield-make-trees class)
+          && (yield-initial-value-assignments class :NULL-VALUE-ONLY))))))))
+
+(defun mark-direct-equivalent-slot ((slot SLOT))
+  ;; Called by 'yield-initial-value-assignments'.
+  ;; Mark the slot inherited directly by 'slot' via its
+  ;;   'slot-direct-equivalent-link'.
+  ;; Tricky: If the direct equivalent of 'slot' is ALREADY marked,
+  ;;    then 'slot' has an equivalent sibling. In this case
+  ;;    'slot' bows out by marking itself.
+  ;; Small bug: If two siblings have a common grandparent,
+  ;;    they may both remain unmarked after repeated calls
+  ;;    to 'mark-direct-equivalent-slot'.
+  (let ((directEquivalent (slot-direct-equivalent slot)))
+    (when (defined? directEquivalent)
+      (if (slot-marked? directEquivalent)
+        (setf (slot-marked? slot) TRUE)
+        (setf (slot-marked? directEquivalent) TRUE))) ))
+
+(defun (is-context-sensitive-slot? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if 'slot' or its direct equivalent is context
+  ;;    sensitive.
+  (return
+   (or (slot-context-sensitive? slot)
+       (and (defined? (slot-direct-equivalent slot))
+            (is-context-sensitive-slot?
+             (slot-direct-equivalent slot)))) ) )
+
+(defun (yield-initial-value-assignment CONS) ((slot STORAGE-SLOT) (mode KEYWORD))
+  ;; Yield an initial value assignment tree for 'slot'.
+  ;; If `mode' is :NULL-VALUE-ONLY, return an assignment tree only if
+  ;;    `slot' gets initialized to a NULL value.
+  ;; If `mode' is :INITIAL-VALUE-ONLY return an assignment tree only if
+  ;;    `slot' gets initialized to a non-NULL value.
+  ;; If `mode' is :FORCE-NULL-VALUE, return an assignment tree that
+  ;;    initializes `slot' with a NULL value.
+  ;; If `mode' is :ANY-INITIAL-VALUE, return an assignment tree that
+  ;;    initializes `slot' with an initial or NULL value.
+  (let ((initialValueExpression (yield-initial-value-expression slot))
+        ;; don't bother to set the initial value of required slots:
+        (requiredSlot? (required? slot)))
+    (when (and (defined? initialValueExpression)
+               (not (eql? (slot-name slot) (quote next-sweep-list-object))))
+      (case mode
+        (:NULL-VALUE-ONLY
+         (when (or requiredSlot?
+                   (not (equal-cons-trees?
+                         (type-to-null-value-tree (type slot))
+                         initialValueExpression)))
+           (setq initialValueExpression NULL)))
+        (:INITIAL-VALUE-ONLY
+         (when (or requiredSlot?
+                   (equal-cons-trees?
+                    (type-to-null-value-tree (type slot))
+                    initialValueExpression))
+           (setq initialValueExpression NULL)))
+        (:FORCE-NULL-VALUE
+         (setq initialValueExpression (type-to-null-value-tree (type slot))))
+        (:ANY-INITIAL-VALUE
+         (when requiredSlot?
+           (setq initialValueExpression NULL))))
+      (when (defined? initialValueExpression)
+        (return
+          (bquote
+           (setf (slot-value
+                  self
+                  ;; Canonicalize the slot for the benefit of the early walker:
+                  & (slot-name (canonical-slot slot))
+                  && (choose (is-context-sensitive-slot? slot)
+                             (bquote (:context-sensitive? FALSE))
+                             NIL))
+             & initialValueExpression)))))
+    (return NULL)))
+
+(defun (yield-initial-value-assignments CONS) ((class CLASS) (mode KEYWORD))
+  ;; Helping function for 'yield-constructor-body'.
+  ;; Return a list of assignment statements derived from :initially
+  ;;    forms on the slot definitions of 'class' according to `mode' (see
+  ;;    `yield-initial-value-assignment' for an explanation of `mode').
+  ;; The logic collects initial value expressions only for the most
+  ;;    specific slots.
+  (let ((assignments NIL)
+        (initialValueAssignment OBJECT NULL))
+    (foreach slot in (class-slots class) do (setf (slot-marked? slot) FALSE))
+    ;; Mark all slots that are not at the start of a slot-inheritance chain:
+    (foreach slot in (class-slots class) do (mark-direct-equivalent-slot slot))
+    (foreach slot in (class-slots class)
+        where (and (not (slot-marked? slot))
+                   (storage-slot? slot))
+        do (setq initialValueAssignment
+             (yield-initial-value-assignment slot mode))
+           (when (defined? initialValueAssignment)
+             (pushq assignments initialValueAssignment)))
+    (return assignments) ))
+
+(defun (yield-local-initial-value-assignments CONS) ((class CLASS))
+  ;; Return a list of assignment statements derived from :initially
+  ;;    forms on the local slot definitions of 'class'.
+  ;; The logic collects initial value expressions only for the most
+  ;;    specific slots.
+  ;; C++ initializers call this function; CLOS initializers call
+  ;;    'yield-initial-value-assignments'.
+  (let ((assignments NIL)
+        (initialValueAssignment OBJECT NULL))
+    (foreach slot in (class-local-slots class)
+             do (setf (slot-marked? slot) FALSE))
+    ;; Mark all slots that are not at the start (leaf)
+    ;; of a local slot-inheritance chain:
+    (foreach slot in (class-local-slots class)
+             do (mark-direct-equivalent-slot slot))
+    (foreach slot in (class-local-slots class)
+             where (and (not (slot-marked? slot))
+                        (storage-slot? slot))
+             do
+             (setq initialValueAssignment
+                   (yield-initial-value-assignment slot :ANY-INITIAL-VALUE))
+             (when (defined? initialValueAssignment)
+               (pushq assignments initialValueAssignment)))
+    (return (reverse assignments))))
+
+(defun (yield-initializer-trees CONS) ((class CLASS))
+  ;; Collect the initializer of `class' and of all its supers into a list of
+  ;;    initialization forms that run them from most general to most specific.
+  ;; NOTE: THIS NEEDS TO BE RETHOUGHT, SINCE INHERITANCE OF PARENT INITIALIZERS
+  ;;    CAN'T BE OVERRIDDEN.  ONCE WE HAVE A `SUPER' CONSTRUCT, WE CAN GO
+  ;;    BACK TO THE ORIGINAL SCHEME THAT DIDN'T INHERIT, SINCE THEN WE CAN CALL
+  ;;    THE PARENT INITIALIZER EXPLICITYLY WITHOUT HAVING TO KNOW ITS NAME.
+  ;;    ONCE WE SWITCH, WE MIGHT WANT TO GENERATE A WARNING FOR CASES WHERE
+  ;;    THE BEHAVIOR CHANGED.
+  (let ((initializers NIL)
+        (cursor NIL))
+    (when (defined? (class-initializer class))
+      (pushq initializers (class-initializer class)))
+    ;; Collect the initializers of all its parents:
+    (foreach super in (class-all-super-classes class)
+        where (and (defined? (class-initializer super))
+                   (not (memb? initializers (class-initializer super))))
+        do (pushq initializers (class-initializer super)))
+    (setq cursor initializers)
+    (while (non-empty? cursor)
+      (setf (first cursor)
+        (bquote (& (first cursor) self)))
+      (setq cursor (rest cursor)))
+    (return initializers)))
+
+(defun (yield-constructor-body CONS) ((class CLASS) (requiredAssignments CONS))
+  ;; Return a code body that defines a constructor for the class 'class'.
+  (let ((initialValueAssignments
+         (yield-initial-value-assignments
+          class
+          ;; don't repeat NULL-value assignments on recycled items:
+          (choose (decided-to-recycle? class)
+                  :INITIAL-VALUE-ONLY
+                  :ANY-INITIAL-VALUE))))
+    (when (and (empty? initialValueAssignments)
+               (empty? requiredAssignments)
+               (not (defined? (initializer class)))
+               (not (active? class))
+               (not (decided-to-recycle? class)))
+      (return (yield-creation-trees class)))
+    (return
+     (bquote (&& (yield-creation-trees class)
+              && requiredAssignments
+              && initialValueAssignments
+              && (yield-initializer-trees class)
+              && (choose (active? class)
+                         (bquote ((run-constructor-demons self)))
+                         NIL))))))
+
+;;; A constructor combines the effects of a creator function and
+;;;    an initializer function.  The arguments to a constructor are
+;;;    the values for required (public) slots attached to the
+;;;    corresponding class.  The arguments are assigned to the newly
+;;;    created instance after the creator function has been called and
+;;;    before the initializer is called.
+;;; The default creator function is 'MAKE'.  If a ':recycle-method' is
+;;;    specified, then a system-defined creator tries a free list before 
+;;     calling 'MAKE'.
+;;; The default initializer is a no-op.
+
+(defun (yield-constructor-definition CONS) ((class CLASS))
+  ;; Return a list containing the definition of a constructor for the class
+  ;;    'class'.
+  (when (exception-class? class)
+    (return (yield-exception-constructor-definition class)))
+  (let ((requiredParameters NIL)
+        (assignments NIL)
+        (slot SLOT NULL))
+    (foreach slotName in (class-required-slot-names class)
+             do
+             (pushq assignments
+                    (bquote (setf (& slotName self) & slotName)))
+             (setq slot (lookup-slot class slotName))
+             collect (bquote (& slotName
+                                & (type-to-symbol (type slot))))
+             into requiredParameters)
+    (return
+      (bquote (defun (& (yield-constructor-name class) & (class-symbol class))
+                  (&& requiredParameters)
+		:constructor? TRUE
+		:public? & (public? class)
+                (let ((self & (class-symbol class) NULL))
+                  && (yield-constructor-body class (reverse assignments))
+                  (return self)))))))
+
+
+(defun (yield-exception-constructor-body CONS) ((class CLASS) 
+						(messageParameter SYMBOL)
+						(requiredAssignments CONS))
+  ;; Return a code body that defines a constructor for the exception class 'class'.
+  (let ((initialValueAssignments
+         (yield-initial-value-assignments
+          class
+          ;; don't repeat NULL-value assignments on recycled items:
+          (choose (decided-to-recycle? class)
+                  :INITIAL-VALUE-ONLY
+                  :ANY-INITIAL-VALUE))))
+    (when (and (empty? initialValueAssignments)
+               (empty? requiredAssignments)
+               (not (defined? (initializer class)))
+               (not (active? class))
+               (not (decided-to-recycle? class)))
+      (return (bquote ((setq self (make & (class-symbol class) & messageParameter))))))
+    (return
+     (bquote ((setq self (make & (class-symbol class) & messageParameter))
+              && requiredAssignments
+              && initialValueAssignments
+              && (yield-initializer-trees class)
+              && (choose (active? class)
+                         (bquote ((run-constructor-demons self)))
+                         NIL))))))
+
+(defun (yield-exception-constructor-definition CONS) ((class CLASS))
+  ;; Return a list containing the definition of a constructor for the Exception
+  ;;    class 'class'.
+  ;; THIS IS A BIT OF A KLUDGE, SINCE THERE IS ONE REQUIRED ARGUMENT "MESSAGE"
+  ;;   THAT WE NEED TO DEAL WITH SPECIALLY.  The special handling consists of
+  ;;   NOT assigning the value in the constructor body, but having the native
+  ;;   constructor called with that particular parameter instead (in the body).
+  (let ((requiredParameters NIL)
+        (assignments NIL)
+        (slot SLOT NULL)
+	(messageParameter (quote message)))
+    (foreach slotName in (class-required-slot-names class)
+             do (unless (eq? slotName messageParameter)
+                  (pushq assignments
+                         (bquote (setf (& slotName self) & slotName))))
+             (setq slot (lookup-slot class slotName))
+             collect (bquote (& slotName
+                                & (type-to-symbol (type slot))))
+             into requiredParameters)
+    (return
+      (bquote (defun (& (yield-constructor-name class) & (class-symbol class))
+                  (&& requiredParameters)
+		:constructor? TRUE
+		:public? & (public? class)
+                (let ((self & (class-symbol class) NULL))
+                  && (yield-exception-constructor-body
+		      class messageParameter (reverse assignments))
+                  (return self)))))))
+
+;;; A 'free' method is generated by the system if a :recycle-method was
+;;; specified, or if the user defined a :terminator and/or :destructor.
+;;; Terminator and destructor are the duals to initializer and creator.
+;;; The terminator has the additional role to act as a guard.  It is
+;;; assumed to return a boolean which when true will result in the
+;;; destruction of the freed object.  This mechanism can be used to guard
+;;; against freeing of special objects such as NIL, etc.  However, if
+;;; a sweep list is used, no guarding is performed since there is no good
+;;; way to exclude some objects from being swept.  If a terminator is
+;;; specified but no destructor, the default destructor 'unmake' will
+;;; be used.
+
+(defun (yield-destructor-definitions CONS) ((class CLASS))
+  ;; Return a definition for a destructor method for the class 'className'.
+  (let ((className (class-symbol class))
+        (destructor (class-destructor class))
+        (terminator (terminator class))
+        (definitions NIL))
+    (cond
+     ((decided-to-recycle? class)
+      (let ((recycleSlot (recycle-slot class))
+            (recycleList (yield-recycle-list-name class)))
+        (when (use-free-list? class)
+          (pushq definitions
+                 (bquote
+                  (defmethod free ((self & className))
+                    (when (and *recycling-enabled?*
+                               (defined? & recycleList)
+                               ;; For the sake of `reduce-recycle-list-size',
+                               ;;    if the sweep list got simply cleared and then
+                               ;;    somebody freed a lot of stuff, try to maintain
+                               ;;    the sweep list as a superset of the free list:
+                               && (choose
+                                   (and (use-sweep-list? class)
+                                        (not (subtype-of?
+                                              (class-type class)
+                                              @STANDARD-OBJECT)))
+                                   (bquote ((defined? (all-items & recycleList))))
+                                   NIL))
+                      && (yield-terminate-object-trees class)
+                      && (yield-register-recycled-item-trees)
+                      && (choose
+                          (defined? recycleSlot)
+                          (bquote
+                           ((setf (slot-value
+                                   self & (slot-name recycleSlot))
+                              (recycled-items & recycleList))
+                            (setf (recycled-items & recycleList) self)))
+                          (bquote ((push (list-of-recycled-items & recycleList)
+                                         self))))
+                      && (choose
+                          (not (use-sweep-list? class))
+                          (bquote
+                           ((++ (current-length & recycleList))
+                            (when (= (-- *recycle-lists-maintenance-timer*) 0)
+                              (maintain-recycle-lists))))
+                          NIL))))))
+        (when (use-sweep-list? class)
+          (when (not (use-free-list? class))
+            ;; Shadow any 'free' methods inherited from higher up,
+            ;; since sweeping will most certainly interfere with them:
+            (pushq definitions
+                   (bquote (defmethod free ((self & className)) NULL))))
+          (pushq definitions
+                 (bquote
+                  (defmethod sweep ((self & className))
+                    (when (and *recycling-enabled?*
+                               (defined? & recycleList))
+                      && (choose
+                          (use-free-list? class)
+                          (choose
+                           (defined? (recycle-slot class))
+                           (bquote ((setf (recycled-items & recycleList) NULL)))
+                           (bquote ((clear (list-of-recycled-items
+                                            & recycleList)))))
+                          NIL)
+                      (let ((unused (unused-items & recycleList)))
+                        (setq self (all-items & recycleList))
+                        (while (not (eql? self unused))
+                          && (yield-terminate-object-trees class)
+                          (setq self (next-sweep-list-object self)))
+                        (setf (unused-items & recycleList)
+                          (all-items & recycleList))))))))))
+     ((or (defined? terminator)
+          (defined? destructor))
+      (unless (defined? destructor)
+        ;; Use the default destructor to delete the object:
+        (setq destructor (quote unmake)))
+      ;; catch case when user picks same destructor name as the built-in one:
+      (unless (eq? destructor (quote free))
+        (pushq definitions
+               (bquote
+                (defmethod free ((self & className))
+                  & (choose (defined? terminator)
+                            (bquote (when (& terminator self)
+                                      (& destructor self)))
+                            (bquote (& destructor self)))))))))
+    (return (reverse definitions))))
+
+(defun create-constructor-and-destructor-units ((class CLASS))
+  ;; Create translation units that define constructor and destructor
+  ;;    functions for 'class', and push them onto '*translationUnits*'.
+  (when (eql? (translator-output-language) :cpp-standalone)
+    (create-cpp-constructor-unit class)
+    (return))
+  (when (not (or (class-abstract? class)
+                 (subtype-of? (class-type class) @LITERAL)))
+    (foreach definition in (yield-recycle-list-definitions class)
+             do (walk-auxiliary-tree definition))
+    (walk-auxiliary-tree (yield-constructor-definition class))
+    (foreach destructor in (yield-destructor-definitions class)
+             do (walk-auxiliary-tree destructor))))
+
+  ;;
+;;;;;; Support for C++ constructors and :cpp-standalone translation:
+  ;;
+
+(defun (parameterized-class? BOOLEAN) ((class CLASS))
+  ;; Return true if 'class' is parameterized.
+  (return (non-empty? (parameters class))))
+
+(defun (class-with-initializer? BOOLEAN) ((class CLASS))
+  ;; Return true if 'class' needs an initializer function.
+  (return
+    (exists slot in (class-slots class)
+            where (storage-slot? slot))))
+
+(defun (yield-initializer-name SYMBOL) ((class CLASS))
+  ;; Return the name of the initializer function for 'class'.
+  (return (intern-derived-symbol
+           (class-type class)
+           (concatenate "initialize-" (class-name class)))) )
+
+(defun (yield-initializer-definition CONS) ((class CLASS))
+  ;; Return the definition of an initializer definition for 'class'.
+  (let ((parentInitForms NIL))
+    ;; Collect the initializers of all its parents:
+    (foreach super in (class-direct-supers class)
+             where (class-with-initializer? (type-class super))
+             collect (bquote (& (yield-initializer-name (type-class super))
+                                self))
+             into parentInitForms)
+    (return
+      (bquote
+       (defun & (yield-initializer-name class)
+         ((self & (yield-type-spec-tree (class-type class))))
+         && parentInitForms
+         && (yield-local-initial-value-assignments class))))))
+
+(defun create-cpp-constructor-unit ((class CLASS))
+  ;; Create a C++ constructor for 'class'.
+  ;; This is a hack, since C++ constructors are neither functions
+  ;;    nor methods.  Maybe we should have a special 'defconstructor'
+  ;;    construct.  However, since this is only needed for :cpp-standalone,
+  ;;    we'll wait and see what's really needed.
+  ;; In :cpp-standalone mode, parameterized classes are defined as
+  ;;    templates which don't need/can't have constructors:
+  (unless (parameterized-class? class)
+    (let ((className (yield-type-spec-tree (class-type class)))
+          (hasInitializer? (class-with-initializer? class)))
+      (when hasInitializer?
+        (walk-auxiliary-tree (yield-initializer-definition class)))
+      (help-walk-auxiliary-tree
+       (bquote
+        (defmethod & className ((self & className))
+	  :public? & (public? class)
+          && (choose hasInitializer?
+                     (bquote ((& (yield-initializer-name class) self)))
+                     (bquote (NULL)))))
+       FALSE))))
+
+(defun (cpp-constructor? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if 'method' represents a C++ constructor.
+  (return (and (eql? (type method) @VOID)
+               (eq? (length (method-parameter-names method)) 1)
+               (string-eql? (symbol-name (slot-owner method))
+                            (symbol-name (slot-name method)))
+               (eql? (interned-in (slot-owner method))
+                     (interned-in (slot-name method))))))
+
+  ;;
+;;;;;; Recycling runtime support
+  ;;
+
+;;; Whether explicit recycling pays compared to completely relying on the
+;;; garbage collector will depend on the particular situation.  Most likely,
+;;; however, a good garbage collector should generally be faster than the
+;;; additional overhead incured by the recycling machinery.  This can be
+;;; benchmarked by setting `*recycling-enabled?*' to FALSE.  Even more
+;;; radical would be a translation approach that would convert all calls
+;;; to `free' and friends into no-ops (unless a class has a terminator).
+
+(defspecial *recycling-enabled?* BOOLEAN TRUE
+  :documentation "If `TRUE' calls to `new' or `free' on classes with :recycle-method;
+specifications will actually operate on recycle lists.  Otherwise, all
+recycle list operations will be no-ops."
+  :public? TRUE)
+
+(defglobal *all-recycle-lists* (LIST OF RECYCLE-LIST) NULL)
+(startup-time-progn :early-inits
+  (setq *all-recycle-lists* (make-non-recycled-list)))
+
+(defun (create-recycle-list RECYCLE-LIST) ((classType TYPE) (itemSize INTEGER))
+  ;; Create a RECYCLE-LIST for `classType'.
+  ;; Initialize its `item-size' slot to `itemSize'.
+  (let ((list (new RECYCLE-LIST))
+        (oldList (some list in *all-recycle-lists*
+                     where (eql? (recycle-list-of list) classType))))
+    (when (defined? oldList)
+      ;; We had a class redefinition; clear out the old list:
+      (clear-recycle-list oldList) ;; only semi-necessary
+      (remove *all-recycle-lists* oldList))
+    (push *all-recycle-lists* list)
+    (setf (recycle-list-of list) classType)
+    (setf (item-size list) itemSize)
+    (return list)))
+
+(defun clear-recycle-list ((list RECYCLE-LIST))
+  :documentation "Reset `list' to its empty state."
+  (setf (all-items list) NULL)
+  (setf (unused-items list) NULL)
+  (setf (recycled-items list) NULL)
+  (setf (the-cons-list (list-of-recycled-items list)) NIL)
+  (setf (current-length list) 0))
+
+(defun clear-recycle-lists ()
+  :documentation "Reset all currently active recycle lists to their empty state."
+  :public? TRUE
+  (setq *recycle-lists-maintenance-timer*
+    *recycle-lists-maintenance-interval*)
+  (foreach list in *all-recycle-lists*
+      do (clear-recycle-list list)))
+
+(defun print-recycle-lists ()
+  :documentation "Print the current state of all recycle lists."
+  :public? TRUE
+  (print "Approximate space occupied by recycle lists: "
+         (* (total-recycle-lists-size) 4) " bytes" EOL)
+  (foreach list in *all-recycle-lists*
+      do (print list EOL)))
+
+(defglobal *max-recycle-list-bytes* INTEGER 3000000
+  :documentation "Maximum number of bytes to be occupied by recycle lists."
+  :public? TRUE)
+
+(defglobal *recycle-lists-maintenance-interval* INTEGER 5000
+  :documentation "Total number of recycle list extensions after which a
+size maintenance operation is performed to ensure that
+the `*MAX-RECYCLE-LIST-BYTES*' limit is still met."
+  :public? TRUE)
+
+(defglobal *recycle-lists-maintenance-timer* INTEGER
+           *recycle-lists-maintenance-interval*
+  :public? TRUE)
+
+(defun maintain-recycle-lists ()
+  :public? TRUE
+  ;; Map over all recycle lists and, if necessary, reduce some of them
+  ;;    in size to meet the `*max-recycle-list-bytes*' limit.
+  ;; Reset the maintenance timer and perform other maintenance tasks.
+  (when (recycle-list-debugging-enabled?)
+    (return))
+  (let ((totalSize (total-recycle-lists-size))
+        ;; assume 4 bytes per slot:
+        (maxSize (floor (/ *max-recycle-list-bytes* 4.0)))
+        (listSize INTEGER NULL)
+        (classRedefinition? FALSE))
+    (setq *recycle-lists-maintenance-timer* *recycle-lists-maintenance-interval*)
+    (foreach list in *all-recycle-lists*
+        where (and (defined? (type-class (recycle-list-of list)))
+                   (not (decided-to-recycle? (type-class (recycle-list-of list)))))
+        do (setq classRedefinition? TRUE)
+           ;; clear it, since the global list variable still points at it:
+           (clear-recycle-list list)
+           (setf (deleted? list) TRUE))
+    (when classRedefinition?
+      (remove-deleted-members *all-recycle-lists*))
+    (when (> totalSize maxSize)
+      (sort *all-recycle-lists* (the-code :function recycle-list-size<))
+      (reverse *all-recycle-lists*)
+      (while (> totalSize maxSize)
+        (foreach list in *all-recycle-lists*
+            do (when (<= totalSize maxSize)
+                 (break))
+               (setq listSize (recycle-list-size list))
+               (if (> listSize 0)
+                   (setq totalSize (- totalSize listSize))
+                 (continue))
+               (reduce-recycle-list-size list 0.5)
+               ;; Remeasure list size and add it to the total:
+               (setq totalSize (+ totalSize (recycle-list-size list))))))))
+
+(defmethod (deleted? BOOLEAN) ((self RECYCLE-LIST))
+  (return (null? (recycle-list-of self))))
+
+(defmethod (deleted?-setter BOOLEAN) ((self RECYCLE-LIST) (value BOOLEAN))
+  (if value
+      (setf (recycle-list-of self) NULL)
+    (when (null? (recycle-list-of self))
+      ;; undeletion should really never happen:
+      (setf (recycle-list-of self) @UNKNOWN)))
+  (return value))
+
+(defun (recycle-list-size INTEGER) ((list RECYCLE-LIST))
+  :globally-inline? TRUE
+  ;; NOTE: In the case that `list' has a free and a sweep list, `current-length'
+  ;;    is the length of the sweep list, since it is always the longer one.
+  (return (* (item-size list) (current-length list))))
+
+(defun (total-recycle-lists-size INTEGER) ()
+  ;; Compute the (approximate) number of object slots occupied by all
+  ;;    recycle lists.
+  (let ((size 0))
+    (foreach list in *all-recycle-lists*
+        do (setq size (+ size (recycle-list-size list))))
+    (return size)))
+
+(defun (recycle-list-size< BOOLEAN)
+    ((list1 RECYCLE-LIST) (list2 RECYCLE-LIST))
+  (return (< (recycle-list-size list1) (recycle-list-size list2))))
+
+(defun reduce-recycle-list-size ((list RECYCLE-LIST) (fraction FLOAT))
+  ;; Reduce the length of `list' to `fraction' (0.0 <= `fraction' <= 1.0).
+  ;; Unfortunately, we have to use interpreted slot access here, otherwise,
+  ;;    we would need to generate reduction methods for each list.
+  ;; NOTE: For :free-and-sweep lists `current-length' is the length of
+  ;;    the sweep list, since it is (should be) a superset of the free list.
+  ;;    However, if we reduce the size of the sweep list, and then
+  ;;    somebody frees items that were held onto while the list size was
+  ;;    reduced, then the size of the free list could become larger (at
+  ;;    least for a while) than the size of the sweep list, and the size
+  ;;    computations in this case would be wrong (at least for a while).
+  (let ((length (current-length list))
+        (reducedLength (floor (* length fraction)))
+        (itemType (recycle-list-of list))
+        (cursor OBJECT NULL)
+        (trailingCursor OBJECT NULL)
+        (unused OBJECT NULL)
+        (nextSlot STORAGE-SLOT NULL))
+    (when (and (or (defined? (all-items list))
+                   (defined? (recycled-items list)))
+               (not (subtype-of? itemType @STANDARD-OBJECT)))
+      ;; Interpreted slot access only works for standard objects;
+      ;;    if we have a different kind, we simply clear the list and punt.
+      ;;    NOTE: UNFORTUNATELY, THIS DOESN'T CUT SWEEP-LIST POINTERS WHICH
+      ;;    MEANS SOME USED ELEMENT COULD STILL POINT AT A LOT OF UNUSED STUFF.
+      (clear-recycle-list list)
+      (return))
+    ;; make sure `list' won't be modified while we are working on it:
+    (setq *recycling-enabled?* FALSE)
+    (when (defined? (all-items list))
+      (setq cursor (all-items list))
+      (setq unused (unused-items list))
+      (setq nextSlot
+        (lookup-slot (type-class itemType) (quote next-sweep-list-object)))
+      ;; we discard an initial segment of the list to keep as many
+      ;;    unused elements as possible:
+      (foreach i in (interval 1 (- length reducedLength))
+          do (ignore i)
+	     (when (eq? cursor unused) ;; `eq?' is sufficient
+               ;; we passed the unused cursor, remember that:
+               (setf (unused-items list) (all-items list)))
+             (setq trailingCursor cursor)
+             (setq cursor (read-slot-value cursor nextSlot))
+             ;; cut sweep list links so used elements won't point at unused ones:
+             (put-slot-value trailingCursor nextSlot NULL))
+      (when (eql? (unused-items list) (all-items list))
+        (setf (unused-items list) cursor))
+      (setf (all-items list) cursor))
+    (cond
+     ((non-empty? (list-of-recycled-items list))
+      (setq cursor
+        (nth-rest (the-cons-list (list-of-recycled-items list)) reducedLength))
+      (when (defined? cursor)
+        (setf (rest (cast cursor CONS)) NIL)))
+     ((defined? (recycled-items list))
+      (cond
+       ((defined? (all-items list))
+        (setf (recycled-items list) NULL))
+       (otherwise
+        (setq cursor (recycled-items list))
+        (setq nextSlot (recycle-slot (type-class itemType)))
+        (foreach i in (interval 2 reducedLength)
+            do (setq cursor (read-slot-value cursor nextSlot))
+               (when (null? cursor)
+                 (break)))
+        (when (defined? cursor)
+          (put-slot-value cursor nextSlot NULL))))))
+    (setf (current-length list) reducedLength)
+    (setq *recycling-enabled?* TRUE)))
+
+(defmethod sweep ((self OBJECT))
+  :documentation "Default method.  Sweep up all `self'-type objects."
+  NULL)
+
+(defun sweep-transients ()
+  :public? TRUE
+  ;; Reclaim all transient objects currently in use.
+  ;; For now, there is no need to sweep transient symbols and keywords,
+  ;;    since they get reused via the transient symbol table mechanism.
+  (foreach recycleList in *all-recycle-lists*
+      where (and (defined? (all-items recycleList))
+                 (isa? (all-items recycleList) @TRANSIENT-MIXIN))
+      do (sweep (all-items recycleList)))
+  ;; special-case transient symbols:
+  (free-transient-symbols))
+
+(defun (make-non-recycled-list LIST) ()
+  ;; Return a new empty LIST.
+  (let ((list (make LIST)))
+    (setf (the-cons-list list) NIL)
+    (return list) ))
+
+;;; Recycle list debugging
+
+;;; Below is some simple support for detecting multiply freed objects.
+;;; To use it the to-be-debugged STELLA code has to be translated with
+;;; `*translate-with-recycle-list-debugging?*' set to TRUE.  Then at
+;;; runtime debugging can be started with `start-recycle-list-debugging'
+;;; which will start to monitor recycling operations.  Every time an
+;;; object is freed that already resides on a free list, a program
+;;; break is triggered.
+;;; CAREFUL: Recycle list debugging costs time and space!
+
+(defglobal *currently-recycled-items* (HASH-TABLE OF OBJECT OBJECT) NULL
+  :documentation "During recycle list debugging holds all items that live in
+some free list.  Depending on program behavior, this table can get quite large!")
+
+(defun register-recycled-item ((item OBJECT))
+  (if (defined? (lookup *currently-recycled-items* item))
+      (break-program "Trying to recyle an already recycled item!")
+    (insert-at *currently-recycled-items* item item)))
+
+(defun unregister-recycled-item ((item OBJECT))
+  (remove-at *currently-recycled-items* item))
+
+(defun start-recycle-list-debugging ()
+  (setq *currently-recycled-items* NULL)
+  (clear-recycle-lists)
+  (setq *currently-recycled-items* (new (HASH-TABLE OF OBJECT OBJECT))))
+
+(defun stop-recycle-list-debugging ()
+  (setq *currently-recycled-items* NULL))
+
+(defun (recycle-list-debugging-enabled? BOOLEAN) ()
+  :globally-inline? TRUE
+  (return (defined? *currently-recycled-items*)))
+
+(defglobal *translate-with-recycle-list-debugging?* BOOLEAN FALSE)
+
+(defun (translate-with-recycle-list-debugging? BOOLEAN) ()
+  :globally-inline? TRUE
+  (return *translate-with-recycle-list-debugging?*))
+
+(defun (yield-register-recycled-item-trees CONS) ()
+  (if (translate-with-recycle-list-debugging?)
+      (return
+        (bquote ((when (recycle-list-debugging-enabled?)
+                   (register-recycled-item self)))))
+    (return NIL)))
+
+(defun (yield-unregister-recycled-item-trees CONS) ()
+  (if (translate-with-recycle-list-debugging?)
+      (return
+        (bquote ((when (recycle-list-debugging-enabled?)
+                   (unregister-recycled-item self)))))
+    (return NIL)))
+
+
+  ;;
+;;;;;; System-defined slot accessors
+  ;;
+
+(defun (has-non-null-default-value? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if 'slot' has a default value form defined for it, and if
+  ;;    that form is not identical to the null value form for the slot type.
+  (let ((defaultForm (system-default-value slot)))
+    (return (and (defined? defaultForm)
+                 (not (equal-cons-trees?
+                       (type-to-null-value-tree (type slot))
+                       defaultForm))))))
+
+(defun (system-defined-slot-reader? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Called by 'walk-slot-accessor-trees'.
+  ;; Return TRUE if there is no user-defined reader for 'slot'
+  ;;    AND if either a default expression is defined for 'slot',
+  ;;        OR if 'active?' is set for 'slot',
+  ;;        OR if 'hardwired?' is set for 'slot'.
+  ;; In that case a reader method will be generated by the system.
+  (return (and (null? (reader slot))
+               ;; Note: This scheme defines reader functions for dynamic
+               ;;       slots whose type class has an initial value, e.g.,
+               ;;       for dynamic slots with type LIST.
+               (or (has-non-null-default-value? slot)
+                   (active? slot)
+                   (slot-hardwired? slot)))) )
+
+(defun (system-defined-slot-writer? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Called by 'walk-slot-accessor-trees'.
+  ;; Return TRUE if there is no user-defined writer for 'slot'
+  ;;    AND if 'active?' is set for slot.
+  ;; In that case a writer method will be generated by the system.
+  (return (and (null? (writer slot))
+               (active? slot))))
+
+(defun (yield-slot-type-tree OBJECT) ((slot STORAGE-SLOT))
+  ;; Yield a type tree for the type of 'slot'.
+  (return (yield-type-spec-tree
+           (choose (defined? (slot-type-specifier slot))
+                   (slot-type-specifier slot)
+                   (slot-base-type slot)))))
+
+(defun (yield-hardwired-slot-variable SYMBOL) ((slot STORAGE-SLOT))
+  ;; Return name of a variable that can be used to store a
+  ;;    hardwired value for 'slot'.
+  (return
+    (intern-derived-symbol
+     (slot-name slot)
+     (concatenate
+       "*HARDWIRED-"
+       (concatenate
+         (symbol-name (slot-name slot))
+         (concatenate
+           "-ON-"
+           (concatenate
+             (symbol-name (slot-owner slot))
+             "*")))))))
+
+(defun (yield-hardwired-slot-reader-body CONS CONS) ((slot STORAGE-SLOT))
+  ;; Yield a reader body for a hardwired 'slot'.
+  ;; As a second value the auxiliary slot-variable definition is returned.
+  (let ((slotVariable (yield-hardwired-slot-variable slot))
+        (slotTypeDesc (yield-type-spec-tree
+                       (compute-return-type-spec slot (slot-owner slot)))))
+    (return
+      (bquote (return & slotVariable))
+      (bquote
+       (defglobal & slotVariable & slotTypeDesc NULL)))))
+
+(defun finalize-auxiliary-method ((method METHOD-SLOT))
+  ;; Do some slot-type finalization necessary for auxiliary 'method's,
+  ;;    since they are not attached to a class and won't get finalized
+  ;;    (this plays the role of the old 'copy-slot-type-into-method-type').
+  (when (and (null? (slot-base-type method))
+             (defined? (slot-type-specifier method)))
+    (setf (slot-base-type method)
+      (validate-type-specifier
+       (slot-type-specifier method) (type-class (slot-owner method)) FALSE))))
+
+(defun (wrap-with-default-value-and-return-code CONS)
+    ((slot STORAGE-SLOT) (defaultExpression OBJECT))
+  ;; Helping function for 'yield-slot-reader-tree'.
+  ;; If 'defaultExpression', wrap read code for `slot' with logic that
+  ;;    conditionally returns the default value.
+  ;; Also, wrap with a return statement.
+  (let ((readCode (bquote (slot-value self & (slot-name slot)))))
+    (if (defined? defaultExpression)
+        (cond
+         ((eql? (type slot) @BOOLEAN)
+          ;; Special kludge to handle :default values for dynamic boolean slots
+          ;;    (in a limited way).  Maybe we should simply make BOOLEAN
+          ;;    default values illegal and always require a BOOLEAN-WRAPPER
+          ;;    (or THREE-VALUED-BOOLEAN) for this case, since the efficiency
+          ;;    of a regular BOOLEAN slot is already lost anyway.
+          (if (not (dynamic-slot? slot))
+              (walk-warn
+               "Ignoring :default annotation on non-dynamic BOOLEAN slot "
+               slot "." EOL
+               " Limited :default support is available for dynamic BOOLEAN "
+               "slots," EOL
+               " and full support for THREE-VALUED-BOOLEAN slots")
+            (progn
+              ;; Hackery to provide limited :default support for BOOLEAN
+              ;;    slots as long as no actual value has been stored: Supply
+              ;;    the default value as the null-wrapper value and walk the
+              ;;    slot access tree to force the modified access semantics:
+              (set-literal-type-info
+               @BOOLEAN :null-wrapper
+               (bquote (inline-wrap-boolean & defaultExpression)))
+              (push-variable-binding (quote self) (slot-owner slot))
+              (setq readCode
+                (sys-tree
+                 (walk-expression-tree
+                  readCode @BOOLEAN (slot-name slot) FALSE)
+                 @BOOLEAN))
+              (pop-variable-binding)
+              (set-literal-type-info
+               @BOOLEAN :null-wrapper (quote FALSE-WRAPPER))))
+          (return (bquote (return & readCode))))
+         (otherwise
+          (return
+            (bquote
+             (let ((answer & readCode))
+               (if (null? answer)
+                   (return & (transientify-form defaultExpression))
+                (return answer)))))))
+      (return (bquote (return & readCode))))))
+
+(defun (yield-slot-reader-tree CONS) ((slot STORAGE-SLOT) (class CLASS))
+  ;; Return a tree defining a method that reads the slot 'slot' on class.
+  ;; A default values computation may be wrapped around the answer.
+  ;; TO DO: FOLD IN USER-DEFINED READER HERE.
+  ;; TO DO: IMPLEMENT SIDE-EFFECTS LOGIC HERE.
+  (let ((parameters (bquote ((self & (type-to-symbol (class-type class))))))
+        (typeTree (yield-slot-type-tree slot))
+        (defaultExpression (choose (has-non-null-default-value? slot)
+                                   (system-default-value slot)
+                                   NULL))
+        (slotVisible? (subtype-of? (class-type class) (slot-owner slot)))
+        (readCode CONS NULL)
+        (auxiliaryCode CONS NULL))
+    (cond ((not slotVisible?)
+           ;; Handle catch-all methods for mixin slots:
+           (setq readCode
+             (bquote
+              (progn
+                (error "Slot '" & (symbol-name (slot-name slot))
+                       "' does not exist on " self)
+                (return NULL)))))
+          ((active? slot)
+           (setq readCode
+             (yield-active-slot-reader-body slot defaultExpression)))
+          ((slot-hardwired? slot)
+           (mv-setq (readCode auxiliaryCode)
+             (yield-hardwired-slot-reader-body slot))
+           (when (eql? (class-type class) (slot-owner slot))
+             ;; CAUTION: This pushes a translation unit as a side-effect
+             ;; (ugly, since 'yield-' functions should really be pure):
+             (walk-auxiliary-tree auxiliaryCode)))
+          (otherwise
+           (setq readCode
+             (wrap-with-default-value-and-return-code
+              slot defaultExpression))))
+    (return
+      (bquote
+       (DEFMETHOD (& (slot-name slot) & typeTree)
+           & parameters
+           :auxiliary? TRUE
+           & readCode)))))
+
+(defun (yield-slot-writer-tree CONS) ((slot STORAGE-SLOT) (class CLASS))
+  ;; Return a tree defining a method that writes the slot 'slot' on 'class'.
+  ;; TO DO: FOLD IN USER-DEFINED WRITER HERE.
+  (let ((typeTree (yield-slot-type-tree slot))
+        (parameters (bquote ((self & (type-to-symbol (class-type class)))
+                             (value & typeTree))))
+        (slotVisible? (subtype-of? (class-type class) (slot-owner slot)))
+        (writeCode CONS NULL))
+    (cond ((not slotVisible?)
+           ;; Handle catch-all methods for mixin slots:
+           (setq writeCode
+             (bquote
+              (progn
+                (error "Slot '" & (symbol-name (slot-name slot))
+                       "' does not exist on " self)
+                (return NULL)))))
+          ((active? slot)
+           (setq writeCode (yield-active-slot-writer-body slot)))
+          (otherwise
+           (setq writeCode
+             (bquote 
+              (return
+                (setf (slot-value self & (slot-name slot)) value))))))
+    (return
+      (bquote
+       (DEFMETHOD (& (yield-setter-method-name (slot-name slot)) 
+                     & (copy-cons-tree typeTree))
+           & parameters
+           :auxiliary? TRUE
+           && (choose slotVisible?
+                      NIL
+                      (bquote ((ignore value))))
+           & writeCode)))))
+
+  ;;
+;;;;;; Generic slot accessors
+  ;;
+
+;;; Generic slot accessors are called within 'read-slot-value' and
+;;;    friends to access slot values.  Pointers to them are stored
+;;;    on every qualifying class in the slot 'class-slot-accessor-code'.
+;;; To read slot FOO on class BAR the code of 'access-BAR-slot-value'
+;;;    is looked-up on class BAR (actually the owner class of FOO)
+;;;    and called with the appropriate arguments.
+;;; Currently, generic slot access is possible only if the type of FOO
+;;;    is coercible into type OBJECT, and if BAR is a subclass of
+;;;    OBJECT.  A call to the generic accessor is equivalent to accessing
+;;;    FOO in Stella code via '(FOO ...)', i.e., default values will be
+;;;    returned and demons will be run if necessary.  Currently, there is
+;;;    no generic access to native slot values as accessed in Stella
+;;;    code with '(slot-value ... FOO)'.
+;;; This scheme is more compact than defining an access method for each
+;;;    slot, however, the access is slightly less efficient, since the
+;;;    accessors use a 'case' statement to dispatch on the slot name.
+
+(defun (slot-value-is-bare-literal? BOOLEAN) ((slot SLOT))
+  ;; Helping function for slot accessor formulators.
+  ;; Return TRUE if slot 'slot' returns a bare literal.
+  ;; Must be rewritten if we invent encapsulation for other
+  ;;    types of non-objects besides literals.
+  (let ((type (type slot)))
+    (return (and (defined? type)
+                 (defined? (type-class type))
+                 (subtype-of? (type slot) @LITERAL))) ))
+
+#|
+;; This code has been obsoleted by the slot accessor function scheme:
+(defun (yield-wrapped-slot-reader-name SYMBOL) ((slotName SYMBOL))
+  ;; Return the name of the wrapped read-slot method for the slot
+  ;;    named 'slotName'.
+  (return (intern-derived-symbol
+           slotName
+           (concatenate "WRAPPED-" (symbol-name slotName)))) )
+                                        
+(defun (yield-wrapped-slot-reader-tree CONS)
+    ((slot STORAGE-SLOT) (class CLASS))
+  ;; Return a tree defining a method that that reads the literal
+  ;;    slot 'slot' on 'class' and wraps stored literals.
+  (let ((className (type-to-symbol (class-type class)))
+        (methodName (yield-wrapped-slot-reader-name (slot-name slot)))
+        (wrappedType (type-to-wrapped-type (type slot))))
+    (return
+      (bquote
+       (DEFMETHOD (& methodName & wrappedType) ((self & className))
+         :auxiliary? TRUE
+         (let ((bareValue (& (slot-name slot) self)))
+           (return (choose (defined? bareValue)
+                           (& (choose (eq? (slot-base-type slot)
+                                           @BOOLEAN)
+                                      (quote wrap-boolean)
+                                      (quote wrap-literal))
+                              bareValue)
+                           NULL))))))))
+
+(defun (yield-wrapped-slot-writer-tree CONS)
+    ((slot STORAGE-SLOT) (class CLASS))
+  ;; Return a method object plus body for a method that writes into the
+  ;;    literal 'slot' and unwraps wrapped literals before they get stored.
+  (let ((className (type-to-symbol (class-type class)))
+        (methodName (yield-setter-method-name
+                     (yield-wrapped-slot-reader-name (slot-name slot))))
+        (wrappedType (type-to-wrapped-type (type slot))))
+    (return
+      (bquote
+       (DEFMETHOD (& methodName & wrappedType)
+           ((self & className) (value & wrappedType))
+         :auxiliary? TRUE
+         (let ((bareValue & (type slot) (wrapper-value value)))
+           (setf (& (slot-name slot) self) bareValue)
+           (return value)))))))
+|#
+
+(defun (generically-accessible-type? BOOLEAN) ((type TYPE))
+  (return (or (subtype-of? type @OBJECT)
+              (and (subtype-of? type @LITERAL)
+                   (defined? (lookup-literal-type-info
+                              type :wrap-function))))))
+
+(defun (generic-slot-reader? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if 'slot' is readable with a generic accessor.
+  (let ((type (canonical-type (type slot))))
+    (return (and (not (abstract? slot))
+                 (subtype-of? (slot-owner slot) @OBJECT)
+                 (defined? (type-class type))
+                 (generically-accessible-type? type)))))
+
+(defun (generic-slot-writer? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if 'slot' is writable with a generic accessor.
+  (return (and (not (slot-hardwired? slot))
+               (generic-slot-reader? slot))))
+
+(defun (slot-access-method? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if 'slot' has an access method defined for it.
+  (return (or (defined? (reader slot))
+              (system-defined-slot-reader? slot)
+              (defined? (writer slot))
+              (system-defined-slot-writer? slot))))
+
+(defun (yield-generic-slot-accessor-name SYMBOL) ((class CLASS))
+  ;; Return the name of the generic accessor for slots on 'class'.
+  (return
+    (intern-derived-symbol
+     (class-type class)
+     (concatenate
+       "ACCESS-"
+       (concatenate (symbol-name (class-type class)) "-SLOT-VALUE")))))
+
+(defun (yield-generic-slot-accessor-definition CONS) ((class CLASS))
+  ;; Return the definition of the generic accessor for slots on 'class'.
+  ;; Both read and write access is achieved with the same accessor
+  ;;    to save an extra native slot on classes.
+  ;; The signature of a generic accessor is:
+  ;;
+  ;;    (defun (access-<class>-slot-value OBJECT)
+  ;;        ((self <class-type>) (slotName SYMBOL)
+  ;;         (value OBJECT) (setValue? BOOLEAN)))
+  ;;
+  (let ((clauses NIL)
+        (accessTree NIL)
+        (valueTree OBJECT NULL)
+        (slotType TYPE NULL))
+    (when (not (subclass-of? class (type-class @OBJECT)))
+      (return NULL))
+    (foreach slot in (class-local-slots class)
+        where (and (storage-slot? slot)
+                   (generic-slot-reader? slot))
+        do (when (or (slot-external? slot)
+                     (and (space-saver-slot-allocation? slot)
+                          (not (slot-access-method? slot))))
+             (continue))
+           ;; Generate the read-access tree:
+           (setq accessTree
+             (bquote (setq value (& (slot-name slot) self))))
+           ;; If this slot is writable, generate the full access tree:
+           (when (not (slot-hardwired? (cast slot STORAGE-SLOT)))
+             (setq slotType (canonical-type (type slot)))
+             (setq valueTree (quote value))
+             (when (and (subtype-of? slotType @LITERAL)
+                        (defined? (lookup-literal-type-info
+                                   slotType :wrap-function)))
+               (setq valueTree
+                 (bquote (cast value & (type-to-wrapped-type slotType)))))
+             (setq accessTree
+               (bquote
+                (if setValue?
+                    (setf (& (slot-name slot) self) & valueTree)
+                  & accessTree))))
+           (pushq clauses (bquote (& (slot-name slot) & accessTree))))
+    (when (subclass-of? class (type-class @DYNAMIC-SLOTS-MIXIN))
+      (let ((renameClauses NIL))
+        ;; Handle renamed internal dynamic slots (external slots might
+        ;;    be in other modules, and we don't want to create "foreign"
+        ;;    symbols here; this means renamed external slots have to be
+        ;;    handled similar to external slots with access methods):
+        (foreach slot in (class-local-slots class)
+            where (and (storage-slot? slot)
+                       (not (slot-external? slot))
+                       (space-saver-slot-allocation? slot)
+                       (not (slot-access-method? slot))
+                       (not (eql? slot (canonical-slot slot))))
+            collect (bquote
+                     (& (slot-name slot)
+                        (setq slotName
+                          (quote & (slot-name (canonical-slot slot))))))
+            into renameClauses)
+        (when (non-empty? renameClauses)
+          (setq renameClauses
+            (bquote ((case slotName
+                       && renameClauses
+                       (otherwise NULL))))))
+        (pushq clauses
+               (bquote
+                (otherwise
+                 && renameClauses
+                 (if setValue?
+                     (set-dynamic-slot-value
+                      (dynamic-slots self) slotName value NULL)
+                   (setq value (lookup (dynamic-slots self) slotName))))))))
+    (if (empty? clauses)
+        (return NULL)
+      (return
+        (bquote
+         (defun (& (yield-generic-slot-accessor-name class) OBJECT)
+             ((self & (class-type class)) (slotName SYMBOL)
+              (value OBJECT) (setValue? BOOLEAN))
+           (case slotName
+             && (reverse clauses))
+           (return value)))))))
+
+(defun create-generic-slot-accessor-unit ((class CLASS))
+  ;; Create a translation unit for the generic slot accessor of 'class'.
+  (let ((tree (yield-generic-slot-accessor-definition class)))
+    (when (defined? tree)
+      (walk-auxiliary-tree tree))))
+
+(defun (yield-generic-slot-accessor-attachment CONS)
+    ((class CLASS) (classRef SYMBOL))
+  ;; Return startup code that assigns the code of the generic slot accessor
+  ;;    of 'class' to the 'class-slot-accessor-code' slot of the class object
+  ;;    bound to 'classRef'.
+  (if (exists slot in (class-local-slots class)
+          where (and (storage-slot? slot)
+                     (generic-slot-reader? slot)))
+      (return
+        (bquote
+         ((setf (class-slot-accessor-code & classRef)
+            (the-code :function & (yield-generic-slot-accessor-name class))))))
+    (return NIL)))
+
+  ;;
+;;;;;; Mixin slot access for single-inheritance languages
+  ;;
+
+;;; See also: `*mixin-implementation-style*':
+
+;;; When translating to a single-inheritance language, every mixin slot
+;;; is inherited down to every most general non-mixin class that
+;;; inherits the owner class of the mixin slot.  Slot access to a mixin
+;;; slot on such a non-mixin class is straight forward.  However,
+;;; slot access to a mixin slot on the mixin class itself has to be handled
+;;; specially.  There are two schemes to handle such accesses:
+;;; 
+;;;    (1) Generate an access function defined on OBJECT that contains
+;;;        a 'typecase' to handle every most general non-mixin child 
+;;;        of the mixin class.
+;;;    (2) Generate a native-slot access method for the mixin slot on
+;;;        every most general non-mixin child of the mixin class, and
+;;;        one catch-all method on OBJECT.
+;;;
+;;; In Lisp the second scheme is more efficient.  Scheme 1 also has
+;;; the additional problem that the 'typecase' may not work properly
+;;; during startup time (this is especially problematic for the mixin
+;;; slot 'DYNAMIC-SLOTS-MIXIN.dynamic-slots', since that slot is
+;;; needed early on in the bootstrap).  Scheme 2, of course, has the
+;;; drawback of increasing the size of v-tables in C++ and Java.
+;;;
+;;; CURRENTLY, HOWEVER, WE ENTIRELY OUTLAW VARIABLES/PARAMETERS OF A
+;;; MIXIN TYPE AND AVOID THE PROBLEM ALLTOGETHER.  ONE COULD ARGUE
+;;; THAT THAT'S REALLY WHAT IT MEANS TO BE A MIXIN CLASS.
+
+;;; Mixin slot accessor construction with scheme 1:
+
+(defun (yield-mixin-class-users-tree (CONS OF SYMBOL)) ((class CLASS))
+  ;; Generate the names of the set of most general non-mixin subclasses
+  ;;    of the mixin class 'class'.
+  (let ((result NIL))
+    ;; BUG: This is wrong, since mixins might inherit other mixins!!
+    (foreach sub in (class-direct-subs class)
+        where (not (mixin? (type-to-class sub)))
+        collect (type-to-symbol sub) into result)
+    (return result)))
+
+(defun (yield-mixin-slot-reader-name SYMBOL) ((slot STORAGE-SLOT))
+  (return
+    (intern-derived-symbol
+     (slot-name slot)
+     (concatenate
+       (symbol-name (slot-name slot))
+       (concatenate "-ON-" (symbol-name (slot-owner slot)))))))
+
+(defun (yield-mixin-slot-writer-name SYMBOL) ((slot STORAGE-SLOT))
+  (return (yield-setter-method-name (yield-mixin-slot-reader-name slot))))
+
+(defun (yield-mixin-slot-reader-tree CONS) ((slot STORAGE-SLOT))
+  ;; Return a tree defining a function that reads the mixin slot 'slot'.
+  (let ((readerName (yield-mixin-slot-reader-name slot))
+        (typeTree (yield-slot-type-tree slot)))
+    (return
+      (bquote
+       (DEFUN (& readerName & typeTree) ((self OBJECT))
+         :auxiliary? TRUE
+         (typecase self
+           (& (yield-mixin-class-users-tree (type-class (slot-owner slot)))
+              (return (& (slot-name slot) self)))
+           ;; Should we raise an error here?
+           (otherwise (return NULL))))))))
+
+(defun (yield-mixin-slot-writer-tree CONS) ((slot STORAGE-SLOT))
+  ;; Return a tree defining a function that writes the mixin slot 'slot'.
+  (let ((writerName (yield-mixin-slot-writer-name slot))
+        (typeTree (yield-slot-type-tree slot)))
+    (return
+      (bquote
+       (DEFUN (& writerName & typeTree)
+           ((self OBJECT) (value & (copy-cons-tree typeTree)))
+         :auxiliary? TRUE
+         (typecase self
+           (& (yield-mixin-class-users-tree (type-class (slot-owner slot)))
+              (return (setf (& (slot-name slot) self) value)))
+           ;; Should we raise an error here?
+           (otherwise (return NULL))))))))
+
+;;; Mixin slot accessor construction with scheme 2:
+
+(defun (yield-native-slot-reader-name SYMBOL) ((slot STORAGE-SLOT))
+  ;; Return the name for the native slot reader method of 'slot'.
+  (return
+    (intern-derived-symbol
+     (slot-name slot)
+     (concatenate (symbol-name (slot-name slot)) "-NATIVE-VALUE"))))
+
+(defun (yield-native-slot-writer-name SYMBOL) ((slot STORAGE-SLOT))
+  ;; Return the name for the native slot writer method of 'slot'.
+  (return (yield-setter-method-name (yield-native-slot-reader-name slot))))
+
+(defun (yield-native-slot-reader-tree CONS) ((slot STORAGE-SLOT) (class CLASS))
+  ;; Return a tree defining a method that reads the native slot value
+  ;;    of 'slot' on 'class'.
+  (let ((readerName (yield-native-slot-reader-name slot))
+        (typeTree (yield-slot-type-tree slot))
+        (slotVisible? (subtype-of? (class-type class) (slot-owner slot))))
+    (return
+      (bquote
+       (DEFMETHOD (& readerName & typeTree) ((self & (class-symbol class)))
+         :auxiliary? TRUE
+         && (choose slotVisible?
+                    (bquote
+                     ((return
+                        (slot-value
+                         self & (slot-name slot) :context-sensitive? FALSE))))
+                    (bquote
+                     ((error "Slot '" & (symbol-name (slot-name slot))
+                             "' does not exist on " self)
+                      (return NULL)))))))))
+
+(defun (yield-native-slot-writer-tree CONS) ((slot STORAGE-SLOT) (class CLASS))
+  ;; Return a tree defining a method that writes the native slot value
+  ;;    of 'slot' on 'class'.
+  (let ((writerName (yield-native-slot-writer-name slot))
+        (typeTree (yield-slot-type-tree slot))
+        (slotVisible? (subtype-of? (class-type class) (slot-owner slot))))
+    (return
+      (bquote
+       (DEFMETHOD (& writerName & typeTree)
+           ((self & (class-symbol class)) (value & (copy-cons-tree typeTree)))
+         :auxiliary? TRUE
+         && (choose slotVisible?
+                    (bquote
+                     ((return
+                        (setf (slot-value self & (slot-name slot)
+                                          :context-sensitive? FALSE)
+                          value))))
+                    (bquote
+                     ((ignore value)
+                      (error "Slot '" & (symbol-name (slot-name slot))
+                             "' does not exist on " self)
+                      (return NULL)))))))))
+
+  ;;
+;;;;;; Key-based equality methods
+  ;;
+
+(defun create-keyed-equality-method-unit ((class CLASS))
+  ;; Create a translation unit to define the method 'equal' on the class
+  ;;    'class' that checks for equality over the slots listed in
+  ;;    '(class-key class)', and push it onto '*translationUnits*'.
+  (let ((testTrees NIL))
+    (foreach slotName in (class-key class)
+             collect (bquote
+                      (eq? (& slotName self) (& slotName other)))
+             into testTrees)
+    (walk-auxiliary-tree
+     (bquote
+      (defmethod (equal BOOLEAN) ((self & (class-symbol class)) other)
+        (return (and && testTrees))))) ))
+
+(defun (transient-object? BOOLEAN) ((object OBJECT))
+  ;; Return TRUE if 'object' is transient.  Since non-transient objects
+  ;;    don't have a 'transient?' slot we cannot simply check its value.
+  ;;    Instead we check whether it exists as a slot on the primary class
+  ;;    of 'object', since then that class must inherit TRANSIENT-MIXIN.
+  ;;    This lookup should be faster than a full subclass test, it is still
+  ;;    a bit expensive though.
+  (let ((type (primary-type object)))
+    (return
+      ;;(defined? (lookup-slot (type-class type) (quote transient?)))
+      (subtype-of? type @TRANSIENT-MIXIN))))

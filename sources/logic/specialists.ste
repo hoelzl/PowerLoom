@@ -1,0 +1,2590 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                          ;
+;  COPYRIGHT (C) UNIVERSITY OF SOUTHERN CALIFORNIA, 1998-2003              ;
+;  University of Southern California, Information Sciences Institute       ;
+;  4676 Admiralty Way                                                      ;
+;  Marina Del Rey, California 90292                                        ;
+;                                                                          ;
+;  This software was developed under the terms and conditions of Contract  ;
+;  No. N00014-94-C-0245 between the Defense Advanced Research Projects     ;
+;  Agency and the University of Southern California, Information Sciences  ; 
+;  Institute.  Use and distribution of this software is further subject    ;
+;  to the provisions of that contract and any other agreements developed   ;
+;  between the user of the software and the University of Southern         ;
+;  California, Information Sciences Institute.  It is supplied "AS IS",    ;
+;  without any warranties of any kind.  It is furnished only on the basis  ;
+;  that any party who receives it indemnifies and holds harmless the       ;
+;  parties who furnish and originate it against any claims, demands, or    ;
+;  liabilities connected with using it, furnishing it to others or         ;
+;  providing it to a third party.  THIS NOTICE MUST NOT BE REMOVED FROM    ;
+;  THE SOFTWARE, AND IN THE EVENT THAT THE SOFTWARE IS DIVIDED, IT SHOULD  ;
+;  BE ATTACHED TO EVERY PART.                                              ;
+;                                                                          ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: specialists.ste,v 1.52 2003/08/08 17:28:24 hans Exp
+
+;;; Specialists that perform procedural computations to evaluate
+;;;    relational queries.
+
+(in-package "STELLA")
+
+(in-module "LOGIC")
+
+
+  ;;
+;;;;;; Query Specialists
+  ;;
+
+;; Defined here instead of `pl-kernel-kb.ste', since it is a class
+;;    (does it need to be?):
+(defclass COMPUTED-PROCEDURE (THING)
+  :public? TRUE
+  :documentation "Each instance denotes a programming language 
+function that computes some procedure.  The slot 'procedure-name'
+provides the name of the procedure.  The slot 'procedure-code'
+points directly to the procedure itself.  Both slots are optional;
+if neither is supplied, the procedure will be invoked by extracting
+its name from the name of the instance."
+  :public-slots ((procedure-name :type STELLA/SYMBOL)
+		 (procedure-code :type STELLA/FUNCTION-CODE)) )
+
+(defun (function-code-from-procedure FUNCTION-CODE) ((p OBJECT))
+  ;; Given a PROCEDURE instance, return a pointer to a STELLA function that
+  ;;    computes that procedure.
+  ;; Note: STELLA bug causes problems when the input parameter has type
+  ;;    PL-KERNEL/COMPUTED-PROCEDURE, so we kludge things here:
+  (let ((procedure PL-KERNEL/COMPUTED-PROCEDURE p))
+    (when (defined? (PL-KERNEL/procedure-code procedure))
+      (return (PL-KERNEL/procedure-code procedure)))
+    (let ((procedureName (PL-KERNEL/procedure-name procedure))
+          (stellaFunction STELLA/FUNCTION NULL))
+      (when (null? procedureName)
+        (setq procedureName
+          (type-to-symbol (surrogate-value-inverse procedure)))
+        ;; cache name for future use:
+        (setf (PL-KERNEL/procedure-name procedure) procedureName))
+      (setq stellaFunction (lookup-function procedureName))
+      (when (null? stellaFunction)
+        ;; this shouldn't really happen, see if it exists in the kernel:
+        (let ((kernelName
+               (lookup-symbol-in-module (symbol-name procedureName)
+                                        (get-stella-module "PL-KERNEL" TRUE)
+                                        FALSE)))
+          (when (defined? kernelName)
+            (setq stellaFunction (lookup-function kernelName)))))
+      (when (null? stellaFunction)
+        (inform "   Missing specialist -- no STELLA function is named "
+                procedureName EOL)
+        (return NULL))
+      (return (function-code stellaFunction))) ))
+
+(defun (lookup-specialist FUNCTION-CODE) ((description NAMED-DESCRIPTION))
+  ;; Called by 'continue-specialist-proof'.
+  ;; Return a specialist for 'description' if one exists.
+  ;; Unless a specialist explicitly advertises that it can handle
+  ;;    reverse polarity, we assume that it can't.
+  (let ((specialistProcedure
+         (access-binary-value description PL-KERNEL/@relation-specialist))
+        (functionCode FUNCTION-CODE NULL))
+    (when (defined? specialistProcedure)
+      (if (and *reversePolarity?*
+               (not (test-property?
+                     specialistProcedure PL-KERNEL/@HANDLES-REVERSE-POLARITY)))
+        (return NULL)
+        (setq functionCode (function-code-from-procedure specialistProcedure))))
+    (when (null? functionCode)
+      ;; see if native slot access is possible:
+      (when (defined? (native-relation description))                
+        (setq functionCode  (the-code :FUNCTION native-slot-reader-specialist))))
+    (return functionCode) ))
+
+(defun (lookup-constraint FUNCTION-CODE) ((description NAMED-DESCRIPTION))
+  ;; Called by 'PL-KERNEL/constraint-specialist' and by 'evaluate-xxx-proposition'.
+  ;; Return a constraint computation for 'description' if one exists.
+  (let ((computationProcedure
+         (access-binary-value description PL-KERNEL/@relation-constraint))
+        (functionCode FUNCTION-CODE NULL))
+    (when (defined? computationProcedure)
+      (setq functionCode (function-code-from-procedure computationProcedure)))
+    (return functionCode) ))
+
+(defun (lookup-computation FUNCTION-CODE) ((description NAMED-DESCRIPTION))
+  ;; Called by 'PL-KERNEL/computation-specialist' and by 'evaluate-xxx-proposition'.
+  ;; Return a computation for 'description' if one exists.
+  (let ((computationProcedure
+         (access-binary-value description PL-KERNEL/@relation-computation))
+        (functionCode FUNCTION-CODE NULL))
+    (when (defined? computationProcedure)
+      (setq functionCode (function-code-from-procedure computationProcedure)))
+    (return functionCode) ))
+
+(defun (lookup-evaluator FUNCTION-CODE) ((description NAMED-DESCRIPTION))
+  ;; Called by 'evaluate-proposition'.
+  ;; Return a evaluator for 'description' if one exists.
+  (let ((evaluatorProcedure
+         (access-binary-value description PL-KERNEL/@relation-evaluator))
+        (functionCode FUNCTION-CODE NULL))
+    (when (defined? evaluatorProcedure)
+      (setq functionCode (function-code-from-procedure evaluatorProcedure)))
+    (return functionCode) ))
+
+
+  ;;
+;;;;;;; computation specialist
+  ;;
+
+(defun (report-computed-result KEYWORD) 
+       ((success? BOOLEAN) (proposition PROPOSITION))
+  ;; Final step for 'native-slot-reader-specialist' and 
+  ;;    'PL-KERNEL/computation-specialist'.
+  ;; Adjust result for *reversePolarity?*, and set score for partial matcher.
+  (when *reversePolarity?*
+    (setq success? (not success?)))
+  
+  ;; set score for partial matcher - dem
+  (when (and (defined? *queryIterator*)
+             (defined? (partial-match-strategy *queryIterator*)))
+    (if success? 
+      (set-base-partial-match-truth 
+       (partial-match-strategy *queryIterator*) proposition :TRUE)
+      (set-base-partial-match-truth 
+       (partial-match-strategy *queryIterator*) proposition :FAIL)))
+  
+  (if success?
+    (return :FINAL-SUCCESS)
+    (return :TERMINAL-FAILURE)) )
+
+(defun (null-wrapper? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  ;; Return TRUE if 'self' represents NULL for some datatype.
+  (typecase self
+    (THING (return (eql? self NULL)))
+    (INTEGER-WRAPPER (return (eql? self NULL-INTEGER-WRAPPER)))
+    (STRING-WRAPPER (return (eql? self NULL-STRING-WRAPPER)))
+    (FLOAT-WRAPPER (return (eql? self NULL-FLOAT-WRAPPER)))
+    (CHARACTER-WRAPPER (return (eql? self NULL-CHARACTER-WRAPPER)))
+    (FUNCTION-CODE-WRAPPER (return (eql? self NULL-FUNCTION-CODE-WRAPPER)))
+    (METHOD-CODE-WRAPPER (return (eql? self NULL-METHOD-CODE-WRAPPER)))
+    (otherwise 
+     (print "Not prepared to handle native slots with type " (primary-type self) EOL)))
+  (return FALSE) )
+
+(defun (native-slot-reader-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist that reads native slot values.
+  (let ((proposition (proposition frame))
+        (description (get-description (relationRef proposition)))
+        (argumentValue (argument-bound-to (first (arguments proposition))))
+        (slot SLOT 
+              (only-if (not (class-description? description))
+                       (native-relation description)))
+        (success? BOOLEAN NULL))
+    (ignore lastMove)
+    (when (and (defined? argumentValue)
+               (isa? argumentValue @THING)
+               (not (abstract? slot)))
+      (let ((value (read-slot-value argumentValue slot)))
+        (when (null? value)
+          (return :FAILURE))
+        (when (not (null-wrapper? value))
+          (if (function-description? description)
+            (setq success?
+                  (bind-variable-to-value? (last-argument proposition) value TRUE))
+            (setq success? (eql? value TRUE-WRAPPER)))
+         (return (report-computed-result success? proposition)))))
+    (return :FAILURE) ))
+
+#|
+;; THIS WORKS!!:
+(cl:progn
+  (clear-module "PL-USER")
+  (cc pl-user)
+  (defclass Dog (THING)
+    :slots ((happy :type boolean)
+            (age :type INTEGER)
+            (color :type STRING)))
+  (assert (Dog Jake))
+  (eval
+   (let ((jake Dog (get-instance "JAKE")))
+     (setf (happy jake) TRUE)
+     (setf (age jake) 15)
+     (setf (color Jake) "Yellow")))
+  )
+(ask (dog Jake))
+(ask (happy Jake))
+(retrieve (?x ?y) (and (Dog ?x) (age ?x ?y)))
+(retrieve ?y (age Jake ?y))
+(retrieve ?x (color jake ?x))
+|#
+
+
+
+  ;;
+;;;;;; Computation and Constraint Specialists
+  ;;
+
+
+;;; Support Class for substring iteration.  Defined here
+;;; for use in arithmetic.ste, but can't be defined in
+;;; the PL-KERNEL-KB module because of the shadowing of
+;;; the symbol `length'.  That produces a translation error
+;;; because of mismatch between home modules of the method
+;;; name and the iterator class.
+
+(defclass SUBSTRING-POSITION-ITERATOR (ITERATOR)
+  :slots
+  ((super-string :type STRING :required? TRUE)
+   (sub-string :type STRING :required? TRUE)
+   (start :type INTEGER :initially 0)
+   (sub-length :type INTEGER :initially (length (sub-string self)))))
+
+(defmethod (next? BOOLEAN) ((it SUBSTRING-POSITION-ITERATOR))
+  (let ((p1 (string-search (super-string it) (sub-string it) (start it))))
+    (if (defined? p1)
+      (progn
+	(setf (slot-value it value) (cons p1 (cons (+ p1 (sub-length it)) NIL)))
+	(setf (start it) (+ p1 1))
+	(return true))
+      (progn
+	(setf (slot-value it value) NULL)
+	(return false)))))
+
+(defmethod (length integer) ((it SUBSTRING-POSITION-ITERATOR))
+  (let ((count 0)
+	(super (super-string it))
+	(sub (sub-string it))
+	(p1 (string-search super sub 0)))
+    (while (defined? p1)
+      (++ count)
+      (setq p1 (string-search super sub (+ p1 1))))
+    (return count)))
+
+(defun (PL-KERNEL/computation-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist that applies computations.
+  ;; Check if all arguments are bound (to non skolems), and if so, apply
+  ;;    a computation to evaluate the function or predicate.
+  (let ((proposition (proposition frame))
+        (arguments (arguments proposition))
+        (description (get-description (relationRef proposition)))
+        (computationCode (lookup-computation description))
+        (value OBJECT NULL)
+        (boundArguments NIL)
+        (success? BOOLEAN NULL))
+    (ignore lastMove)
+    (cond
+     ((function-description? description)
+      (foreach arg in arguments
+          as i in (interval 2 (length arguments))
+          do (ignore i)
+	     (setq value (argument-bound-to arg))
+             (when (or (null? value)
+                       (skolem? value))
+               (return :FAILURE))
+          collect value into boundArguments)
+      (setq value (apply computationCode boundArguments))
+      (when (null? value)
+        (return :FAILURE))
+      (let ((lastArg (last-argument proposition)))
+        (setq success?
+              (choose (isa? lastArg @PATTERN-VARIABLE)
+                      (bind-variable-to-value? lastArg value TRUE)
+                      (eql? (value-of lastArg) value)))))
+     (otherwise
+      (foreach arg in arguments
+          do (setq value (argument-bound-to arg))
+             (when (or (null? value)
+                       (skolem? value))
+               (return :FAILURE))
+          collect value into boundArguments)
+      (setq success? (apply computationCode boundArguments))))
+    (if success?
+      (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+      (set-frame-truth-value frame FALSE-TRUTH-VALUE))
+    (return (report-computed-result success? proposition)) ))
+
+(defun (PL-KERNEL/constraint-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist that applies computed constraints.
+  ;; If all arguments are bound, the constraint is evaluated to see
+  ;;   if it holds.
+  ;; If all but one argument is bound, and the unbound argument is
+  ;;   a pattern variable, then the missing value is computed.
+  (let ((proposition (proposition frame))
+        (description (get-description (relationRef proposition)))
+        (computationCode (lookup-constraint description))
+	(value OBJECT NULL)
+	(nullCount 0)
+        (variableIndex -1)
+        (argumentValues NIL))
+    (ignore lastMove)
+    (foreach arg in (arguments proposition)
+	as i in (interval 0 NULL)
+        do (setq value (argument-bound-to arg))
+	   (when (and (isa? arg @PATTERN-VARIABLE)
+                      (null? value))
+              (++ nullCount)
+	      (setq variableIndex i))
+	   ;; Can't do anything with a SKOLEM here.
+	   (when (and (defined? value)
+		      (isa? value @SKOLEM))
+	     (return :FAILURE))
+        collect value into argumentValues)
+    (case nullCount
+      (0 (setq value (apply computationCode (cons variableIndex argumentValues)))
+	 (if (cast value BOOLEAN-WRAPPER)
+	   (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	   (set-frame-truth-value frame FALSE-TRUTH-VALUE))
+	 (return (report-computed-result 
+		  (cast value BOOLEAN-WRAPPER)
+		  proposition)))
+      (1 (setq value (apply computationCode (cons variableIndex argumentValues)))
+	 (when (null? value)  ;; Not enough information for constraint
+	   (return :FAILURE))
+	 
+	 (return (report-computed-result 
+		  (bind-variable-to-value?
+		   (nth (arguments proposition) variableIndex) value TRUE)
+		  proposition)))
+      (otherwise
+       (return :FAILURE))) ))
+
+(defun (PL-KERNEL/square-root-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle the square root computation
+  ;; It requires at least one argument to be bound.
+  ;; Since it is a fully defined, it will
+  ;;    return :TERMINAL-FAILURE if it can't find any more bindings.
+  (let ((proposition (proposition frame))
+        (mainArg (first (arguments proposition)))
+        (mainArgValue (argument-bound-to mainArg))
+        (rootArg (second (arguments proposition)))
+        (rootArgValue (argument-bound-to rootArg))
+        (iterator (iterator frame))
+        (collection NIL))
+    (ignore lastMove)
+    ;; ensure that `boundArg' is actually bound and if necessary
+    ;;    switch the relation to its inverse:
+    (when (null? iterator)  ;; First time
+      (if (null? mainArgValue)
+	  (if (null? rootArgValue)
+	      ;; we require at least one bound argument:
+	      (return :TERMINAL-FAILURE)
+	    (if (isa? rootArgValue @NUMBER-WRAPPER)
+		(return
+		  (select-proof-result
+		   (bind-argument-to-value? 
+		    mainArg (/pl-kernel/times-computation rootArgValue rootArgValue) TRUE)
+		   FALSE TRUE))
+	      (return :TERMINAL-FAILURE)))
+	(if (isa? mainArgValue @NUMBER-WRAPPER)
+	    (if (/pl-kernel/arithmetic-less-test mainArgValue (wrap-literal 0))
+		(return :TERMINAL-FAILURE)
+	      (let ((sqrt NUMBER-WRAPPER (/pl-kernel/sqrt-computation mainArgValue)))
+		(setq collection
+		  (cons sqrt
+			(cons (/pl-kernel/times-computation (wrap-literal -1) sqrt)
+			      NIL)))))
+	  (return :TERMINAL-FAILURE))))
+    (when (defined? rootArgValue)
+      ;; both arguments are bound, just check for membership:
+      (if (or (/pl-kernel/arithmetic-equal-test rootArgValue (first collection))
+	      (/pl-kernel/arithmetic-equal-test rootArgValue (second collection)))
+          (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+		 (return :FINAL-SUCCESS))
+	  (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		 (return :TERMINAL-FAILURE))))
+    (when (null? iterator)
+      (setq iterator (allocate-iterator collection))
+      (setf (iterator frame) iterator))
+    (if (and (next? iterator)
+             (bind-argument-to-value? rootArg (value iterator) TRUE))
+        (return :CONTINUING-SUCCESS)
+      (return :TERMINAL-FAILURE))))
+
+
+  ;;
+;;;;;; Utility function
+  ;;
+    
+(defun (select-proof-result KEYWORD) 
+       ((success? BOOLEAN) (continuing? BOOLEAN) (terminal? BOOLEAN))
+  :public? TRUE
+  ;; Return the appropriate keyword indicating success or failure
+  ;;    of a proof.
+  (return
+   (choose success? 
+           (choose continuing? :CONTINUING-SUCCESS :FINAL-SUCCESS)
+           (choose terminal? :TERMINAL-FAILURE :FAILURE))) )
+
+
+  ;;
+;;;;;; 'member-of' specialist
+  ;;
+
+(defun (enumerations-containing-member LIST) ((self OBJECT))
+  ;; Helping function for 'MEMBER-OF-specialist'.
+  ;; Return all enumerated collections (i.e., from SETOF and LISTOF
+  ;;    terms) that contain 'self'.
+  (let ((list (new LIST)))
+    (foreach p in (all-true-dependent-propositions
+                   self PL-KERNEL/@COLLECTIONOF TRUE)
+             do
+             (let ((skolemList (last-argument p)))
+               (when (not (eql? self skolemList))
+                 (push list skolemList))))
+    (return list) ))
+
+(defun (PL-KERNEL/MEMBER-OF-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Extends the semantics of 'member-of' to include membership in 'SETOF' and
+  ;;    'LISTOF' terms.
+  ;; If the second argument is a named description, it converts
+  ;;    proposition to an :ISA proposition.
+  ;; Handles reverse polarity (both args bound; second is an enumeration).
+  (let ((proposition (proposition frame))
+        (arguments (arguments proposition))
+        (memberArg (first arguments))
+        (member (argument-bound-to memberArg))
+        (collectionArg (second arguments))
+        (collection (argument-bound-to collectionArg))
+        (iterator (iterator frame)))
+    (case lastMove
+      (:UP-TRUE
+       (return (choose (defined? (down frame)) :CONTINUING-SUCCESS :FINAL-SUCCESS)))
+      (:UP-FAIL
+       (return :FAILURE))
+      (otherwise NULL))
+    (when (null? iterator)      ; first time through coming down?
+      (cond
+       ((null? collection)
+        (when (null? member)
+          (return :FAILURE))
+        (setq iterator (allocate-iterator 
+                        (enumerations-containing-member member))))
+       (otherwise
+        ;; 'collection' is bound:
+        (typecase collection
+          (NAMED-DESCRIPTION
+           ;; create :ISA proposition as subgoal:
+           (let ((isaProp (create-proposition (quote ISA) 1)))
+             (setf (relationRef isaProp) (surrogate-value-inverse collection))
+             (setf (nth (arguments isaProp) 0) memberArg)
+             (create-down-frame frame isaProp)
+             (return :MOVE-DOWN)))
+          (DESCRIPTION
+           (cond ((and (= (arity collection) 1) ;; just a sanity check
+                       (or (null? (external-variables collection))
+                           (forall var in (external-variables collection)
+                               always (defined? (argument-bound-to var)))))
+                  (if (overlay-with-pattern-frame?
+                       (create-down-frame frame NULL)
+                       collection
+                       (vector memberArg))
+                      (return :MOVE-DOWN)
+                    (return :FAILURE)))
+                 (otherwise
+                  (return :FAILURE))))
+          ((STELLA/COLLECTION LOGIC-OBJECT)
+           (if (null? member)
+             ;; initialize iterator and drop through to 'while' loop:
+             (setq iterator (allocate-iterator 
+                             (asserted-collection-members collection FALSE)))
+             ;; both arguments bound; second is a native collection:
+             (if (member-of-collection? member collection)
+	       (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+		      (return :FINAL-SUCCESS))
+	       (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		      (return :FAILURE)))))    ;; :TERMINAL-FAILURE ?
+          (otherwise (return :FAILURE)))))
+      (setf (iterator frame) iterator))
+    (while (next? iterator)
+      ;; either 'memberArg' or 'collectionArg' is unbound:
+      (if (null? collection)
+        (when (bind-variable-to-value?
+               collectionArg (value-of (value iterator)) TRUE)
+          (return :CONTINUING-SUCCESS))
+        (when (bind-variable-to-value?
+               memberArg (value-of (value iterator)) TRUE)
+          (return :CONTINUING-SUCCESS))))
+    (return :FAILURE) ))
+
+(defun PL-KERNEL/MEMBER-OF-evaluator ((self PROPOSITION))
+  ;; If the second argument to 'self' is an unnamed description, inherit
+  ;;    it onto the first argument during forward propagation.
+; (print "MEMB-eval: " self EOL)
+  (let ((value1 (value-of (nth (arguments self) 0)))
+        (value2 (value-of (nth (arguments self) 1))))
+    (when (and (isa? value2 @DESCRIPTION)
+               (isa? value1 @LOGIC-OBJECT)
+               (not (named-description? value2)))
+      (inherit-unnamed-description 
+       (cast value1 LOGIC-OBJECT) value2 (default-true? self)))) )
+
+
+  ;;
+;;;;;; 'instance-of' specialist
+  ;;
+
+(defun (PL-KERNEL/INSTANCE-OF-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Logic borrowed from 'try-isa-proposition-proof'.
+  ;; Unlike 'member-of' in that it can generate all named descriptions
+  ;;    that a bound first argument belongs to.
+  (let ((proposition (proposition frame))
+        (arguments (arguments proposition))
+        (memberArg (first arguments))
+        (member (argument-bound-to memberArg))
+        (collectionArg (second arguments))
+        (collection (argument-bound-to collectionArg))
+        (iterator (iterator frame)))
+    (case lastMove
+      (:UP-TRUE
+       (return (choose (defined? (down frame))
+                       :CONTINUING-SUCCESS
+                       :FINAL-SUCCESS)))
+      (:UP-FAIL
+       (return :FAILURE))
+      (otherwise NULL))
+    (when (null? iterator) ; first time here?
+      (cond
+       ((defined? collection)
+        (cond ((and (class? collection)
+                    (isa? collection @NAMED-DESCRIPTION))
+               ;; Prove `(instance-of ?x C)' via `(C ?x)':
+               (let ((isaProposition
+                      (create-proposition (quote ISA) 1)))
+                 (setf (operator isaProposition)
+                   (surrogate-value-inverse
+                    (cast collection NAMED-DESCRIPTION)))
+                 (setf (nth (arguments isaProposition) 0) memberArg)
+                 (create-subgoal-frame frame isaProposition NULL)
+                 (return :MOVE-DOWN)))
+              ((null? member)
+               ;; spawn a :SCAN-COLLECTION proof:
+               (create-subgoal-frame
+                frame (proposition frame) :SCAN-COLLECTION)
+               (return :MOVE-DOWN))
+              (otherwise
+               (if (member-of-collection? member collection)
+                   (return :FINAL-SUCCESS)
+                 (return :FAILURE)))))
+       ((defined? member)
+        ;; `memberArg' is bound; generate classes:
+        (setq iterator (allocate-iterator (all-types member)))
+        (setf (iterator frame) iterator))
+       (otherwise
+        ;; Two unbound arguments passed to 'instance-of':
+        (return :FAILURE))))
+       
+    (when (defined? iterator)
+      ;; must be generating classes:
+      (when (next? iterator)
+        (bind-variable-to-value? collectionArg (value iterator) TRUE)
+        (return :CONTINUING-SUCCESS))
+      ;; iterator is used-up:
+      (return :FAILURE))
+    (return :FAILURE)))
+
+
+  ;;
+;;;;;; 'subset-of' specialist
+  ;;
+
+(defun (PL-KERNEL/SUBSET-OF-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Generate proofs using existing IMPLIES links.
+  ;; Tricky:  We follow 'equivalent-value' links that bias towards
+  ;;    comparison of non-named description (a possible kludge that
+  ;;    makes subsumption tests work better).
+  (let ((proposition (proposition frame))
+        (subCollectionArg (first (arguments proposition)))
+        (superCollectionArg (second (arguments proposition)))
+        (subCollection
+         (equivalent-value-of (argument-bound-to subCollectionArg)))
+        (superCollection 
+         (equivalent-value-of (argument-bound-to superCollectionArg)))
+        (iterator (iterator frame)))
+    (ignore lastMove)
+    (when (null? iterator) ; first time through?
+      (cond ((and (defined? subCollection)
+                  (defined? superCollection))
+             ;; both arguments are bound:
+             (if (collection-implies-collection? subCollection superCollection)
+                 (return :FINAL-SUCCESS)
+               (return :FAILURE)))
+            ((defined? subCollection)
+             ;; only the first argument is bound:
+             (typecase subCollection
+               (LOGIC-OBJECT
+                (setq iterator
+                  (concatenate
+                    (allocate-iterator (cons subCollection NIL))
+                    (all-supercollections subCollection))))
+               (STELLA/COLLECTION
+                (return :FAILURE))))
+            ((defined? superCollection)
+             ;; only the second argument is bound:
+             (typecase superCollection
+               (LOGIC-OBJECT
+                (setq iterator
+                  (concatenate
+                    (allocate-iterator (cons superCollection NIL))
+                    (all-subcollections superCollection))))
+               (STELLA/COLLECTION
+                (return :FAILURE))))
+            (otherwise
+             (inform EOL " Found 'subset-of' goal with two unbound arguments."
+                     EOL "   Possibly the query needs rewriting." EOL)
+             (return :FAILURE)))
+      (setf (iterator frame) iterator))
+    (while (next? iterator)
+      (let ((value (value-of (value iterator))))
+        (when (and TRUE ; (isa? value @NAMED-DESCRIPTION)
+                   (choose
+                    (defined? subCollection)
+                    (bind-variable-to-value? superCollectionArg value TRUE)
+                    (bind-variable-to-value? subCollectionArg value TRUE)))
+          (return :CONTINUING-SUCCESS))))
+    (return :FAILURE) ))
+
+
+  ;;
+;;;;;; 'holds' specialist
+  ;;
+
+(defun (PL-KERNEL/HOLDS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; When the first argument to a HOLDS proposition is bound, applies
+  ;;    the description in the first argument to the remaining
+  ;;    arguments.
+  (let ((holdsProposition (proposition frame))
+        (holdsArguments (arguments holdsProposition))
+        (description (argument-bound-to (first holdsArguments))))
+    (case lastMove
+      (:UP-TRUE
+       (return (choose (defined? (down frame)) :CONTINUING-SUCCESS :FINAL-SUCCESS)))
+      (:UP-FAIL (return :FAILURE))
+      (:DOWN NULL))
+    (when (null? description)
+      (return :FAILURE))
+    (typecase description
+      (NAMED-DESCRIPTION
+       (let ((argCountMinus1 (1- (length holdsArguments)))
+             (kind (quote PREDICATE))
+             (relationProposition PROPOSITION NULL)
+             (relationRef (surrogate-value-inverse description)))
+         (cond
+          ((class-description? description) (setq kind (quote ISA)))
+          ((function-description? description) (setq kind (quote FUNCTION))))
+         (setq relationProposition (create-proposition kind argCountMinus1))
+         (setf (relationRef relationProposition) relationRef)
+         (foreach i in (interval 0 (1- argCountMinus1))
+                  do (setf (nth (arguments relationProposition) i)
+                           (nth holdsArguments (1+ i))))
+         (create-subgoal-frame frame relationProposition NULL)
+         (return :MOVE-DOWN)))
+      (DESCRIPTION
+       (let ((argCountMinus1 (1- (length holdsArguments)))
+             (dummyProposition (create-proposition (quote DUMMY) argCountMinus1))
+             (subGoalFrame
+              (create-subgoal-frame frame dummyProposition :FULL-SUBQUERY)))
+         ;; kludge -- we create 'dummyProposition' just to hold the arguments;
+         ;;    'description' overrides it:
+         (foreach i in (interval 0 (1- argCountMinus1))
+                  do (setf (nth (arguments dummyProposition) i)
+                           (nth holdsArguments (1+ i))))
+         (setf (description subGoalFrame) description)
+         (return :MOVE-DOWN)))
+      (otherwise NULL))
+    (return :FAILURE) ))
+
+  ;;
+;;;;;; 'cut' specialist
+  ;;
+
+(defun (PL-KERNEL/CUT-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Succeed the first time and then kill the parent :AND frame the second
+  ;;    time.
+  (ignore lastMove)
+  (cond
+   ((null? (iterator frame))
+    ;; kludgy way to mark that we've been here before:
+    (setf (iterator frame) EMPTY-PROPOSITIONS-ITERATOR)
+    (return :CONTINUING-SUCCESS))
+   (otherwise
+    (let ((parentFrame (up Frame)))
+      (when (or (null? parentFrame)
+                (not (eql? (state parentFrame) :AND)))
+        (return :TERMINAL-FAILURE))
+      ;; fool :AND into thinking it's done with previous conjuncts:
+      (let ((conjuncts (arguments parentFrame)))
+        (when (defined? conjuncts)
+          (foreach conjunct in conjuncts
+              do (if (eql? conjunct frame)
+                     (break)
+                   (pop-control-frame conjunct)))))
+      (return :TERMINAL-FAILURE)))) )
+#|
+(CL:progn
+  (cc pl-kernel)
+  (retrieve all ?x (and (subset-of NUMBER ?x) (cut)))
+  )
+|#
+
+  ;;
+;;;;;; 'bound-variable' specialist
+  ;;
+
+(defun (PL-KERNEL/BOUND-VARIABLES-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Succeed if all arguments are bound variables.
+  (let ((allBound? (forall arg in (arguments (proposition frame))
+                           always (defined? (argument-bound-to arg)))))
+    (ignore lastMove)
+    (when *reversePolarity?*
+      (setq allBound? (not allBound?)))
+    (cond (allBound?
+	 (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	 (return :FINAL-SUCCESS))
+	(otherwise
+	 (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	 (return :TERMINAL-FAILURE)))))
+
+  ;;
+;;;;;; 'fork' specialist
+  ;;
+
+(defun (PL-KERNEL/FORK-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Evaluate the first argument.  If true, return the result of
+  ;;    evaluating the second argument.  Otherwise, return the result
+  ;;    of evaluating the third argument.
+  (case lastMove
+    (:DOWN (return :MOVE-DOWN))
+    (:UP-TRUE
+     (when (> (argument-cursor frame) 0)
+       (return :CONTINUING-SUCCESS))
+     ;; must be that the (first) test argument succeeded:
+     (setf (down frame) NULL)
+     (setf (argument-cursor frame) 1)
+     (return :MOVE-DOWN))
+    (:UP-FAIL
+     (when (> (argument-cursor frame) 0)
+       (return :FAILURE))
+     ;; must be that the (first) test argument failed:
+     (setf (down frame) NULL)
+     (setf (argument-cursor frame) 2)
+     (return :MOVE-DOWN))) )
+
+  ;;
+;;;;;; EXPERIMENTAL 'query' specialist
+  ;;
+
+;;; TO DO:
+;;; - INFORM QUERY OPTIMIZER
+;;; - HANDLE :CURRENT OPTION INHERITANCE
+;;; - IMPROVE TRACING
+;;; - USE PARALLEL FRAME INSTEAD OF QUERY?
+;;; - HANDLE REVERSE POLARITY BY ARGUMENT INVERSION, SINCE SIMPLY
+;;;   SWITCHING THE SPECIAL WON'T DO THE RIGHT THING IN PARTIAL MATCH MODE
+
+;;; Alternatively, we might want to do this with a syntax like the following:
+#|
+(assert
+  (=> (AND
+       (about
+        (!record-fd-murder ?match ?killer ?victim)
+        :weight 4.0
+        :inference-control (:moveout 100 :timeout 1.0 :match-mode :eeld
+                            :inference-level :assertion
+                            :minimum-score 1.0 :how-many 10))
+       (killing ?match2 ?killer ?victim ?weapon ?city)
+       (observe ?match3 ?killer ?victim))
+      (first-degree-murder-method-001
+       ?match ?killer ?victim ?match2 ?city ?match3)))
+|#
+
+#|
+;; This formulation works:
+(assert (=> (exists (?set)
+              (query
+               (and (collect-into-set ?col ?set)
+                    (length-of-list ?set ?card))
+               :match-mode :strict
+               :inference-level :shallow))
+            (|extentCardinality| ?col ?card)))
+
+;; this one used to fail, check whether it still does:
+(assert (=> (query
+             (exists (?set)
+               (and (collect-into-set ?col ?set)
+                    (length-of-list ?set ?card))
+               :match-mode :strict
+               :inference-level :shallow))
+            (|extentCardinality| ?col ?card)))
+|#
+
+(defun (compute-subquery-options PROPOSITION PROPERTY-LIST)
+    ((frame CONTROL-FRAME))
+  ;; Compute the query proposition and option keys and return them.
+  ;; Inherit options from the parent query as indicated via :INHERIT
+  ;;    values or an :INHERIT :ALL specification.
+  ;; Return NULL if the proposition or any of the options or values are
+  ;;    unbound or illegal indicating failure.
+  ;; NOTE: This supports the syntax `(query 5 (prop ?...) ...)' similar
+  ;;    to the top-level `retrieve', however, currently the first argument
+  ;;    of the `QUERY' relation needs to be typed as PROPOSITION for
+  ;;    parsing to work correctly, hence, the number of solutions can
+  ;;    (for now) only be specified via a :HOW-MANY specification.
+  (let ((arguments (arguments (proposition frame)))
+        (arg OBJECT NULL)
+        (propArg PROPOSITION NULL)
+        (lastOptionArgIndex (1- (length arguments)))
+        (cursor 1)
+        (key OBJECT NULL)
+        (value OBJECT NULL)
+        (subQueryOptions (new PROPERTY-LIST))
+        (parentOptions (options *queryIterator*)))
+    (when (< lastOptionArgIndex 0)
+      ;; illegal empty subquery:
+      (return NULL NULL))
+    (setq arg (argument-bound-to (first arguments)))
+    (cond ((and (defined? arg)
+                (isa? arg @PROPOSITION))
+           (setq propArg arg))
+          ((>= lastOptionArgIndex 1)
+           (setq cursor 0)
+           (setq key :HOW-MANY)
+           (setq value arg)
+           (setq arg (argument-bound-to (second arguments)))
+           (if (and (defined? arg)
+                    (isa? arg @PROPOSITION))
+               (setq propArg arg)
+             (return NULL NULL)))
+          (otherwise
+           (return NULL NULL)))
+    (when (even? (- lastOptionArgIndex cursor))
+      ;; skip unbalanced extra key argument - should we signal an error here?
+      (-- lastOptionArgIndex))
+    (while (< cursor lastOptionArgIndex)
+      (cond ((= cursor 0)) ;; we had an initial :HOW-MANY argument
+            (otherwise
+             (setq key
+               (generate-term
+                (argument-bound-to (nth arguments cursor))))
+             (setq value
+               (generate-term
+                (argument-bound-to (nth arguments (1+ cursor)))))))
+      (++ cursor 2)
+      (when (or (null? key)
+                (null? value))
+        ;; unbound option arg, signal failure:
+        (return NULL NULL))
+      ;; inherit parent query options where indicated or copy what's specified:
+      (cond ((eql? key :INHERIT)
+             (when (or (eql? value :ALL)
+                       (eql? value :CURRENT))
+               (foreach (pKey pValue) in parentOptions
+                   do (insert-at subQueryOptions pKey pValue))))
+            ((or (eql? value :INHERIT)
+                 (eql? value :CURRENT))
+             (when (defined? (lookup-query-option parentOptions key))
+               (insert-at subQueryOptions key
+                          (lookup-query-option parentOptions key))))
+            (otherwise
+             (insert-at subQueryOptions key value))))
+    (return propArg subQueryOptions)))
+
+(defslot CONTROL-FRAME query-specialist-io-variables :type LIST)
+
+(defun (create-query-specialist-iterator QUERY-ITERATOR BOOLEAN BOOLEAN)
+    ((frame CONTROL-FRAME))
+  ;; Create the subquery iterator for a `query' goal and return the result.
+  ;;    The second return value indicates whether the query is a true/false
+  ;;    query and the third whether it is partial.
+  ;; Also records the externally unbound variables on `frame' in
+  ;;    `query-specialist-io-variables'.
+  (mv-bind (proposition subQueryOptions)
+      (compute-subquery-options frame)
+    (let ((subQueryIterator (allocate-query-iterator))
+          (subQueryDescription DESCRIPTION NULL)
+          (matchMode OBJECT NULL)
+          (trueFalseQuery? FALSE)
+          (partialQuery? FALSE)
+          (ioVariables (new LIST))
+          (ioVariableBindings VECTOR NULL))
+      (if (null? proposition)
+          (return NULL FALSE FALSE)
+        (process-query-options subQueryIterator subQueryOptions))
+      (setq matchMode (lookup-query-option subQueryIterator :MATCH-MODE))
+      (when (and (defined? matchMode)
+                 (not (string-equal? (coerce-to-string matchMode) "STRICT")))
+        (setq partialQuery? TRUE))
+      (collect-free-variables proposition ioVariables (list) (list))
+      (setf (query-specialist-io-variables frame) ioVariables)
+      (setq subQueryDescription
+        (new DESCRIPTION
+             :io-variables (copy-list-to-arguments-vector ioVariables)
+             :proposition proposition))
+      (compute-internal-variables subQueryDescription)
+      (setq ioVariableBindings (new VECTOR :array-size (length ioVariables)))
+      (setq trueFalseQuery? TRUE)
+      (foreach var in ioVariables
+          as i in (interval 0 NULL)
+          do (setf (nth ioVariableBindings i) (argument-bound-to var))
+             (when (null? (nth ioVariableBindings i))
+               (setq trueFalseQuery? FALSE)))
+      ;; note, that the io-variables of `subQueryDescription' are allocated
+      ;;    as copies of the unbound variables of `frame':
+      (initialize-query-iterator
+       subQueryIterator subQueryDescription ioVariableBindings)
+      (return subQueryIterator trueFalseQuery? partialQuery?))))
+
+(defun (PL-KERNEL/QUERY-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Evaluates its argument as a completely independent subquery with modified
+  ;;    search control options.  The list of accepted options is currently
+  ;;    the same as are legal for a top-level query.  The special option value
+  ;;    :INHERIT inherits the option value from the parent query.  The
+  ;;    pair :INHERIT :ALL inherits all parent options which can then be
+  ;;    further modified by additional individual option specifications.
+  ;; How many solutions will be generated is controlled by the :HOW-MANY
+  ;;    option (just like in the top level `retrieve').  The default is 1
+  ;;    which is again the same as for `retrieve' but different from how
+  ;;    other subgoals behave.  The reason for this is that partial match
+  ;;    solutions need to be handled eagerly, therefore a default of :ALL
+  ;;    is not desirable.
+  (let ((subQueryIterator QUERY-ITERATOR (iterator frame))
+        (trueFalseQuery? FALSE)
+        (partialQuery? FALSE)
+        (success? FALSE)
+        (result CONTROL-FRAME NULL))
+    (ignore lastMove)
+    (cond ((null? subQueryIterator)
+           ;; first time through:
+           (mv-setq (subQueryIterator trueFalseQuery? partialQuery?)
+             (create-query-specialist-iterator frame))
+           (if (null? subQueryIterator)
+               (return :TERMINAL-FAILURE)
+             (setf (iterator frame) subQueryIterator))
+           (when partialQuery?
+             ;; use `call-ask/retrieve-partial', since they know how to generate
+             ;;    the properly optimized and ordered set of solution(s):
+             (if trueFalseQuery?
+                 (call-ask-partial subQueryIterator)
+               (call-retrieve-partial subQueryIterator))))
+          (otherwise
+           ;; slightly tricky, we don't need to set `trueFalseQuery?' here
+           ;;    since we terminally succeed or fail the first time around
+           ;;    (maybe we need to relax this for partial true/false queries
+           ;;    that might generate multiple explanations):
+           (setq partialQuery?
+             (defined? (partial-match-strategy subQueryIterator)))))
+    (trace-if :GOAL-TREE EOL)
+    (loop
+      (cond (partialQuery?
+             ;; we already eagerly precomputed any solutions above; now just
+             ;;    supply them one-by-one from their storage in the iterator:
+             (setq success? (query-succeeded? subQueryIterator))
+             (when success?
+               ;; Fake the various query result data structures:
+               (let ((solution (pop (solutions subQueryIterator))))
+                 (setq result (base-control-frame subQueryIterator))
+                 (unless trueFalseQuery?
+                   (setf (slot-value subQueryIterator value) solution))
+                 (setf (truth-value result) (truth-value solution))
+                 (when (record-justifications?)
+                   (setf (justification result) (justification solution)))
+                 (setf (positive-score (partial-match-frame result))
+                   (match-score solution)))))
+            (otherwise
+             (special ((*queryIterator* subQueryIterator)
+                       (*reversePolarity?* (reverse-polarity? frame))
+                       (*inferenceLevel* (current-inference-level))
+                       (*generate-all-proofs?* FALSE))
+               ;; strict subqueries are evaluated lazily as prompted by
+               ;;    the surrounding goals:
+               (let ((howMany (lookup-how-many-solutions subQueryIterator)))
+                 (when (or (null? howMany)
+                           (>= howMany 1))
+                   (setq success? (next? subQueryIterator)))
+                 ;; decrement :HOW-MANY option:
+                 (cond ((null? howMany)) ;; get all solutions
+                       ((<= howMany 1)   ;; we are done
+                        (setf (exhausted? subQueryIterator) TRUE))
+                       (otherwise
+                        ;; we must have at least a defined :HOW-MANY option:
+                        (insert-at (options subQueryIterator)
+                                   :HOW-MANY (1- howMany))))
+                 (when success?
+                   (setq result (base-control-frame subQueryIterator)))))))
+      (when success?
+        (foreach var in (query-specialist-io-variables frame)
+            as value in (bindings (value subQueryIterator))
+            do (unless (bind-variable-to-value? var value TRUE)
+                 ;; this can really only fail with a type violation:
+                 (setq success? FALSE)
+                 (break)))
+        (when (and (not success?)
+                   (not trueFalseQuery?))
+          (continue)))
+      (break))
+    (trace-if :GOAL-TREE EOL)
+    (cond (success?
+           ;; simply copy justifications and truth values without generating
+           ;;    a separate justifications for the `query' frame:
+           (propagate-frame-truth-value result frame)
+           (when (and (partial-match-mode?)
+                      ;; make sure the subquery was also partial:
+                      partialQuery?)
+             (propagate-frame-partial-truth
+              (partial-match-frame result) frame))
+           (when (record-justifications?)
+             (record-goal-justification frame (justification result)))
+           (if trueFalseQuery?
+               (return :FINAL-SUCCESS)
+             (return :CONTINUING-SUCCESS)))
+          (otherwise
+           (return :TERMINAL-FAILURE)))))
+
+       
+  ;;
+;;;;;; Concept prototype specialist
+  ;;
+
+
+(defglobal *prototype-id-counter* INTEGER 0)
+
+;;; Discussion:  Currently, concept prototypes are logic objects instead of
+;;;    skolems.  This choice principally hinges on the fact that skolems
+;;;    are equated via equality propositions, and we prefer a direct
+;;;    'variable-value' link to point at the prototype.  An alternative
+;;;    would be to attach intensional assertions to the intensional
+;;;    skolem, but we chose not to do that.
+  
+(defun (PL-KERNEL/CONCEPT-PROTOTYPE-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Initialize the logic object created to represent the prototype:
+  ;;    Assert membership in the class;
+  ;;    Block insertion into the class extension.
+  ;;    Mark as hypothesized skolem.
+  (let ((proposition (proposition frame))
+        (class DESCRIPTION (argument-bound-to (first (arguments proposition))))
+        (prototypeArgument (second (arguments proposition)))
+        (prototype LOGIC-OBJECT NULL))
+    (ignore lastMove)
+    (when (or (null? class)
+              (not (isa? class @DESCRIPTION)))
+      (return :TERMINAL-FAILURE))
+    (setq prototype (access-binary-value class PL-KERNEL/@CONCEPT-PROTOTYPE))
+    (when (null? prototype)
+      (let ((name STRING NULL))
+        (if (isa? class @NAMED-DESCRIPTION)
+          (setq name (concatenate "PROTO-" (symbol-name (description-name class))))
+          (setq name (concatenate "PROTOTYPE"
+                                  (integer-to-string (++ *prototype-id-counter*)))))
+        (within-context (home-context class)
+          (special (;(*suppressInsertionIntoClassExtension?* TRUE)
+                    (*invisibleAssertion?* TRUE))
+            (setq prototype (create-logic-instance (surrogatify name) NULL))
+            (setf (hypothesized-instance? prototype) TRUE)
+            (assert-member-of-proposition prototype class)
+            (assert-binary-value PL-KERNEL/@CONCEPT-PROTOTYPE class prototype)))))
+    (return
+     (select-proof-result 
+      (bind-argument-to-value? prototypeArgument prototype TRUE)
+      FALSE TRUE)) ))
+
+(defun (concept-prototype? BOOLEAN) ((self LOGIC-OBJECT))
+  ;; Return true if `self' is a concept prototype.
+  (return
+    (and (hypothesized-instance? self)
+         (exists prop in (all-true-dependent-isa-propositions self)
+             where (defined?
+                     (access-binary-value
+                      (surrogate-to-description (operator prop))
+                      PL-KERNEL/@CONCEPT-PROTOTYPE))))))
+
+
+  ;;
+;;;;;; Closed specialist
+  ;;
+
+;;; Note: 'closed-term?' is intended to be used both by the specialist
+;;;    and by any procedural code that needs it.
+
+(defun (PL-KERNEL/CLOSED-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Return TRUE if the argument to PL-KERNEL/@CLOSED is closed.
+  (let ((proposition (proposition frame))
+        (argValue (argument-bound-to (first (arguments proposition))))
+        (closed? (closed-term? argValue)))
+    (ignore lastMove)
+    (when (null? argValue)
+      (return :TERMINAL-FAILURE))
+    (when *reversePolarity?*
+      (setq closed? (not closed?)))
+    (return
+     (select-proof-result closed? FALSE TRUE)) ))
+
+(defun (closed-by-assertion? BOOLEAN) ((self OBJECT))
+  ;; Helping function for 'closed-term?'.
+  ;; Return TRUE if 'self' is asserted to be closed and we are
+  ;;    not in a monotonic world.
+  :globally-inline? TRUE
+  (return
+    ;; don't memoize, since `test-property?' already is:
+    (and (test-property? self PL-KERNEL/@CLOSED)
+         (not (monotonic? *context*)))) )
+
+(defun (closed-term? BOOLEAN) ((self OBJECT))
+  ;; Return TRUE if 'self' can be proved closed.
+  :public? TRUE :globally-inline? TRUE
+  (return
+    ;; probably doesn't gain much anymore, since most of its
+    ;;    helper functions are now memoized:
+    (memoize (self *context*)
+             :timestamps :KB-UPDATE ;; be conservative
+             :max-values 500
+             (help-closed-term? self NIL))))
+
+(defun (help-closed-term? BOOLEAN) ((self OBJECT) (activeTerms CONS))
+  ;; Helper function for `closed-term?'.
+  ;; `activeTerms' holds a list of currently active terms on the stack
+  ;;     to avoid infinite recursion if we have cycles.
+  (when (null? self)
+    (return FALSE))
+  (if (memb? activeTerms self)
+      (return FALSE)
+    (setq activeTerms (cons self activeTerms)))
+  (typecase self
+    (NAMED-DESCRIPTION
+     (return (or (closed-by-assertion? self)
+                 (and (defined? (equivalent-value self))
+                      (help-closed-term? (equivalent-value self) activeTerms)))))
+    (DESCRIPTION
+     (return (help-closed-proposition? (proposition self) activeTerms)))
+    (SURROGATE (return (help-closed-term? (value-of self) activeTerms)))
+    (PATTERN-VARIABLE (return TRUE))
+    (SKOLEM
+     (let ((definingProp (defining-proposition self)))
+       (return (or (and (defined? definingProp)
+                        (collectionOf-proposition? definingProp))
+                   (closed-by-assertion? self)))))
+    ((LOGIC-OBJECT THING)
+     (return (closed-by-assertion? self)))
+    (STELLA/COLLECTION (return TRUE))
+    (otherwise
+     ;; not sure about this; just being conservative:
+     (return FALSE))) )
+
+(defun (closed-proposition? BOOLEAN) ((self PROPOSITION))
+  ;; Return TRUE if all predications at or within 'self'
+  ;;    have closed descriptions.
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (memoize (self *context*)
+             :timestamps :META-KB-UPDATE
+             :max-values 500
+             (help-closed-proposition? self NIL))))
+
+(defun (help-closed-proposition? BOOLEAN) ((self PROPOSITION) (activeTerms CONS))
+  ;; Helper function for `closed-proposition?'.
+  ;; `activeTerms' holds a list of currently active terms on the stack
+  ;;     to avoid infinite recursion if we have cycles.
+  (if (memb? activeTerms self)
+      (return FALSE)
+    (setq activeTerms (cons self activeTerms)))
+  (case (kind self)
+    ((:AND :OR :NOT :FORALL :EXISTS)
+     (return (forall arg in (arguments self)
+                     always (help-closed-proposition? arg activeTerms))))
+    ((:PREDICATE :FUNCTION :ISA)
+     (case (relationRef self)
+       (PL-KERNEL/@MEMBER-OF
+        (return (help-closed-term? (second (arguments self)) activeTerms)))
+       (otherwise
+        (let ((description (get-description (relationRef self))))
+          (return (or (help-closed-term? description activeTerms)
+                      (and (single-valued-term? description)
+                           (test-property? description PL-KERNEL/@TOTAL))))))))
+    (:FAIL (return TRUE))
+    (otherwise (return FALSE))))
+
+
+  ;;
+;;;;;; Single-valued Specialist
+  ;;
+
+(defun (PL-KERNEL/SINGLE-VALUED-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Return TRUE if the argument to SINGLE-VALUED is single-valued.
+  (let ((proposition (proposition frame))
+        (argValue (argument-bound-to (first (arguments proposition))))
+        (singleValued? (single-valued-term? argValue)))
+    (ignore lastMove)
+    (when (null? argValue)
+      (return :TERMINAL-FAILURE))
+    (when *reversePolarity?*
+      (setq singleValued? (not singleValued?)))
+    (if singleValued?
+      (return :FINAL-SUCCESS)
+      (return :TERMINAL-FAILURE)) ))
+
+(defun (single-valued-term? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  ;; Designed for use by both a specialist and procedural code.
+  ;; Return TRUE if 'self' is a relation that can generate only one
+  ;;    binding for its last argument if all but the last are bound.
+  ;; Only for descriptions (but the name mimics 'closed-term?').
+  (special ((*reversePolarity?* FALSE))
+    (when-cyc-kludges-enabled
+     ;; try this to avoid running up the hierarchy with Cyc:
+     (return (or (function? self)
+                 (test-property? self PL-KERNEL/@SINGLE-VALUED))))
+    (return
+      (memoize (self *context*)
+               :timestamps :META-KB-UPDATE :max-values 500
+               (or (non-recursive-single-valued-term? self)
+                   (and (not (class? self))
+                        ;; TO DO: CHECK IF SYMMETRIC INVERSE IS SINGLE-VALUED:
+                        (exists d in (all-supercollections self)
+                            where (non-recursive-single-valued-term? d))))))))
+
+(defun (non-recursive-single-valued-term? BOOLEAN) ((self OBJECT))
+  ;; Helping function for 'single-valued-term?', invented to avoid
+  ;;    infinite recursions.
+  (typecase self
+    (NAMED-DESCRIPTION
+     (return (or (function-description? self)
+                 (test-property? self PL-KERNEL/@SINGLE-VALUED))))
+    (DESCRIPTION
+     (let ((proposition (proposition self))
+           (ioVariables (CONS OF PATTERN-VARIABLE) NIL))
+       (foreach arg in (io-variables self)
+                do (pushq ioVariables arg))
+       (return (single-valued-goal? 
+                proposition ioVariables (copy-cons-list (rest ioVariables))))))
+    (otherwise (return FALSE))) )
+
+(defun (single-valued-goal? BOOLEAN) 
+       ((proposition PROPOSITION) (ioVariables (CONS OF PATTERN-VARIABLE))
+        (boundVariables (CONS OF PATTERN-VARIABLE)))
+  :public? TRUE
+  ;; Return TRUE if the unbound variables in 'proposition' can only be
+  ;;    bound once if 'proposition' is evaluated in a query.
+  (let ((boundVariablesList (listify boundVariables))
+        (oldCount (length boundVariablesList))
+        (newCount INTEGER NULL))
+    (loop
+      (help-collect-singly-bound-variables proposition boundVariablesList)
+      (setq newCount (length boundVariablesList))
+      (when (eql? oldCount newCount)
+        (break))
+      (setq oldCount newCount))
+    (return (forall vbl in ioVariables
+                    always (member? boundVariablesList vbl))) ))
+
+(defun help-collect-singly-bound-variables
+       ((proposition PROPOSITION) (boundVariables (LIST OF PATTERN-VARIABLE)))
+  ;; Helping function for 'single-valued-proposition?'.
+  ;; Collect additional variables that can be bound only once into
+  ;;    'boundVariables'.
+  (case (kind proposition)
+    (:AND
+     (foreach arg in (arguments proposition)
+         do (help-collect-singly-bound-variables arg boundVariables)))
+    ((:FUNCTION :PREDICATE)
+     (when (> (length (arguments proposition)) 0)
+       (let ((lastArg (last-argument proposition)))
+         (when (and (variable? lastArg)
+                    (not (member? boundVariables lastArg))
+                    (or (eql? (kind proposition) :FUNCTION)
+                        (single-valued-term? 
+                         (get-description (relationRef proposition))))
+                    (forall arg in (but-last (arguments proposition))
+                        always (or (not (variable? arg))
+                                   (member? boundVariables arg))))
+           (push boundVariables lastArg)))))
+    (:EQUIVALENT
+     (let ((unboundVariables NIL))
+       (foreach arg in (arguments proposition)
+           where (and (variable? arg)
+                      (not (member? boundVariables arg)))
+           do (pushq unboundVariables arg))
+       (when (eql? (length unboundVariables) 1)
+         (push boundVariables (first unboundVariables)))))
+    (otherwise NULL)) )
+         
+    
+  ;;
+;;;;;; COLLECT-INTO-SET specialist and friends
+  ;;
+
+(defun create-collect-description-extension-frame 
+       ((frame CONTROL-FRAME) (description DESCRIPTION))
+  ;; Create a down frame that collects the instances of the
+  ;;    "next" description in 'frame'.
+  (let ((downFrame (create-down-frame frame NULL)))
+    ;; unless create relation extensions, we need to have
+    ;;    bodies for higher arity relations:
+    (overlay-with-pattern-frame? downFrame description NULL)
+    ;; convert :PATTERN frame into collection frame:
+    (setf (collection-list (pattern-record downFrame)) (new LIST)) ))
+
+(defun (PL-KERNEL/COLLECT-INTO-SET-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Compute as many members of the first collection argument as possible,
+  ;;    remove duplicates, and bind the second argument to a set containing them.
+  (let ((proposition (proposition frame))
+        (collectionArg (first (arguments proposition)))
+        (collectionValue (argument-bound-to collectionArg))
+        (listArg (second (arguments proposition))))
+    (ignore lastMove)
+    (when (null? collectionValue)
+      (return :TERMINAL-FAILURE))
+;    (when (defined? (argument-bound-to listArg))
+;      (inform 
+;       EOL "User bug: 'collect-into-set' called with bound second argument." EOL)
+;      (return :TERMINAL-FAILURE))
+    (when (null? (iterator frame))      ; first time through
+      ;; Optimization: if we are passed an explicitly enumerated set,
+      ;;    simply return it instead of generating an identical copy:
+      (when (and (enumerated-set? collectionValue)
+                 ;; check for equivalents:
+                 (empty? (variable-value-inverse
+                          (cast collectionValue LOGIC-OBJECT))))
+        (bind-argument-to-value? listArg collectionValue TRUE)
+        (return :FINAL-SUCCESS))
+      (typecase collectionValue
+        ((STELLA/COLLECTION SKOLEM)
+         (let ((members (asserted-collection-members collectionValue FALSE)))
+           (when (null? members)
+             (return :TERMINAL-FAILURE))
+           (bind-argument-to-value?
+            listArg (create-enumerated-set members) TRUE)
+           (return :FINAL-SUCCESS)))
+        (DESCRIPTION
+         (when (and (defined? (external-variables collectionValue))
+                    (exists v in (external-variables collectionValue)
+                            where (not (defined? (argument-bound-to v)))))
+           (return :TERMINAL-FAILURE))
+         (if (inferable? collectionValue)
+           (progn
+             (create-collect-description-extension-frame frame collectionValue)
+             ;; tiny kludge: set '(iterator frame)' so we know
+             ;;    when we are returning from a collection proof:
+             (setf (iterator frame) EMPTY-PROPOSITIONS-ITERATOR)
+             (return :MOVE-DOWN))
+           ;; must be a non-inferable named description, where a simple scan of
+           ;;    isa's down the hierarchy suffices:
+           (let ((members (asserted-collection-members collectionValue FALSE)))
+             (when (null? members)
+               (return :TERMINAL-FAILURE))
+             (bind-argument-to-value? 
+              listArg (create-enumerated-set members) TRUE)
+             (return :FINAL-SUCCESS))))
+        (otherwise
+         (return :FAILURE))))
+    ;; we have collected instances of a named description:
+    (when (null? (down frame))
+      (return :FAILURE))
+    (let ((list (collection-list (pattern-record (down frame)))))
+      ;; we are now done with :PATTERN frame:
+      (pop-frames-up-to (down frame))
+      ;; NOTE: this doesn't yet eliminate (some) skolems - should it?
+      (remove-duplicates list)
+      (bind-argument-to-value? listArg (create-enumerated-set list) TRUE)
+      (return :FINAL-SUCCESS)) ))
+
+(defun (PL-KERNEL/LENGTH-OF-LIST-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Compute as many members of the first list argument as possible
+  ;;    and bind the second argument to the length of the computed list.
+  ;; TO DO: MAYBE SPECIAL-CASE ENUMERATED LISTS AND SETS WITHOUT EQUIVALENTS
+  ;;    TO AVOID THE OVERHEAD OF CALLING `ASSERTED-COLLECTION-MEMBERS'.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (lengthArg (second (arguments proposition))))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'LENGTH-OF-LIST'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE))
+	  (len INTEGER NULL))
+      (when (null? listValue)
+        (return :TERMINAL-FAILURE))
+      (setq len (length (cast listValue STELLA/LIST)))
+      (if (bind-argument-to-value? lengthArg len TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+(defun (PL-KERNEL/MINIMUM-OF-NUMBERS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the smallest.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (minArg (second (arguments proposition)))
+	(minValue (argument-bound-to MinArg))
+        (minimum NUMBER-WRAPPER NULL)
+	(missingNumbers? FALSE))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'MINIMUM-OF-NUMBERS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE)))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+	  do (if (isa? v @NUMBER-WRAPPER)
+	       (when (or (null? minimum)
+			 (pl-kernel/arithmetic-less-test
+			  (cast v @NUMBER-WRAPPER) minimum))
+		 (setq minimum v))
+	       (setq missingNumbers? TRUE)))
+      (when (null? minimum)
+        (return :TERMINAL-FAILURE))
+
+      (when missingNumbers?   ;; We can still check for failure
+	(if (and (defined? minValue)
+		 (isa? minValue @NUMBER-WRAPPER)
+		 (pl-kernel/arithmetic-greater-test
+		  (cast minValue @NUMBER-WRAPPER) minimum))
+	  (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		 (return :TERMINAL-FAILURE))
+	  (progn (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+		 (return :FAILURE))))	; :TERMINAL-FAILURE ?
+
+      (if (bind-argument-to-value? minArg minimum TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+(defun (PL-KERNEL/MAXIMUM-OF-NUMBERS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the largest.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (maxArg (second (arguments proposition)))
+	(maxValue (argument-bound-to MaxArg))
+        (maximum NUMBER-WRAPPER NULL)
+	(missingNumbers? FALSE))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'MAXIMUM-OF-NUMBERS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE)))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+               do (if (isa? v @NUMBER-WRAPPER)
+		    (when (or (null? maximum)
+                              (pl-kernel/arithmetic-greater-test
+			       (cast v @NUMBER-WRAPPER) maximum))
+		      (setq maximum v))
+		    (setq missingNumbers? TRUE)))
+      (when (null? maximum)
+        (return :TERMINAL-FAILURE))
+
+      (when missingNumbers?
+	(if (and (defined? maxValue)
+		 (isa? maxValue @NUMBER-WRAPPER)
+		 (pl-kernel/arithmetic-less-test
+		  (cast maxValue @NUMBER-WRAPPER) maximum))
+	  (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		 (return :TERMINAL-FAILURE))
+	  (progn (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+		 (return :FAILURE))))	; :TERMINAL-FAILURE ?
+
+      (if (bind-argument-to-value? maxArg maximum TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+;;;
+;;;  The following functions could be made more efficient by
+;;;     making the accumulator objects be of type FLOAT and
+;;;     using floating point arithmetic internally, while keeping
+;;;     track of whether the result should be of type INTEGER
+;;;     or not, and then making the appropriate change at that
+;;;     point.  - tar
+;;;
+
+(defun (PL-KERNEL/SUM-OF-NUMBERS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the sum.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (sumArg (second (arguments proposition)))
+        (sum NUMBER-WRAPPER NULL))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'SUM-OF-NUMBERS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE)))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+	  do (if (isa? v @NUMBER-WRAPPER)
+	       (if (null? sum)
+		 (setq sum (cast v @NUMBER-WRAPPER))
+		 (setq sum (pl-kernel/plus-computation (cast v @NUMBER-WRAPPER) sum)))
+	       (return :FAILURE)))	; :TERMINAL-FAILURE ?
+      (when (null? sum)
+        (return :TERMINAL-FAILURE))
+      (if (bind-argument-to-value? sumArg sum TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+(defun (PL-KERNEL/MEAN-OF-NUMBERS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the mean value
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (meanArg (second (arguments proposition)))
+        (sum NUMBER-WRAPPER 0)
+	(numberCount 0))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'MEAN-OF-NUMBERS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE)))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+	  do (if (isa? v @NUMBER-WRAPPER)
+	       (progn (setq sum (pl-kernel/plus-computation
+				 (cast v @NUMBER-WRAPPER) sum))
+		      (++ numberCount))
+	       (return :FAILURE)))	; :TERMINAL-FAILURE ?
+      (when (= numberCount 0)
+        (return :TERMINAL-FAILURE))
+      (if (bind-argument-to-value? 
+	   meanArg (pl-kernel/divide-computation sum numberCount) TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+(defun (PL-KERNEL/MEDIAN-OF-NUMBERS-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the median value.
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+	(sortList (new (LIST OF NUMBER-WRAPPER)))
+        (listSkolem (argument-bound-to listArg))
+        (medianArg (second (arguments proposition)))
+	(numberCount 0)
+	(result NUMBER-WRAPPER NULL))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'MEDIAN-OF-NUMBERS'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE)))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+	  do (if (isa? v @NUMBER-WRAPPER)
+	       (push sortList v)
+	       (return :FAILURE)))	; :TERMINAL-FAILURE ?
+      (setq numberCount (length sortList))
+      (when (= numberCount 0)
+        (return :TERMINAL-FAILURE))
+      (sort sortList (the-code :function pl-kernel/arithmetic-less-test))
+      (if (odd? numberCount)
+	(setq result (nth sortList (/ (1- numberCount) 2)))
+	(setq result (pl-kernel/divide-computation 
+		      (pl-kernel/plus-computation (nth sortList (1- (/ numberCount 2)))
+						  (nth sortList (/ numberCount 2)))
+		      2)))
+      (if (bind-argument-to-value? medianArg result TRUE)
+	(progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+	       (return :FINAL-SUCCESS))
+	(progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+	       (return :TERMINAL-FAILURE)))) ))
+
+
+(defun (compute-variance-or-standard-deviation KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD) (standard-deviation? BOOLEAN))
+  ;; Helping function for 'STANDARD-DEVIATION-specialist' and 'VARIANCE-specialist'.
+  ;; Given a list of numbers return either the standard deviation or the
+  ;;  variance, depending on the value of the Boolean standard-deviation?
+  (let ((proposition (proposition frame))
+        (listArg (first (arguments proposition)))
+        (listSkolem (argument-bound-to listArg))
+        (resultArgg (second (arguments proposition)))
+        (sum  0.0)
+	(sum2 0.0)
+	(x 0.0)
+	(numberCount 0))
+    (ignore lastMove)
+    (when (and (defined? listSkolem)
+               (not (logical-collection? listSkolem)))
+      (inform EOL "Non list appears in second argument to 'VARIANCE or STANDARD-DEVIATION'" EOL)
+      (return :TERMINAL-FAILURE))
+    (let ((listValue (asserted-collection-members listSkolem TRUE)))
+      (when (empty? listValue)
+        (return :TERMINAL-FAILURE))
+      (foreach v in listValue
+	  do (typecase v
+	       (INTEGER-WRAPPER
+		(setq x (wrapper-value v)))
+	       (FLOAT-WRAPPER
+		(setq x (wrapper-value v)))
+	       (otherwise
+		(set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
+		(return :FAILURE)))	; :TERMINAL-FAILURE ?
+	     (++ sum x)
+	     (++ sum2 (* x x))
+	     (++ numberCount))
+      (case numbercount
+	(0 
+	 (return :TERMINAL-FAILURE))
+	(1
+	 (if (bind-argument-to-value? resultArgg (wrap-literal 0.0) TRUE)
+	   (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+		  (return :FINAL-SUCCESS))
+	   (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		  (return :TERMINAL-FAILURE))))
+	(otherwise
+	  ;; X now holds the variance:
+	  (setq x (/ (- sum2 (/ (* sum sum) numberCount))
+		     (1- numberCount)))
+	  (when standard-deviation?
+	    ;; Turn into standard deviation:
+	    (setq x (sqrt x)))
+	  (if (bind-argument-to-value? resultArgg (wrap-literal x) TRUE)
+	    (progn (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+		   (return :FINAL-SUCCESS))
+	    (progn (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+		   (return :TERMINAL-FAILURE))))) )))
+
+(defun (PL-KERNEL/STANDARD-DEVIATION-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the standard deviation.
+  (return (compute-variance-or-standard-deviation frame lastMove TRUE)))
+
+(defun (PL-KERNEL/VARIANCE-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Given a list of numbers, return the variance
+  (return (compute-variance-or-standard-deviation frame lastMove FALSE)))
+
+
+  ;;
+;;;;;; Disjointness computations
+  ;;
+
+(defun help-derive-partition-memberships 
+       ((self LOGIC-OBJECT) (super LOGIC-OBJECT) (tuples (LIST OF PROPOSITION)))
+  ;; Assert PARTITION-MEMBERSHIP tuples for any disjointness relations
+  ;;    attached to 'super'.
+  
+  ;; derive partition memberships from MUTUALLY-DISJOINT-COLLECTION tuples:
+  (foreach mc in (apply-retrieve (?super ?mdc)
+                              (and (member-of ?super ?mdc)
+                                   (mutually-disjoint-collection ?mdc))
+                              (super NULL))
+           do (let ((MDCproposition
+                     (first (consify
+                             (all-true-dependent-propositions
+                              mc PL-KERNEL/@MUTUALLY-DISJOINT-COLLECTION FALSE)))))
+                (push tuples
+                      (assert-tuple
+                       PL-KERNEL/@PARTITION-MEMBERSHIP
+                       (cons-list self MDCproposition super)))))
+  ;; derive partition memberships from DISJOINT tuples:
+  (foreach p in (all-true-dependent-propositions
+                 super PL-KERNEL/@DISJOINT FALSE)
+           do (push tuples
+                    (assert-tuple
+                     PL-KERNEL/@PARTITION-MEMBERSHIP
+                     (cons-list self p super)))) )
+
+(defun (derive-partition-memberships? BOOLEAN) ((self LOGIC-OBJECT))
+  ;; Derive zero or more PARTITION-MEMBERSHIP tuples for 'self'.
+  ;; Return TRUE if at least one tuple was produced.
+  (let ((tuples (LIST OF PROPOSITION) (list)))
+    (help-derive-partition-memberships self self tuples)
+    (foreach super in (all-supercollections self)
+             do (help-derive-partition-memberships self super tuples))
+    (return (non-empty? tuples)) ))
+
+(defun (PL-KERNEL/HAS-PARTITION-MEMBERSHIP-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Creates a cache of PARTITION-MEMBERSHIP tuples for the instance
+  ;;    passed to 'HAS-PARTITION-MEMBERSHIP-specialist'.
+  ;; Creates a HAS-PARTITION-MEMBERSHIP tuple to record that
+  ;;    the caching has occurred.
+  (let ((proposition (proposition frame))
+        (argumentValue (argument-bound-to (first (arguments proposition)))))
+    (ignore lastMove)
+    (when (or (null? argumentValue)
+              (not (isa? argumentValue @LOGIC-OBJECT)))
+      (return :FAILURE))
+    (let ((hasPartitionProposition 
+           (some p in (unfiltered-dependent-propositions
+                       argumentValue PL-KERNEL/@HAS-PARTITION-MEMBERSHIP)
+                 where (eql? (relationRef p) PL-KERNEL/@HAS-PARTITION-MEMBERSHIP))))
+      (when (defined? hasPartitionProposition)
+        (cond
+         ((true? hasPartitionProposition)
+          (return :FINAL-SUCCESS))
+         ((false? hasPartitionProposition)
+          (return :TERMINAL-FAILURE))))
+      (if (derive-partition-memberships? argumentValue)
+        (progn
+          (update-property 
+           argumentValue PL-KERNEL/@HAS-PARTITION-MEMBERSHIP :ASSERT-TRUE)
+          (return :FINAL-SUCCESS))
+        (progn
+          (update-property 
+           argumentValue PL-KERNEL/@HAS-PARTITION-MEMBERSHIP :ASSERT-FALSE)
+          (return :TERMINAL-FAILURE)))) ))
+
+(defun (PL-KERNEL/REFUTATION-DISJOINT-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Create a hypothetical world, create a skolem argument(s) that belongs to
+  ;;    both classes, elaborate, and look for a clash.
+  ;; Note: Not called when polarity is reversed.
+  (let ((proposition (proposition frame))
+        (class1 DESCRIPTION (argument-bound-to (first (arguments proposition))))
+        (class2 DESCRIPTION (argument-bound-to (second (arguments proposition)))))
+    (ignore lastMove)
+    (when (or (null? class1)
+              (null? class2)
+              (> (length (arguments proposition)) 2))
+      (return :TERMINAL-FAILURE))
+    ;; note: We can't fork a parallel world here because the parallel machinery
+    ;;    isn't built for specialists (yet, if ever):  -rmm
+    (push-monotonic-world)
+    (initialize-inference-world *context*)
+    (exception-case
+     (let ((skolem (create-hypothesized-skolem "REFUTATION-DISJOINT")))
+       (foreach c in (cast (cons-list class1 class2) (CONS OF DESCRIPTION))
+                do (assert-member-of-proposition skolem c))
+       (elaborate-instance skolem))
+     (CLASH ()
+       (pop-world)
+       (return :FINAL-SUCCESS)))
+    (pop-world)
+    (return :FAILURE) ))
+
+
+  ;;
+;;;;;; 'empty-term?'
+  ;;
+
+(defun (PL-KERNEL/EMPTY-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Return TRUE if the argument to PL-KERNEL/@EMPTY is empty.
+  (let ((proposition (proposition frame))
+        (argValue (argument-bound-to (first (arguments proposition))))
+        (empty? (empty-term? argValue)))
+    (ignore lastMove)
+    (return (select-proof-result empty? FALSE TRUE)) ))
+
+;; CONSIDER ADDING ADDITIONAL STRATEGY:
+;;    'self' IS EMPTY IF IT IS CLOSED AND HAS NO MEMBERS.
+;;    'self' is EMPTY IF IT HAS CARDINALITY ZERO (THIS MIGHT BE
+;;        CIRCULAR).
+(defun (empty-term? BOOLEAN) ((self OBJECT))
+  :public? TRUE
+  ;; Designed for use by both a specialist and procedural code.
+  ;; Return TRUE if 'self' is a collection that contains no members.
+  ;; Proof strategies.  TRUE if 
+  ;;    (1) 'self' is an empty collection, or is asserted to be empty.
+  ;;    (2) 'self' has an empty supercollection,
+  ;;    (3) 'self' has two disjoint supercollections.
+  (typecase self
+    (LOGIC-OBJECT
+     (return (or (cheap-empty-term? self)
+                 (expensive-empty-term? self))))
+    (STELLA/COLLECTION 
+     (return (eql? (length self) 0)))
+    (otherwise
+     (return FALSE))) )
+
+(defun (cheap-empty-term? BOOLEAN) ((self LOGIC-OBJECT))
+  ;; Helping function for 'empty-term?' that implements strategies
+  ;;    (1) and (2).
+  (when (skolem? self)
+    (let ((definingProposition (defining-proposition (cast self SKOLEM))))
+      (when (and (defined? definingProposition)
+                 (collectionOf-proposition? definingProposition)
+                 (eql? (length (arguments definingProposition)) 1))
+        (return TRUE))))
+  (return
+   (or (test-property? self PL-KERNEL/@EMPTY)
+       (exists super in (all-direct-supercollections self FALSE)
+               where (cheap-empty-term? super)))) )
+
+(defun (expensive-empty-term? BOOLEAN) ((self LOGIC-OBJECT))
+  ;; Helping function for 'empty-term?' that implements strategy (3).
+  (foreach
+   super1 in (all-direct-supercollections self FALSE)
+   do
+   (foreach 
+    super2 in (all-direct-supercollections self FALSE)
+    do
+    (when (and (not (eql? super1 super2))
+               (disjoint-terms? super1 super2))
+      (return TRUE))))
+  (return FALSE) )
+
+
+  ;;
+;;;;;; home-context computation
+  ;;
+
+;; this might need renaming:
+(defun (PL-KERNEL/context-of-computation CONTEXT) ((instance OBJECT))
+  (return (home-module instance)))
+
+  
+  ;;
+;;;;;; IST (within context)
+  ;;
+
+(defclass SAVED-CONTEXT-PROOF-ADJUNCT (PROOF-ADJUNCT)
+  ;; Stores the saved context for an IST predicate.
+  :slots ((saved-context :type CONTEXT)))
+
+(defun (PL-KERNEL/IST-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Arg1 is a context; Arg2 is a proposition.  Return TRUE if the
+  ;;    proposition is TRUE in the context.
+  ;; Note: If we were really good, we could handle an unbound first
+  ;;    argument by iterating over all contexts, returning those in which
+  ;;    the proposition in the second argument was true.  But we aren't
+  ;;    feeling that energetic yet.
+  (let ((proposition (proposition frame))
+        (contextValue (argument-bound-to (first (arguments proposition))))
+        (propositionValue (argument-bound-to (second (arguments proposition))))
+        (adjunct SAVED-CONTEXT-PROOF-ADJUNCT (proof-adjunct frame)))
+    (case lastMove
+      (:DOWN
+       ;; first time through:
+       (when (or (null? contextValue)
+                 (null? propositionValue)
+                 (not (isa? contextValue @CONTEXT)))
+         (return :TERMINAL-FAILURE))
+       ;; save current query context:
+       (setf (proof-adjunct frame)
+             (new SAVED-CONTEXT-PROOF-ADJUNCT :saved-context *context*))
+       (change-context (cast contextValue CONTEXT))
+       ;; point cursor at 'proposition' argument:
+       (setf (argument-cursor frame) 1)
+       (return :MOVE-DOWN))
+      ;; returning from below:
+      (:UP-TRUE
+       (propagate-frame-truth-value (result frame) frame)
+       (when (partial-match-mode?)
+         (propagate-frame-partial-truth
+          (partial-match-frame (result frame)) frame))
+       (when (record-justifications?)
+         (record-goal-justification
+          frame
+          (new JUSTIFICATION
+               :inference-rule :IST-INTRODUCTION
+               :antecedents (cons (justification (result frame)) NIL))))
+       (change-context (saved-context adjunct))
+       (if (defined? (down frame))
+         (return :CONTINUING-SUCCESS)
+         (return :FINAL-SUCCESS)))
+      (:UP-FAIL
+       (propagate-frame-truth-value (result frame) frame)
+       (when (partial-match-mode?)
+         (propagate-frame-partial-truth
+          (partial-match-frame (result frame)) frame))
+       (when (record-justifications?)
+         (record-primitive-justification frame :UP-FAIL))
+       (change-context (saved-context adjunct))
+       (return :FAILURE))) ))
+
+(startup-time-progn
+  (define-explanation-phrase :IST-introduction :technical
+    "by IST-Introduction")
+  (define-explanation-phrase :IST-introduction :lay
+    "because its argument is true")
+  (define-explanation-phrase :IST-introduction :lay
+    "because its argument is partly true" :partial))
+
+#|
+;;; DEMONSTRATION OF 'IST':
+
+(defmodule "MDL1"
+  :includes "PL-KERNEL"
+  :documentation " ")
+
+(defmodule "MDL2"
+  :includes "MDL1"
+  :documentation " ")
+
+(cl:progn
+  (clear-module "MDL1")
+  (clear-module "MDL2")
+  (cc MDL1)
+  (defconcept Wagon (?w))
+  (deffunction color (?w) :-> ?c)
+  (assert (Wagon W1))
+  (assert (color W1 Blue))
+  (cc MDL2)
+  (assert (color W1 Red))
+  (retrieve ?x (ist MDL1 (color W1 ?x)))
+  (retrieve ?x (ist MDL2 (color W1 ?x)))
+  )
+
+|#
+        
+
+  ;;
+;;;;;; Cardinalities
+  ;;
+
+(defglobal *accelerate-frame-computations?* BOOLEAN TRUE
+  :documentation "Used to test how big is the effect of the frame
+specialists.")
+
+(defun (get-roleset-of SKOLEM) 
+       ((relation NAMED-DESCRIPTION) (instance OBJECT))
+  ;; Get the roleset denoting the collection of fillers of relation
+  ;;    'relation' applied to instance 'instance'.
+  (return (first (all-relation-values
+                  PL-KERNEL/@THE-ROLESET (cons-list relation instance)))) )
+
+(defun (compute-stored-bound-on-roleset INTEGER)
+       ((relation NAMED-DESCRIPTION) (instance OBJECT) (lowerOrUpper KEYWORD))
+  ;; Helping function for 'compute-minimum-cardinality'.
+  (let ((roleset (get-roleset-of relation instance))
+        (cardinality OBJECT NULL)
+        (intervalCache PL-KERNEL/INTEGER-INTERVAL-CACHE NULL))
+    (when (null? roleset)
+      (return NULL))
+    (setq cardinality 
+          (access-binary-value roleSet PL-KERNEL/@CARDINALITY))
+    (when (defined? cardinality)
+      (typecase cardinality
+        (INTEGER-WRAPPER (return cardinality))
+        (SKOLEM
+         (when
+           (setq? intervalCache (PL-KERNEL/get-interval-cache cardinality)))
+         (case lowerOrUpper
+           (:LOWER (return (lower-bound intervalCache)))
+           (:UPPER (return (upper-bound intervalCache)))))))
+    (return NULL) ))
+
+(defun (compute-minimum-cardinality INTEGER)
+       ((relation NAMED-DESCRIPTION) (instance OBJECT))
+  ;; Compute a lower bound on the number of fillers of the roleset
+  ;;    '(roleset-of <relation> <instance>)'.
+  (let ((relationRef (surrogate-value-inverse relation)))
+    (when (and (single-valued-term? relation)
+               (defined? (access-binary-value instance relationRef)))
+      (return 1))
+    (let ((minCards (CONS OF INTEGER-WRAPPER)
+                    (cons-list 0 (compute-stored-bound-on-roleset
+                                  relation instance :LOWER))))
+      (pushq minCards
+             (length (all-slot-values instance relationRef)))
+      (foreach subR in (all-subrelations relation FALSE)
+               do
+               (pushq minCards
+                      (compute-stored-bound-on-roleset subR instance :LOWER)))
+      (let ((maxMin (first minCards)))
+        (foreach lb in (rest minCards)
+                 where (defined? lb)
+                 do (setq maxMin (max lb maxMin)))
+        (return maxMin))) ))
+                        
+(defun (PL-KERNEL/RANGE-MIN-CARDINALITY-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; 'Arg1' is a relation; 'Arg2' is an instance.  Compute a lower
+  ;;     bound on the number of fillers for the corresponding roleset,
+  ;;     and bind it to 'Arg3'.
+  (let ((proposition (proposition frame))
+        (relation (argument-bound-to (first (arguments proposition))))
+        (instance (argument-bound-to (second (arguments proposition))))
+        (minCardArg (third (arguments proposition)))
+        ;; wrapper makes it easy to handle NULL value:
+        (minCardValue INTEGER-WRAPPER (argument-bound-to minCardArg))
+        (computedValue INTEGER NULL))
+    (ignore lastMove)
+    (when (not *accelerate-frame-computations?*)
+      (return :FAILURE))
+    (when (or (null? relation)
+            (null? instance))
+      (return :TERMINAL-FAILURE))
+    (if (and (isa? relation @NAMED-DESCRIPTION)
+             (setq? computedValue (compute-minimum-cardinality relation instance)))
+      (let ((success? 
+             (choose (defined? minCardValue)
+                     (>= computedValue minCardValue)
+                     (bind-argument-to-value? minCardArg computedValue TRUE))))
+        (return (select-proof-result success? FALSE TRUE)))
+      (return :FAILURE)) ))
+
+(defun (compute-maximum-cardinality INTEGER)
+       ((relation NAMED-DESCRIPTION) (instance OBJECT))
+  ;; Compute an upper bound on the number of fillers of the roleset
+  ;;    '(roleset-of <relation> <instance>)'.
+  (let ((relationRef (surrogate-value-inverse relation))
+        (singleValued? (single-valued-term? relation)))
+    (when (and singleValued?
+               (defined? (access-binary-value instance relationRef)))
+      (return 1))
+    (let ((maxCards (CONS OF INTEGER-WRAPPER)
+                    (cons-list (compute-stored-bound-on-roleset
+                                relation instance :UPPER))))
+      (when singleValued?
+        (pushq maxCards 1))
+      (let ((roleSet (get-roleset-of relation instance)))
+        (when (and (defined? roleSet)
+                   (empty-term? roleSet))
+          (return 0)))
+      ;; closed semantics only holds for rolesets on instances, not on
+      ;;    hypothetical instances representing descriptions:
+      (when (closed-term? relation)
+        (pushq maxCards (compute-minimum-cardinality relation instance)))
+      (foreach superR in (all-superrelations relation FALSE)
+               do
+               (pushq maxCards
+                      (compute-stored-bound-on-roleset superR instance :UPPER)))
+      (let ((minMax (first maxCards)))
+        (foreach ub in (rest maxCards)
+                 where (defined? ub)
+                 do (setq minMax (min ub minMax)))
+        (return minMax))) ))
+
+(defun (PL-KERNEL/RANGE-MAX-CARDINALITY-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; 'Arg1' is a relation; 'Arg2' is an instance.  Compute an upper
+  ;;     bound on the number of fillers for the corresponding roleset,
+  ;;     and bind it to 'Arg3'.
+  (let ((proposition (proposition frame))
+        (relation (argument-bound-to (first (arguments proposition))))
+        (instance (argument-bound-to (second (arguments proposition))))
+        (maxCardArg (third (arguments proposition)))
+        (maxCardValue INTEGER-WRAPPER (argument-bound-to maxCardArg))
+        (computedValue INTEGER NULL))
+    (ignore lastMove)
+    (when (not *accelerate-frame-computations?*)
+      (return :FAILURE))
+    (when (or (null? relation)
+            (null? instance))
+      (return :TERMINAL-FAILURE))
+    (if (and (isa? relation @NAMED-DESCRIPTION)
+             (setq? computedValue (compute-maximum-cardinality relation instance)))
+      (let ((success? 
+             (choose (defined? maxCardValue)
+                     (<= computedValue maxCardValue)
+                     (bind-argument-to-value? maxCardArg computedValue TRUE))))
+        (return (select-proof-result success? FALSE TRUE)))
+      (return :FAILURE)) ))
+
+(defun (test-range-type? BOOLEAN)
+       ((relation NAMED-DESCRIPTION) (instance OBJECT) 
+        (valueType NAMED-DESCRIPTION))
+  ;; Return TRUE if the roleset '(roleset-of <relation> <instance>)
+  ;;    is a subset of 'valueType'.
+  (let ((relationRef (surrogate-value-inverse relation))
+        (valueSurrogate (surrogate-value-inverse valueType)))
+    (when (single-valued-term? relation)
+      (let ((filler (access-binary-value instance relationRef)))
+        (when (defined? filler)
+          (return (test-type-on-instance? filler valueSurrogate)))))
+    (let ((roleset (get-roleset-of relation instance)))
+      (when (and (defined? roleset)
+                 (or (collection-implies-collection? roleset valueType)
+                     (and (or (closed-term? relation)
+                              (closed-term? roleset))
+                          (forall filler in (all-slot-values instance relationRef)
+                                  always 
+                                  (test-type-on-instance? filler valueSurrogate)))))
+        (return TRUE)))
+    (foreach superR in (all-superrelations relation FALSE)
+             do
+             (let ((superRoleSet (get-roleset-of superR instance)))
+               (when (and (defined? superRoleSet)
+                          (collection-implies-collection? superRoleSet valueType))
+                 (return TRUE))))
+    (return FALSE) ))
+
+(defun (PL-KERNEL/RANGE-TYPE-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; 'Arg1' is a relation; 'Arg2' is an instance.  Compute an upper
+  ;;     bound on the number of fillers for the corresponding roleset,
+  ;;     and bind it to 'Arg3'.
+  (let ((proposition (proposition frame))
+        (relation (argument-bound-to (first (arguments proposition))))
+        (instance (argument-bound-to (second (arguments proposition))))
+        (valueTypeArg (third (arguments proposition)))
+        (valueTypeValue (argument-bound-to valueTypeArg)))
+    (ignore lastMove)
+    (when (not *accelerate-frame-computations?*)
+      (return :FAILURE))
+    (when (or (null? relation)
+              (null? instance))
+      (return :TERMINAL-FAILURE))
+    (when (null? valueTypeValue)
+      (return :FAILURE))
+    (when (isa? valueTypeValue @SURROGATE)
+      (setq valueTypeValue (surrogate-to-description valueTypeValue)))
+    (when (or (not (isa? relation @NAMED-DESCRIPTION))
+              (not (isa? valueTypeValue @NAMED-DESCRIPTION))
+              ;; don't use a specialist to generate value types (only to
+              ;;    test a value type):
+              (null? valueTypeValue))
+      (return :FAILURE))
+    (return (select-proof-result
+             (test-range-type? relation instance valueTypeValue)
+             FALSE TRUE)) ))
+
+
+  ;;
+;;;;;; arity computation
+  ;;
+
+(defun (PL-KERNEL/ARITY-computation INTEGER-WRAPPER) ((descriptionArg OBJECT))
+  ;; Return the arity of 'description'.
+  (let ((description OBJECT (value-of descriptionArg)))
+    (if (defined? description)
+      (typecase description
+        (LOGIC/DESCRIPTION (return (LOGIC/arity description)))
+        ;; POSSIBLY LOGIC-OBJECTS OF TYPE COLLECTION SHOULD RETURN 1?:
+        (otherwise (return NULL)))
+      (return NULL)) ))
+
+
+  ;;
+;;;;;; documentation specialist
+  ;;
+
+#|
+;; Not needed anymore, all documentation strings are stored via assertions now.
+
+(defun (PL-KERNEL/DOCUMENTATION-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; If the first proposition argument has a STELLA `documentation' slot
+  ;;    attached to it, try to bind the second argument to it.
+  ;; Since there are multiple native `documentation' slots, we can't do this
+  ;;    by hooking up a native relation to the PowerLoom `documentation'
+  ;;    relation and relying on the native slot reader specialist.
+  ;; This will do the right thing if there are additional documentation strings
+  ;;    asserted about the first argument.
+  (let ((proposition (proposition frame))
+        (objectArgValue (argument-bound-to (first (arguments proposition))))
+        (documentationArg (second (arguments proposition)))
+        (documentationArgValue (argument-bound-to documentationArg))
+        (documentationSlot STORAGE-SLOT NULL)
+        (documentation STRING-WRAPPER NULL))
+    (ignore lastMove)
+    (when (null? objectArgValue)
+      (return :FAILURE))
+    (when (defined? (iterator frame))
+      ;; we've been here before:
+      (return :FAILURE))
+    (setq documentationSlot
+      (safe-lookup-slot (primary-class objectArgValue) (quote documentation)))
+    (when (null? documentationSlot)
+      (return :FAILURE))
+    (setq documentation (read-slot-value objectArgValue documentationSlot))
+    (when (or (null? documentation)
+              (null-wrapper? documentation))
+      (return :FAILURE))
+    ;; kludgy way to mark that we've been here before:
+    (setf (iterator frame) EMPTY-PROPOSITIONS-ITERATOR)
+    (when (bind-argument-to-value? documentationArg documentation TRUE)
+      ;; don't lose explicitly asserted documentation strings:
+      (return :CONTINUING-SUCCESS))
+    (return :FAILURE)))
+|#
+
+
+  ;;
+;;;;;; Relation hierarchy specialist
+  ;;
+
+(defun (PL-KERNEL/relation-hierarchy-specialist KEYWORD)
+    ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; Specialist to handle relation hierarchy queries that inquire about
+  ;;    sub, super and equivalent relations.
+  ;; It requires at least one argument to be bound.  Since the relevant
+  ;;    relations are "read-only" (we should have a marker for that), it will
+  ;;    return :TERMINAL-FAILURE if it can't find any more bindings.
+  (let ((proposition (proposition frame))
+        (relation (operator proposition))
+        (boundArg (first (arguments proposition)))
+        (boundArgValue (argument-bound-to boundArg))
+        (otherArg (second (arguments proposition)))
+        (otherArgValue (argument-bound-to otherArg))
+        (reflexive? FALSE)
+        (iterator (iterator frame))
+        (collection NIL))
+    (ignore lastMove)
+    ;; ensure that `boundArg' is actually bound and if necessary
+    ;;    switch the relation to its inverse:
+    (when (null? boundArgValue)
+      (cond ((null? otherArgValue)
+             ;; we require at least one bound argument:
+             (return :TERMINAL-FAILURE))
+            (otherwise
+             (setq boundArg otherArg)
+             (setq boundArgValue otherArgValue)
+             (setq otherArg (first (arguments proposition)))
+             (setq otherArgValue NULL)
+             (case relation
+               (PL-KERNEL/@direct-subrelation
+                (setq relation PL-KERNEL/@direct-superrelation))
+               (PL-KERNEL/@direct-superrelation
+                (setq relation PL-KERNEL/@direct-subrelation))
+               (PL-KERNEL/@subrelation
+                (setq relation PL-KERNEL/@superrelation))
+               (PL-KERNEL/@superrelation
+                (setq relation PL-KERNEL/@subrelation))
+               (PL-KERNEL/@proper-subrelation
+                (setq relation PL-KERNEL/@proper-superrelation))
+               (PL-KERNEL/@proper-superrelation
+                (setq relation PL-KERNEL/@proper-subrelation))
+               (otherwise NULL)))))
+
+    (when (not (isa? boundArgValue @NAMED-DESCRIPTION))
+      ;; is this too restrictive?
+      (return :TERMINAL-FAILURE))
+
+    (when (null? iterator)
+      ;; first time around:
+      (case relation
+	(PL-KERNEL/@direct-subrelation
+	 (setq collection (all-direct-subrelations boundArgValue TRUE)))
+	(PL-KERNEL/@subrelation
+	 (setq reflexive? TRUE)
+	 (setq collection (all-subrelations boundArgValue FALSE)))
+	(PL-KERNEL/@proper-subrelation
+	 (setq collection (all-subrelations boundArgValue TRUE)))
+	(PL-KERNEL/@direct-superrelation
+	 (setq collection (all-direct-superrelations boundArgValue TRUE)))
+	(PL-KERNEL/@superrelation
+	 (setq reflexive? TRUE)
+	 (setq collection (all-superrelations boundArgValue FALSE)))
+	(PL-KERNEL/@proper-superrelation
+	 (setq collection (all-superrelations boundArgValue TRUE)))
+	(PL-KERNEL/@equivalent-relation
+	 ;; already reflexive:
+	 (setq collection (all-equivalent-relations boundArgValue TRUE))))
+      (when (and reflexive?
+		 (not (memb? collection boundArgValue)))
+	(setq collection (cons boundArgValue collection))))
+    
+    (when (defined? otherArgValue)
+      ;; both arguments are bound, just check for membership:
+      (if (memb? collection otherArgValue)
+          (return :FINAL-SUCCESS)
+        (return :TERMINAL-FAILURE)))
+    (when (null? iterator)
+      (when (empty? collection)
+        (return :TERMINAL-FAILURE)) ;; minor optimization
+      (setq iterator (allocate-iterator collection))
+      (setf (iterator frame) iterator))
+    (if (and (next? iterator)
+             (bind-argument-to-value? otherArg (value iterator) TRUE))
+        (return :CONTINUING-SUCCESS)
+      (return :TERMINAL-FAILURE))))
+
+
+  ;;
+;;;;;; Tuple Projection specialists
+  ;;
+
+;; TO DO: Add a specialist for projecting multiple tuple columns into 
+;;   a list-like structure.  The main issue is how to do that without
+;;   the need to create heavy-duty logical list objects.
+;;
+
+(defun (help-project-nth-column LIST) ((n integer) (tupleList LIST))
+  ;; Helping function for 'PL-KERNEL/project-column-specialist' that
+  ;;   returns a list of the N-th column of the tuples in tupleList.
+  (when (null? tupleList)
+    (return NULL))
+  (let ((projectedList (new LIST))
+	(item OBJECT NULL))
+    ;; To avoid having to reverse the list, we set the item in
+    ;;  the typecase and then collect into the projectedList
+    (foreach tuple in tupleList
+	do (typecase tuple
+	     (CONS
+	      (setq item (nth tuple n)))
+	     (LIST
+	      (setq item (nth tuple n)))
+	     ((STELLA/COLLECTION SKOLEM)
+	      (let ((members (asserted-collection-members tuple FALSE)))
+		(if (defined? members)
+		    (setq item (nth members n))
+		  (continue))))
+	     (otherwise
+	      (inform "Can't handle tuple object " tuple EOL)
+	      (continue)))
+	collect item into projectedList)
+    (if (empty? projectedList)
+	(return NULL)
+      (return projectedList)) ))
+
+(defun (PL-KERNEL/project-column-specialist KEYWORD)
+       ((frame CONTROL-FRAME) (lastMove KEYWORD))
+  ;; The first collection argument is a set of tuples.  Collect all of
+  ;;    the elements (including duplicates) in the second argument's
+  ;;    position in the tuple.  Bind the third argument to a list containing them.
+  (let ((proposition (proposition frame))
+	(projectionArg (first (arguments proposition)))
+        (projectionValue (argument-bound-to projectionArg))
+        (collectionArg (second (arguments proposition)))
+        (collectionValue (argument-bound-to collectionArg))
+	(selector INTEGER NULL)
+        (listArg (third (arguments proposition))))
+    (ignore lastMove)
+    (when (or (null? collectionValue)
+	      (null? projectionValue)
+	      (not (isa? projectionValue @INTEGER-WRAPPER)))
+      (return :TERMINAL-FAILURE))
+    (setq selector (cast projectionValue INTEGER-WRAPPER))
+;    (when (defined? (argument-bound-to listArg))
+;      (inform 
+;       EOL "User bug: 'collect-into-set' called with bound second argument." EOL)
+;      (return :TERMINAL-FAILURE))
+    (when (null? (iterator frame))      ; first time through
+      (typecase collectionValue
+        ((STELLA/COLLECTION SKOLEM)
+	 (let ((members (help-project-nth-column 
+			 selector
+			 (asserted-collection-members collectionValue FALSE))))
+	   (when (null? members)
+	     (return :TERMINAL-FAILURE))
+	   (return
+	     (select-proof-result
+	      (bind-argument-to-value? listArg (create-logical-list members) TRUE)
+	      FALSE TRUE))))
+        (DESCRIPTION
+         (when (and (defined? (external-variables collectionValue))
+                    (exists v in (external-variables collectionValue)
+                            where (not (defined? (argument-bound-to v)))))
+           (return :TERMINAL-FAILURE))
+         (if (inferable? collectionValue)
+           (progn
+             (create-collect-description-extension-frame frame collectionValue)
+             ;; tiny kludge: set '(iterator frame)' so we know
+             ;;    when we are returning from a collection proof:
+             (setf (iterator frame) EMPTY-PROPOSITIONS-ITERATOR)
+             (return :MOVE-DOWN))
+           ;; must be a non-inferable named description, where a simple scan of
+           ;;    isa's down the hierarchy suffices:
+           (let ((members (help-project-nth-column 
+			   selector
+			   (asserted-collection-members collectionValue FALSE))))
+             (when (null? members)
+               (return :TERMINAL-FAILURE))
+	     (return
+	       (select-proof-result
+		(bind-argument-to-value? listArg (create-logical-list members) TRUE)
+		FALSE TRUE)))))
+        (otherwise
+         (return :FAILURE))))
+    ;; we have collected instances of a named description:
+    (when (null? (down frame))
+      (return :FAILURE))
+    (let ((list (help-project-nth-column 
+			 selector
+			 (collection-list (pattern-record (down frame))))))
+      ;; we are now done with :PATTERN frame:
+      (pop-frames-up-to (down frame))
+      (when (null? list)
+	(return :TERMINAL-FAILURE))
+      (return
+	(select-proof-result
+	 (bind-argument-to-value? listArg (create-logical-list list) TRUE)
+	 FALSE TRUE))) ))
+
+;;
+;; Tests
+;;
+#|
+(retrieve all ?i  
+   (project-column 0
+		   (listof (listof 0 1 2  3) (listof 10 11 12 13) (listof 20 21 22 23))
+		   ?i))
+;;  #1: ?I=|SK|(LISTOF 0 10 20)
+
+(retrieve all ?i  
+   (project-column 2
+		   (listof (listof 0 1 2  3) (listof 10 11 12 13) (listof 20 21 22 23))
+		   ?i))
+;;  #1: ?I=|SK|(LISTOF 2 12 22)
+
+
+;; Doesn't bind.
+(retrieve all (?i ?j ?k)  
+   (project-column 0
+		   (listof (listof 0 1 2  3) (listof 10 11 12 13) (listof 20 21 22 23))
+		   (listof ?i ?j ?k)))
+;; Want:  #1: ?I=|L|0, ?J=|L|10, ?K=|L|20
+
+;; This does work:
+(retrieve all (?i ?j ?k)  
+   (exists (?q) (and (project-column 0
+		     (listof (listof 0 1 2  3) (listof 10 11 12 13) (listof 20 21 22 23))
+		     ?q)
+                (= ?q (listof ?i ?j ?k)))))
+;;  #1: ?I=|L|0, ?J=|L|10, ?K=|L|20
+|#
+
+
+  ;;
+;;;;;; Synonym support:
+  ;;
+
+(defun PL-KERNEL/assert-synonym-demon ((self PROPOSITION))
+  ;; Point the surrogate of the second argument at the value of
+  ;;    the first argument.
+  (let ((term (value-of (nth (arguments self) 0)))
+        (synonym (value-of (nth (arguments self) 1)))
+        (synonymName SURROGATE NULL))
+    (when (and (not (eql? term synonym))
+               (isa? synonym @LOGIC-OBJECT))
+      (setq synonymName (surrogate-value-inverse (cast synonym LOGIC-OBJECT)))
+      ;; should we try to catch the case where `synonymName' is already bound
+      ;;    to something else (e.g., a concept)?
+      (setf (surrogate-value synonymName) term)
+      ;; KLUDGE: create this additional assertion, otherwise the retraction
+      ;;    demon won't ever run, since the proposition we are trying to
+      ;;    retract is really `(synonym X X)' which was never asserted:
+      (assert-tuple PL-KERNEL-KB/@SYNONYM (cons-list term term)))))
+
+(defun PL-KERNEL/retract-synonym-demon ((self PROPOSITION))
+  ;; Point all synonyms of the first argument at their original value.
+  ;;    The second argument is ignored, since it will usually be equal
+  ;;    to the first due to synonym dereferencing.
+  (let ((term (value-of (nth (arguments self) 0)))
+        (synonym OBJECT NULL)
+        (synonymName SURROGATE NULL))
+    ;; TRICKY: since `self' referenced a synonym of `term' the reference was
+    ;;    substituted with `term' and a different proposition was built than
+    ;;    the one created during the synonym assertion.  Therefore, we lookup
+    ;;    all currently true synonym relations for `term' and retract them:
+    (foreach prop in (all-true-dependent-propositions
+                      term PL-KERNEL-KB/@SYNONYM FALSE)
+        do (setq synonym (value-of (second (arguments prop))))
+           (when (isa? synonym @LOGIC-OBJECT)
+             (setq synonymName
+               (surrogate-value-inverse (cast synonym LOGIC-OBJECT)))
+             (setf (surrogate-value synonymName) synonym))
+           ;; tricky, make sure we don't run demons again:
+           (setf (truth-value prop) NULL))))
+
+(defun (get-synonyms (CONS OF LOGIC-OBJECT)) ((term OBJECT))
+  ;; Return a list of all synonyms such that `(synonym <term> <synonym>)'
+  ;;    has been asserted by the user.
+  (let ((termValue (value-of term))
+        (firstArg OBJECT NULL)
+        (secondArg OBJECT NULL)
+        (synonyms NIL))
+    (foreach prop in (all-true-dependent-propositions
+                      term PL-KERNEL-KB/@SYNONYM FALSE)
+        do (setq firstArg (value-of (first (arguments prop))))
+           (setq secondArg (value-of (second (arguments prop))))
+           (when (and (eql? firstArg termValue)
+                      (not (eql? firstArg secondArg))
+                      (not (memb? synonyms secondArg)))
+             (pushq synonyms secondArg)))
+    (return synonyms)))
+
+(defun (synonym-surrogate? BOOLEAN) ((name SURROGATE))
+  ;; Return true if `name' was used as a synonym in some assertion
+  ;;    `(synonym <term> <synonym>)' asserted by the user.
+  (within-module (home-module name)
+    (let ((value (surrogate-value name))
+          (valueName (object-surrogate value)))
+      (return
+        (and (defined? valueName)
+             (not (eql? name valueName))
+             (exists synonym in (get-synonyms value)
+                 where (eql? (surrogate-value-inverse synonym) name)))))))
+
+(defun transfer-synonyms ((oldObject OBJECT) (newObject OBJECT))
+  ;; Helping function for `redefine-logic-object'.
+  ;; `oldObject' is about to be redefined to `newObject'.  Make any
+  ;;    synonym surrogates pointing at `oldObject' point to `newObject'.
+  ;; NOTE: transfer of synonym propositions is handled just like transfer
+  ;;    of any other propositions.
+  (let ((originatedProps (originated-propositions oldObject)))
+    (foreach synonym in (get-synonyms oldObject)
+        do (if (exists prop in (all-true-dependent-propositions
+                                synonym PL-KERNEL-KB/@SYNONYM FALSE)
+                   where (and (eql? (first (arguments prop)) oldObject)
+                              (eql? (second (arguments prop)) synonym)
+                              (not (memb? originatedProps prop))))
+               ;; only redirect the surrogate, if the synonym proposition
+               ;;    was asserted outside of `oldObject's definition:
+               (setf (surrogate-value (object-surrogate synonym)) newObject)
+             ;; otherwise, reset to NULL to not point at deleted object:
+             (setf (surrogate-value (object-surrogate synonym)) NULL)))))
+
+
+  ;;
+;;;;;; `different' specialist
+  ;;
+
+(defun (PL-KERNEL/DIFFERENT-specialist KEYWORD) ((frame CONTROL-FRAME)
+                                                 (lastMove KEYWORD))
+  ;; Efficiently test whether all arguments of the propositions are different
+  ;;    from each other.  This is much faster and easier to use than having
+  ;;    to write multiple pairwise inequalities.
+  (let ((arguments (arguments (proposition frame)))
+        (nofArguments (length arguments))
+        (argumentValues NIL)
+        (nofBoundArguments 0)
+        (nofUniqueArguments 0)
+        (value OBJECT NULL))
+    (ignore lastMove)
+    (foreach arg in arguments
+        do (setq value (argument-bound-to arg))
+           (if (or (null? value)
+                   (skolem? value))
+               (continue)
+             (++ nofBoundArguments))
+        collect value into argumentValues)
+    (setq nofUniqueArguments (length (remove-duplicates argumentValues)))
+    (cond ((and (= nofBoundArguments nofArguments)
+                (= nofBoundArguments nofUniqueArguments))
+           ;; no duplicates, all args were bound and different:
+           (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+           (return :FINAL-SUCCESS))
+          ((= nofBoundArguments nofUniqueArguments)
+           ;; some args were NULL or skolems, punt for now (actually, since
+           ;;    this is a computed relation, we shouldn't get unbounds):
+           (return :FAILURE))
+          (otherwise
+           ;; there were duplicates among the bound or non-skolem arguments,
+           ;;    so this is false even if we don't know about the rest:
+           (set-frame-truth-value frame FALSE-TRUTH-VALUE)
+           (return :TERMINAL-FAILURE)))))

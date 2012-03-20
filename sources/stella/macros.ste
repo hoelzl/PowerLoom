@@ -1,0 +1,442 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: macros.ste,v 1.46 2003/04/18 21:15:16 hans Exp
+
+;;; Macros that define some built-in Stella operators.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; CAUTION: You might lose if your macro expansion structure shares portions
+;;;    of its parse trees.
+
+  ;;
+;;;;;; Simple macros
+  ;;
+
+(defmacro pushq ((variable SYMBOL) (value OBJECT))
+  :documentation "Push 'value' onto the cons list 'variable'."
+  (return (bquote (setq & variable (cons & value & variable)))) )
+
+(defmacro popq ((variable SYMBOL))
+  :documentation "Pops a value from the cons list 'variable'."
+  (let ((valueVar (local-gensym "HEAD")))
+    (return
+      (bquote (vrlet ((& valueVar (value & variable)))
+                (setq & variable (rest & variable))
+                & valueVar)))))
+
+(defmacro pushf ((place CONS) (value OBJECT))
+  :documentation "Push 'value' onto the cons list 'place'."
+  (let ((placeCopy (copy-cons-tree place))) 
+    (return (bquote (setf & place (cons & value & placeCopy)))) ))
+
+(defmacro pushq-new ((variable SYMBOL) (value OBJECT))
+  :documentation "Push `value' onto the cons list `variable', unless `value'
+is already a member of the list."
+  :public? TRUE
+  (if (cons? value)
+      (let ((valueVar (local-gensym "VALUE")))
+        (return
+          (bquote
+           (vrlet ((& valueVar & value))
+             (setq & variable
+                   (choose (member? & variable & valueVar)
+                           & variable
+                           (cons & valueVar & variable)))))))
+    (return
+      (bquote 
+       (setq & variable
+             (choose (member? & variable & value)
+                     & variable
+                     (cons & value & variable)))))))
+
+(defmacro ++ ((place OBJECT) &body (increment CONS))
+  :documentation "Increment the value of `place' and return the result.
+`place' can be either a variable name or a slot reference.  Increment by
+the optional `increment' (which can be a float) or 1 otherwise."
+  (let ((incr (first increment)))
+    (unless (or (symbol? place)
+                (cons? place))
+      (if (null? place)
+          (walk-error "Missing place in `++' expression")
+        (walk-error "Illegal place in `++' expression: " place))
+      (return NIL))
+    (when (null? incr)
+      (setq incr ONE-WRAPPER))
+    (return (choose (symbol? place)
+                    ;; Assume 'place' is a variable:
+                    (bquote (setq & place (+ & place & incr)))
+                    ;; Assume 'place' is a slot:
+                    (bquote
+                     (setf & place (+ & (copy-cons-tree place) & incr)))))))
+
+;;; KLUDGE: work around a Java name translation bug where `--' completely
+;;;    disappears; remove once this is fixed:
+(startup-time-progn
+  (register-native-name (quote --) :java :function))
+
+(defmacro -- ((place OBJECT) &body (decrement CONS))
+  :documentation "Decrement the value of `place' and return the result.
+`place' can be either a variable name or a slot reference.  Decrement by
+the optional `decrement' (which can be a float) or 1 otherwise."
+  (let ((decr (first decrement)))
+    (unless (or (symbol? place)
+                (cons? place))
+      (if (null? place)
+          (walk-error "Missing place in `--' expression")
+        (walk-error "Illegal place in `--' expression: " place))
+      (return NIL))
+    (when (null? decr)
+      (setq decr ONE-WRAPPER))
+    (return (choose (symbol? place)
+                    ;; Assume 'place' is a variable:
+                    (bquote (setq & place (- & place & decr)))
+                    ;; Assume 'place' is a slot:
+                    (bquote
+                     (setf & place (- & (copy-cons-tree place) & decr)))))))
+
+(defmacro 1+ ((expression OBJECT))
+  :documentation "Add 1 to 'expression' and return the result."
+  (return (bquote (+ & expression 1))))
+
+(defmacro 1- ((expression OBJECT))
+  :documentation "Subtract 1 from 'expression' and return the result."
+  (return (bquote (- & expression 1))))
+                  
+
+(defmacro setq? ((variable SYMBOL) (expression CONS))
+  :documentation "Assign 'variable' the result of evaluating 'expression', 
+and return TRUE if 'expression' is not NULL else return FALSE."
+  (return
+    (bquote (vrlet
+             ()
+             (setq & variable & expression)
+             (defined? & variable)))))
+
+(defmacro first-defined (&body (forms CONS))
+  :documentation
+  "Return the result of the first form in `forms' whose value is defined
+or NULL otherwise."
+  (case (length forms)
+    (0 (return (quote NULL)))
+    (1 (return (first forms)))
+    (2 (if (symbol? (first forms))
+           ;; avoid the VRLET:
+           (return
+             (bquote (choose (defined? & (first forms))
+                             & (first forms)
+                             & (second forms))))
+         (let ((letVariable (local-gensym "TEMP")))
+           (return
+             (bquote (vrlet ((& letVariable & (first forms)))
+                       (choose (defined? & letVariable)
+                               & letVariable
+                               & (second forms))))))))
+    (otherwise
+     (return
+       (bquote (first-defined
+                & (first forms)
+                (first-defined && (rest forms))))))))
+
+(defmacro all-defined? (&body (forms CONS))
+  :documentation "Evaluate each of the forms in 'forms', and
+return TRUE if none of them are NULL."
+  (case (length forms)
+    ;; Is this the right choice for degenerate cases?
+    (0 (return (quote TRUE)))
+    (1 (return (bquote (defined? & (first forms)))))
+    (otherwise 
+     (let ((tests NIL))
+       (foreach f in forms
+	   collect (bquote (defined? & f)) into tests)
+       (return
+	 (bquote (and && tests)))))) )
+
+(defmacro either ((value1 OBJECT) (value2 OBJECT))
+  :documentation "If 'value1' is defined, return that, else return 'value2'."
+  (return (bquote (first-defined & value1 & value2))))
+
+(defmacro collect ((collectVariable SYMBOL) &body (body CONS))
+  :documentation "Use a VRLET to collect values.  Input has the form
+'(collect <x> in <expression> where (<test> <x>))'."
+  (let ((collection (gensym "V")))
+    (return (bquote (vrlet ((& collection NIL))
+                           (foreach & collectVariable && body
+                                    collect & collectVariable
+                                    into & collection)
+                           & collection))) ))
+
+(defmacro with-permanent-objects (&body (body CONS))
+  :documentation "Allocate 'permanent' (as opposed to 'transient')
+objects within the scope of this declaration."
+  :public? TRUE
+  (return
+   (bquote (special ((*transientObjects?* FALSE))
+             && body))) )
+
+(defmacro with-transient-objects (&body (body CONS))
+  :documentation "Allocate 'transient' (as opposed to 'permanent')
+objects within the scope of this declaration.
+CAUTION: The default assumption is the allocation of permanent objects.
+The scope of `with-transient-objects' should be as small as possible, and
+the user has to make sure that code that wasn't explicitly written to
+account for transient objects will continue to work correctly."
+  :public? TRUE
+  (return
+   (bquote (special ((*transientObjects?* TRUE))
+             && body))) )
+
+(defmacro ignore (&body (variables CONS))
+  :documentation "Ignore unused 'variables' with NoOp 'setq' statements."
+  (let ((ignoreTrees NIL))
+    (foreach variable in variables
+             collect (bquote (setq & variable & variable))
+             into ignoreTrees)
+    (return (prognify ignoreTrees))))
+
+(defmacro only-if ((test OBJECT) (expression OBJECT))
+  :documentation "If 'test' is TRUE, return the result of evaluating 
+'expression'."
+  (return (bquote (choose & test & expression NULL))) )
+
+(defmacro phase-to-integer ((startupTimePhase KEYWORD))
+  :documentation "Expands into the integer representing 'startupTimePhase'."
+  (return (wrap-literal (encode-startup-time-phase startupTimePhase))))
+
+(defmacro if-output-language
+    ((language KEYWORD) (thenForm OBJECT) (elseForm OBJECT))
+  :documentation "Expand to 'thenForm' if the current translator output
+language equals 'language'.  Otherwise, expand to 'elseForm'.  This can
+be used to conditionally translate Stella code."
+  (if (eql? language (translator-output-language))
+      (return (choose (eql? thenForm (quote NULL)) NULL thenForm))
+    (return (choose (eql? elseForm (quote NULL)) NULL elseForm))))
+
+(defmacro if-stella-feature
+    ((feature KEYWORD) (thenForm OBJECT) (elseForm OBJECT))
+  :documentation "Expand to 'thenForm' if 'feature' is a currently enabled
+STELLA environment feature.  Otherwise, expand to 'elseForm'.  This can
+be used to conditionally translate Stella code."
+  (if (enabled-stella-feature? feature)
+      (return (choose (eql? thenForm (quote NULL)) NULL thenForm))
+    (return (choose (eql? elseForm (quote NULL)) NULL elseForm))))
+
+(defmacro within-world ((worldForm OBJECT) &body (body CONS))
+  :documentation
+  "Execute `body' within the world resulting from `worldForm'."
+  :public? TRUE
+  (return
+   (bquote (special ((*context* & worldForm))
+             (safety 3 (eql? (base-module (cast *context* WORLD)) *module*)
+                     "within-world: The base module of world " *context*
+                     " does not match the current module.")
+             && body))))
+
+(defmacro within-context ((contextForm OBJECT) &body (body CONS))
+  :documentation
+  "Execute `body' within the context resulting from `contextForm'."
+  :public? TRUE
+  (return
+    (bquote
+     (special ((*context* & contextForm)
+               (*module* (base-module *context*)))
+       && body))))
+
+(defmacro within-module ((moduleForm OBJECT) &body (body CONS))
+  :documentation
+  "Execute `body' within the module resulting from `moduleForm'.
+`*module*' is an acceptable `moduleForm'.  It will locally rebind 
+`*module*' and `*context*' and shield the outer bindings from changes."
+  :public? TRUE
+  (return
+    (bquote
+     (special ((*module* & moduleForm)
+               (*context* *module*))
+       && body))))
+
+(defmacro coerce-&rest-to-cons ((restVariable SYMBOL))
+  :documentation "Coerce the argument list variable `restVariable' into a CONS
+list containing all its elements (uses argument list iteration to do so).  If
+`restVariable' already is a CONS due to argument listification, this is a no-op."
+  :public? TRUE
+  (if (pass-variable-arguments-as-list? *methodBeingWalked*)
+      (return
+        (sys-tree (walk-without-type-tree restVariable)
+                  (yield-listified-variable-arguments-type *methodBeingWalked*)))
+    (let ((argVar (local-gensym "ARG"))
+          (listVar (local-gensym "ARGLIST")))
+      (return
+        (bquote
+         (vrlet ((& listVar
+                    & (yield-listified-variable-arguments-type *methodBeingWalked*)
+                    NIL))
+           (foreach & argVar in & restVariable
+               collect & argVar into & listVar)
+           & listVar))))))
+
+
+  ;;
+;;;;;; with-system-definition
+  ;;
+
+(defmacro with-system-definition ((systemNameExpression OBJECT) &body (body CONS))
+  :documentation "Set *currentSystemDefinition* to the system definition named `system'.
+Set *currentSystemDefinitionSubdirectory* to match. Execute `body' within
+that scope."
+  :public? TRUE
+  (return
+    (bquote
+     (special ((*currentSystemDefinition* (get-system-definition & systemNameExpression))
+               (*currentSystemDefinitionSubdirectory*
+                (only-if (defined? *currentSystemDefinition*)
+		  (directory *currentSystemDefinition*))))
+       (if (defined? *currentSystemDefinition*)
+         (progn && body)
+         (warn "Can't find a system named " & systemNameExpression EOL))))))
+
+  ;;
+;;;;;; defmain
+  ;;
+
+(defmacro defmain ((varList CONS) &body (body CONS))
+  :documentation
+  "Defines a function called MAIN which will have the appropriate
+signature for the target translation language.  The signature will be:
+  C++:   public static int main (int v1, char** v2) {<body>}
+  Java:  public static void main (String [] v2) {<body>}
+  Lisp:  (defun main (&rest args) <body>)
+The argument `varList' must have two symbols, which will be the names for the
+INTEGER argument count and an array of STRINGs with the argument values.  It
+can also be empty to indicate that no command line arguments will be handled.
+The startup function for the containing system will automatically be called
+before `body' is executed unless the option :STARTUP-SYSTEM? was supplied as
+FALSE.  There can only be one DEFMAIN per module."
+  :public? TRUE :lisp-macro? TRUE
+  (let ((processCmdLineArgs? (non-empty? varList))
+        (v1Name SYMBOL (first varList))
+	(v2Name SYMBOL (second varList))
+        (bodyWithHeader (cons NULL body)) ;; needed by `extract-options'
+        (options (new PROPERTY-LIST
+                      :the-plist (extract-options bodyWithHeader NULL)))
+	(startupFunctionCall
+         (choose
+          (and (defined? *currentSystemDefinition*)
+               (not (eql? (lookup options :STARTUP-SYSTEM?) (quote FALSE))))
+          (bquote
+           ((& (system-startup-function-symbol *currentSystemDefinition*))))
+          NIL)))
+    ;; remove `defmain'-specific options:
+    (remove-at options :STARTUP-SYSTEM?)
+    (remove-at options :PUBLIC?) ;; force `:PUBLIC? TRUE'
+    (setq body (concatenate (the-plist options) (rest bodyWithHeader)))
+    (cond
+     ((not processCmdLineArgs?)
+      ;; this is easy:
+      (case (translator-output-language)
+        (:common-lisp
+         (return
+           (bquote
+            (defun main ()
+              :PUBLIC? TRUE
+              && startupFunctionCall
+              && body))))
+        ((:cpp :cpp-standalone :idl)
+         (return
+           (bquote
+            (defun (main INTEGER) ()
+              :PUBLIC? TRUE
+              && startupFunctionCall
+              && body
+              (return 1)))))
+        (:java
+         (return
+           (bquote 
+            (defun main ((& (local-gensym "ARGV") (ARRAY () of STRING)))
+              :PUBLIC? TRUE
+	      && startupFunctionCall
+	      && body))))
+        (otherwise NULL)))
+     (otherwise
+      ;; this is a bit more involved:
+      (case (translator-output-language)
+        (:common-lisp
+         (return
+           (bquote 
+            (defun main (&rest (%%args STRING))
+              :PUBLIC? TRUE
+              (let ((& v1Name INTEGER
+                       (verbatim :common-lisp (cl:length %%args)))
+                    (& v2Name (ARRAY () of STRING)
+                       (verbatim :common-lisp
+                         (cl:make-array (cl:length %%args)
+                                        :initial-contents %%args))))
+                && startupFunctionCall
+                && body)))))
+        (:java
+         (return
+           (bquote 
+            (defun main ((& v2Name (ARRAY () of STRING)))
+              :PUBLIC? TRUE
+              (let ((& v1Name INTEGER
+                       (verbatim
+                           :java & (concatenate
+                                     (wrapper-value (java-translate-name v2Name))
+                                     ".length"))))
+                && startupFunctionCall
+                && body))
+            )))
+        ((:cpp :cpp-standalone :idl)
+         (return
+           (bquote
+            (defun (main INTEGER) ((& v1Name INTEGER) (& v2Name (ARRAY () of STRING)))
+              :PUBLIC? TRUE
+              && startupFunctionCall
+              && body
+              (return 1)))
+           ))
+        (otherwise NULL))))
+    (walk-error "`defmain' is not supported for " (translator-output-language))
+    (return NULL)))

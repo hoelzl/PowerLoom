@@ -1,0 +1,993 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: literals.ste,v 1.51 2003/09/19 00:25:01 tar Exp
+
+;;; Procedures that manipulate wrapped literals, and that
+;;;    wrap and unwrap literals.
+;;; Also, procedures that define quote and backquote.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Special wrapper objects
+  ;;
+
+(defglobal ZERO-WRAPPER INTEGER-WRAPPER NULL :public? TRUE)
+(defglobal ONE-WRAPPER INTEGER-WRAPPER NULL :public? TRUE)
+(startup-time-progn :early-inits
+  (setq ZERO-WRAPPER (new INTEGER-WRAPPER :wrapper-value 0))
+  (setq ONE-WRAPPER (new INTEGER-WRAPPER :wrapper-value 1)))
+
+(defglobal TRUE-WRAPPER BOOLEAN-WRAPPER NULL :public? TRUE)
+(defglobal FALSE-WRAPPER BOOLEAN-WRAPPER NULL :public? TRUE)
+(startup-time-progn :early-inits
+  (setq FALSE-WRAPPER (new BOOLEAN-WRAPPER :wrapper-value FALSE))
+  (setq TRUE-WRAPPER (new BOOLEAN-WRAPPER :wrapper-value TRUE)))
+
+;;; Null wrappers:
+
+(defglobal NULL-INTEGER-WRAPPER INTEGER-WRAPPER NULL :public? TRUE)
+(defglobal NULL-FLOAT-WRAPPER FLOAT-WRAPPER NULL :public? TRUE)
+(defglobal NULL-STRING-WRAPPER STRING-WRAPPER NULL :public? TRUE)
+(defglobal NULL-MUTABLE-STRING-WRAPPER MUTABLE-STRING-WRAPPER
+           NULL :public? TRUE)
+(defglobal NULL-CHARACTER-WRAPPER CHARACTER-WRAPPER NULL :public? TRUE)
+(defglobal NULL-FUNCTION-CODE-WRAPPER FUNCTION-CODE-WRAPPER NULL :public? TRUE)
+(defglobal NULL-METHOD-CODE-WRAPPER METHOD-CODE-WRAPPER NULL :public? TRUE)
+(startup-time-progn :early-inits
+  (setq NULL-INTEGER-WRAPPER
+    (new INTEGER-WRAPPER :wrapper-value NULL))
+  (setq NULL-FLOAT-WRAPPER
+    (new FLOAT-WRAPPER :wrapper-value NULL))
+  (setq NULL-STRING-WRAPPER
+    (new STRING-WRAPPER :wrapper-value NULL))
+  (setq NULL-MUTABLE-STRING-WRAPPER
+    (new MUTABLE-STRING-WRAPPER :wrapper-value NULL))
+  (setq NULL-CHARACTER-WRAPPER
+    (new CHARACTER-WRAPPER :wrapper-value NULL))
+  (setq NULL-FUNCTION-CODE-WRAPPER
+    (new FUNCTION-CODE-WRAPPER :wrapper-value NULL))
+  (setq NULL-METHOD-CODE-WRAPPER
+    (new METHOD-CODE-WRAPPER :wrapper-value NULL)))
+
+;;; Terminators:
+
+(defmethod (terminate-wrapper? BOOLEAN) ((self WRAPPER))
+  :public? TRUE
+  ;; Make sure special wrappers never get freed.
+  (if (or (eq? self NULL-FLOAT-WRAPPER)
+          (eq? self NULL-STRING-WRAPPER)
+	  (eq? self NULL-MUTABLE-STRING-WRAPPER)
+          (eq? self NULL-CHARACTER-WRAPPER)
+          (eq? self NULL-FUNCTION-CODE-WRAPPER)
+          (eq? self NULL-METHOD-CODE-WRAPPER))
+      (return FALSE)
+    (return TRUE)))
+
+(defmethod (terminate-wrapper? BOOLEAN) ((self INTEGER-WRAPPER))
+  :public? TRUE
+  ;; Make sure special integer wrappers never get freed.
+  (if (or (eq? self ZERO-WRAPPER)
+          (eq? self ONE-WRAPPER)
+          (eq? self NULL-INTEGER-WRAPPER))
+      (return FALSE)
+    (return TRUE)))
+
+
+  ;;
+;;;;;; Storage of special literal type information:
+  ;;
+
+(defglobal *literal-type-info-table*
+    (HASH-TABLE OF TYPE (KEY-VALUE-LIST OF KEYWORD OBJECT))
+  (new HASH-TABLE)
+  :documentation "Table that holds a variety of information about literal
+types, e.g., the name of their null-wrapper, wrap-function, etc.")
+
+(defglobal *literal-types* (LIST OF TYPE) (new LIST)
+  :documentation "List of literal types stored in '*literal-type-info-table*'.
+Maintained for iteration purposes.")
+
+(defun (lookup-literal-type-info OBJECT) ((type TYPE) (key KEYWORD))
+  ;; Return the type info of literal type 'type' associated with 'key'.
+  (let ((entry (lookup *literal-type-info-table* type)))
+    (if (defined? entry)
+        (return (lookup entry key))
+      (return NULL))))
+
+
+(defun set-literal-type-info ((type TYPE) (key KEYWORD) (value OBJECT))
+  ;; Set the type info of literal type 'type' associated with 'key'
+  ;;    to 'value'.
+  (let ((entry (lookup *literal-type-info-table* type)))
+    (when (null? entry)
+      (setq entry (new KEY-VALUE-LIST))
+      (insert-at *literal-type-info-table* type entry)
+      (insert-last *literal-types* type))
+    (insert-at entry key value)))
+
+(startup-time-progn :globals
+  (set-literal-type-info
+   @BOOLEAN :null-wrapper (quote FALSE-WRAPPER))
+  (set-literal-type-info
+   @INTEGER :null-wrapper (quote NULL-INTEGER-WRAPPER))
+  (set-literal-type-info
+   @FLOAT :null-wrapper (quote NULL-FLOAT-WRAPPER))
+  (set-literal-type-info
+   @STRING :null-wrapper (quote NULL-STRING-WRAPPER))
+  (set-literal-type-info
+   @MUTABLE-STRING :null-wrapper (quote NULL-MUTABLE-STRING-WRAPPER))
+  (set-literal-type-info
+   @CHARACTER :null-wrapper (quote NULL-CHARACTER-WRAPPER))
+  (set-literal-type-info
+   @FUNCTION-CODE :null-wrapper (quote NULL-FUNCTION-CODE-WRAPPER))
+  (set-literal-type-info
+   @METHOD-CODE :null-wrapper (quote NULL-METHOD-CODE-WRAPPER)))
+
+
+  ;;
+;;;;;; "un/wrap-<literal-type>"
+  ;;
+
+(defun (wrap-integer INTEGER-WRAPPER) ((value INTEGER))
+  :documentation "Return a literal object whose value is the INTEGER 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-INTEGER-WRAPPER)
+    (case value
+      (0 (return ZERO-WRAPPER))
+      (1 (return ONE-WRAPPER))
+      (otherwise
+       (return (new INTEGER-WRAPPER :wrapper-value value))))))
+
+(defun (unwrap-integer INTEGER) ((wrapper INTEGER-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-float FLOAT-WRAPPER) ((value FLOAT))
+  :documentation "Return a literal object whose value is the FLOAT 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-FLOAT-WRAPPER)
+    (return (new FLOAT-WRAPPER :wrapper-value value))))
+
+(defun (unwrap-float FLOAT) ((wrapper FLOAT-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-string STRING-WRAPPER) ((value STRING))
+  :documentation "Return a literal object whose value is the STRING 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-STRING-WRAPPER)
+    (return (new STRING-WRAPPER :wrapper-value value))))
+
+(defun (unwrap-string STRING) ((wrapper STRING-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-mutable-string MUTABLE-STRING-WRAPPER) ((value MUTABLE-STRING))
+  :documentation
+  "Return a literal object whose value is the MUTABLE-STRING 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-MUTABLE-STRING-WRAPPER)
+    (return (new MUTABLE-STRING-WRAPPER :wrapper-value value))))
+
+(defun (unwrap-mutable-string MUTABLE-STRING) ((wrapper MUTABLE-STRING-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-character CHARACTER-WRAPPER) ((value CHARACTER))
+  :documentation "Return a literal object whose value is the CHARACTER 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-CHARACTER-WRAPPER)
+    (return (new CHARACTER-WRAPPER :wrapper-value value))))
+
+(defun (unwrap-character CHARACTER) ((wrapper CHARACTER-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-function-code FUNCTION-CODE-WRAPPER) ((value FUNCTION-CODE))
+  :documentation
+  "Return a literal object whose value is the FUNCTION-CODE 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-FUNCTION-CODE-WRAPPER)
+    (return (new FUNCTION-CODE-WRAPPER :wrapper-value value))))
+
+(defun (unwrap-function-code FUNCTION-CODE) ((wrapper FUNCTION-CODE-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-method-code METHOD-CODE-WRAPPER) ((value METHOD-CODE))
+  :documentation
+  "Return a literal object whose value is the METHOD-CODE 'value'."
+  :public? TRUE
+  (if (null? value)
+      (return NULL-METHOD-CODE-WRAPPER)
+    (return (new METHOD-CODE-WRAPPER :wrapper-value value))))
+
+(defun (unwrap-method-code METHOD-CODE) ((wrapper METHOD-CODE-WRAPPER))
+  :documentation "Unwrap `wrapper' and return the result.
+Return NULL if `wrapper' is NULL."
+  :public? TRUE
+  (if (null? wrapper)
+      (return NULL)
+    (return (wrapper-value wrapper))))
+
+(defun (wrap-boolean BOOLEAN-WRAPPER) ((value BOOLEAN))
+  :documentation "Return a literal object whose value is the BOOLEAN 'value'."
+  :public? TRUE :globally-inline? TRUE
+  (return (choose value TRUE-WRAPPER FALSE-WRAPPER)))
+
+;; Support for converting between BOOLEANs and BOOLEAN-WRAPPERs:
+
+(defun (unwrap-boolean BOOLEAN) ((wrapper BOOLEAN-WRAPPER))
+  :documentation "Unwrap `wrapper' and return its values as a regular BOOLEAN.
+Map NULL onto FALSE."
+  :public? TRUE :globally-inline? TRUE
+  (return (eq? wrapper TRUE-WRAPPER)))
+
+(defun (coerce-wrapped-boolean-to-boolean BOOLEAN) ((wrapper BOOLEAN-WRAPPER))
+  ;; Unwrap `wrapper' and return its values as a regular BOOLEAN.
+  ;; Map NULL onto FALSE, but issue a warning for this case.
+  :public? TRUE
+  (when (null? wrapper)
+    (warn "Coercing an undefined BOOLEAN-WRAPPER to FALSE.  Explicitly guard"
+          EOL " with `defined?' or use `unwrap-boolean' to avoid this warning."))
+  (return (eq? wrapper TRUE-WRAPPER)))
+
+(defmacro inline-wrap-boolean ((expression OBJECT))
+  ;; Coercion macro used by the walker that is smart about constant conversions.
+  (cond ((eql? expression (quote TRUE))
+         (return (quote TRUE-WRAPPER)))
+        ((eql? expression (quote FALSE))
+         (return (quote FALSE-WRAPPER)))
+        (otherwise
+         (return (bquote (wrap-boolean & expression))))))
+
+(defmacro inline-unwrap-boolean ((expression OBJECT))
+  ;; Coercion macro used by the walker that is smart about constant conversions.
+  (cond ((eql? expression (quote TRUE-WRAPPER))
+         (return (quote TRUE)))
+        ((eql? expression (quote FALSE-WRAPPER))
+         (return (quote FALSE)))
+        (otherwise
+         (return (bquote (coerce-wrapped-boolean-to-boolean & expression))))))
+
+(startup-time-progn :globals
+  (set-literal-type-info
+   @BOOLEAN :wrap-function (quote wrap-boolean))
+  (set-literal-type-info
+   @INTEGER :wrap-function (quote wrap-integer))
+  (set-literal-type-info
+   @FLOAT :wrap-function (quote wrap-float))
+  (set-literal-type-info
+   @STRING :wrap-function (quote wrap-string))
+  (set-literal-type-info
+   @CHARACTER :wrap-function (quote wrap-character))
+  (set-literal-type-info
+   @FUNCTION-CODE :wrap-function (quote wrap-function-code))
+  (set-literal-type-info
+   @METHOD-CODE :wrap-function (quote wrap-method-code)))
+
+
+  ;;
+;;;;;; "wrap-literal"
+  ;;
+
+;;; BOOLEANs always need to be wrapped with 'wrap-boolean',
+;;; since in Lisp they are indistinguishable from INTEGERs.
+
+(defmethod (wrap-literal INTEGER-WRAPPER) ((value INTEGER))
+  ;; Return a literal object whose value is the INTEGER 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-integer value)))
+
+(defmethod (wrap-literal FLOAT-WRAPPER) ((value FLOAT))
+  ;; Return a literal object whose value is the FLOAT 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-float value)))
+
+;; FOR COMMON LISP, These next two functions must come in this
+;;  order, because the STRING => STRING-WRAPPER method needs to
+;;  be second in order to redefine the MUTABLE-STRING version, which
+;;  will have the same Common Lisp method signature.
+;;       - tar
+
+(defmethod (wrap-literal MUTABLE-STRING-WRAPPER) ((value MUTABLE-STRING))
+  ;; Return a literal object whose value is the MUTABLE-STRING 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-mutable-string value)))
+
+(defmethod (wrap-literal STRING-WRAPPER) ((value STRING))
+  ;; Return a literal object whose value is the STRING 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-string value)))
+
+(defmethod (wrap-literal CHARACTER-WRAPPER) ((value CHARACTER))
+  ;; Return a literal object whose value is the CHARACTER 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-character value)))
+
+(defmethod (wrap-literal FUNCTION-CODE-WRAPPER) ((value FUNCTION-CODE))
+  ;; Return a literal object whose value is the FUNCTION-CODE 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-function-code value)))
+
+(defmethod (wrap-literal METHOD-CODE-WRAPPER) ((value METHOD-CODE))
+  ;; Return a literal object whose value is the METHOD-CODE 'value'.
+  :globally-inline? TRUE
+  :public? TRUE
+  (return (wrap-method-code value)))
+
+;; Methods that copy wrapped literals but pass ordinary objects through:
+(defmethod (copy-wrapped-literal OBJECT) ((self STANDARD-OBJECT))
+  (return self))
+(defmethod (copy-wrapped-literal OBJECT) ((self LITERAL-WRAPPER))
+  (return self))
+(defmethod (copy-wrapped-literal OBJECT) ((self INTEGER-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
+(defmethod (copy-wrapped-literal OBJECT) ((self FLOAT-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
+(defmethod (copy-wrapped-literal OBJECT) ((self STRING-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
+(defmethod (copy-wrapped-literal OBJECT) ((self MUTABLE-STRING-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
+(defmethod (copy-wrapped-literal OBJECT) ((self CHARACTER-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
+(defmethod (copy-wrapped-literal OBJECT) ((self FUNCTION-CODE-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
+(defmethod (copy-wrapped-literal OBJECT) ((self METHOD-CODE-WRAPPER))
+  (return (wrap-literal (wrapper-value self))))
+
+
+  ;;
+;;;;;; eql?
+  ;;
+
+;;; 'EQL?' is intended as a generally-used equality test.  Its like
+;;;  the C++ '==' except that (1) it tests for string equivalence
+;;;  when its first argument is a string, and (2) it understands
+;;;  wrapped literals and variables.  The STELLA walker will
+;;;  substitute the faster 'EQ?' whenever the type declarations sanction
+;;;  the switch.
+
+;;; OPTIMIZATION:  Whenever one or more arguments to 'eql?' have a 
+;;; static type that determines the kind of equality test, then the
+;;; walker will substitute that test, and 'eql?' will not be called.
+
+;;; The 'object-eql?' methods defined below are 'eql?' helper
+;;; methods that assume that bare literals won't appear as arguments
+;;; (otherwise they will break).
+
+(defmethod (object-eql? BOOLEAN) ((x OBJECT) (y OBJECT))
+  ;; SHOULD THIS BE WARN?  - tar
+  (error "object-eql?: Don't know how to compare " x " with " y)
+  ; (return FALSE)
+  )
+
+(defmethod (object-eql? BOOLEAN) ((x STANDARD-OBJECT) (y OBJECT))
+  (return (eq? x y)) )
+
+(defmethod (object-eql? BOOLEAN) ((x INTEGER-WRAPPER) (y OBJECT))
+  (return (and (defined? y)
+               (eql? (primary-type y) @INTEGER-WRAPPER) ;; treat as final
+               (= (wrapper-value x)
+                  (wrapper-value (cast y INTEGER-WRAPPER))))))
+
+(defmethod (object-eql? BOOLEAN) ((x FLOAT-WRAPPER) (y OBJECT))
+  (return (and (defined? y)
+               (eql? (primary-type y) @FLOAT-WRAPPER)   ;; treat as final
+               (= (wrapper-value x)
+                  (wrapper-value (cast y FLOAT-WRAPPER))))))
+
+(defmethod (object-eql? BOOLEAN) ((x BOOLEAN-WRAPPER) (y OBJECT))
+  (return (eq? x y)) )
+  
+(defmethod (object-eql? BOOLEAN) ((x STRING-WRAPPER) (y OBJECT))
+  (when (defined? y)
+    (let ((yType (primary-type y)))
+      (when (or (eql? yType @STRING-WRAPPER)            ;; treat as final
+                (eql? yType @VERBATIM-STRING-WRAPPER)
+                ;; if we use STELLA hash tables, we need to make this work
+                ;;    before symbols (such as type names) become available:
+                (and (not *class-hierarchy-booted?*)
+                     (or (null? yType)
+                         (null? @STRING-WRAPPER)
+                         (null? @VERBATIM-STRING-WRAPPER))))
+        (return (eql? (wrapper-value x)
+                      (wrapper-value (cast y STRING-WRAPPER)))))))
+  (return FALSE))
+
+(defmethod (object-eql? BOOLEAN) ((x MUTABLE-STRING-WRAPPER) (y OBJECT))
+  (return (eq? x y)))
+
+(defmethod (object-eql? BOOLEAN) ((x CHARACTER-WRAPPER) (y OBJECT))
+  (return (and (defined? y)
+               (eql? (primary-type y) @CHARACTER-WRAPPER)  ;; treat as final
+               (eq? (wrapper-value x)
+                    (wrapper-value (cast y CHARACTER-WRAPPER))))))
+
+;;; The 'eql-to-<literal>' functions assist in defining 'eql?'
+;;;    to test the case of an object compared with a literal:
+
+;;; Added -erm
+(defun (eql-to-boolean? BOOLEAN) ((y OBJECT) (x BOOLEAN))
+  (return (and (boolean? y)
+               (eq? (wrapper-value (cast y BOOLEAN-WRAPPER)) x))) )
+
+(defun (eql-to-integer? BOOLEAN) ((y OBJECT) (x INTEGER))
+  (return (and (integer? y)
+               (eq? (wrapper-value (cast y INTEGER-WRAPPER)) x))) )
+
+(defun (eql-to-float? BOOLEAN) ((y OBJECT) (x FLOAT))
+  (return (and (float? y)
+               (eq? (wrapper-value (cast y FLOAT-WRAPPER)) x))) )
+
+(defun (eql-to-string? BOOLEAN) ((y OBJECT) (x STRING))
+  (return (and (string? y)
+               (string-eql? (wrapper-value (cast y STRING-WRAPPER)) x))) )
+
+ ;; Is this necessary? -tar
+;(defun (eql-to-mutable-string? BOOLEAN) ((y OBJECT) (x MUTABLE-STRING))
+;  (return (eq? y x)) )
+
+(defun (eql-to-character? BOOLEAN) ((y OBJECT) (x CHARACTER))
+  (return (and (character? y)
+               (eq? (wrapper-value (cast y CHARACTER-WRAPPER)) x))) )
+
+
+  ;;
+;;;;;; '=' Testing
+  ;;
+
+#|
+;;; The '=' test is the same as the 'eql?' test except that
+;;;    run-time coersion between different numeric types is
+;;;    supported.
+
+(defmethod (= BOOLEAN) ((x OBJECT) (y OBJECT))
+  ;; The default '=' method calls 'eql?'.
+  :public? TRUE
+  (return (eql? x y)) )
+
+;;; The 'equal-to-integer?' methods test for equality between an 
+;;;    integer and an object.  The test can succeed both for 
+;;;    an wrapped integer and an wrapped float.
+
+;;; Note: When we have several kinds of integers and floats, we
+;;;    will need lots more of these:
+
+(defmethod (equal-to-integer? BOOLEAN) ((y INTEGER-WRAPPER) (x INTEGER))
+  (return (eq? x (wrapper-value y))) )
+
+(defmethod (equal-to-integer? BOOLEAN) ((y FLOAT-WRAPPER) (x INTEGER))
+  ;; USE THIS IF C++ DOESN'T AUTOMATICALLY CAST:
+;  (return (eq? (cast x FLOAT) (wrapper-value y)))
+  (return (= x (wrapper-value y))) )
+
+(defmethod (equal-to-integer? BOOLEAN) ((y WRAPPER) (x INTEGER))
+  (ignore x)
+  (return FALSE) )
+
+(defmethod (= BOOLEAN) ((x INTEGER-WRAPPER) (y OBJECT))
+  (return (equal-to-integer? y (wrapper-value x))) )
+
+
+(defmethod (equal-to-float? BOOLEAN) ((y FLOAT-WRAPPER) (x FLOAT))
+  (return (eq? x (wrapper-value y))) )
+
+(defmethod (equal-to-float? BOOLEAN) ((y INTEGER-WRAPPER) (x FLOAT))
+  ;; USE THIS IF C++ DOESN'T AUTOMATICALLY CAST:
+;  (return (eq? x (cast (wrapper-value y) FLOAT)))
+  (return (= x (wrapper-value y))) )
+
+(defmethod (equal-to-float? BOOLEAN) ((y WRAPPER) (x FLOAT))
+  (ignore x)
+  (return FALSE) )
+
+(defmethod (= BOOLEAN) ((x FLOAT-WRAPPER) (y OBJECT))
+  (return (equal-to-float? y (wrapper-value x))) )
+|#
+
+    ;;
+  ;;;;;;
+;;;;;;;;;; Quotation and Backquote
+  ;;;;;;
+    ;;
+
+
+;;; Now that collections, symbols, and literals are up, we can
+;;;    define quotation.
+
+;;; These functions begin the conversion from walking Lisp s-expressions
+;;;    to walking Stella parse trees.
+
+(defun (help-bquotify OBJECT) ((tree OBJECT))
+  ;; Helping function for "bquotify".
+  ;; Return a tree that evaluates to "tree".
+  (when (null? tree)
+    (return (quote NULL)))
+  (typecase tree
+    (CONS
+     (if (nil? tree)
+         (return (quote NIL))
+       (return (cons-list (quote CONS)
+                          (help-bquotify (value tree))
+                          (help-bquotify (rest tree))))))
+   ((INTEGER STRING FLOAT CHARACTER)
+    ;; allocate storage for literal encapsulation:
+    (return (cons-list (quote WRAP-LITERAL) tree)))
+   (KEYWORD
+    (if (use-hardcoded-symbols?)
+	(return (cons-list (quote GET-KWD)
+			   (wrap-literal (symbol-id tree))))
+      (return (cons-list (quote TYPED-SYS)
+			 (register-symbol tree)
+			 @SYMBOL))))
+   (SURROGATE
+    (if (use-hardcoded-symbols?)
+	(return (cons-list (quote GET-SGT)
+			   (wrap-literal (symbol-id tree))))
+      
+      (return (cons-list (quote TYPED-SYS)
+			 (register-symbol tree)
+			 @SYMBOL))))
+   (SYMBOL
+    (if (symbol-common-lisp? tree)
+        (return (cons-list (quote INTERN-COMMON-LISP-SYMBOL)
+                           (wrap-literal (symbol-name tree))))
+      (if (use-hardcoded-symbols?)
+	  (return (cons-list (quote GET-SYM)
+			     (wrap-literal (symbol-id (permanentify tree)))))
+	(return (cons-list (quote TYPED-SYS)
+			   (register-symbol tree)
+			   @SYMBOL)))))
+   (otherwise
+    (walk-error "Illegal argument to quote: " tree)
+    (return NULL))))
+
+(defun (bquotify OBJECT) ((tree OBJECT))
+  ;; Situation: 'tree' is atomic.
+  ;; Return a Stella parse tree that evaluates to "tree".
+  (return (help-bquotify tree)) )
+
+(defun (expand-bquote-tree OBJECT) ((tree OBJECT))
+  ;; Walk a bquote form, returning an equivalent expanded form.
+  ;; Strategy: Built up "expandedTree" backwards and then reverse it.
+  (typecase tree
+    (CONS
+     (let ((expandedTree (cons (quote LIST*) NIL))
+           (cursor tree)
+           (term (value cursor)))
+       (while (and (non-empty? cursor)
+                   (not (or (eq? term (bquote &))
+                            (eq? term (bquote &&)))))
+         (setq expandedTree (cons (expand-bquote-tree term)
+                                  expandedTree))
+         (setq cursor (rest cursor))
+         (setq term (first cursor)))
+    
+       ;; "value(cursor)" == & or &&:
+       (cond
+        ((empty? cursor)
+         (return (reverse (cons (quote NIL) expandedTree))))
+        ((eq? term (bquote &))
+         (setq cursor (rest cursor))
+         (when (empty? cursor)
+           (walk-error "Illegal bquote tree -- missing term after '&'."))
+         (return
+           (reverse (cons (expand-bquote-tree (rest cursor)) 
+                          (cons (value cursor)
+                                expandedTree)))))
+        (otherwise ;; else  term == quote(&&):
+         (setq cursor (rest cursor))
+         (when (empty? cursor)
+           (walk-error "Illegal bquote tree -- missing term after '&&'"))
+         (return
+           (reverse (cons (cons-list (quote CONCATENATE)
+                                     (value cursor)
+                                     (expand-bquote-tree (rest cursor)))
+                          expandedTree)))))))
+    (otherwise
+     (return (bquotify tree)))))
+
+(defun (simplify-bquote-tree OBJECT) ((tree OBJECT))
+  ;; Return 'tree' with 'cons' substituted for 'list*' wherever
+  ;;    its has exactly two arguments, and with 'list*' removed
+  ;;    whenever it has a single argument.  Destructive operation.
+  (typecase tree
+    (CONS
+     (let ((cursor (rest tree)))
+       (while (non-empty? cursor)
+         (setf (value cursor) (simplify-bquote-tree (value cursor)))
+         (setq cursor (rest cursor)))
+       (when (not (eq? (value tree) (quote LIST*)))
+         (return tree))
+       (case (length (rest tree))
+         (1
+          (return (value (rest tree))))
+         (2
+          (setf (value tree) (quote CONS))
+          (return tree))
+         (otherwise (return tree)))))
+    (otherwise
+     (return tree))))
+     
+    
+
+  ;;
+;;;;;; Utility functions used during parsing of class and method definitions
+  ;;
+
+(defmethod (permanentify OBJECT) ((self OBJECT))
+  :public? TRUE
+  ;; Return a permanent version of 'self'.
+  ;; Transient versions of symbols return permanent copies.
+  ;; Wrapped literals are copied.
+  (return self) )
+
+(defmethod (permanentify SYMBOL) ((self SYMBOL))
+  :public? TRUE
+  ;; Exists solely to propagate the type if `permanentify' is called on a symbol.
+  (return self))
+
+(defmethod (permanentify SYMBOL) ((self TRANSIENT-SYMBOL))
+  :public? TRUE
+  ;; Convert from transient symbol to permanent symbol.
+  (return (intern-permanent-symbol (symbol-name self))) )
+
+(defmethod (permanentify LITERAL-WRAPPER) ((self LITERAL-WRAPPER))
+  :public? TRUE
+  ;; Permanentify literals by copying them - this might be obsolete.
+  (return (copy-wrapped-literal self)))
+
+(defun (permanent-copy OBJECT) ((tree OBJECT))
+  :public? TRUE
+  ;; Make a copy of the parse tree 'tree' using permanent symbols.
+  ;; CAUTION: Non parse tree objects embedded in 'tree' are transmitted
+  ;;    as is rather than copied.
+  (typecase tree
+    (CONS
+     (if (nil? tree)
+         (return tree)
+       (return
+         (cons (permanent-copy (value tree))
+               (permanent-copy (rest tree))))))
+    (otherwise
+     (return (permanentify tree)))))
+
+(defmethod (soft-permanentify SYMBOL) ((symbol SYMBOL))
+  ;; If 'symbol' is transient, its permanent version is returned if
+  ;;    it already exists.  Otherwise, 'symbol' is returned unmodified.
+  ;; This is "soft", since it does not create any new structure.
+  (return symbol))
+
+(defmethod (soft-permanentify SYMBOL) ((symbol TRANSIENT-SYMBOL))
+  ;; If 'symbol' is transient, its permanent version is returned if
+  ;;    it already exists.  Otherwise, 'symbol' is returned unmodified.
+  ;; This is "soft", since it does not create any new structure.
+  (let ((permanentSymbol
+         (lookup-rigid-symbol-wrt-module
+          (symbol-name symbol)
+          (choose (defined? (interned-in symbol))
+                  (interned-in symbol)
+                  *module*)
+          SYMBOL-SYM)))
+    (if (defined? permanentSymbol)
+        (return permanentSymbol)
+      (return symbol))))
+
+  ;;
+;;;;;; various support for characters and strings
+  ;;
+
+(defun print-character ((char CHARACTER) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print 'char' onto 'stream'.  Print a verbose representation of
+  ;;   special characters such as #\Return or #\Linefeed.  Note we
+  ;;   don't use #\Newline because it varies across platforms.
+  :public? TRUE
+  (print-native-stream stream "#\\")
+  (case char
+    (#\Linefeed (print-native-stream stream "Linefeed"))
+    (#\Backspace (print-native-stream stream "Backspace"))
+    (#\Tab (print-native-stream stream "Tab"))
+    ;; Commented until C++ translator handles it:
+    ;;(#\Rubout (print-native-stream stream "Rubout"))
+    ;; Common Lisp MCL compiler equates 'Newline' and 'Return':
+    (#\Return (print-native-stream stream "Return"))
+    (#\Page (print-native-stream stream "Page"))
+    (otherwise (print-native-stream stream char))))
+
+(defun (create-character-type-table (ARRAY (256) OF KEYWORD)) ()
+  ;; Create a table of character types (see '*character-type-table*').
+  (let ((table (new (ARRAY (256) OF KEYWORD))))
+    (foreach code in (interval 0 255)
+             do (setf (aref table code) :OTHER))
+    (foreach code in (interval (character-code #\0) (character-code #\9))
+             do (setf (aref table code) :DIGIT))
+    (foreach code in (interval (character-code #\A) (character-code #\Z))
+             do (setf (aref table code) :LETTER))
+    (foreach code in (interval (character-code #\a) (character-code #\z))
+             do (setf (aref table code) :LETTER))
+
+    (setf (aref table (character-code #\! )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\$ )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\% )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\< )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\> )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\= )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\? )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\[ )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\] )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\^ )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\_ )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\{ )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\} )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\~ )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\* )) :SYMBOL-CONSTITUENT)
+    ;; should these be :OTHER, since they could also start a number?
+    (setf (aref table (character-code #\. )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\+ )) :SYMBOL-CONSTITUENT)
+    (setf (aref table (character-code #\- )) :SYMBOL-CONSTITUENT)
+
+    (setf (aref table (character-code #\: )) :SYMBOL-QUALIFIER)
+    (setf (aref table (character-code #\/ )) :SYMBOL-QUALIFIER)
+    (setf (aref table (character-code #\@ )) :SYMBOL-QUALIFIER)
+    
+    (setf (aref table (character-code #\\ )) :ESCAPE)
+    
+    (setf (aref table (character-code #\( )) :DELIMITER)
+    (setf (aref table (character-code #\) )) :DELIMITER)
+    (setf (aref table (character-code #\" )) :DELIMITER)
+    (setf (aref table (character-code #\| )) :DELIMITER)
+    (setf (aref table (character-code #\' )) :DELIMITER)
+    (setf (aref table (character-code #\` )) :DELIMITER)
+    (setf (aref table (character-code #\, )) :DELIMITER)
+    
+    (setf (aref table (character-code #\  ))       :WHITE-SPACE)
+    (setf (aref table (character-code #\Tab))      :WHITE-SPACE)
+    (setf (aref table (character-code #\Linefeed)) :WHITE-SPACE)
+    (setf (aref table (character-code #\Return))   :WHITE-SPACE)
+    (setf (aref table (character-code #\Newline))  :WHITE-SPACE)
+    (setf (aref table (character-code #\Page))     :WHITE-SPACE)
+    (return table)))
+
+(defglobal *character-type-table* (ARRAY (256) OF KEYWORD)
+  (create-character-type-table)
+  :documentation "Table of character types.  Entry 'i' represents the type
+of the character whose 'char-code' equals 'i'.  Each character is classified 
+by one of the following keywords: :DIGIT, :LETTER, :SYMBOL-CONSTITUENT, 
+:SYMBOL-QUALIFIER, :ESCAPE, :DELIMITER, :WHITE-SPACE, or :OTHER."
+  :public? TRUE)
+
+(defun (digit-character? BOOLEAN) ((ch CHARACTER))
+  :documentation "Return TRUE if `ch' represents a digit."
+  :public? TRUE :globally-inline? TRUE
+  (return (eql? (aref *character-type-table* (character-code ch)) :DIGIT)))
+
+(defun (letter-character? BOOLEAN) ((ch CHARACTER))
+  :documentation "Return TRUE if `ch' represents a letter."
+  :public? TRUE :globally-inline? TRUE
+  (return (eql? (aref *character-type-table* (character-code ch)) :LETTER)))
+
+(defun (upper-case-character? BOOLEAN) ((ch CHARACTER))
+  :public? TRUE
+  :documentation "Return TRUE if `ch' represents an upper-case character."
+  ;; Note that this is not quite the complement of `lower-case-character?'.
+  (let ((charCode (character-code ch)))
+    (return (and (>= charCode (character-code #\A))
+		 (<= charCode (character-code #\Z))))))
+
+(defun (lower-case-character? BOOLEAN) ((ch CHARACTER))
+  :public? TRUE
+  :documentation "Return TRUE if `ch' represents a lower-case character."
+  ;; Note that this is not quite the complement of `upper-case-character?'.
+  (let ((charCode (character-code ch)))
+    (return (and (>= charCode (character-code #\a))
+		 (<= charCode (character-code #\z))))))
+
+(defun (white-space-character? BOOLEAN) ((ch CHARACTER))
+  :documentation "Return TRUE if `ch' is a white space character."
+  :public? TRUE :globally-inline? TRUE
+  (return (eql? (aref *character-type-table* (character-code ch)) :WHITE-SPACE)))
+
+(defun (all-upper-case-string? BOOLEAN) ((s STRING))
+  :documentation "Return TRUE if all letters in `s' are upper case."
+  :public? TRUE
+  (let ((code 0)
+        (codea (character-code #\a))
+        (codez (character-code #\z)))
+    (foreach ch in s
+        do (setq code (character-code ch))
+           (when (and (>= code codea)
+                      (<= code codez))
+             (return FALSE)))
+    (return TRUE)))
+
+(defun (all-lower-case-string? BOOLEAN) ((s STRING))
+  :documentation "Return TRUE if all letters in `s' are lower case."
+  :public? TRUE
+  (let ((code 0)
+        (codeA (character-code #\A))
+        (codeZ (character-code #\Z)))
+    (foreach ch in s
+        do (setq code (character-code ch))
+           (when (and (<= code codeZ)
+                      (>= code codeA))
+             (return FALSE)))
+    (return TRUE)))
+
+(defglobal *character-upcase-table* STRING
+           (initialize-character-upcase-table))
+
+(defun (initialize-character-upcase-table STRING) ()
+  (let ((buffer (make-mutable-string 256 NULL)))
+    (foreach i in (interval 0 255)
+        do (setf (nth buffer i) (code-character i))
+           (when (and (>= i (character-code #\a))
+                      (<= i (character-code #\z)))
+             (setf (nth buffer i)
+               (code-character
+                (+ (character-code #\A)
+                   (- i (character-code #\a)))))))
+    (return buffer)))
+
+(defglobal *character-downcase-table* STRING
+           (initialize-character-downcase-table))
+
+(defun (initialize-character-downcase-table STRING) ()
+  (let ((buffer (make-mutable-string 256 NULL)))
+    (foreach i in (interval 0 255)
+        do (setf (nth buffer i) (code-character i))
+           (when (and (>= i (character-code #\A))
+                      (<= i (character-code #\Z)))
+             (setf (nth buffer i)
+               (code-character
+                (+ (character-code #\a)
+                   (- i (character-code #\A)))))))
+    (return buffer)))
+
+(defun (upcase-character CHARACTER) ((char CHARACTER))
+  :public? TRUE :globally-inline? TRUE
+  :documentation "If `char' is lowercase, return its uppercase version,
+otherwise, return 'char' unmodified."
+  (return (nth *character-upcase-table* (character-code char))))
+
+(defun (downcase-character CHARACTER) ((char CHARACTER))
+  :public? TRUE :globally-inline? TRUE
+  :documentation "If `char' is uppercase, return its lowercase version,
+otherwise, return 'char' unmodified."
+  (return (nth *character-downcase-table* (character-code char))))
+
+(defun print-string-readably ((string STRING) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print 'string' readably (with quotes and escape chars) onto 'stream'.
+  (verbatim
+      ;; In Lisp this is more efficient:
+      :common-lisp (CL:progn
+                       (CL:prin1 string stream)
+                       (CL:return-from print-string-readably))
+      :otherwise NULL)
+  (print-native-stream stream "\"")
+  (foreach i in (interval 0 (- (length string) 1))
+           do (let ((char (nth string i)))
+                (if (or (eq? char #\")
+                        (eq? char #\\))
+                    (print-native-stream stream "\\" char)
+                  (print-native-stream stream char))))
+  (print-native-stream stream "\""))
+
+
+  ;;
+;;;;;; Coercion Functions
+  ;;
+
+(defun (string-to-mutable-string MUTABLE-STRING) ((s STRING))
+  :documentation "Copy `s' into a mutable string with the same content.
+In Lisp and C++ this simply copies `s'."
+  :public? TRUE :globally-inline? TRUE
+  (return (verbatim :common-lisp (CL:copy-seq s)
+		    :cpp "strcpy(new (GC) char[strlen(s)+1], s)"
+		    :java "new StringBuffer(s)")))
+
+;; Should this copy also in CL and C++ ??  
+;; NO, BECAUSE THIS CAUSES PROBLEMS IN C++ IF `S' CONTAINS NULL CHARACTERS.
+(defun (mutable-string-to-string STRING) ((s MUTABLE-STRING))
+  :documentation "Convert `s' into a regular string with the same content.
+In Lisp and C++ this is a no-op."
+  :public? TRUE :globally-inline? TRUE
+  (return (verbatim :common-lisp s
+		    :cpp "s"
+		    :java "s.toString()")))
+
+(defmethod (number-wrapper-to-float FLOAT) ((self NUMBER-WRAPPER))
+  :public? TRUE
+  ;; Dummy.
+  (return NULL) )
+
+(defmethod (number-wrapper-to-float FLOAT) ((self INTEGER-WRAPPER))
+  :public? TRUE
+  ;; Return a floating point representation of the integer 'self'.
+  (return (* self 1.0)))
+
+(defmethod (number-wrapper-to-float FLOAT) ((self FLOAT-WRAPPER))
+  :public? TRUE
+  ;; Return an  unwrapped 'self'.
+  (return (wrapper-value self)) )
+

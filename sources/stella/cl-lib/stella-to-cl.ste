@@ -1,0 +1,546 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: stella-to-cl.ste,v 1.66 2003/09/30 00:54:46 hans Exp
+
+;;; Common Lisp macros that expand Stella declarations into Common Lisp.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+(defun (cl-incrementally-translate LISP-CODE) ((expression LISP-CODE))
+  ;; Translate the STELLA `expression' into executable Lisp code
+  ;;    and return the result.
+  (let ((tree OBJECT NULL))
+    (with-transient-objects
+      (setq tree (stella-code-to-cons-tree expression)))
+    (return (cons-tree-to-lisp-code (incrementally-translate tree)))))
+
+(verbatim :common-lisp
+  (CL:defun safely-expand-macro (form)
+"Run the translator over 'form' to obtain its expansion.
+Guard against expansions that expand repeatedly
+due to the head of the result matching the head of 'form'."
+  (CL:let ((head (CL:and (cl:consp form) (cl:car form)))
+           (expandedForm (cl-incrementally-translate form)))
+    (CL:if (CL:and (CL:consp expandedForm)
+                   (CL:eq head (CL:car expandedForm)))
+      (CL:progn
+        (CL:format CL:t "Can't expand the macro ~A~%" head)
+        (CL:return-from safely-expand-macro NULL))
+      (CL:return-from safely-expand-macro expandedForm)) )))
+          
+
+  ;;
+;;;;;; 'eval' and friends:
+  ;;
+
+;;; WE REALLY DON'T HAVE "bi-modal" TRANSLATION ANYMORE:
+(defun (bi-modal-translate LISP-CODE) ((statement LISP-CODE))
+  ;; Call either the boostrap translator or the real translator
+  ;;    to translate 'statement' from Stella code into Common Lisp code.
+  (return (help-bi-modal-translate statement)))
+
+(defun (help-bi-modal-translate LISP-CODE) ((statement LISP-CODE))
+  ;; Work-horse for 'bi-modal-translate'.
+  ;; Extracted the functionality, so 'bi-modal-translate' can be "advised"
+  ;;    for debugging purposes.
+  (return (cl-incrementally-translate statement)))
+
+;;; NOTE: Can't use CL backquote syntax below, since the functions generated
+;;;       by the reader macro expansion don't reside in the CL package, thus,
+;;;       the symbols wind up in the Stella package when written to a file.
+
+(verbatim :common-lisp
+  "(CL:defmacro eval (statement)
+    \"Translate and evaluate a STELLA statement or expression.\"
+    (CL:list
+     'CL:eval (CL:list 'bi-modal-translate (CL:list 'CL:quote statement))))")
+
+
+  ;;
+;;;;;; Support functions for the Emacs-Lisp interfaces
+  ;;
+
+;;; Improved interface to use STELLA reader for proper handling of case
+;;; sensitivity and read macros such as `''.  Still need to upgrade the
+;;; CLdebug interface to achieve the same.
+
+(defun (emacs-region-to-statements (CONS OF CONS)) ((region STRING))
+  ;; Convert `region' into a set of statement trees relative to the current
+  ;;    STELLA module and Lisp package.  The result is a list with elements
+  ;;    of the form `({:STELLA | :LISP} <statement>)'.
+  ;; If <statement> is a :STELLA statement, it is a known top-level STELLA
+  ;;    command and it will be generated by `read-s-expression-from-string',
+  ;;    otherwise, it will be a Lisp tree generated by `CL:read-from-string'.
+  (let ((start 0)
+        (newStart 0)
+        (lispStatement OBJECT NULL)
+        (stellaStatement OBJECT NULL)
+        (eofValue *module*)
+        (result NIL))
+    (loop
+      ;; this currently assumes that all legal STELLA code can be read by
+      ;;    the Lisp reader without generating an error:
+      (verbatim :common-lisp
+        "(CL:multiple-value-setq (lispStatement newStart)
+           (CL:read-from-string region CL:NIL eofValue :start start))")
+      (when (CL:eq lispStatement eofValue)
+        (break))
+      (exception-case
+          (setq stellaStatement
+            (read-s-expression-from-string
+             (subsequence region start newStart)))
+        (READ-EXCEPTION ()
+          (setq stellaStatement NULL)))
+      (if (and (cons? stellaStatement)
+               (or (declaration-tree? stellaStatement)
+                   (and (symbol? (first (cast stellaStatement CONS)))
+                        (defined? (lookup-command
+                                   (first (cast stellaStatement CONS)))))))
+          ;; we have a STELLA top-level command:
+          (pushq result (cons-list :STELLA stellaStatement))
+        ;; we have some arbitrary Lisp code:
+        (pushq result (cons-list :LISP lispStatement)))
+      (setq start newStart))
+    (return (reverse result))))
+
+(defun (translate-emacs-region-in-module LISP-CODE) ((moduleName STRING)
+                                                     (region STRING))
+  ;; Read and translate each statement in `region' relative to module
+  ;;    `moduleName' and return the translations as a Lisp list.
+  ;; Does do slightly different things depending on whether a statement is
+  ;;    a STELLA command or arbitrary Lisp code, so case-sensitive modules
+  ;;    and special STELLA read syntax are taken care of appropriately.
+  (let ((result LISP-CODE (verbatim :common-lisp CL:NIL)))
+    (within-module (get-stella-module moduleName TRUE)
+      (foreach statement in (emacs-region-to-statements region)
+          do (cond ((eql? (first statement) :STELLA)
+                    (CL:push
+                     (cons-tree-to-lisp-code
+                      (incrementally-translate (second statement)))
+                     result))
+                   (otherwise
+                    (CL:push (second statement) result))))
+      (return (CL:reverse result)))))
+
+(verbatim :common-lisp
+  "(CL:defmacro lisp-eval-emacs-region-in-module (moduleName region)
+     ;; Read and evaluate each statement in `region' relative to module
+     ;;    `moduleName' and return the result of the last evaluation.
+     ;; Does do slightly different things depending on whether a statement is
+     ;;    a STELLA command or arbitrary Lisp code, so case-sensitive modules
+     ;;    and special STELLA read syntax are taken care of appropriately.
+     ;; This needs to be a macro to do the right thing in the Allegro Emacs
+     ;;    interface (e.g., to get functions compiled).
+     (CL:let* ((translatedStatements
+                (translate-emacs-region-in-module moduleName region)))
+      `(CL:let* ((*module* (get-stella-module ',moduleName TRUE))
+                 (*context* *module*))
+         ,@translatedStatements)))")
+
+(verbatim :common-lisp
+  (CL:defmacro lisp-macroexpand-emacs-region-in-module
+      (expander moduleName region)
+    ;; Read and macro-expand each statement in `region' relative to module
+    ;;    `moduleName' and return the resulting expansions.
+    ;; Does do slightly different things depending on whether a statement is
+    ;;    a STELLA command or arbitrary Lisp code, so case-sensitive modules
+    ;;    and special STELLA read syntax are taken care of appropriately.
+    ;; This needs to be a macro to do the right thing in the Allegro Emacs
+    ;;    interface.
+    (CL:let* ((translatedStatements
+               (translate-emacs-region-in-module moduleName region))
+              (expansions
+               (CL:loop for statement in translatedStatements
+                  collect (CL:funcall expander statement))))
+      (CL:if (CL:= (CL:length expansions) 1)
+          (CL:first expansions)
+        (CL:cons (CL:quote CL:progn) expansions)))))
+
+(defun (lisp-eval-form-in-module LISP-CODE)
+    ((moduleName STRING) (form LISP-CODE))
+  ;; Lisp-evaluate 'form' while '*module*' is bound to the module
+  ;;    named 'moduleName' (support function for the Emacs interface).
+  (within-module (get-stella-module moduleName TRUE)
+    (return (CL:eval form))))
+
+
+  ;;
+;;;;;; Common-Lisp API (maybe this should go somewhere else?)
+  ;;
+
+(defun (lispify LISP-CODE) ((thing UNKNOWN))
+  :documentation "Convert a Stella 'thing' as much as possible into a
+Common-Lisp analogue.  The currently supported 'thing' types are CONS, LIST,
+KEY-VALUE-LIST, ITERATOR, SYMBOL, KEYWORD, and all wrapped and unwrapped
+literal types.  BOOLEANs are translated into Lisp's CL:T and CL:NIL logic.
+Unsupported types are left unchanged."
+  :public? TRUE
+  (if (eq? (verbatim
+             :common-lisp
+             (CL:or (CL:typep thing (CL:quote OBJECT))
+                    (CL:and (CL:listp NIL)
+                            (CL:listp thing)))
+             :otherwise NULL)
+           CL-NIL)
+      (if (defined? thing)
+	  (return thing)
+	;; Translate NULL into CL:NIL:
+	(return CL-NIL))
+    (typecase thing
+      (CONS 
+       (when (empty? thing)
+         (return (cl:identity CL-NIL)))
+       (let ((first (lispify (value thing)))
+             (rest (lispify (rest thing))))
+         (return (CL:cons first rest))))
+      (LIST
+       (return (lispify (the-cons-list thing))))
+      (KEY-VALUE-LIST
+       (let ((result CL-NIL))
+         (foreach (key value) in thing
+                  do
+                  (CL:push (CL:cons (lispify key) (lispify value))
+                           result))
+         (return (CL:nreverse result))))
+      (ITERATOR (return (lispify (listify thing))))
+      (SYMBOL (return (cons-tree-to-lisp-code
+                       (cl-translate-global-symbol thing))))
+      (KEYWORD (return (cons-tree-to-lisp-code thing)))
+      (BOOLEAN-WRAPPER
+       (let ((truthValue (wrapper-value thing)))
+         (return (verbatim :common-lisp truthValue
+                           :otherwise NULL))))
+      (VERBATIM-STRING-WRAPPER
+       (return (cons-tree-to-lisp-code thing)))
+      ((INTEGER-WRAPPER FLOAT-WRAPPER STRING-WRAPPER CHARACTER-WRAPPER)
+       (return (safe-cast (wrapper-value thing) LISP-CODE)))
+      (otherwise (return thing)))))
+
+(defun (lispify-boolean LISP-CODE) ((thing UNKNOWN))
+  :documentation "Lispify 'thing' which is assumed to be a (possibly wrapped) 
+Stella boolean."
+  :public? TRUE
+  (if (not (verbatim :common-lisp "(CL:typep thing 'OBJECT)"))
+      ;; This also maps 'NULL' onto CL:NIL:
+      (return (verbatim :common-lisp thing
+                        :otherwise NULL))
+    ;; It must be a boolean wrapper:
+    (return (lispify thing))))
+
+(defun (stellafy OBJECT) ((thing LISP-CODE) (targetType TYPE))
+  :documentation "Partial inverse to 'lispify'.  Convert the Lisp object 
+'thing' into a Stella analogue of type 'targetType'.
+Note: See also 'stellify'. it is similar, but guesses 'targetType' on its own,
+and makes somewhat different translations."
+  :public? TRUE
+  (case targetType
+    ((@BOOLEAN @WRAPPED-BOOLEAN)
+     (return (wrap-boolean (not (eq? thing CL-NIL)))))
+    (@CONS
+     (return (stella-code-to-cons-tree thing)))
+    (otherwise
+     (if (eq? thing CL-NIL)
+         (return NULL)
+       (return (stella-code-to-cons-tree thing))))))
+
+(defun (cl-slot-value LISP-CODE)
+    ((object OBJECT) (slotName STRING) (dontConvert? BOOLEAN))
+  :documentation "Lookup slot 'slotName' on 'object' and return the lispified
+slot value (see 'lispify').  If 'dontConvert?' is TRUE, the returned slot value
+will not be lispified.  Generate a warning if no such slot exists on 'object'.
+In a call directly from Lisp 'slotName' can also be supplied as a Lisp symbol."
+  :public? TRUE
+  (verbatim :common-lisp
+    (setq slotName (CL:string slotName))
+    :otherwise NULL)
+  (let ((objectType (primary-type object))
+        (slot (safe-lookup-slot
+               (type-to-class objectType)
+               (intern-derived-symbol objectType slotName)))
+        (value OBJECT NULL))
+    (when (null? slot)
+      (warn "slot-value: Slot " slotName
+            " does not exist on object " object ".")
+      (return NULL))
+    (typecase slot
+      (STORAGE-SLOT
+       (setq value (read-slot-value object slot))
+       ;; Testing with 'eq?' allows NULL values for 'dontConvert?':
+       (if (eq? dontConvert? TRUE)
+           (return (safe-cast value LISP-CODE))
+         (if (eql? (type slot) @BOOLEAN)
+             (return (lispify-boolean value))
+           (return (lispify value)))))
+      (otherwise
+       (warn "slot-value: Cannot read method slots.")
+       (return NULL)))))
+
+(defun (cl-slot-value-setter LISP-CODE)
+    ((object OBJECT) (slotName STRING)
+     (value LISP-CODE) (dontConvert? BOOLEAN))
+  :documentation "Lookup slot 'slotName' on 'object' and set its value to
+the stellafied 'value' (see 'stellafy').  If 'dontConvert?' is TRUE, 'value'
+will not be stellafied before it gets assigned.  Generate a warning if no
+such slot exists on 'object', or if 'value' has the wrong type.  In a call
+directly from Lisp 'slotName' can also be supplied as a Lisp symbol."
+  :public? TRUE
+  (verbatim :common-lisp
+    (setq slotName (CL:string slotName))
+    :otherwise NULL)
+  (let ((objectType (primary-type object))
+        (slot (safe-lookup-slot
+               (type-to-class objectType)
+               (intern-derived-symbol objectType slotName)))
+        (stellaValue OBJECT (safe-cast value OBJECT)))
+    (when (null? slot)
+      (warn "slot-value-setter: Slot " slotName
+            " does not exist on object " object ".")
+      (return NULL))
+    (unless (eq? dontConvert? TRUE)
+      (setq stellaValue (stellafy value (type slot))))
+    (when (not (and (not (eq? (CL:typep stellaValue (CL:quote OBJECT)) CL-NIL))
+                    (subtype-of? (primary-type stellaValue)
+                                 (type-to-wrapped-type (type slot)))))
+      (warn "slot-value-setter: Illegal value type for slot " slotName EOL
+            " on object " object "." "  Type " (type slot) " expected.")
+      (return NULL))
+    (typecase slot
+      (STORAGE-SLOT
+       (write-slot-value object slot stellaValue))
+      (otherwise
+       (warn "slot-value-setter: Cannot write method slots.")
+       (return NULL)))
+    (return value)))
+
+;;; Lisp interface to 'cl-slot-value' and 'cl-slot-value-setter':
+
+;;; Examples: 
+;;;    (setq cons (cons NIL NIL))
+;;;    (slot-value cons 'rest)
+;;;    (slot-value cons 'rest TRUE)
+;;;    (setf (slot-value cons 'value) 2)
+;;;    (setf (slot-value cons 'value TRUE) (wrap-literal 3))
+
+(verbatim :common-lisp
+  (CL:defun slot-value (object slotName CL:&optional dontConvert?)
+    "See 'cl-slot-value'."
+    (CL:if (CL:or (CL:not dontConvert?)
+                  (CL:eql dontConvert? FALSE))
+        (cl-slot-value object slotName FALSE)
+      (cl-slot-value object slotName TRUE))))
+
+(verbatim :common-lisp
+  (CL:defun slot-value-setter
+      (object slotName value CL:&optional dontConvert?)
+    "See 'cl-slot-value-setter'."
+    (CL:if (CL:or (CL:not dontConvert?)
+                  (CL:eql dontConvert? FALSE))
+        (cl-slot-value-setter object slotName value FALSE)
+      (cl-slot-value-setter object slotName value TRUE))))
+
+(verbatim :common-lisp
+  "(CL:defsetf slot-value (object slot CL:&optional dontConvert?) (value)
+     `(slot-value-setter ,object ,slot ,value ,dontConvert?))")
+
+  ;;
+;;;;;; Final Stella- and Common-Lisp-specific versions of 'defclass'.
+;;;;;; 'defmethod' and 'defun'.
+  ;;
+
+(verbatim :common-lisp
+  "(CL:defmacro defmethod (name parameters CL:&body body)
+    \"Define a method and a method object named 'name'.  Keyword
+options are :public? :native? :globally-inline? :inline :auxiliary?
+:documentation :type :return-types :storage-slot :inherits-through.\"
+    (bi-modal-translate (CL:list* '/stella/defmethod name parameters body)))")
+
+(verbatim :common-lisp
+  "(CL:defmacro defun (name parameters CL:&body body)
+    \"Define a method and a method object named 'name'.\"
+    (bi-modal-translate (CL:list* '/stella/defun name parameters body)))")
+
+(verbatim :common-lisp
+  "(CL:defmacro defclass (name (CL::&rest supers) CL::&rest options)
+    \"Define a native (Lisp/C++) class and create a Stella class object.
+   Class options:
+     :slots :methods :abstract? :documentation
+     :creator :initializer :terminator :destructor
+     :recycle-method :cl-native-type :cpp-native-type
+   Storage slot options:
+     :type :initially :default :allocation :public?
+   Method slot options:
+     :abstract?\"
+    ;; Create a Stella class for use during preprocessing.
+    ;; Expand to native code that, at initialize time, defines a native CLOS
+    ;;    class, class creator, slot accessors, etc., and also redefines
+    ;;    the Stella class.
+    (bi-modal-translate (CL:list* '/stella/defclass name supers options)))")
+
+(verbatim :common-lisp
+  "(CL:defmacro defslot (class name CL:&rest options)
+    \"Define an external storage slot with 'name' on the class named 'class'.\"
+    (bi-modal-translate (CL:list* '/stella/defslot class name options)))")
+
+  ;;
+;;;;;; Global variable declarations
+  ;;
+
+;;; These versions don't toggle, i.e., they always use the final translator.
+
+(verbatim :common-lisp
+  "(CL:defmacro defglobal (variable type initialValue CL::&rest options)
+    \"Define a global variable 'variable' of type 'type' and initial value
+'initialValue'.  Legal options are ':documentation' and ':public?'.\"
+    (cl-incrementally-translate
+     (CL:list* '/stella/defglobal variable type initialValue options)))")
+
+(verbatim :common-lisp
+  "(CL:defmacro defconstant (variable type initialValue CL::&rest options)
+    \"Define a constant variable 'variable' of type 'type' and initial value
+'initialValue'.  Legal options are ':documentation' and ':public?'.\"
+    (cl-incrementally-translate
+     (CL:list* '/stella/defconstant variable type initialValue options)))")
+
+(verbatim :common-lisp
+  "(CL:defmacro defspecial (variable type CL:&optional initialValue
+                           CL::&rest options)
+    \"Define a special variable 'variable' of type 'type' and initial value
+'initialValue'.  Legal options are ':documentation' and ':public?'.\"
+    (cl-incrementally-translate
+     (CL:list* '/stella/defspecial variable type initialValue options)))")
+
+  ;;
+;;;;;; 'deftype':
+  ;;
+
+(verbatim :common-lisp
+  "(CL:defmacro deftype (type definition CL::&rest options)
+    \"Define 'type' to be equivalent to 'definition'.\"
+    (cl-incrementally-translate
+     (CL:list* '/stella/deftype type definition options)))")
+
+  ;;
+;;;;;; Stella 'defmacro'
+  ;;
+
+(verbatim :common-lisp
+  "(CL:defmacro defmacro (name parameters CL:&body body)
+    \"Define a Stella macro.  The macro expands into a function that
+returns a cons tree representing a STELLA expression or statement.
+The operators 'bquote', '&' and '&&' (corresponding to the Common Lisp
+backquote, ',' and '.@' respectively) can be used to splice together code
+expressions.  Just as '.@', '&&' operates using destructive concatenation
+rather than an append.\"
+    (cl-incrementally-translate
+     (CL:list* '/stella/defmacro name parameters body)))")
+
+  ;;
+;;;;;; Module operations:
+  ;;
+
+#|
+;; Folded into definition of `in-module' operator.  Does the
+;;    package switching make sense at all anymore?
+(verbatim :common-lisp
+  "(CL:defmacro in-module (moduleName)
+    \"Change to the module named 'moduleName'\"
+    ;; Side-effect:  Switch to the STELLA package.
+    `(CL:eval-when (CL:compile CL:load CL:eval)
+       (CL:in-package \"STELLA\")
+       ;; Guard against bootstrap problem:
+       ,(CL:when (CL:fboundp 'change-module)
+          `(/stella/cc ,moduleName))))")
+|#
+
+  ;;
+;;;;;; startup-time-progn:
+  ;;
+
+(verbatim :common-lisp
+  "(CL:defmacro startup-time-progn (CL:&body body)
+    \"Translate 'body' into a 'progn' executed at startup time.\"
+    (bi-modal-translate (CL:list* '/stella/startup-time-progn body)))")
+
+
+;;; Make the various macros available in their fully qualified form,
+;;; so they can be used when translating in modules unrelated to /STELLA:
+(verbatim :common-lisp
+  "(CL:loop for operator in '(defmethod defun defclass defslot
+                             defglobal defconstant defspecial deftype
+                             defmacro defmodule defdemon
+                             startup-time-progn)
+      do (CL:setf (CL:macro-function
+                   (CL:intern
+                    (CL:concatenate
+                      'CL:string \"/STELLA/\" (CL:symbol-name operator))
+                    \"STELLA\"))
+           (CL:macro-function operator)))")
+
+;; REINSTATE NATIVE CLASS CREATION:
+(verbatim :common-lisp
+  (CL:defun create-native-class-p (supers options)
+    ;; Return TRUE if the superclasses and class options indicate that its
+    ;;    ok to create a native (C++/CLOS) class.
+    (CL:declare (CL:ignore supers options)
+                (CL:special *create-native-class-enabled*))
+    *create-native-class-enabled*))
+
+  ;;
+;;;;;; verbatim:
+  ;;
+
+;;; This needs to be at the very end, otherwise subsequent
+;;;    'verbatim's would expand to 'bi-modal-translate' which
+;;;    isn't defined during the early-walker bootstrap until
+;;;    this file gets loaded.
+
+(verbatim :common-lisp
+  "(CL:progn
+    (CL:defmacro verbatim (CL:&body body)
+      \"Translate 'body' into a 'verbatim' statement.\"
+      (bi-modal-translate (CL:list* '/stella/verbatim body)))
+    (CL:setf (CL:macro-function '/stella/verbatim)
+      (CL:macro-function 'verbatim)))")

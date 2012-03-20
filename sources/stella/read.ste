@@ -1,0 +1,2504 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: read.ste,v 1.56 2003/09/05 00:45:08 tar Exp
+
+;;; Stream tokenizers and the Stella reader.  
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Tokenizer Tables
+  ;;
+
+;;; Tokenizer tables are deterministic finite automatons combined with
+;;;    some additional information to map states onto their names.
+;;;    The transition table is encoded as a string where each from-state
+;;;    has 256 entries encoding the to-state for each possible 8-bit
+;;;    character.  The lower two bits of the to-state information are
+;;;    used to encode whether the to-state begins a new logical group,
+;;;    and whether that group should be ignored or not.  This currently
+;;;    limits us to tokenizer tables with at most 64 states.
+
+;;; NOTE: Instead of encoding the state modifiers in the 2 low bits of the
+;;;    to-state, we could have an extra byte next to each to-state to encode
+;;;    that information, giving us 256 states for the price of double memory
+;;;    and one extra array access.  Alternatively, we could devise a scheme
+;;;    where true 8-bit characters (which are rare) are handled in a more
+;;;    expensive scheme freeing up one extra bit for 128 states.
+
+;;; TO DO:
+
+;;; - handle parsing of character ranges
+;;; - improve parsing of complement ranges to avoid quadratic runtime
+;;; - detect macro states (such as :delimiter) that never appear as a to-state
+;;;   and make sure they don't take up a valuable state slot
+;;; - constantify various places where we assume 8-bit characters
+
+(defclass TOKENIZER-TABLE (STANDARD-OBJECT)
+  :slots ((transitions :type STRING)
+          (unique-state-names :type (VECTOR OF GENERALIZED-SYMBOL))
+          (state-names :type (VECTOR OF GENERALIZED-SYMBOL))
+          (legal-EOF-states :type (VECTOR OF BOOLEAN-WRAPPER))))
+
+(defglobal *max-tokenizer-states* INTEGER 64)
+(defglobal *max-tokenizer-characters* INTEGER 256)
+;(defglobal *max-tokenizer-characters-bits* INTEGER 8)
+
+;;; Use CONS representation instead of MUTABLE-STRINGs for character sets
+;;;    to avoid NULL character problems in C++:
+(deftype CHARACTER-SET (CONS OF CHARACTER-WRAPPER))
+
+(defun (parse-tokenizer-definition TOKENIZER-TABLE)
+    ((definition (CONS OF CONS)))
+  ;; Parse the tokenizer `definition' into a tokenizer table usable by
+  ;;    the tokenization and parsing procedures.  A tokenizer definition
+  ;;    is a list of state specifications where each state has the
+  ;;    following syntax:
+  ;;
+  ;;        (<from-state>
+  ;;           [*|!] <character-set-1> <to-state-1>
+  ;;           ...
+  ;;           [*|!] <character-set-N> <to-state-N>)
+  ;;
+  ;; From and to-states can be symbols or keywords.  A to-state can also be
+  ;;    of the form
+  ;;
+  ;;                 (<to-state> <alias>)
+  ;;
+  ;;    where the actual success state will be set to <alias> if the token
+  ;;    ended there.  Every to-state can have at most one alias.
+  ;; A `*' or `!' flag before the character set indicates the start of a new
+  ;;    token.  It will be collected until the next token start is
+  ;;    encountered.  The subsequent token can be ignored by using the `!'
+  ;;    modifier.
+  ;; A character set can be either a string, a list of characters such as
+  ;;    `(#\a #\b #\c)', or the special sets :any, :otherwise and :eof. :any
+  ;;    indicates any character, :otherwise denotes the set of characters
+  ;;    not covered by any other character sets in this state definition,
+  ;;    and :eof specifies the virtual character indicated by the EOF
+  ;;    condition.
+  ;; IMPORTANT: Character sets are assumed to be disjoint (we define a DFA),
+  ;;    but this is not really checked right now.
+  ;; TO DO: Should have a `(:not <character-set>)' syntax for complement sets.
+  ;; The syntax
+  ;;
+  ;;                 :include <state>
+  ;;
+  ;;    includes all the transitions from <state>.
+  ;; The state names :start, :error and :eof are reserved state names that
+  ;;    indicate the start, error and eof state of the tokenizer.  The :eof
+  ;;    state does not have any significance, but by using it we can avoid
+  ;;    having to use a real state for this condition.
+  ;;
+  (let ((transitionTable
+         (new (VECTOR OF MUTABLE-STRING-WRAPPER)
+              :array-size *max-tokenizer-states*))
+        (transitions (make-mutable-string *max-tokenizer-characters* NULL))
+        (uniqueStateNames
+         (new (VECTOR OF GENERALIZED-SYMBOL)
+              :array-size *max-tokenizer-states*))
+        (stateNames
+         (new (VECTOR OF GENERALIZED-SYMBOL)
+              :array-size *max-tokenizer-states*))
+        (legalEOFStates
+         (new (VECTOR OF BOOLEAN-WRAPPER)
+              :array-size *max-tokenizer-states*))
+        (fromStateName GENERALIZED-SYMBOL NULL)
+        (fromStateId INTEGER NULL)
+        (toStateName GENERALIZED-SYMBOL NULL)
+        (toStateAlias GENERALIZED-SYMBOL NULL)
+        (toStateId INTEGER NULL)
+        (freeStateId 2)
+        (characterSpec OBJECT NULL)
+        (characterSet CHARACTER-SET NULL)
+        (allCharacterSets (new (LIST OF CHARACTER-SET)))
+        (stateModifiers 0)
+        (errors? FALSE)
+        (table (new TOKENIZER-TABLE)))
+    ;; :start, :error and :eof are reserved state names:
+    (setf (nth uniqueStateNames 0) :ERROR)
+    (setf (nth stateNames 0) :ERROR)
+    (setf (nth uniqueStateNames 1) :START)
+    (setf (nth stateNames 1) :START)
+    
+    (foreach stateDefinition in definition
+        do (unless (legal-tokenizer-from-state? (first stateDefinition))
+             (warn "Illegal from state: " (first stateDefinition))
+             (setq errors? TRUE)
+             (continue))
+           (setq fromStateName (first stateDefinition))
+           (setq stateDefinition (rest stateDefinition))
+           (setq fromStateId (position uniqueStateNames fromStateName 0))
+           (when (null? fromStateId)
+             (when (= freeStateId *max-tokenizer-states*)
+               (warn "Too many tokenizer states; maximum is "
+                     *max-tokenizer-states*)
+               (setq errors? TRUE)
+               (break))
+             (setf (nth uniqueStateNames freeStateId) fromStateName)
+             (setf (nth stateNames freeStateId) fromStateName)
+             (setq fromStateId freeStateId)
+             (++ freeStateId))
+           
+           (clear allCharacterSets)
+           ;; initialize every transition with the error state:
+           (foreach i in (interval 0 (1- *max-tokenizer-characters*))
+               do (setf (nth transitions i) (code-character 0)))
+
+           ;; parse all to-states:
+           (while (non-empty? stateDefinition)
+             (when (tokenizer-include-spec? (first stateDefinition))
+               (unless (legal-tokenizer-from-state?
+                        (first (rest stateDefinition)))
+                 (warn "Illegal include specification for state " fromStateName)
+                 (setq errors? TRUE)
+                 (break))
+               (setq stateDefinition (copy-cons-list stateDefinition))
+               (foreach stateDef in definition
+                   where (eql? (first stateDef) (first (rest stateDefinition)))
+                   do (setf (first stateDefinition) (second stateDef))
+                      (setf (rest stateDefinition)
+                        (concatenate (copy-cons-list (rest (rest stateDef)))
+                                     (rest (rest stateDefinition))))
+                      (break))
+               (continue))
+             (setq stateModifiers
+               (parse-tokenizer-state-modifiers (first stateDefinition)))
+             (when (> stateModifiers 0)
+               (setq stateDefinition (rest stateDefinition)))
+             (setq characterSpec (first stateDefinition))
+             (setq stateDefinition (rest stateDefinition))
+             (unless (defined? characterSpec)
+               (warn "Illegal definition of " fromStateName " state")
+               (setq errors? TRUE)
+               (break))
+             (unless (legal-tokenizer-to-state? (first stateDefinition))
+               (warn "Illegal to state " (first stateDefinition)
+                     " for state " fromStateName)
+               (setq errors? TRUE)
+               (break))
+             ;; The :EOF transition has to occur as a separate one right now,
+             ;;    and the to-state of it will be simply ignored:
+             (when (eql? characterSpec :EOF)
+               (setf (nth legalEOFStates fromStateId) TRUE)
+               (setq stateDefinition (rest stateDefinition))
+               (continue))
+             (setq toStateName
+               (tokenizer-to-state-name (first stateDefinition)))
+             (setq toStateAlias
+               (tokenizer-to-state-alias (first stateDefinition)))
+             (setq stateDefinition (rest stateDefinition))
+             (setq toStateId (position uniqueStateNames toStateName 0))
+             (when (null? toStateId)
+               (when (= freeStateId *max-tokenizer-states*)
+                 (warn "Too many tokenizer states; maximum is "
+                       *max-tokenizer-states*)
+                 (setq errors? TRUE)
+                 (break))
+               (setf (nth uniqueStateNames freeStateId) toStateName)
+               (setf (nth stateNames freeStateId) toStateAlias)
+               (setq toStateId freeStateId)
+               (++ freeStateId))
+             (when (and (not (eql? (nth stateNames toStateId) toStateAlias))
+                        (defined? (nth stateNames toStateId)))
+               (warn "Illegal redefinition of alias " toStateAlias
+                     " for state " toStateName " in state " fromStateName)
+               (setq errors? TRUE))
+             (setq characterSet
+               (parse-tokenizer-character-spec characterSpec allCharacterSets))
+             (when (null? characterSet)
+               (warn "Illegal character specification " characterSpec
+                     " for state " fromStateName)
+               (setq errors? TRUE)
+               (continue))
+             (push allCharacterSets characterSet)
+             (foreach char in characterSet
+                 do (setf (nth transitions (character-code char))
+                      (code-character
+                       (logor (shift-left stateModifiers 6) toStateId)))))
+
+           ;; CAREFUL: AVOID COPYING HERE, SINCE THAT WILL TRIP US UP IN C++ IF
+           ;;    THE TABLE CONTAINS NULL CHARACTERS:
+           (setf (nth transitionTable fromStateId) transitions)
+           (setq transitions
+             (make-mutable-string *max-tokenizer-characters* NULL)))
+
+    ;; check for undefined states:
+    (foreach i in (interval 0 (1- freeStateId))
+        where (null? (nth transitionTable i))
+        do (warn "State " (nth uniqueStateNames i) " is undefined")
+           (setq errors? TRUE))
+    (when errors?
+      (return NULL))
+
+    ;; create the full transition table:
+    (setq transitions
+      (make-mutable-string (* freeStateId *max-tokenizer-characters*) NULL))
+    (foreach i in (interval 0 (1- freeStateId))
+        do (foreach j in (interval 0 (1- *max-tokenizer-characters*))
+               as k in (interval (* *max-tokenizer-characters* i) NULL)
+               do (setf (nth transitions k)
+                    (nth (wrapper-value (nth transitionTable i)) j))))
+    ;; CAREFUL: THIS ASSUMES THAT THE C++ VERSION DOESN'T COPY (DUE TO NULL'S):
+    (setf (transitions table) (mutable-string-to-string transitions))
+    (setf (unique-state-names table)
+      (new (VECTOR OF KEYWORD) :array-size freeStateId))
+    (setf (state-names table)
+      (new (VECTOR OF KEYWORD) :array-size freeStateId))
+    (foreach i in (interval 0 (1- freeStateId))
+        do (setf (nth (unique-state-names table) i) (nth uniqueStateNames i))
+           (setf (nth (state-names table) i) (nth stateNames i)))
+    (setf (legal-EOF-states table)
+      (new (VECTOR OF BOOLEAN-WRAPPER) :array-size freeStateId))
+    (foreach i in (interval 0 (1- freeStateId))
+        do (setf (nth (legal-EOF-states table) i)
+             (choose (null? (nth legalEOFStates i))
+                     FALSE-WRAPPER
+                     (nth legalEOFStates i))))
+    (return table)))
+
+(defun (legal-tokenizer-state? BOOLEAN) ((x OBJECT))
+  ;; Return TRUE if `x' is a legal tokenizer state.
+  (return (or (keyword? x)
+              (symbol? x))))
+
+(defun (legal-tokenizer-from-state? BOOLEAN) ((x OBJECT))
+  ;; Return TRUE if `x' is a legal tokenizer from-state.
+  (return (legal-tokenizer-state? x)))
+
+(defun (legal-tokenizer-to-state? BOOLEAN) ((x OBJECT))
+  ;; Return TRUE if `x' is a legal tokenizer to-state.
+  (return (or (legal-tokenizer-state? x)
+              (and (cons? x)
+                   ;; we have an alias:
+                   (legal-tokenizer-state? (first (cast x CONS)))
+                   (legal-tokenizer-state? (second (cast x CONS)))))))
+
+(defun (tokenizer-to-state-name GENERALIZED-SYMBOL) ((state OBJECT))
+  ;; Return the non-alias name of a to-`state'.
+  (if (cons? state)
+      (return (first (cast state CONS)))
+    (return state)))
+
+(defun (tokenizer-to-state-alias GENERALIZED-SYMBOL) ((state OBJECT))
+  ;; Return the alias of a to-`state'.
+  (if (cons? state)
+      (return (second (cast state CONS)))
+    (return state)))
+
+(defun (parse-tokenizer-state-modifiers INTEGER) ((modifier OBJECT))
+  ;; Parse the `modifier's of a state transition into a 2-bit representation
+  ;;    and return the result.
+  (typecase modifier
+    (GENERALIZED-SYMBOL
+     (case (symbol-name modifier)
+       ("*" (return 2)) ;; start a new token
+       (("!" "*!" "!*") ;; start a new token but ignore it
+        (return 3))
+       (otherwise (return 0))))
+    (otherwise
+     (return 0))))
+
+(defun (tokenizer-include-spec? BOOLEAN) ((x OBJECT))
+  (return (and (isa? x @GENERALIZED-SYMBOL)
+               (eql? (symbol-name (cast x GENERALIZED-SYMBOL)) "INCLUDE"))))
+
+(defun (parse-tokenizer-character-spec CHARACTER-SET)
+    ((characterSpec OBJECT) (allCharacterSets (LIST OF CHARACTER-SET)))
+  ;; Parse the character-set specification `characterSpec' and return
+  ;;    the result as a CHARACTER-SET.
+  ;; `allCharacterSets' is the set of all transition characters encountered
+  ;;    so far in the current state (this is needed to parse :otherwise).
+  ;;    It will be destructively unioned with the characters specified int
+  ;;    `characterSpec'.
+  ;; TO DO: THE PARSING AND COMPLEMENT GENERATION IS SOMEWHAT SIMPLISTIC
+  ;;    AND NOT VERY EFFICIENT (IF GENERATING TOKENIZER TABLES BECOMES
+  ;;    MORE FREQUENT, WE WOULD HAVE TO IMPROVE THIS).
+  (let ((charSet CHARACTER-SET NIL)
+        (complementSet CHARACTER-SET NIL)
+        (parsedSpec CHARACTER-SET NULL))
+    (typecase characterSpec
+      (STRING
+       (foreach char in (wrapper-value characterSpec)
+           collect char into charSet))
+      (CHARACTER
+       (pushq charset characterSpec))
+      (CONS
+       (foreach spec in characterSpec
+           do (setq parsedSpec (parse-tokenizer-character-spec spec NIL-LIST))
+              (when (null? parsedSpec)
+                (return NULL))
+              (foreach char in parsedSpec
+                  collect char into charSet)))
+      (GENERALIZED-SYMBOL
+       (case (symbol-name characterSpec)
+         ("ANY" (foreach i in (interval 0 (1- *max-tokenizer-characters*))
+                    collect (code-character i) into charSet))
+         ("OTHERWISE"
+          (foreach set in allCharacterSets
+              do (foreach char in set
+                     collect char into charSet))
+          (foreach i in (interval 0 (1- *max-tokenizer-characters*))
+              where (not (member? charSet (code-character i)))
+              collect (code-character i) into complementSet)
+          (setq charSet complementSet))
+         (otherwise
+          (return NULL))))
+      (otherwise
+       (return NULL)))
+    (return charSet)))
+
+;;; STELLA tokenizer bootstrap support:
+
+;;; The STELLA reader needs to be available very early in the bootstrap,
+;;;    thus various STELLA functionality is not yet availabel to parse
+;;;    a tokenizer definition.  For this reason, we stringify the STELLA
+;;;    tokenizer into a representation that can be unstringified with
+;;;    minimal means.
+
+(defun (stringify-tokenizer-table STRING) ((table TOKENIZER-TABLE))
+  ;; Return a string representation of `table'.
+  (let ((result (new STRING-OUTPUT-STREAM))
+        (aCode (character-code #\A))
+        (transitions (transitions table))
+        (encodedTransitions
+         (make-mutable-string
+          (* 2 *max-tokenizer-states* *max-tokenizer-characters*) NULL))
+        (j -1)
+        (uniqueStateNames (unique-state-names table))
+        (stateNames (state-names table))
+        (eofStates (legal-EOF-states table))
+        ;; we use a separator character instead of EOL to avoid problems
+        ;;    with `read-line' compatibility across platforms:
+        (separator "|"))
+    (print-stream result (* 2 *max-tokenizer-states*
+                            *max-tokenizer-characters*)
+                  separator)
+    ;; We encode every transition character with 2 (hex-like) characters
+    ;;    to avoid problems with NULL characters in C++:
+    (foreach i in (interval 0 (1- (* *max-tokenizer-states*
+                                     *max-tokenizer-characters*)))
+        do (setf (nth encodedTransitions (++ j))
+             (code-character
+              (+ (logand (character-code (nth transitions i)) 15) aCode)))
+           (setf (nth encodedTransitions (++ j))
+             (code-character
+              (+ (shift-right (character-code (nth transitions i)) 4) aCode))))
+    (print-stream result (mutable-string-to-string encodedTransitions)
+                  separator)
+    (print-stream result (length uniqueStateNames) separator)
+    (foreach state in uniqueStateNames
+        do (print-stream result (symbol-name state) separator))
+    (print-stream result (length stateNames) separator)
+    (foreach state in stateNames
+        do (print-stream result (symbol-name state) separator))
+    (print-stream result (length eofStates) separator)
+    (foreach state in eofStates
+        do (print-stream result (choose state "T" "F")))
+    (print-stream result separator)
+    (return (the-string result))))
+
+(defun (unstringify-tokenizer-table TOKENIZER-TABLE) ((table STRING))
+  ;; Unstringify `table' into a TOKENIZER-TABLE.
+  (let ((result (new TOKENIZER-TABLE))
+        (aCode (character-code #\A))
+        (line STRING NULL)
+        (count 0)
+        (transitions MUTABLE-STRING NULL)
+        (separator #\|)
+        (start 0)
+        (end 0))
+    (setq end (position table separator start))
+    (setq line (subsequence table start end))
+    (setq start (1+ end))
+    (setq count (string-to-integer line))
+    (setq end (position table separator start))
+    (setq line (subsequence table start end))
+    (setq start (1+ end))
+    (setq transitions (make-mutable-string (/ count 2) NULL))
+    (foreach i in (interval 0 (1- (/ count 2)))
+        do (setf (nth transitions i)
+             (code-character
+              (logor (- (character-code (nth line (* 2 i))) aCode)
+                     (shift-left
+                      (- (character-code (nth line (1+ (* 2 i)))) aCode) 4)))))
+    (setf (transitions result) transitions)
+    (setq end (position table separator start))
+    (setq line (subsequence table start end))
+    (setq start (1+ end))
+    (setq count (string-to-integer line))
+    (setf (unique-state-names result)
+      (new (VECTOR OF KEYWORD) :array-size count))
+    (foreach i in (interval 0 (1- count))
+        do (setq end (position table separator start))
+           (setq line (subsequence table start end))
+           (setq start (1+ end))
+           (setf (nth (unique-state-names result) i)
+             (intern-keyword line)))
+    (setq end (position table separator start))
+    (setq line (subsequence table start end))
+    (setq start (1+ end))
+    (setq count (string-to-integer line))
+    (setf (state-names result)
+      (new (VECTOR OF KEYWORD) :array-size count))
+    (foreach i in (interval 0 (1- count))
+        do (setq end (position table separator start))
+           (setq line (subsequence table start end))
+           (setq start (1+ end))
+           (setf (nth (state-names result) i)
+             (intern-keyword line)))
+    (setq end (position table separator start))
+    (setq line (subsequence table start end))
+    (setq start (1+ end))
+    (setq count (string-to-integer line))
+    (setq end (position table separator start))
+    (setq line (subsequence table start end))
+    (setq start (1+ end))
+    (setf (legal-EOF-states result)
+      (new (VECTOR OF BOOLEAN-WRAPPER) :array-size count))
+    (foreach i in (interval 0 (1- count))
+        do (case (nth line i)
+             (#\T (setf (nth (legal-EOF-states result) i) TRUE))
+             (#\F (setf (nth (legal-EOF-states result) i) FALSE))))
+    (return result)))
+
+
+  ;;
+;;;;;; Buffered reading support:
+  ;;
+
+;;; Crucial to the performance of the tokenizer is properly buffered
+;;;    reading.  Since standard Lisp/C++/Java streams don't allow us
+;;;    to efficiently access/address their read buffers, we implement
+;;;    our own buffered reading scheme based on a reading semantics
+;;;    similar to Common-Lisp's `read-sequence'.
+;;; Tokenizer read buffers are implemented as TOKENIZER-BYTE-ARRAYs.
+;;;    The only operations they have to support is filling via a native reader,
+;;;    `nth/-setter', and conversion to/from STRINGs.  If we had ARRAYs in
+;;;    STELLA, we could make it an (ARRAY OF TOKENIZER-BYTE).
+;;; NOTE: In Java, MUTABLE-STRINGs are still the data-type of choice if we
+;;;    have to convert back into STRINGs (doing that for Byte arrays
+;;;    kills us due to overly general and expensive byte-to-character
+;;;    conversion schemes).
+
+(defclass TOKENIZER-BYTE ()
+  :cl-native-type "CHARACTER"
+  :cpp-native-type "char"
+  :java-native-type "byte")
+
+(defclass TOKENIZER-BYTE-ARRAY ()
+  :cl-native-type "STRING"
+  :cpp-native-type "char*"
+  :java-native-type "byte[]")
+
+(defun (make-tokenizer-byte-array TOKENIZER-BYTE-ARRAY) ((size INTEGER))
+  ;; Create a TOKENIZER-BYTE-ARRAY of `size'.
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (verbatim
+      :common-lisp (CL:make-string size)
+      :cpp "new (GC) char[size]"
+      :java "new byte[size]")))
+
+(defun (string-to-tokenizer-byte-array TOKENIZER-BYTE-ARRAY) ((string STRING))
+  ;; Convert `string' into a TOKENIZER-BYTE-ARRAY with the same content.
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (verbatim
+      :common-lisp string
+      :cpp "string"
+      :java "string.getBytes()")))
+
+(defun (tokenizer-byte-array-to-string STRING) ((bytes TOKENIZER-BYTE-ARRAY))
+  ;; Convert the TOKENIZER-BYTE-ARRAY `bytes' into a string.
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (verbatim
+      :common-lisp bytes
+      :cpp "bytes"
+      :java "new String(bytes)")))
+
+;;; Don't use `nth' here to not override STRING.nth IN LISP
+
+(defmethod (byte-array-nth CHARACTER)
+    ((buffer TOKENIZER-BYTE-ARRAY) (position INTEGER))
+  ;; Return the character at `position' in `buffer'.
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (verbatim
+      :common-lisp (CL:schar (CL:the CL:simple-string buffer)
+                             (CL:the CL:fixnum position))
+      :cpp "buffer[position]"
+      :java "((char) (0x00ff & buffer[position]))")))
+
+(defmethod (byte-array-nth-setter TOKENIZER-BYTE)
+    ((buffer TOKENIZER-BYTE-ARRAY) (ch CHARACTER) (position INTEGER))
+  :globally-inline? TRUE :public? TRUE
+  ;; Set the character at `position' in `buffer' to `ch'.
+;;; UGLY: WE NEED A RETURN-TYPE TO MAKE INLINING WORK, BUT THE JAVA CODE
+;;;    CAN'T CONTAIN THE NECESSARY CAST TO CHARACTER, SINCE IT WILL CAUSE AN
+;;;    ILLEGAL EXPRESSION/STATEMENT WARNING, THUS WE NEED TO DEFINE A
+;;;    TOKENIZER-BYTE TYPE TO MAKE THINGS BEHAVE RIGHT.
+;;;    THIS ALSO MEANS `(SETF (BYTE-ARRAY-NTH ...) ...)' CANNOT BE USED
+;;;    AS AN EXPRESSION.
+;;; Tom:  What about  "(char) (0x00ff & (buffer[position] = (byte)ch))"
+;;;       for the Java version.  This should work.
+  (return
+    (verbatim
+      :common-lisp
+      (CL:setf (CL:schar (CL:the CL:simple-string buffer)
+                         (CL:the CL:fixnum position))
+               (CL:the CL:character ch))
+      :cpp "buffer[position] = ch"
+      :java "buffer[position] = (byte)ch")))
+
+(defun (byte-array-read-sequence INTEGER)
+    ((buffer TOKENIZER-BYTE-ARRAY) (stream NATIVE-INPUT-STREAM)
+     (start INTEGER) (end INTEGER))
+  ;; Read from `stream' filling `buffer' between `start' and `end' (depending
+  ;;    on how many characters are available).
+  ;; Return the actual end pointer to the input read into `buffer'.  EOF is
+  ;;    indicated by the return value being equal to start.
+  ;; This implements the Common-Lisp `read-sequence' semantics.
+  (let ((n 0))
+    (verbatim
+        :common-lisp
+        "(setq n
+    (- (%%read-sequence buffer stream :start start :end end) start))"
+        :cpp
+        "if (stream->eof()) return start;
+    stream->read(buffer + start, end - start);
+    n = stream->gcount()"
+        :java
+        "try {n = stream.read(buffer, start, end - start); if (n < 0) n = 0;}
+         catch (java.io.IOException e) {n = 0;}")
+    (return (+ n start))))
+
+;; SHOULD THIS GO SOMEWHERE ELSE?
+(defun byte-array-write-sequence
+    ((buffer TOKENIZER-BYTE-ARRAY) (stream NATIVE-OUTPUT-STREAM)
+     (start INTEGER) (end INTEGER))
+  ;; Write from `buffer' to `stream', using data in the buffer starting at position
+  ;;   `start' stopping just before `end'.
+  ;; This implements the Common-Lisp `write-sequence' semantics.
+  (verbatim
+    :common-lisp
+        "(%%write-sequence buffer stream :start start :end end)"
+        :cpp
+        "stream->write(buffer + start, end - start)"
+        :java
+        "try {stream.write(buffer, start, end - start);}
+         catch (java.lang.Exception e) {}"))
+
+(defglobal *tokenizer-initial-buffer-size* INTEGER 2048)
+
+(defun ensure-tokenizer-buffer-size ((state TOKENIZER-STREAM-STATE)
+                                     (currentTokenStart INTEGER)
+                                     (requiredSpace INTEGER))
+  ;; Ensure that `state's buffer has an unused portion of at least
+  ;;    `requiredSpace' starting at `state's `end';
+  ;;    grow the buffer if necessary.
+  ;; Makes the same assumptions as `read-into-tokenizer-buffer'.
+  ;; TO DO: MAYBE HAVE A HARD LIMIT TO AVOID GROWING THE BUFFER
+  ;;    INDEFINITELY IN CASE THERE IS A SYNTAX PROBLEM.
+  (let ((size (buffer-size state))
+        (newSize size)
+        (end (rem (end state) size)) ;; wrap around if necessary
+        (freeSpace
+         (choose (= currentTokenStart -1)
+                 size
+                 (choose (<= end currentTokenStart)
+                         (- currentTokenStart end)
+                         (+ currentTokenStart (- size end)))))
+        (buffer (buffer state))
+        (newBuffer buffer))
+    (while (< freeSpace requiredSpace)
+      (setq freeSpace (+ freeSpace newSize))
+      (setq newSize (* newSize 2)))
+    (when (> newSize size)
+      (setq newBuffer (make-tokenizer-byte-array newSize))
+      (cond
+       ((< currentTokenStart 0)
+        (setf (cursor state) 0)
+        (setf (end state) newSize))
+       ((> end currentTokenStart)
+        ;; copy current token to new buffer:
+        (foreach i in (interval currentTokenStart (1- end))
+            do (setf (byte-array-nth newBuffer i) (byte-array-nth buffer i))))
+       (otherwise
+        ;; copy initial portion of current token to new buffer:
+        (foreach i in (interval currentTokenStart (1- size))
+            do (setf (byte-array-nth newBuffer i) (byte-array-nth buffer i)))
+        ;; copy the portion leading up to `currentTokenStart' after
+        ;;    it in the new bigger buffer and move the cursor:
+        (foreach i in (interval 0 (1- end))
+            as j in (interval size NULL)
+            do (setf (byte-array-nth newBuffer j) (byte-array-nth buffer i)))
+        (setf (end state) (+ size end))
+        (setf (cursor state) (end state))))
+      (setf (buffer state) newBuffer)
+      (setf (buffer-size state) newSize))))
+
+(defun (read-into-tokenizer-buffer BOOLEAN) ((stream INPUT-STREAM)
+                                             (state TOKENIZER-STREAM-STATE)
+                                             (currentTokenStart INTEGER))
+  ;; Fill the unused portion of `state's `buffer' by reading from `stream'.
+  ;;    Grow `buffer' if necessary, and return TRUE on EOF.
+  ;; Assumes `cursor', `end' and `buffer-size' of `state' are current.
+  ;; If `currentTokenStart' is >= 0 the region between it and `end' will
+  ;;    not be overwritten by new input; new input will be appended
+  ;;    following `end'.
+  ;; Reset `state's `end' to new end of input (`end' will never be wrapped
+  ;;    around on exit, i.e., it will point to `buffer-size' instead of 0 -
+  ;;    this is relied upon by `get-next-token').
+  ;; If necessary, also resets `state's `cursor' (e.g., if buffer is grown
+  ;;    or no token is currently accumulated), but NEVER changes the start
+  ;;    of the current token.
+  (let ((requiredSpace
+         (choose (< (buffer-size state) *tokenizer-initial-buffer-size*)
+                 ;; if we are using a small STRING-STREAM buffer, stay with it:
+                 1
+                 (shift-right *tokenizer-initial-buffer-size* 1)))
+        (inputChar CHARACTER NULL)
+        (inputLine STRING NULL)
+        (eof? FALSE))
+    
+    (unless (eql? (buffering-scheme stream) :BLOCK)
+      ;; We can't use `read-sequence' and have to use `read-character' or
+      ;;    `read-line' instead, but we have to make sure it reads from the
+      ;;    native stream:
+      (setf (tokenizer-state stream) NULL)
+      (case (buffering-scheme stream)
+        (:LINE
+  ;;;;; THIS WON'T WORK FOR FILES/STREAMS THAT TRAVELED ACROSS PLATFORMS
+  ;;;;; WE WOULD NEED TO WRITE A NATIVE READ-LINE THAT CAN HANDLE ALL THREE
+  ;;;;; EOL SEQUENCES AND POSSIBLY RETURNS A CODE INDICATING WHICH ONE IT
+  ;;;;; ENCOUNTERED.
+         (mv-setq (inputLine eof?) (read-line stream))
+         (when (null? inputLine)
+           (setq inputLine ""))
+         ;; WILL THIS WORK FOR DIFFERENT LINE BREAK CHARACTER SEQUENCES?
+         (setq inputLine (string-concatenate inputLine EOL-STRING)))
+        (:CHARACTER
+         (mv-setq (inputChar eof?) (read-character stream))
+         (if eof?
+             (setq inputLine "")
+           (setq inputLine (character-to-string inputChar)))))
+      (setf (tokenizer-state stream) state)
+      (setq requiredSpace (length inputLine)))
+    
+    (ensure-tokenizer-buffer-size state currentTokenStart requiredSpace)
+    (let ((nativeStream (native-stream stream))
+          (buffer (buffer state))
+          (size (buffer-size state))
+          (end (end state))
+          (start -1))
+      ;; Wrap-around end pointer:
+      (when (= end size)
+        (setq end 0))
+      (cond ((< currentTokenStart 0)
+             ;; No token accumulated, we can use the whole buffer:
+             (setq start 0)
+             (setq end size)
+             (setf (cursor state) 0))
+            ((<= end currentTokenStart)
+             ;; Fill buffer from end to token start:
+             (setq start end)
+             (setq end currentTokenStart))
+            ((> end currentTokenStart)
+             ;; Fill buffer from end to buffer end:
+             (setq start end)
+             (setq end size)))
+      (cond ((defined? inputLine)
+             ;; we have enough free space to hold `inputLine' starting from
+             ;;    `start', but we might have to wrap around:
+             (setq end start)
+             (foreach ch in inputLine
+                 do (setf (byte-array-nth buffer end) ch)
+                    (++ end)
+                    (when (= end size)
+                      (setq end 0))))
+            (otherwise
+             ;; For reading from files we use a double-buffer scheme that on
+             ;;   average  uses two calls to `read-sequence' to fill the `buffer':
+             (setq end (byte-array-read-sequence buffer nativeStream start end))))
+      (setf (end state) end)
+      ;; Return TRUE on EOF:
+      (return (or eof? (= start end))))))
+
+;;; TO DO:
+;;; - THESE MIGHT HAVE TO CHANGE `state->state' BACK TO :START TO MAKE SURE
+;;;   SUBSEQUENT CALLS TO THE TOKENIZER WILL START IN A PROPER STATE (SEE
+;;;   ALSO `save-tokenizer-stream-state').
+
+(defun (read-character-from-tokenizer-buffer CHARACTER BOOLEAN)
+    ((stream INPUT-STREAM))
+  ;; Read one character from the tokenizer buffer associated with `stream'.
+  (let ((state (tokenizer-state stream))
+        (cursor (cursor state))
+        (end (end state))
+        (size (buffer-size state))
+        (echoStream (echo-stream stream))
+        (ch CHARACTER NULL))
+    (when (= cursor end)
+      (when (read-into-tokenizer-buffer stream state -1)
+        (return NULL TRUE))
+      (setq cursor (cursor state))
+      (when (= cursor size)
+        (setq cursor 0)))
+    (setq ch (byte-array-nth (buffer state) cursor))
+    (when (defined? echoStream)
+      (print-stream echoStream ch))
+    (setf (cursor state) (1+ cursor))
+    (return ch FALSE)))
+
+(defun unread-character-from-tokenizer-buffer
+    ((char CHARACTER) (stream INPUT-STREAM))
+  ;; Unread the last `char'acter read from the tokenizer buffer associated
+  ;;    with `stream'.
+  ;; TO DO: If we were really picky, we would record on the stream that the
+  ;;    last operation was an unread to avoid multiple unreads.
+  (let ((state (tokenizer-state stream))
+        (cursor (cursor state)))
+    (if (= cursor 0)
+        (setq cursor (1- (buffer-size state)))
+      (-- cursor))
+    (unless (eql? char (byte-array-nth (buffer state) cursor))
+      (error "Unread character " char " does not match last character read"))
+    (setf (cursor state) cursor)))
+
+(defun (read-line-from-tokenizer-buffer STRING BOOLEAN) ((stream INPUT-STREAM))
+  ;; Read one line from the tokenizer buffer associated with `stream'.
+  ;; THIS IS INEFFICIENT, SINCE IT USES `read-character-from-tokenizer-buffer'
+  ;;    AND OUTPUT TO A STRING STREAM (WHICH COULD BE AVOIDED BY COPYING FROM
+  ;;    THE READ BUFFER DIRECTLY), HOWEVER, FOLDING THAT LOGIC INTO HERE WOULD
+  ;;    JUST INCREASE THE ALREADY CONSIDERABLE CODING PAIN.
+  ;; IT ALSO DEPENDS ON `EOL-STRING' AND MIGHT NOT WORK WITH FILES THAT HAVE
+  ;;    TRAVELED ACROSS PLATFORMS.  MAYBE A BETTER APPROACH WOULD BE TO ALWAYS
+  ;;    CHECK FOR ALL THREE POSSIBLE NL-SEQUENCES.
+  (let ((buffer (new STRING-OUTPUT-STREAM))
+        (line STRING NULL)
+        (ch CHARACTER NULL)
+        (ch2 CHARACTER NULL)
+        (eof? FALSE)
+        (newline (nth EOL-STRING 0)))
+    (loop
+      (mv-setq (ch eof?) (read-character-from-tokenizer-buffer stream))
+      (when eof?
+        (setq line (the-string buffer))
+        (if (= (length line) 0)
+            (setq line NULL)
+          (setq eof? FALSE))
+        (break))
+      (when (eql? ch newline)
+        (when (= (length EOL-STRING) 2)
+          (mv-setq (ch2 eof?) (read-character-from-tokenizer-buffer stream))
+          (when eof?
+            (setq line (the-string buffer))
+            (if (= (length line) 0)
+                (setq line NULL)
+              (setq eof? FALSE))
+            (break))
+          (when (not (eql? ch2 (nth EOL-STRING 1)))
+            (print-stream buffer ch ch2)
+            (continue)))
+        (setq line (the-string buffer))
+        (break))
+      (print-stream buffer ch))
+    (return line eof?)))
+
+
+  ;;
+;;;;;; Tokenizers
+  ;;
+
+(defclass TOKENIZER-TOKEN (STANDARD-OBJECT)
+  :slots ((type :type KEYWORD)
+          (content :type STRING)
+          (next :type TOKENIZER-TOKEN)))
+
+(defclass TOKENIZER-STREAM-STATE (STANDARD-OBJECT)
+  :slots ((buffer :type TOKENIZER-BYTE-ARRAY
+                  :initially
+                  (make-tokenizer-byte-array *tokenizer-initial-buffer-size*))
+          (buffer-size :type INTEGER :initially *tokenizer-initial-buffer-size*)
+          (cursor :type INTEGER :initially *tokenizer-initial-buffer-size*)
+          (end :type INTEGER :initially *tokenizer-initial-buffer-size*)
+          (state :type INTEGER :initially 1)
+          (token-list :type TOKENIZER-TOKEN)))
+
+;; Indicates the type of the input stream for the curren invocation of
+;;    `with-tokenizer' (allows us to distinguish between regular
+;;    INPUT-STREAMs and STRINGs):
+(defspecial *withTokenizerInputType* TYPE NULL)
+
+(defmacro with-tokenizer ((table OBJECT) (input OBJECT) &body (body CONS))
+  ;; Sets up the tokenizing environment for parsing from `input' according
+  ;;    to the tokenizer table `table'.  The main reason for using this
+  ;;    approach is efficiency, it allows us to reduce slot accesses to
+  ;;    a minimum.
+  ;; We use a `tok_<var>_' naming scheme for hidden tokenizer variables,
+  ;;    since piping gensyms to all the places that need to know about
+  ;;    them would be too painful.
+  :public? TRUE
+  (mv-bind (inputTree inputType)
+      (walk-a-tree input)
+    (unless (or (sub-type-spec-of? inputType @INPUT-STREAM)
+                (sub-type-spec-of? inputType @STRING)
+                ;; not yet, need another coercion function if we want to
+                ;;    support this - see also `with-tokenizer-string-input?':
+                ;(sub-type-spec-of? inputType @MUTABLE-STRING)
+                )
+      (walk-error "with-tokenizer: Can't handle input of type " inputType)
+      (return (walk-dont-call-me-tree body @VOID)))
+    (let ((string?
+           (or (sub-type-spec-of? inputType @STRING)
+               (sub-type-spec-of? inputType @MUTABLE-STRING)))
+          (expansion
+           (bquote
+            (let ((tok_table_ & table)
+                  (tok_transitions_ (transitions tok_table_))
+                  (tok_stateNames_ (the-array (state-names tok_table_)))
+                  (tok_tokenStart_ -1)
+                  (tok_endOfTokens?_ FALSE)
+                  && (choose
+                      string?
+                      (bquote
+                       ((tok_streamState_ TOKENIZER-STREAM-STATE NULL)
+                        (tok_buffer_ (string-to-tokenizer-byte-array & input))
+                        (tok_state_ 1)
+                        (tok_nextState_ tok_state_)
+                        (tok_cursor_ 0)
+                        (tok_size_ (length & input))
+                        (tok_end_ tok_size_)))
+                       (bquote
+                        ((tok_inputStream_ & (sys-tree inputTree inputType))
+                         (tok_echoStream_ (echo-stream tok_inputStream_))
+                         (tok_streamState_
+                          (choose (null? (tokenizer-state tok_inputStream_))
+                                  (setf (tokenizer-state tok_inputStream_)
+                                    (new TOKENIZER-STREAM-STATE))
+                                  (tokenizer-state tok_inputStream_)))
+                         (tok_buffer_ (buffer tok_streamState_))
+                         (tok_size_ (buffer-size tok_streamState_))
+                         (tok_state_ (state tok_streamState_))
+                         (tok_nextState_ tok_state_)
+                         (tok_cursor_ (cursor tok_streamState_))
+                         (tok_end_ (end tok_streamState_))
+                         (tok_checkPoint_ (choose (<= tok_cursor_ tok_end_)
+                                                  tok_end_
+                                                  tok_size_))))))
+	      (ignore tok_stateNames_ tok_endOfTokens?_)
+	      && (choose string? (bquote ((ignore tok_streamState_))) NIL)
+              && body))))
+      ;; HACK: Walk body right here, so nested macro calls can do different
+      ;;    things depending on the type of stream we are parsing, etc.:
+      (special ((*withTokenizerInputType* inputType))
+        (return (walk-a-tree (copy-cons-tree expansion)))))))
+
+(defun (with-tokenizer-string-input? BOOLEAN) ()
+  ;; Return TRUE if the input stream for the current `with-tokenizer'
+  ;;    environment is a STRING.
+  (return (or (eql? *withTokenizerInputType* @STRING)
+              ;(eql? *withTokenizerInputType* @MUTABLE-STRING)
+              )))
+
+(defun (inside-with-tokenizer? BOOLEAN) ()
+  ;; Return TRUE if we are within the scope of a `with-tokenizer' environment.
+  (return (defined? *withTokenizerInputType*)))
+
+(defmacro end-of-tokens? ()
+  ;; User-level macro to test for EOF on the currently tokenized stream.
+  :public? TRUE
+  (when (not (inside-with-tokenizer?))
+    (walk-error
+     "Encountered `end-of-tokens?' outside of `with-tokenizer' macro.")
+    (return (bquote (end-of-tokens?))))
+  (return (bquote tok_endOfTokens?_)))
+
+(defmacro get-token-text (&body (options CONS))
+  ;; User-level macro to access the content of the most recently parsed token:
+  ;;    (get-token-text [upcase? [start [end]]])
+  ;; Takes three optional arguments:
+  ;; If the first argument (`upcase?') is TRUE, the resulting string will
+  ;;    be upcased.
+  ;; The second argument (`start') is an offset for the start of the token.
+  ;; The third argument (`end') is an offset for the end of the token.  If
+  ;;    it is negative, it is measured from the end of the token.
+  ;; NOTE: `start' and `end' should be cheap, side-effect free expressions.
+  :public? TRUE
+  (when (not (inside-with-tokenizer?))
+    (walk-error
+     "Encountered `get-token-text' outside of `with-tokenizer' macro.")
+    (return (bquote (get-token-text))))
+  (let ((upcase? (first options))
+        (start (second options))
+        (end (third options)))
+    (when (eql? upcase? (quote FALSE))
+      (setq upcase? NULL))
+    (when (eql? start ZERO-WRAPPER)
+      (setq start NULL))
+    (return
+      (bquote
+       (get-token-text-internal
+        tok_buffer_
+        & (choose (null? start)
+                  (bquote tok_tokenStart_)
+                  (bquote (+ tok_tokenStart_ & start)))
+        & (choose (null? end)
+                  (bquote tok_cursor_)
+                  (choose (integer? end)
+                          (choose (< (cast end INTEGER-WRAPPER) 0)
+                                  (bquote (+ tok_cursor_ & end))
+                                  (bquote (+ tok_tokenStart_ & end)))
+                          (bquote
+                           (choose (< & end 0)
+                                   (+ tok_cursor_ & end)
+                                   (+ tok_tokenStart_ & end)))))
+        tok_size_
+        & (choose (defined? upcase?)
+                  upcase?
+                  (quote FALSE)))))))
+
+(defun (get-token-text-internal STRING)
+    ((buffer TOKENIZER-BYTE-ARRAY) (start INTEGER) (end INTEGER)
+     (size INTEGER) (upcase? BOOLEAN))
+  ;; Helper function for `get-token-text' that does all the neccessary
+  ;;    work to copy the current token from `buffer'.
+  (cond ((>= start size)
+         (setq start (- start size)))
+        ((< start 0)
+         (setq start (+ size start))))
+  (cond ((> end size)
+         (setq end (- end size)))
+        ((< end 0)
+         (setq end (+ size end))))
+  (let ((length (- end start))
+        (result MUTABLE-STRING NULL)
+        (cursor 0)
+        (auxEnd end))
+    (when (< length 0)
+      (setq length (+ length size))
+      (setq auxEnd size))
+    (setq result (make-raw-mutable-string length))
+    (cond
+     (upcase?
+      (loop
+        (while (< start auxEnd)
+          (setf (nth result cursor)
+            (upcase-character (byte-array-nth buffer start)))
+          (++ cursor)
+          (++ start))
+        (when (= auxEnd end)
+          (break))
+        (setq start 0)
+        (setq auxEnd end)))
+     (otherwise
+      (loop
+        (while (< start auxEnd)
+          (setf (nth result cursor) (byte-array-nth buffer start))
+          (++ cursor)
+          (++ start))
+        (when (= auxEnd end)
+          (break))
+        (setq start 0)
+        (setq auxEnd end))))
+    (return result)))
+
+(defmacro get-token-type ()
+  ;; User-level macro to access the keyword representation of the ending
+  ;;    state of the last token.
+  (when (not (inside-with-tokenizer?))
+    (walk-error
+     "Encountered `get-token-type' outside of `with-tokenizer' macro.")
+    (return (bquote (get-token-type))))
+  (return (bquote (nth tok_stateNames_ tok_state_))))
+
+;;; TO DO/FIGURE OUT:
+;;; - THERE SHOULD BE SOME RESET TO THE :START STATE AT APPROPRIATE PLACES,
+;;;   SINCE RE-ENTERING THE TOKENIZER WITH A STATE THAT DOESN'T CORRESPOND
+;;;   TO THE ACTUAL STATE OF THE STREAM ANYMORE IS PROBLEMATIC (SEE PROBLEM
+;;;   WITH `eat-next-character-if-whitespace').  THE PROBLEM IS WHERE THAT
+;;;   RESET SHOULD LOGICALLY OCCUR (THIS ALSO RELATES TO THE PROBLEM OF
+;;;   INTERLEAVING TOKENIZATION WITH `read-line' or `un/read-character').
+
+(defmacro save-tokenizer-stream-state ()
+  ;; Save all the necessary state information in the tokenizer state to
+  ;;    allow proper continuation after leaving and re-entering the current
+  ;;    `with-tokenizer' environment.
+  ;; This allows us to squeeze out a bit more performance in situations
+  ;;    where we know when and how we enter/leave the `with-tokenizer'
+  ;;    environment.
+  (return
+    (bquote
+     (when (defined? tok_streamState_)
+       ;; Save the changed stream state  so that if somebody leaves the scope
+       ;;    of `with-tokenizer' with a local or non-local exit, that we can
+       ;;    continue where we left off.
+       ;; In Lisp, this can add up to 50% runtime depending on granularity,
+       ;;    which is why we make it user controllable (it is done by default
+       ;;    with every call to `get-next-token').
+       (setf (cursor tok_streamState_) tok_cursor_)
+       (setf (state tok_streamState_) tok_state_)))))
+             
+(defmacro get-next-token (&body (options CONS))
+  ;; User-level macro to run the tokenizer until the next token is parsed:
+  ;;    (get-next-token [saveState?])
+  ;; Takes one optional argument (`saveState?') whose default is TRUE.
+  ;;    If supplied as FALSE, the changed state will not be saved in
+  ;;    the current tokenizer state.
+  (when (not (inside-with-tokenizer?))
+    (walk-error
+     "Encountered `get-next-token' outside of `with-tokenizer' macro.")
+    (return (bquote (get-next-token))))
+  (let ((saveStreamState? (first options))
+        (saveStreamStateTree
+         (bquote ((save-tokenizer-stream-state)))))
+    (cond ((or (null? saveStreamState?)
+               (eql? saveStreamState? (quote TRUE))))
+          ((eql? saveStreamState? (quote FALSE))
+           (setq saveStreamStateTree NIL))
+          (otherwise
+           (setq saveStreamStateTree
+             (bquote
+              ((when & saveStreamState?
+                     && saveStreamStateTree))))))
+    (return
+      (bquote
+       (progn
+         (setq tok_tokenStart_ -1)
+         (loop
+           & (choose
+              (with-tokenizer-string-input?)
+              (bquote
+               (when (= tok_cursor_ tok_end_)
+                 ;; EOF is handled in 2 phases: The first time around, we check
+                 ;;    whether EOF is a legal transition from the current state
+                 ;;    and set `tok_nextState_' to -1 to indicate completion of
+                 ;;    the first phase.  The second time around we indicate EOF
+                 ;;    to the surrounding code by setting `tok_endOfTokens?_'.
+                 (cond ((= tok_nextState_ -1)
+                        (setq tok_endOfTokens?_ TRUE))
+                       ((nth (legal-EOF-states tok_table_) tok_state_)
+                        (setq tok_nextState_ -1)
+                        (when (= tok_tokenStart_ -1);; current token is ignored
+                          (setq tok_endOfTokens?_ TRUE)))
+                       (otherwise
+                        (setq tok_state_ 0) ;; :ERROR
+                        (setq tok_nextState_ -1)))
+                 (break)))
+             
+              (bquote
+               (when (= tok_cursor_ tok_checkPoint_)
+                 ;; we either have to wrap around and/or refill the buffer:
+                 (cond
+                  ((= tok_cursor_ tok_end_)
+                   ;; we reached the end of the buffered input:
+                   (setf (cursor tok_streamState_) tok_cursor_) ;; update state
+                   (setq tok_endOfTokens?_
+                     (read-into-tokenizer-buffer
+                      tok_inputStream_ tok_streamState_ tok_tokenStart_))
+                   ;; import various state variables in case the buffer grew:
+                   (setq tok_buffer_ (buffer tok_streamState_))
+                   (setq tok_size_ (buffer-size tok_streamState_))
+                   (setq tok_cursor_ (mod (cursor tok_streamState_) tok_size_))
+                   (setq tok_end_ (end tok_streamState_))
+
+                   ;; EOF is handled in 2 phases: (see above).
+                   (when tok_endOfTokens?_
+                     (cond ((= tok_nextState_ -1))
+                           ((nth (legal-EOF-states tok_table_) tok_state_)
+                            (setq tok_nextState_ -1)
+                            (unless (= tok_tokenStart_ -1) ;; token is ignored
+                              ;; unset this the first time around:
+                              (setq tok_endOfTokens?_ FALSE)))
+                           (otherwise
+                            ;; unset this the first time around:
+                            (setq tok_endOfTokens?_ FALSE)
+                            (setq tok_state_ 0) ;; :ERROR
+                            (setq tok_nextState_ -1)))
+                     (break))
+                   
+                   ;; reset the checkpoint:
+                   (if (>= tok_cursor_ tok_end_)
+                       ;; cursor will reach size before it reaches end; we
+                       ;;    must have  wrapped around during filling:
+                       (setq tok_checkPoint_ tok_size_)
+                     (setq tok_checkPoint_ tok_end_)))
+                  (otherwise
+                   (setq tok_checkPoint_ tok_end_)
+                   (setq tok_cursor_ 0)))
+                 )))
+       
+           ;; THIS STATE TRANSITION COSTS ABOUT 70% OF THE TIME; IMPROVING IT
+           ;;    WOULD PAY THE MOST.
+           (setq tok_nextState_
+             (character-code
+              (nth tok_transitions_
+                   (logor (shift-left tok_state_ 8) ;; assumes 8-bit chars
+                          (character-code
+                           (byte-array-nth tok_buffer_ tok_cursor_))))))
+
+           (cond
+            ((= (logand tok_nextState_ 128) 0)
+             (setq tok_state_ tok_nextState_) ;; no modifiers
+             (++ tok_cursor_))
+            ;; we found a token start:
+            ((= tok_tokenStart_ -1)
+             ;; it was the first one:
+             (when (= (logand tok_nextState_ 64) 0)
+               ;; we don't ignore the token:
+               (setq tok_tokenStart_ tok_cursor_))
+             (setq tok_state_ (logand tok_nextState_ 63))
+             (++ tok_cursor_))
+            (otherwise
+             ;; 2nd token start terminated the current token:
+             (break)))
+
+           ;; Handle echoing; do this here so we know a char has been consumed:
+           && (choose
+               (not (with-tokenizer-string-input?))
+               (bquote
+                ((when (defined? tok_echoStream_)
+                   (print-stream
+                    tok_echoStream_
+                    (byte-array-nth tok_buffer_ (1- tok_cursor_))))))
+               NIL))
+         
+         && saveStreamStateTree
+         )))))
+
+(defun (unescape-token-string STRING)
+    ((token STRING) (escapeChar CHARACTER) (upcase? BOOLEAN))
+  ;; Remove escaping occurrences of `escapeChar' from `token' (but not
+  ;;    escapees) and return the result.
+  ;; Upcase unescaped characters if `upcase?' is true.
+  (let ((nofEscapes 0)
+        (cursor 0)
+        (cursor2 0)
+        (size (length token))
+        (result MUTABLE-STRING NULL)
+        (escape? FALSE))
+    (while (< cursor size)
+      (when (eql? (nth token cursor) escapeChar)
+        (++ nofEscapes)
+        (++ cursor))
+      (++ cursor))
+    (when (= nofEscapes 0)
+      (return token))
+    (setq result (make-raw-mutable-string (- size nofEscapes)))
+    (setq cursor 0)
+    (while (< cursor size)
+      (cond
+       ((and (eql? (nth token cursor) escapeChar)
+             (not escape?))
+        (setq escape? TRUE))
+       ((and upcase?
+             (not escape?))
+        (setf (nth result cursor2)
+          (upcase-character (nth token cursor)))
+        (++ cursor2))
+       (otherwise
+        (setf (nth result cursor2) (nth token cursor))
+        (setq escape? FALSE)
+        (++ cursor2)))
+      (++ cursor))
+    (return result)))
+
+(defclass STREAM-TOKENIZER (ITERATOR)
+  :documentation "Iterator that generates tokens by tokenizing a `stream'
+according to a particular tokenization `table'."
+  :public? TRUE
+  :parameters ((any-value :type TOKENIZER-TOKEN))
+  :slots ((stream :type INPUT-STREAM :required? TRUE)
+          (table :type TOKENIZER-TABLE :required? TRUE)
+          (token :renames value)))
+
+(defmethod (next? BOOLEAN) ((self STREAM-TOKENIZER))
+  ;; Generate the next token from `self'.
+  ;; PERFORMANCE NOTE: Using a STREAM-TOKENIZER is convenient but not very
+  ;;    efficient.  For high-speed parsing it is best to interleave tokenization
+  ;;    and parsing in the style done by `tokenize-s-expression', since saving
+  ;;    and reestablishing the tokenization context costs time.
+  (with-tokenizer (table self) (stream self)
+    (get-next-token)
+    (if (end-of-tokens?)
+        (setf (token self) NULL)
+      (setf (slot-value self token)
+        (new TOKENIZER-TOKEN
+             :type (get-token-type)
+             :content (get-token-text)))))
+  (return (defined? (value self))))
+
+
+  ;;
+;;;;;; Tokenizing STELLA:
+  ;;
+
+;;; TO DO:
+
+;;; - Make macro states such as :atom not use up any state space
+
+;;; NOTES:
+
+;;; - We could paramterize the generation of subnetworks to allow simple
+;;;   assembly of tokenizers relative to an Emacs-like syntax table.
+
+;;; Fully escaped and/or qualified symbols, surrogates, keywords:
+;;;    Valid:    |foo|, /foo/|bar|, @|bar|, /foo/@|bar|, :|foo|
+;;;    Invalid:  f|oo|, /foo/:bar, /foo\//bar
+
+;;; We could decide that `|' is only special if it occurs at the beginning
+;;;    or end of a symbol name, i.e., f|o or @f|o or :f|o would be legal input
+;;;    which would always be printed as |f\|o| though.
+
+;;; We require module names to be simple symbol names, i.e., they are not
+;;;    allowed to contain [\/|].  This makes parsing and post-processing
+;;;    simpler, and it keeps the number of different table states down, i.e.,
+;;;    a symbol/surrogate is either simple, escaped, or fully-escaped, and
+;;;    each of these variants can additionally be qualified.  Without that,
+;;;    we could have additional complications such as an escaped-fully-escaped
+;;;    symbol, e.g., /\foo\//|bar|.  Allowing full escape go across a whole
+;;;    qualified name such as |/foo/@bar| is somewhat strange, since it then
+;;;    needs to treat the `/' and `@' special despite the full escape.
+
+;;; Eventually, we might also disallow modules that start with [+-.0-9] to
+;;;    support dimensioned numbers.
+
+;;; There might be further name restrictions for code modules, if they have to
+;;;    be mapped onto things like Java packages (same thing for identifiers).
+
+;;; We'll store module names case-sensitively (for printing), but we'll treat
+;;;    them case-insensitively to avoid some weirdness if module names are
+;;;    read within a case-sensitive module.  We can always relax this later
+;;;    if it seems too restrictive.
+
+;;; IDEA: Have a module lookup cache that maps module references to the actual
+;;;    modules.  Thus we only have to parse a module name once.  Multiple
+;;;    equivalent pathnames such as `/stella/foo' or `stella/foo' can map to
+;;;    the same module.  Whenever we redefine or destroy a module, we simply
+;;;    wipe out the complete cache.
+
+;;; NOTE: CHANGES TO `*stella-tokenizer-table-definition*' WON'T HAVE ANY
+;;;    EFFECT, UNTIL THE INITIALIZATION OF `*stella-tokenizer-table*' (WHICH
+;;;    SEE) HAS BEEN CHANGED ACCORDINGLY.
+
+(defglobal *stella-tokenizer-table-definition* CONS
+  (bquote
+     ((:start :include :delimiter
+              :include :atom)
+
+      ;; Delimiters:
+      (:delimiter * "(" :open-paren
+                  * ")" :close-paren
+                  * "\"" (:open-string :string)
+                  * "'" :single-quote
+                  * "`" :back-quote
+                  * "," :comma
+                  ! ";" :comment
+                  ! "#" :hash
+                  ! (#\space #\tab #\linefeed #\return) :white-space
+                  :eof :eof)
+      
+      ;; White space and comments:
+      (:white-space :include :start)
+      (:comment (#\linefeed #\return) :start
+                :eof :eof
+                :otherwise :comment)
+      (:paren-comment "\\" :paren-comment-escape
+                      "|" :paren-comment-bar
+                      :otherwise :paren-comment)
+      (:paren-comment-escape :any :paren-comment)
+      (:paren-comment-bar "#" :start
+                          "\\" :paren-comment-escape
+                          "|" :paren-comment-bar
+                          :otherwise :paren-comment)
+
+      ;; Parentheses and quotes:
+      (:open-paren :include :start)
+      (:close-paren :include :start)
+      (:single-quote :include :start)
+      (:back-quote :include :start)
+      (:comma "." :comma-splice
+              :include :delimiter
+              ;; hand-include :atom without the "." transition (maybe
+              ;;    we should have a special :include syntax for this):
+              *  "-+" (:symbol-or-signed-number :symbol)
+              *  "0123456789" (:symbol-or-number :integer)
+              ;*  "." (:symbol-or-mantissa :symbol)
+              *  "cC" (:symbol-or-CL-symbol :symbol)
+              *  "|" (:open-fully-escaped-symbol :fully-escaped-symbol)
+              * "\\" :escaped-symbol-escape
+              * "/" :qualified-name
+              * ":" (:open-keyword :keyword)
+              * "@" (:open-surrogate :surrogate)
+              * :otherwise :symbol)
+              
+      (:comma-splice :include :start)
+
+      ;; Strings are split into :string and :escaped-string.  They include
+      ;;    the opening quote.  :escaped-string's need post-processing to
+      ;;    remove escape characters.
+      (:open-string * "\"" :close-string
+                    "\\" :string-escape
+                    :otherwise :string)
+      (:string * "\"" :close-string ;; see tokenizer why this is a proper state
+               "\\" :string-escape
+               :otherwise :string)
+      (:close-string :include :start)
+      (:string-escape :any :escaped-string)
+      (:escaped-string * "\"" :close-string
+                       "\\" :string-escape
+                       :otherwise :escaped-string)
+
+      ;; Hash syntax:
+      (:hash "\\" :character-constant
+             "|" :paren-comment)
+
+      ;; Character constants gobble up everything until the next delimiter;
+      ;;    thu , we need post-processing to ensure legal character names:
+      (:character-constant * :any :character)
+      (:character :include :delimiter
+                  :otherwise :character)
+
+      ;; Symbols and numbers - somewhat messy:
+      (:atom *  "-+" (:symbol-or-signed-number :symbol)
+             *  "0123456789" (:symbol-or-number :integer)
+             *  "." (:symbol-or-mantissa :symbol)
+             *  "cC" (:symbol-or-CL-symbol :symbol)
+             *  "|" (:open-fully-escaped-symbol :fully-escaped-symbol)
+             * "\\" :escaped-symbol-escape
+             * "/" :qualified-name
+             * ":" (:open-keyword :keyword)
+             * "@" (:open-surrogate :surrogate)
+             * :otherwise :symbol)
+      
+      ;; Prefixes shared by symbols and numbers:
+      (:symbol-or-signed-number
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       "0123456789" (:symbol-or-number :integer)
+       "." (:symbol-or-mantissa :symbol)
+       "|" :error
+       :otherwise :symbol)
+      (:symbol-or-number
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       "0123456789" (:symbol-or-number :integer)
+       "." (:symbol-or-mantissa2 :float)
+       "eE" (:symbol-or-exponent-delimiter :symbol)
+       "|" :error
+       :otherwise :symbol)
+      (:symbol-or-mantissa
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       "0123456789" (:symbol-or-mantissa2 :float)
+       "eE" (:symbol-or-exponent-delimiter :symbol)
+       "|" :error
+       :otherwise :symbol)
+      (:symbol-or-mantissa2 :include :symbol-or-mantissa)
+      (:symbol-or-exponent-delimiter
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       "+-" (:symbol-or-exponent :symbol)
+       "0123456789" (:symbol-or-exponent2 :float)
+       "|" :error
+       :otherwise :symbol)
+      (:symbol-or-exponent
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       "0123456789" (:symbol-or-exponent2 :float)
+       "|" :error
+       :otherwise :symbol)
+      (:symbol-or-exponent2 :include :symbol-or-exponent)
+
+      ;; Prefixes shared by symbols and CL: symbols:
+      (:symbol-or-CL-symbol
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       "lL" (:symbol-or-CL-symbol2 :symbol)
+       "|" :error
+       :otherwise :symbol)
+      (:symbol-or-CL-symbol2
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       ":" (:symbol-or-CL-symbol3 :symbol)
+       "|" :error
+       :otherwise :symbol)
+      (:symbol-or-CL-symbol3
+       :include :delimiter
+       "|" :error
+       :otherwise :CL-symbol)
+      (:CL-symbol
+       :include :delimiter
+       "|" :error
+       :otherwise :CL-symbol)
+
+      ;; Escaped symbols:
+      (:escaped-symbol-escape
+       :any :escaped-symbol)
+      (:escaped-symbol
+       :include :delimiter
+       "/|" :error
+       "\\" :escaped-symbol-escape
+       :otherwise :escaped-symbol)
+
+      ;; Fully escaped symbols:
+      (:open-fully-escaped-symbol
+       * "|" :close-fully-escaped-name ;; see tokenizer why this is a proper state
+       "\\" :fully-escaped-symbol-escape
+       :otherwise :fully-escaped-symbol)
+      (:fully-escaped-symbol-escape :any :fully-escaped-symbol)
+      (:fully-escaped-symbol
+       * "|" :close-fully-escaped-name
+       "\\" :fully-escaped-symbol-escape
+       :otherwise :fully-escaped-symbol)
+      (:close-fully-escaped-name :include :start)
+
+      ;; Plain old symbols:
+      (:symbol
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :escaped-symbol-escape
+       "|" :error
+       :otherwise :symbol)
+
+      ;; Keywords:
+      (:open-keyword
+       :include :delimiter
+       "|" :fully-escaped-keyword
+       "\\" :escaped-keyword-escape
+       ;;"/" :error ???
+       :otherwise :keyword)
+      (:keyword
+       :include :delimiter
+       "\\" :escaped-keyword-escape
+       ;;"/" :error ???
+       "|" :error
+       :otherwise :keyword)
+      (:escaped-keyword-escape
+       :any :escaped-keyword)
+      (:escaped-keyword
+       :include :delimiter
+       "\\" :escaped-keyword-escape
+       "|" :error
+       :otherwise :escaped-keyword)
+      (:fully-escaped-keyword
+       * "|" :close-fully-escaped-name
+       "\\" :fully-escaped-keyword-escape
+       :otherwise :fully-escaped-keyword)
+      (:fully-escaped-keyword-escape :any :fully-escaped-keyword)
+
+      ;; Surrogates:
+      (:open-surrogate
+       :include :delimiter
+       "|" :fully-escaped-surrogate
+       "\\" :escaped-surrogate-escape
+       :otherwise :surrogate)
+      (:surrogate
+       :include :delimiter
+       "/|" :error
+       "\\" :escaped-surrogate-escape
+       :otherwise :surrogate)
+      (:escaped-surrogate
+       :include :delimiter
+       "/|" :error
+       "\\" :escaped-surrogate-escape
+       :otherwise :escaped-surrogate)
+      (:escaped-surrogate-escape :any :escaped-surrogate)
+      (:fully-escaped-surrogate
+       * "|" :close-fully-escaped-name
+       "\\" :fully-escaped-surrogate-escape
+       :otherwise :fully-escaped-surrogate)
+      (:fully-escaped-surrogate-escape :any :fully-escaped-surrogate)
+
+      ;; Qualified names:
+      (:qualified-name
+       ;; In most contexts qualified names will be an error:
+       :include :delimiter
+       "@" :qualified-surrogate
+       ":" :error
+       "\\" :qualified-escaped-symbol-escape
+       "|" :qualified-fully-escaped-symbol
+       "/" :qualified-name
+       :otherwise :qualified-symbol)
+      (:qualified-symbol
+       :include :delimiter
+       "/" :qualified-name
+       "\\" :qualified-escaped-symbol-escape
+       "|" :error
+       :otherwise :qualified-symbol)
+      (:qualified-surrogate
+       :include :delimiter
+       "/" :error
+       "\\" :qualified-escaped-surrogate-escape
+       ;;; BUG: Need `open-qualified-surrogate' to rule out /a/@f|oo
+       ;;;      (not enough states available right now):
+       "|" :qualified-fully-escaped-surrogate
+       :otherwise :qualified-surrogate)
+
+      ;; Escaped qualified symbols and surrogates:
+      (:qualified-escaped-symbol
+       :include :delimiter
+       "/|" :error
+       "\\" :qualified-escaped-symbol-escape
+       :otherwise :qualified-escaped-symbol)
+      (:qualified-escaped-symbol-escape
+       :any :qualified-escaped-symbol)
+      (:qualified-escaped-surrogate
+       :include :delimiter
+       "/|" :error
+       "\\" :qualified-escaped-surrogate-escape
+       :otherwise :qualified-escaped-surrogate)
+      (:qualified-escaped-surrogate-escape
+       :any :qualified-escaped-surrogate)
+
+      ;; Fully escaped qualified symbols and surrogates:
+      (:qualified-fully-escaped-symbol
+       * "|" :close-fully-escaped-name
+       "\\" :qualified-fully-escaped-symbol-escape
+       :otherwise :qualified-fully-escaped-symbol)
+      (:qualified-fully-escaped-symbol-escape
+       :any :qualified-fully-escaped-symbol)
+      (:qualified-fully-escaped-surrogate
+       * "|" :close-fully-escaped-name
+       "\\" :qualified-fully-escaped-surrogate-escape
+       :otherwise :qualified-fully-escaped-surrogate)
+      (:qualified-fully-escaped-surrogate-escape
+       :any :qualified-fully-escaped-surrogate)
+      
+      (:error :include :start)
+      )))
+
+;;; Since the STELLA tokenizer has to be available early in the bootstrap
+;;;    (e.g., to unstringify class definitions), we have to create the
+;;;    tokenizer table from a stringified encoding that was created with
+;;;
+;;;        (eval (stringify-tokenizer-table
+;;;                (parse-tokenizer-definition
+;;;                  *stella-tokenizer-table-definition*)))
+
+(defglobal *stella-tokenizer-table* TOKENIZER-TABLE NULL)
+
+;;; Initialize here, so the string doesn't get stored in the variable object:
+(startup-time-progn :globals
+  (setq *stella-tokenizer-table*
+   (unstringify-tokenizer-table
+    "32768|EJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBKJMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBLBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILIJBBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJIAIAIAIAIAIAIAIAIAIABAIAIABAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBNABBMAMAMAMAMAMAMAMAMAMAEBIMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBBCBBMAMAMAMAMAMAMAMAMAMAEBIMEBEBEBEBEBEBEBEBEBCCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBCCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBEBBBBCBCBCBCBCBCBCBCBCBCEBIMEBEBEBEBEBEBEBEBEBCCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBCCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBEBBBEBEBEBEBEBEBEBEBEBEBEBIMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBFCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBEBEBEBEBEBEBEBFCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCKCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCJKLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICJDJDJDJDJDJDJDJDJDKMKMJDJDKMJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDKMJDEIJMJDJDJDFICIDIJDJDHIJDJDBBJDJDJDJDJDJDJDJDJDJDAAIMJDJDJDJDGDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDHDJDJDJDGIJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDIDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDOCOCOCOCOCOCOCOCOCKMKMOCOCKMOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCKMOCEIJMOCOCOCFICIDIOCOCHIOCOCOCOCOCOCOCOCOCOCOCOCOCOCIMOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCNCOCOCOCGIOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCMCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCDDDDDDDDDDDDDDDDDDKMKMDDDDKMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDKMDDEIJMDDDDDDFICIDIDDDDHIDDDDDDDDDDDDDDDDDDDDDDDDDDDDIMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDCDDDDDDDGIDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDBDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBEBBBEBEBEBEBEBEBEBEBEBEBEBIMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAAAAAAAAAAAAAAAAAKMKMAAAAKMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKMAAEIJMAAAAAAFICIDIAAAAHIAAAAAAAAAAAAAAAAAAAAAAAAAAAAIMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBHBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBIBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBBAGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBHBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBIBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBGBEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBKJMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBLBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBMBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBKJNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBLBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBNBPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPJPBPBPBPBPBPBPBPBPBKMKMPBPBKMPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBKMPBEIJMPBPBPBFICIDIPBPBHIPBPBPBPBPBPBPBPBPBPBPBPBPBPBIMPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBGIPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBPBEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJLIEJLINIBJMIMIMIMIMIMIMIMIMIMICJEJEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJEJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBEBBBBCBCBCBCBCBCBCBCBCBCEBIMEBEBEBEBEBEBEBEBEBCCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBCCEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBDCHIDCEBBBECECECECECECECECECECEBIMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBEBBBECECECECECECECECECECEBIMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBEBBBECECECECECECECECECECEBIMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMKMEBEBKMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBKMEBEIJMEBEBEBFICIDIEBEBHIEBEBBBEBEBEBEBEBEBEBEBEBEBGCIMEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBABEBEBEBGIEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBAAEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBEBHCHCHCHCHCHCHCHCHCKMKMHCHCKMHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCKMHCEIJMHCHCHCFICIDIHCHCHIHCHCHCHCHCHCHCHCHCHCHCHCHCHCIMHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCGIHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCAAHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCKMKMHCHCKMHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCKMHCEIJMHCHCHCFICIDIHCHCHIHCHCHCHCHCHCHCHCHCHCHCHCHCHCIMHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCGIHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCAAHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCHCICICICICICICICICICKMKMICICKMICICICICICICICICICICICICICICICICICICKMICEIJMICICICFICIDIICICHIICICAAICICICICICICICICICICICIMICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICABICICICGIICICICICICICICICICICICICICICICICICICICICICICICICICICICAAICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICEJEJEJEJEJEJEJEJEJKMKMEJEJKMEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJKMEJEIJMEJEJEJFICIDIEJLIHILINIBJMIMIMIMIMIMIMIMIMIMICJIMEJEJEJEJDJEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJAJEJEJEJGIEJEJOIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJPIEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJEJLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCKCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCJKLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCLCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCADMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCJKMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCOCOCOCOCOCOCOCOCOCKMKMOCOCKMOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCKMOCEIJMOCOCOCFICIDIOCOCHIOCOCOCOCOCOCOCOCOCOCOCOCOCOCIMOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCNCOCOCOCGIOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCAAOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCOCPCPCPCPCPCPCPCPCPCKMKMPCPCKMPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCKMPCEIJMPCPCPCFICIDIPCPCHIPCPCPCPCPCPCPCPCPCPCPCPCPCPCIMPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCNCPCPCPCGIPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCAAPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCPCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCMCBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDFDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDJKBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDDDDDDDDDDDDDDDDDDDKMKMDDDDKMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDKMDDEIJMDDDDDDFICIDIDDDDHIDDDDAADDDDDDDDDDDDDDDDDDDDDDIMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDCDDDDDDDGIDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDAADDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDEDEDEDEDEDEDEDEDEDKMKMEDEDKMEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDKMEDEIJMEDEDEDFICIDIEDEDHIEDEDAAEDEDEDEDEDEDEDEDEDEDEDIMEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDCDEDEDEDGIEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDAAEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDEDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDBDGDGDGDGDGDGDGDGDGDKMKMGDGDKMGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDKMGDEIJMGDGDGDFICIDIGDGDHIGDGDAAGDGDGDGDGDGDGDGDGDGDGDIMGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDKDGDGDGDGIGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDLDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDGDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDODIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDJKIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDJDJDJDJDJDJDJDJDJDKMKMJDJDKMJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDKMJDEIJMJDJDJDFICIDIJDJDHIJDJDBBJDJDJDJDJDJDJDJDJDJDJDIMJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDHDJDJDJDGIJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDAAJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDJDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDPDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDJKLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDMDMDMDMDMDMDMDMDMDKMKMMDMDKMMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDKMMDEIJMMDMDMDFICIDIMDMDHIMDMDAAMDMDMDMDMDMDMDMDMDMDMDIMMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDHDMDMDMDGIMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDAAMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDMDNDNDNDNDNDNDNDNDNDKMKMNDNDKMNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDKMNDEIJMNDNDNDFICIDINDNDHINDNDAANDNDNDNDNDNDNDNDNDNDNDIMNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDKDNDNDNDGINDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDAANDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDNDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDIDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLDLD|64|ERROR|START|OPEN-PAREN|CLOSE-PAREN|OPEN-STRING|SINGLE-QUOTE|BACK-QUOTE|COMMA|COMMENT|HASH|WHITE-SPACE|SYMBOL-OR-SIGNED-NUMBER|SYMBOL-OR-NUMBER|SYMBOL-OR-MANTISSA|SYMBOL-OR-CL-SYMBOL|OPEN-FULLY-ESCAPED-SYMBOL|ESCAPED-SYMBOL-ESCAPE|QUALIFIED-NAME|OPEN-KEYWORD|OPEN-SURROGATE|SYMBOL|DELIMITER|PAREN-COMMENT|PAREN-COMMENT-ESCAPE|PAREN-COMMENT-BAR|COMMA-SPLICE|CLOSE-STRING|STRING-ESCAPE|STRING|ESCAPED-STRING|CHARACTER-CONSTANT|CHARACTER|ATOM|SYMBOL-OR-MANTISSA2|SYMBOL-OR-EXPONENT-DELIMITER|SYMBOL-OR-EXPONENT|SYMBOL-OR-EXPONENT2|SYMBOL-OR-CL-SYMBOL2|SYMBOL-OR-CL-SYMBOL3|CL-SYMBOL|ESCAPED-SYMBOL|CLOSE-FULLY-ESCAPED-NAME|FULLY-ESCAPED-SYMBOL-ESCAPE|FULLY-ESCAPED-SYMBOL|FULLY-ESCAPED-KEYWORD|ESCAPED-KEYWORD-ESCAPE|KEYWORD|ESCAPED-KEYWORD|FULLY-ESCAPED-KEYWORD-ESCAPE|FULLY-ESCAPED-SURROGATE|ESCAPED-SURROGATE-ESCAPE|SURROGATE|ESCAPED-SURROGATE|FULLY-ESCAPED-SURROGATE-ESCAPE|QUALIFIED-SURROGATE|QUALIFIED-ESCAPED-SYMBOL-ESCAPE|QUALIFIED-FULLY-ESCAPED-SYMBOL|QUALIFIED-SYMBOL|QUALIFIED-ESCAPED-SURROGATE-ESCAPE|QUALIFIED-FULLY-ESCAPED-SURROGATE|QUALIFIED-ESCAPED-SYMBOL|QUALIFIED-ESCAPED-SURROGATE|QUALIFIED-FULLY-ESCAPED-SYMBOL-ESCAPE|QUALIFIED-FULLY-ESCAPED-SURROGATE-ESCAPE|64|ERROR|START|OPEN-PAREN|CLOSE-PAREN|STRING|SINGLE-QUOTE|BACK-QUOTE|COMMA|COMMENT|HASH|WHITE-SPACE|SYMBOL|INTEGER|SYMBOL|SYMBOL|FULLY-ESCAPED-SYMBOL|ESCAPED-SYMBOL-ESCAPE|QUALIFIED-NAME|KEYWORD|SURROGATE|SYMBOL|DELIMITER|PAREN-COMMENT|PAREN-COMMENT-ESCAPE|PAREN-COMMENT-BAR|COMMA-SPLICE|CLOSE-STRING|STRING-ESCAPE|STRING|ESCAPED-STRING|CHARACTER-CONSTANT|CHARACTER|ATOM|FLOAT|SYMBOL|SYMBOL|FLOAT|SYMBOL|SYMBOL|CL-SYMBOL|ESCAPED-SYMBOL|CLOSE-FULLY-ESCAPED-NAME|FULLY-ESCAPED-SYMBOL-ESCAPE|FULLY-ESCAPED-SYMBOL|FULLY-ESCAPED-KEYWORD|ESCAPED-KEYWORD-ESCAPE|KEYWORD|ESCAPED-KEYWORD|FULLY-ESCAPED-KEYWORD-ESCAPE|FULLY-ESCAPED-SURROGATE|ESCAPED-SURROGATE-ESCAPE|SURROGATE|ESCAPED-SURROGATE|FULLY-ESCAPED-SURROGATE-ESCAPE|QUALIFIED-SURROGATE|QUALIFIED-ESCAPED-SYMBOL-ESCAPE|QUALIFIED-FULLY-ESCAPED-SYMBOL|QUALIFIED-SYMBOL|QUALIFIED-ESCAPED-SURROGATE-ESCAPE|QUALIFIED-FULLY-ESCAPED-SURROGATE|QUALIFIED-ESCAPED-SYMBOL|QUALIFIED-ESCAPED-SURROGATE|QUALIFIED-FULLY-ESCAPED-SYMBOL-ESCAPE|QUALIFIED-FULLY-ESCAPED-SURROGATE-ESCAPE|64|TTTTFTTTTFTTTTTFFTTTTTFFFTTFFFFTFTTTTTTTTTFFFFTTFFFTTFTFFTFFTTFF|")))
+
+;;; FIGURE OUT: CAN WE USE STATE :ALIASES TO PROVIDE THIS MAPPING???
+(defglobal *stella-logical-state-names* (VECTOR OF KEYWORD) NULL)
+(defglobal *stella-logical-state-names-table*
+    (PROPERTY-LIST OF KEYWORD KEYWORD)
+    (new (PROPERTY-LIST OF KEYWORD KEYWORD)
+         :the-plist
+         (bquote
+          (:symbol                             :SYMBOL
+           :escaped-symbol                     :SYMBOL
+           :fully-escaped-symbol               :SYMBOL
+           :qualified-symbol                   :SYMBOL
+           :qualified-escaped-symbol           :SYMBOL
+           :qualified-fully-escaped-symbol     :SYMBOL
+           :CL-symbol                          :SYMBOL
+
+           :surrogate                          :SURROGATE
+           :escaped-surrogate                  :SURROGATE
+           :qualified-surrogate                :SURROGATE
+           :qualified-escaped-surrogate        :SURROGATE
+           :fully-escaped-surrogate            :SURROGATE
+           :qualified-fully-escaped-surrogate  :SURROGATE
+
+           :keyword                            :KEYWORD
+           :escaped-keyword                    :KEYWORD
+           :fully-escaped-keyword              :KEYWORD
+
+           :qualified-name                     :QUALIFIED-NAME
+
+           :string                             :STRING
+           :escaped-string                     :STRING
+           
+           :integer                            :INTEGER
+           :float                              :FLOAT
+           :character                          :CHARACTER
+
+           :open-paren                         :OPEN-PAREN
+           :close-paren                        :CLOSE-PAREN
+           :single-quote                       :SINGLE-QUOTE
+           :back-quote                         :BACK-QUOTE
+           :comma                              :COMMA
+           :comma-splice                       :COMMA-SPLICE
+
+           :close-string                       :CLOSE-BALANCED-QUOTE
+           :close-fully-escaped-name           :CLOSE-BALANCED-QUOTE
+
+           :error                              :ERROR
+           ))))
+
+(startup-time-progn :globals
+  (setq *stella-logical-state-names*
+    (new (VECTOR OF KEYWORD)
+         :array-size (length (state-names *stella-tokenizer-table*))))
+  (foreach i in (interval 0 (1- (length *stella-logical-state-names*)))
+      do (setf (nth *stella-logical-state-names* i)
+           (lookup *stella-logical-state-names-table*
+                   (nth (state-names *stella-tokenizer-table*) i)))
+         (when (null? (nth *stella-logical-state-names* i))
+           (setf (nth *stella-logical-state-names* i) :ERROR))))
+
+(defmacro with-stella-tokenizer ((input OBJECT) &body (body CONS))
+  ;; Version of `with-tokenizer' specialized for STELLA tokenization.
+  (return
+    (bquote
+     (with-tokenizer *stella-tokenizer-table* & input
+       (let (;;(tok_stellaStateName_ KEYWORD NULL)  ; not used?
+             (tok_stellaLogicalStateNames_
+              (the-array *stella-logical-state-names*))
+             (tok_stellaLogicalStateName_ KEYWORD NULL))
+         && body)))))
+
+(defmacro get-next-stella-token (&body (options CONS))
+  ;; Version of `get-next-token' specialized for STELLA tokenization.
+  (return
+    (bquote
+     (progn
+       (get-next-token && options)
+       ;; (setq tok_stellaStateName_ (nth tok_stateNames_ tok_state_))  ; not used?
+       (setq tok_stellaLogicalStateName_
+         (nth tok_stellaLogicalStateNames_ tok_state_))))))
+
+(defmacro get-stella-token-type ()
+  ;; Return the STELLA token type of the last parsed token.
+  (return (bquote tok_stellaLogicalStateName_)))
+
+(defmacro get-qualified-symbol-separator-position (&body (escapeMode CONS))
+  ;; Return the position of the right-most module separator of the
+  ;;    last parsed token (assumed to be a qualified symbol).
+  ;; If `escapeMode' is supplied it will be passed on (understood are
+  ;;    :NONE, :ESCAPED and :FULLY-ESCAPED).
+  (let ((escape (first escapeMode)))
+    (when (null? escape)
+      (setq escape :NONE))
+    (return
+      (bquote
+       (get-qualified-symbol-separator-position-internal
+        tok_buffer_ tok_tokenstart_ tok_cursor_ tok_size_ & escape)))))
+
+(defun (get-qualified-symbol-separator-position-internal INTEGER)
+    ((buffer TOKENIZER-BYTE-ARRAY) (tokenStart INTEGER)
+     (tokenEnd INTEGER) (size INTEGER) (escapeMode KEYWORD))
+  ;; Return the position of the right-most module separator of
+  ;;    the qualified symbol ending at `tokenEnd' relative to `tokenStart'.
+  (let ((cursor (1- tokenEnd))
+        (separatorPosition 0)
+        (nofEscapes 0)
+        (fullyEscaped? (eql? escapeMode :FULLY-ESCAPED))
+        (targetChar
+         (choose fullyEscaped? #\| MODULE-SEPARATOR-CHARACTER)))
+    (loop
+      (while (>= cursor 0)
+        (cond
+         ((eql? (byte-array-nth buffer cursor) targetChar)
+          (setq separatorPosition cursor)
+          (-- cursor)
+          (when (< cursor 0)
+            (setq cursor (1- size)))
+          (setq nofEscapes 0)
+          (loop
+            (while (and (>= cursor 0)
+                        (eql? (byte-array-nth buffer cursor) #\\))
+                (++ nofEscapes)
+                (-- cursor))
+            (if (and (< cursor 0)
+                     (eql? (byte-array-nth buffer 0) #\\))
+                (setq cursor (1- size))
+              (break)))
+          (when (even? nofEscapes)
+            (setq separatorPosition (- separatorPosition tokenStart))
+            (when fullyEscaped?
+              (-- separatorPosition))
+            (if (< separatorPosition 0)
+                (return (+ separatorPosition size))
+              (return separatorPosition))))
+         (otherwise
+          (-- cursor))))
+      (setq cursor (1- size)))))
+
+(defclass STELLA-TOKEN (TOKENIZER-TOKEN)
+  :slots ((logical-token-type :type KEYWORD) ;; `logical-type' used in LOGIC
+          (module :type STRING)
+          (escape-mode :type KEYWORD)
+          (next :type STELLA-TOKEN)))
+
+(defun (tokenize-s-expression STELLA-TOKEN)
+    ((stream INPUT-STREAM) (tokenList STELLA-TOKEN))
+  ;; Tokenize one s-expression by reading from `stream' and return the
+  ;;    result.
+  ;; If `tokenList' was supplied as non-NULL, reuse it as much as possible
+  ;;    (the end of the token list is indicated by a NULL token type).
+  ;;    Reusing of the `tokenList' is achieved by attaching it
+  ;;    to the stream state, and by having a contract that says it's
+  ;;    only good until the next call to `tokenize-s-expression'.
+  (let ((upcase? (not (case-sensitive? *module*)))
+        (parenBalance 0)
+        (endOfFile? TRUE)
+        (skipClosingQuote? FALSE)
+        (tokenCursor tokenList))
+    (when (null? tokenList)
+      (setq tokenList (new STELLA-TOKEN))
+      (setq tokenCursor tokenList))
+    (with-stella-tokenizer stream
+      (loop
+        (get-next-stella-token FALSE)
+        (when (end-of-tokens?)
+          (when (= parenBalance 0)
+              (break))
+          (save-tokenizer-stream-state)
+          (signal-read-error "Expression ended prematurely"))
+        (setq endOfFile? FALSE)
+        (unless skipClosingQuote?
+          ;; To enable interleaving of `read-s-expression' with
+          ;; `read-character' and friends, we make closing string and
+          ;; full-escape quotes proper states which we explicitly ignore in
+          ;; here.  That way we can be sure that for each type of STELLA token
+          ;; the cursor points behind it after it was read.  We could do this
+          ;; directly in the tokenizer table, but that would require many new
+          ;; end states for fully escaped things:
+          (setf (type tokenCursor) (get-token-type))
+          (setf (logical-token-type tokenCursor) (get-stella-token-type))
+          (setf (module tokenCursor) NULL)
+          (setf (escape-mode tokenCursor) NULL))
+        (setq skipClosingQuote? FALSE)
+        (case (get-stella-token-type)
+          (:OPEN-PAREN
+           (++ parenBalance)
+           (setf (content tokenCursor) "("))
+          (:CLOSE-PAREN
+           (-- parenBalance)
+           (setf (content tokenCursor) ")")
+           (when (< parenBalance 0)
+             (save-tokenizer-stream-state)
+             (signal-read-error "Extra right parenthesis encountered")))
+          (:SYMBOL
+           (case (get-token-type)
+             (:SYMBOL
+              (setf (content tokenCursor) (get-token-text upcase?)))
+             (:QUALIFIED-SYMBOL
+              (let ((separatorPos (get-qualified-symbol-separator-position)))
+                (setf (content tokenCursor)
+                  (get-token-text upcase? (1+ separatorPos)))
+                (setf (module tokenCursor)
+                  (choose (= separatorPos 0)
+                          "ROOT-MODULE"
+                          (get-token-text TRUE 0 separatorPos)))))
+             (:FULLY-ESCAPED-SYMBOL
+              (setf (content tokenCursor)
+                (unescape-token-string (get-token-text FALSE 1) #\\ FALSE))
+              (setf (escape-mode tokenCursor) :FULL)
+              (setq skipClosingQuote? TRUE))
+             (:QUALIFIED-FULLY-ESCAPED-SYMBOL
+              (let ((separatorPos
+                     (get-qualified-symbol-separator-position :FULLY-ESCAPED)))
+                (setf (content tokenCursor)
+                  (unescape-token-string
+                   (get-token-text FALSE (+ separatorPos 2)) #\\ FALSE))
+                (setf (module tokenCursor)
+                  (choose (= separatorPos 0)
+                          "ROOT-MODULE"
+                          (get-token-text TRUE 0 separatorPos)))
+                (setf (escape-mode tokenCursor) :FULL))
+              (setq skipClosingQuote? TRUE))
+             (:ESCAPED-SYMBOL
+              (setf (content tokenCursor)
+                (unescape-token-string (get-token-text) #\\ upcase?))
+              (setf (escape-mode tokenCursor) :PARTIAL))
+             (:QUALIFIED-ESCAPED-SYMBOL
+              (let ((separatorPos
+                     (get-qualified-symbol-separator-position :ESCAPED)))
+                (setf (content tokenCursor)
+                  (unescape-token-string
+                   (get-token-text FALSE (1+ separatorPos)) #\\ upcase?))
+                (setf (module tokenCursor)
+                  (choose (= separatorPos 0)
+                          "ROOT-MODULE"
+                          (get-token-text TRUE 0 separatorPos)))
+                (setf (escape-mode tokenCursor) :PARTIAL)))
+             (:CL-SYMBOL
+              (setf (content tokenCursor) (get-token-text TRUE 3))
+              (setf (module tokenCursor) "/COMMON-LISP"))))
+          (:SURROGATE
+           (case (get-token-type)
+             (:SURROGATE
+              (setf (content tokenCursor) (get-token-text upcase? 1)))
+             (:QUALIFIED-SURROGATE
+              (let ((separatorPos (get-qualified-symbol-separator-position)))
+                (setf (content tokenCursor)
+                  (get-token-text upcase? (+ separatorPos 2)))
+                (setf (module tokenCursor)
+                  (choose (= separatorPos 0)
+                          "ROOT-MODULE"
+                          (get-token-text TRUE 0 separatorPos)))))
+             (:FULLY-ESCAPED-SURROGATE
+              (setf (content tokenCursor)
+                (unescape-token-string (get-token-text FALSE 2) #\\ FALSE))
+              (setf (escape-mode tokenCursor) :FULL)
+              (setq skipClosingQuote? TRUE))
+             (:QUALIFIED-FULLY-ESCAPED-SURROGATE
+              (let ((separatorPos
+                     (get-qualified-symbol-separator-position :FULLY-ESCAPED)))
+                (setf (content tokenCursor)
+                  (unescape-token-string
+                   (get-token-text FALSE (+ separatorPos 3)) #\\ FALSE))
+                (setf (module tokenCursor)
+                  (choose (= separatorPos 0)
+                          "ROOT-MODULE"
+                          (get-token-text TRUE 0 separatorPos)))
+                (setf (escape-mode tokenCursor) :FULL))
+              (setq skipClosingQuote? TRUE))
+             (:ESCAPED-SURROGATE
+              (setf (content tokenCursor)
+                (unescape-token-string (get-token-text FALSE 1) #\\ upcase?))
+              (setf (escape-mode tokenCursor) :PARTIAL))
+             (:QUALIFIED-ESCAPED-SURROGATE
+              (let ((separatorPos
+                     (get-qualified-symbol-separator-position :ESCAPED)))
+                (setf (content tokenCursor)
+                  (unescape-token-string
+                   (get-token-text FALSE (+ separatorPos 2)) #\\ upcase?))
+                (setf (module tokenCursor)
+                  (choose (= separatorPos 0)
+                          "ROOT-MODULE"
+                          (get-token-text TRUE 0 separatorPos)))
+                (setf (escape-mode tokenCursor) :PARTIAL)))))
+          (:KEYWORD
+           (case (get-token-type)
+             (:KEYWORD
+              (setf (content tokenCursor) (get-token-text TRUE 1)))
+             (:FULLY-ESCAPED-KEYWORD
+              (setf (content tokenCursor)
+                (unescape-token-string (get-token-text FALSE 2) #\\ FALSE))
+              (setf (escape-mode tokenCursor) :FULL)
+              (setq skipClosingQuote? TRUE))
+             (:ESCAPED-KEYWORD
+              (setf (content tokenCursor)
+                (unescape-token-string (get-token-text FALSE 1) #\\ TRUE))
+              (setf (escape-mode tokenCursor) :PARTIAL))))
+          (:STRING
+           (setf (content tokenCursor) (get-token-text FALSE 1))
+           (case (get-token-type)
+             (:STRING NULL)
+             (:ESCAPED-STRING
+              (setf (content tokenCursor)
+                (unescape-token-string (content tokenCursor) #\\ FALSE))
+              (setf (escape-mode tokenCursor) :PARTIAL)))
+           (setq skipClosingQuote? TRUE))
+          ((:INTEGER :FLOAT)
+           (setf (content tokenCursor) (get-token-text)))
+          (:CHARACTER
+           (let ((name (get-token-text)))
+             (when (> (length name) 1)
+               (setq name (string-upcase name)))
+             (setf (content tokenCursor) name)))
+          ((:SINGLE-QUOTE :BACK-QUOTE :COMMA :COMMA-SPLICE)
+           (setf (content tokenCursor) (get-token-text))
+           ;; make sure we read the next expression following the macro char:
+           (when (null? (next tokenCursor))
+             (setf (next tokenCursor) (new STELLA-TOKEN)))
+           (setq tokenCursor (next tokenCursor))
+           (continue))
+          (:QUALIFIED-NAME
+           (let ((token (get-token-text TRUE))
+                 (length (length token)))
+             (cond
+              ;; Handle the division symbol:
+              ((and (>= length 1)
+                    ;; ensure, division symbol equals module separator char:
+                    (eql? (nth token (1- length)) #\/)
+                    (or (= length 1)
+                        (eql? (nth token (- length 2)) #\/)))
+                (setf (content tokenCursor) "/")
+                (setf (type tokenCursor) :SYMBOL)
+                (setf (logical-token-type tokenCursor) :SYMBOL)
+                (when (> length 1)
+                  (setf (module tokenCursor)
+                    (subsequence token 0 (- length 2)))
+                  (setf (type tokenCursor) :QUALIFIED-SYMBOL)))
+               (otherwise
+                (setf (content tokenCursor) token)))))
+          (:CLOSE-BALANCED-QUOTE NULL)           
+          (:ERROR
+           (save-tokenizer-stream-state)
+           (signal-read-error "Illegal read syntax: " (get-token-text)))
+          (otherwise
+           (save-tokenizer-stream-state)
+           (signal-read-error "Illegal read syntax: " (get-token-text)
+                              " in state " (get-token-type))))
+        (unless skipClosingQuote?
+          (when (null? (next tokenCursor))
+            (setf (next tokenCursor) (new STELLA-TOKEN)))
+          (setq tokenCursor (next tokenCursor))
+          (when (= parenBalance 0)
+            (break))))
+      ;; mark the end of the token list:
+      (setf (type tokenCursor) NULL)
+      (setf (logical-token-type tokenCursor) NULL)
+      (save-tokenizer-stream-state)
+      (if endOfFile?
+          (return NULL)
+        (return tokenList)))))
+
+;;; Performance:
+;;; - Without interning symbols we are quite a bit faster than the Lisp reader
+;;;   (8.5 vs 13.2 seconds on the 4MB krk.ste file with 20000 symbols and
+;;;      160000 propositions).
+;;; - Interning symbols, however, jacks up the runtime to 32 secs.
+
+(defun (stella-token-list-to-s-expression OBJECT) ((tokenList STELLA-TOKEN))
+  ;; Convert `tokenList' into an appropriate STELLA s-expression.
+  ;; TO DO: RAISE ERROR FOR COMMA OUTSIDE OF BQUOTE CONTEXT.
+  (let ((parsedTree CONS NULL)
+        ;; Generate CONS-trees without recursive calls:
+        (parsedTreeStack (CONS OF CONS) NIL)
+        (parsedToken OBJECT NULL)
+        (consCell CONS NULL)
+        (tokenType KEYWORD NULL))
+    (loop
+      (setq tokenType (logical-token-type tokenList))
+      (case tokenType
+        (:OPEN-PAREN
+         (when (defined? parsedTree)
+           (pushq parsedTreeStack parsedTree))
+         (setq parsedTree NIL)
+         (setq tokenList (next tokenList))
+         (continue))
+        (:CLOSE-PAREN
+         (cond ((empty? parsedTreeStack)
+                ;; we read a complete s-exp, return it:
+                (setq parsedTree (reverse parsedTree))
+                (break))
+               (otherwise
+                (let ((parentTree parsedTreeStack))
+                  (popq parsedTreeStack)
+                  (setf (rest parentTree) (first parentTree))
+                  (setf (first parentTree) (reverse parsedTree))
+                  (setq parsedTree parentTree)
+                  (setq tokenList (next tokenList))
+                  (continue)))))
+        ((:SYMBOL :SURROGATE)
+         (let ((moduleName (module tokenList))
+               (name (content tokenList))
+               (module (choose (defined? moduleName)
+                               (get-stella-module moduleName FALSE)
+                               *module*)))
+           (cond ((null? module)
+                  (signal-read-error "Module " moduleName " does not exist"))
+                 ((eql? tokenType :SURROGATE)
+                  (setq parsedToken
+                    (intern-surrogate-in-module name module FALSE)))
+                 (otherwise
+                  (setq parsedToken
+                    (choose (and *transientObjects?*
+                                 (null? moduleName))
+                            (intern-transient-symbol name)
+                            (intern-symbol-in-module name module FALSE)))))))
+        (:KEYWORD
+         (setq parsedToken
+           (intern-rigid-symbol-wrt-module
+            (content tokenList) NULL KEYWORD-SYM)))
+        (:STRING
+         (setq parsedToken (make STRING-WRAPPER))
+         (setf (wrapper-value (cast parsedToken STRING-WRAPPER))
+           (content tokenList)))
+        (:INTEGER
+         (setq parsedToken (make INTEGER-WRAPPER))
+         (setf (wrapper-value (cast parsedToken INTEGER-WRAPPER))
+           (string-to-integer (content tokenList))))
+        (:FLOAT
+         (setq parsedToken (make FLOAT-WRAPPER))
+         (setf (wrapper-value (cast parsedToken FLOAT-WRAPPER))
+           (string-to-float (content tokenList))))
+        (:CHARACTER
+         (setq parsedToken (make CHARACTER-WRAPPER))
+         (setf (wrapper-value (cast parsedToken CHARACTER-WRAPPER))
+           (string-to-character (content tokenList))))
+        ;; TO DO: Make these check for proper BQUOTE context:
+        (:COMMA
+         (setq parsedToken (quote &)))
+        (:COMMA-SPLICE
+         (setq parsedToken (quote &&)))
+        ((:SINGLE-QUOTE :BACK-QUOTE)
+         (expand-quote-macro-token tokenList)
+         (continue))
+        (otherwise
+         (signal-read-error "Illegal read syntax: " (content tokenList)
+                            " of type " tokenType)))
+      (cond
+       ((defined? parsedTree)
+        ;; hand-cons for speed:
+        (setq consCell (make CONS))
+        (setf (value consCell) parsedToken)
+        (setf (rest consCell) parsedTree)
+        (setq parsedTree consCell)
+        (setq tokenList (next tokenList)))
+       (otherwise
+        (break))))
+    (if (null? parsedTree)
+        (return parsedToken)
+      (return parsedTree))))
+
+(defun expand-quote-macro-token ((quotedList STELLA-TOKEN))
+  ;; Destructively wrap `quotedList' to convert '<exp> into (quote <exp>).
+  (let ((quoteString (content quotedList))
+        (token (new STELLA-TOKEN
+                    :type :SYMBOL
+                    :logical-token-type :SYMBOL
+                    :content (choose (eql? quoteString "'") "QUOTE" "BQUOTE")
+                    :module "/STELLA"
+                    :next (next quotedList)))
+        (tokenType KEYWORD NULL)
+        (balance 0))
+    (setf (type quotedList) :OPEN-PAREN)
+    (setf (logical-token-type quotedList) :OPEN-PAREN)
+    (setf (content quotedList) "(")
+    (setf (next quotedList) token)
+    (setq quotedList (next token))
+    (loop
+      (setq tokenType (logical-token-type quotedList))
+      (when (null? tokenType)
+        (break))
+      (case tokenType
+        (:OPEN-PAREN
+         (++ balance))
+        (:CLOSE-PAREN
+         (-- balance)
+         (cond ((= balance 0)
+                (break))
+               ((< balance 0)
+                (signal-read-error "Illegal " quoteString " syntax"))))
+        (otherwise
+         (when (= balance 0)
+           (break))))
+      (setq quotedList (next quotedList)))
+    (when (null? tokenType)
+      (signal-read-error
+       "EOF encountered while parsing " quoteString " syntax"))
+    (setq token (new STELLA-TOKEN
+                     :type :CLOSE-PAREN
+                     :logical-token-type :CLOSE-PAREN
+                     :content ")"
+                     :next (next quotedList)))
+    (setf (next quotedList) token)))
+
+(defun (string-to-character CHARACTER) ((name STRING))
+  ;; Convert the character with `name' into an actual character.
+  ;; Multi-character character names are assumed to be upcased.
+  (let ((char (nth name 0)))
+    (when (> (length name) 1)
+      (case name
+        ("SPACE" (setq char #\Space))
+        ("LINEFEED" (setq char #\Linefeed))
+        ("NEWLINE" (setq char #\Newline))
+        ("BACKSPACE" (setq char #\Backspace))
+        ("TAB" (setq char #\Tab))
+        ("RETURN" (setq char #\Return))
+        ("PAGE" (setq char #\Page))
+	("NULL" (setq char #\Null))
+        (otherwise
+         (signal-read-error
+          "Illegal character constant: " (concatenate "#\\" name)))))
+    (return char)))
+
+
+  ;;
+;;;;;; Top level
+  ;;
+
+;;; TO DO:
+
+;;; - rewrite `read-s-expression-from-string' to avoid the generation of
+;;;   a stream and token list.
+;;; - For `read-s-expression' and `read-line' we don't really need a second
+;;;   value to indicate EOF, we could just return NULL.
+;;; - fix `native_read_line', since it might not work on different platforms
+;;; - possibly fix `Native.readLine' to avoid generating a new stream
+;;;   on every call.  Actually, since we now read on a STELLA stream, we
+;;;   could store the new stream in its native stream slot.
+
+(defun (read-s-expression OBJECT BOOLEAN) ((stream INPUT-STREAM))
+  :documentation "Read one STELLA s-expression from `stream' and return
+the result.  Return `true' as the second value on EOF."
+  :public? TRUE
+  (let ((tokenizerState (tokenizer-state stream))
+        (tokenList STELLA-TOKEN (choose (defined? tokenizerState)
+                                        (token-list tokenizerState)
+                                        NULL)))
+    (cond ((defined? tokenList)
+           (setq tokenList (tokenize-s-expression stream tokenList)))
+          (otherwise
+           (setq tokenList (tokenize-s-expression stream NULL))
+           (setf (token-list (tokenizer-state stream))
+             tokenList)))
+    (when (null? tokenList)
+      (return NULL TRUE))
+    (when (or (eql? stream STANDARD-INPUT)
+              (defined? (echo-stream stream)))
+      ;; When reading from an "interactive" stream, eat the white-space character
+      ;;    that immediately followed/terminated the s-expression to avoid that
+      ;;    it stays in the buffer and is picked up by a subsequent read operation:
+      (eat-next-character-if-whitespace stream))
+    (return (stella-token-list-to-s-expression tokenList) FALSE)))
+
+(defglobal *stella-tokenizer-white-space-state* INTEGER
+           (position (state-names *stella-tokenizer-table*) :WHITE-SPACE 0))
+
+(defun (eat-next-character-if-whitespace BOOLEAN) ((stream INPUT-STREAM))
+  ;; If the next character on 'stream' is a whitespace character
+  ;;    consume it; otherwise, leave 'stream' untouched.
+  (mv-bind (char eof?)
+      (read-character stream)
+    (when eof?
+      (return TRUE))
+    (cond ((white-space-character? char)
+           (let ((state (tokenizer-state stream)))
+             ;; update the state in case we were tokenizing:
+             (when (defined? state)
+               (setf (state state) *stella-tokenizer-white-space-state*))))
+          (otherwise
+           (unread-character char stream)))
+    (return FALSE)))
+
+(defun (consume-whitespace BOOLEAN) ((stream INPUT-STREAM))
+  ;; Consumes all whitespace characters on 'stream'.  The stream is left
+  ;;   positioned at the next non-whitespace character.  Returns TRUE if
+  ;;   the END-OF-FILE was reached.
+  (loop (mv-bind (char eof?)
+	    (read-character stream)
+	  (when eof?
+	    (return TRUE))
+	  (unless (white-space-character? char)
+	    (unread-character char stream)
+	    (break))))
+  (return FALSE))
+
+(defun (read-s-expression-from-string OBJECT) ((string STRING))
+  :documentation "Read one STELLA s-expression from `string' and
+return the result."
+  ;; Replacement for `unstringify'.
+  ;; This could combine `tokenize-s-expression' and
+  ;;    `stella-token-list-to-s-expression' to avoid generation of the
+  ;;    tokenList and stream.  For now, we simply use a string stream.
+  :public? TRUE
+  (return (read-s-expression (make-tokenizer-string-stream string))))
+
+(defun (make-tokenizer-string-stream STRING-INPUT-STREAM) ((string STRING))
+  ;; Return a STRING-INPUT-STREAM for `string' and hand-build a stream state
+  ;;    to avoid using large buffers for short strings.
+  (let ((stream (new STRING-INPUT-STREAM :the-string string))
+        (state (make TOKENIZER-STREAM-STATE)) ;; avoid initial values
+        (length (1+ (length string))))        ;; avoid 0-length buffers
+    (setf (buffer state) (make-tokenizer-byte-array length))
+    (setf (buffer-size state) length)
+    (setf (cursor state) length)
+    (setf (end state) length)
+    (setf (state state) 1)
+    (setf (token-list state) (new STELLA-TOKEN))
+    (setf (tokenizer-state stream) state)
+    (return stream)))
+
+(defun (read-line STRING BOOLEAN) ((inputStream INPUT-STREAM))
+  :documentation "Read one line from `inputStream' and return the result.
+Return `true' as the second value on EOF."
+  :public? TRUE
+  (when (defined? (tokenizer-state inputStream))
+    (return (read-line-from-tokenizer-buffer inputStream)))
+  (let ((stream (native-stream inputStream))
+        (echoStream (echo-stream inputStream))
+        (input STRING NULL))
+    (verbatim
+      ;; For the coerce case, we need to use the error handler
+      ;; to make sure we get back the actual NULL-STRING object
+      ;; rather than a copy introduced by the coersion to a simple
+      ;; string.
+	:common-lisp "
+   (setq input
+         #+:stella-coerce-readline
+         (CL:HANDLER-CASE
+             (CL:COERCE (CL:read-line stream CL:T) 'CL:SIMPLE-STRING)
+             (CL:END-OF-FILE ()  NULL-STRING))
+         #-:stella-coerce-readline
+         (CL:read-line stream CL-NIL NULL-STRING))"
+	:cpp "input = native_read_line(stream)"
+	:java "input = Native.readLine(stream)")
+    (when (and (defined? echoStream)
+               (defined? input))
+      (print-stream echoStream input EOL))
+    (return input (null? input))))
+
+(defun (read-character CHARACTER BOOLEAN) ((inputStream INPUT-STREAM))
+  :documentation "Read one character from `inputStream' and return the result.
+Return `true' as the second value on EOF."
+  :public? TRUE
+  (when (defined? (tokenizer-state inputStream))
+    (return (read-character-from-tokenizer-buffer inputStream)))
+  (let ((stream (native-stream inputStream))
+        (echoStream (echo-stream inputStream))
+        (input CHARACTER NULL)
+        (eof FALSE))
+    (verbatim
+      :common-lisp
+      (CL:progn
+        (setq input (CL:read-char stream CL-NIL CL-NIL))
+        (CL:when (CL:null input)
+          (setq eof TRUE)))
+      :cpp "input = native_read_character(stream, eof)"
+      :java "Stella_Object[] eofValue = new Stella_Object[1];
+    input = Native.readCharacter(stream, eofValue);
+    eof = ((BooleanWrapper)(eofValue[0])).wrapperValue")
+    (when (and (defined? echoStream)
+               (not eof))
+      (print-stream echoStream input))
+    (return input eof)))
+
+(defun unread-character ((ch CHARACTER) (inputStream INPUT-STREAM))
+  :documentation "Unread `ch' from `inputStream'.  Signal an error if `ch'
+was not the last character read."
+  :public? TRUE
+  (if (defined? (tokenizer-state inputStream))
+      (unread-character-from-tokenizer-buffer ch inputStream)
+    (let ((stream (native-stream inputStream)))
+      (verbatim
+          :common-lisp (CL:unread-char ch stream)
+          :cpp "stream->putback(ch)"
+          :java "Native.unreadCharacter(ch, stream)"))))
+
+(defspecial *user-query-action* KEYWORD :ASK
+  :public? TRUE
+  :documentation "Controls the behavior of interactive queries.  The default is :ASK
+which asks the user.  Other options are :YES, :NO, :YES-VERBOSE, :NO-VERBOSE.  These
+return the answer indicated, with the verbose versions printing the message and answer.")
+
+(defun (yes-or-no? BOOLEAN) ((message STRING))
+  :documentation "Read a line of input from STANDARD-INPUT and return `true'
+if the input was `yes' or `false' if the input was `no'.  Loop until either
+`yes' or `no' was entered.  If 'message' is non-`null' prompt with it before
+the input is read.  See also special variable `*USER-QUERY-ACTION*'."
+  :public? TRUE
+  (case *user-query-action*
+    (:YES
+     (return TRUE))
+    (:NO
+     (return FALSE))
+    (:YES-VERBOSE
+     (print message " [Auto => YES]" EOL)
+     (return TRUE))
+    (:NO-VERBOSE
+     (print message " [Auto => NO]" EOL)
+     (return FALSE))
+    (:ASK
+     (let ((input STRING NULL)
+           (start 0))
+       (loop
+	 (when (defined? message)
+	   (print message))
+	 (setq input (read-line STANDARD-INPUT))
+         (setq start 0)
+         (foreach ch in input
+             do (if (white-space-character? ch)
+                    (++ start)
+                  (break)))
+	 (when (> (length input) start)
+           (setq input (subsequence input start NULL))
+	   (when (string-equal? input "yes")
+	     (return TRUE))
+	   (when (string-equal? input "no")
+	     (return FALSE))
+	   (print "Type `yes' for yes or `no' for no." EOL)))))))
+
+(defun (y-or-n? BOOLEAN) ((message STRING))
+  :documentation "Read a line of input from STANDARD-INPUT and return `true'
+if the input was `y' or `false' if the input was `n'.  Loop until either
+`y' or `n' was entered.  If 'message' is non-`null' prompt with it before
+the input is read.  See also special variable `*USER-QUERY-ACTION*'."
+  :public? TRUE
+  (case *user-query-action*
+    (:YES
+     (return TRUE))
+    (:NO
+     (return FALSE))
+    (:YES-VERBOSE
+     (print message " [Auto => Y]" EOL)
+     (return TRUE))
+    (:NO-VERBOSE
+     (print message " [Auto => N]" EOL)
+     (return FALSE))
+    (:ASK
+     (let ((input STRING NULL)
+           (start 0))
+       (loop
+	 (when (defined? message)
+	   (print message))
+	 (setq input (read-line STANDARD-INPUT))
+         (setq start 0)
+         (foreach ch in input
+             do (if (white-space-character? ch)
+                    (++ start)
+                  (break)))
+	 (when (> (length input) start)
+	   (case (nth input start)
+	     ((#\y #\Y) (return TRUE))
+	     ((#\n #\N) (return FALSE))
+	     (otherwise NULL)))
+	 (print "Type `y' for yes or `n' for no." EOL))))))
+
+
+  ;;
+;;;;;; Testing/Benchmarking
+  ;;
+
+#|
+
+(defun (generate-read-test-files (CONS OF STRING-WRAPPER)) ()
+  (let ((rootPath "/home/hans/Projects/powerloom")
+        (result NIL)
+        (files (CONS OF STRING-WRAPPER) NIL))
+    (unless (probe-file? rootPath)
+      (setq rootPath "/nfs/isd/hans/.backup/Projects/powerloom"))
+    (load-file (concatenate rootPath "/sources/systems/stella-system.ste"))
+    (setq files (system-definition-source-files (get-system-definition "STELLA")))
+    (setq files
+      (subtract files (lisp-only-files (get-system-definition "STELLA"))))
+    (setq files
+      (subtract files (cpp-only-files (get-system-definition "STELLA"))))
+    (setq files
+      (subtract files (java-only-files (get-system-definition "STELLA"))))
+    (foreach file in files
+        collect (concatenate rootPath "/sources/stella/" file ".ste") into result)
+    ;(foreach file in *logic-system*
+    ;    collect (concatenate rootPath "/sources/logic/" file ".ste")  into result)
+    (return result)))
+
+(defun read-and-print-stella-files ((outFile STRING) (readOnly? BOOLEAN))
+  (let ((inStream INPUT-FILE-STREAM NULL)
+        (outStream (new OUTPUT-FILE-STREAM :filename outFile))
+        (tree OBJECT NULL)
+        (eof? FALSE))
+    (foreach file in (generate-read-test-files)
+        do (print "Processing file " file "..." EOL)
+           (setq inStream (new INPUT-FILE-STREAM :filename file))
+           (within-module *module*
+             (loop
+               (mv-setq (tree eof?)
+                 ;; On ThinkPad 770 for STELLA files only:
+                 ;; This takes about 8.6secs for readOnly?.
+                 ;;(read-stella-expression inStream)
+                 ;; This takes about 5.5secs for readOnly?.
+                 ;;(read-s-expression inStream)
+                 ;; this takes about 2.5secs for readOnly?.
+                 ;(new-read-s-expression inStream)
+                 (read-s-expression inStream)
+                 )
+               (when eof?
+                 (free inStream)
+                 (break))
+               (when (and (cons? tree)
+                          (eql? (first (cast tree CONS)) (quote IN-MODULE)))
+                 (evaluate tree))
+               (unless readOnly?
+                 (print-stream outStream EOL)
+                 (print-stella-definition tree outStream)))))
+    (free outStream)))
+
+(defun test-read-s-expression ((testFile STRING))
+  ;; Run this on `tokenizer-tests.in' and compare it with the results in
+  ;;    `tokenizer-tests.out'.
+  (let ((inputStream (new INPUT-FILE-STREAM :filename testFile))
+        (tokenList (new STELLA-TOKEN)))
+    (setf (echo-stream inputStream) STANDARD-OUTPUT)
+    (loop
+      (exception-case
+          (progn
+            (when (null? (tokenize-s-expression inputStream tokenList))
+              (break))
+            (let ((cursor tokenList))
+              (while (not (null? (type cursor)))
+                (print EOL "   ->   "
+                       (content cursor) ", "
+                       (choose (defined? (module cursor))
+                               (module cursor)
+                               "NULL") ", "
+                       (logical-token-type cursor) ", "
+                       (type cursor)
+                       EOL)
+                (setq cursor (next cursor)))))
+        (READ-EXCEPTION ())))
+    (free inputStream)))
+|#
+
+;; Test drivers for C++ and Java:
+#|
+main () {
+  cout << "Welcome to STELLA!" << endl;
+  startup(TRUE);
+  read_and_print_stella_files("/tmp/read-test-cpp.out", FALSE);
+  cout << "Bye!" << endl;
+}
+
+  import edu.isi.stella.*;  
+  public static void main (String [] args) {
+    System.out.println("Welcome to STELLA!");
+    Startup_Stella_System.startup_stella_system();
+    Flotsam.read_and_print_stella_files("/tmp/read-test-java.out", true);
+    System.out.println("Bye!");
+    System.exit(0);
+  }
+|#
+

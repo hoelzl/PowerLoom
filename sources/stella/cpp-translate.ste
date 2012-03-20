@@ -1,0 +1,2608 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: cpp-translate.ste,v 1.97 2003/09/19 00:24:17 tar Exp
+
+;;; Routines for translating Stella parse trees into C++ trees.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; Stella parse tree to C++ translator
+
+(defun (cpp-use-garbage-collector? BOOLEAN) ()
+  ;; Return TRUE if this translation relies on the Boehm/Weiser collector.
+  (return (enabled-stella-feature? :use-cpp-garbage-collector)))
+
+(defspecial *dummyDeclarations* CONS NULL
+  :documentation "Temporary List of declarations for unused return parameters")
+
+(defspecial *currentDummyIndex* INTEGER NULL-INTEGER
+  :documentation "Current index of dummy parameter for unused return value")
+
+(defglobal *operator-table* KEY-VALUE-LIST
+  (dictionary @KEY-VALUE-LIST
+	      (quote ++) (cons (wrap-literal "++") NIL)
+	      (quote --) (cons (wrap-literal "--") NIL)
+	      (quote +) (cons (wrap-literal "+") NIL)
+	      (quote -) (cons (wrap-literal "-") NIL)
+	      (quote *) (cons (wrap-literal "*") NIL)
+	      (quote /) (cons (wrap-literal "/") NIL)
+	      (quote eq?) (cons (wrap-literal "==") NIL)
+              (quote !=) (cons (wrap-literal "!=") NIL)
+	      (quote >) (cons (wrap-literal ">") NIL)
+	      (quote >=) (cons (wrap-literal ">=") NIL)
+	      (quote =>) (cons (wrap-literal ">=") NIL)
+	      (quote <) (cons (wrap-literal "<") NIL)
+	      (quote =<) (cons (wrap-literal "<=") NIL)
+	      (quote <=) (cons (wrap-literal "<=") NIL)
+	      (quote AND) (cons (wrap-literal "&&") NIL)
+	      (quote OR) (cons (wrap-literal "||") NIL)
+	      (quote NOT) (cons (wrap-literal "!") NIL)
+	      (quote CHOOSE) (cons (wrap-literal "?")
+				   (cons (wrap-literal ":") NIL)))
+  :documentation "Mapping from STELLA operators to C++ operators")
+
+(defun (cpp-lookup-operator-table CONS) ((operator SYMBOL))
+  (let ((entry (CONS OF STRING-WRAPPER) (lookup *operator-table* operator))
+	(copiedEntry NIL))
+    (when (defined? entry)
+      (foreach wrapper in entry
+	       collect (wrap-literal (wrapper-value wrapper))
+	       into copiedEntry)
+      (return copiedEntry))
+    (return NULL)))
+
+(defun (cpp-yield-renamed-reserved-word STRING-WRAPPER) ((word SYMBOL))
+  ;; Yield a properly renamed replacement for the reserved C++ symbol 'word'.
+  (let ((name (symbol-name word))
+        (length (length name)))
+    ;; upcase the last character which keeps us close to the original:
+    (return
+      (concatenate
+        (string-downcase (subsequence name 0 (1- length)))
+        (make-string 1 (upcase-character (nth name (1- length))))))))
+
+(defun (cpp-create-reserved-word-table STRING-HASH-TABLE) ()
+  ;; Create a table of reserved C++ symbols and their associated replacements.
+  (let ((table (new STRING-HASH-TABLE)))
+    (foreach
+     word in (bquote
+              ;; NOTE: Can't add 'this' to the table, since first method
+              ;;       arguments get replaced with 'this' before translation.
+              ;; From B. Stroustrup, section r.2.4, page 479 (plus others):
+              (asm assert auto break case catch char class const
+                   continue default delete do double else enum extern
+                   float for friend goto if inline int long
+                   namespace new operator private protected public
+                   register return short signed sizeof static struct switch
+                   template #| this |# throw try typedef
+                   union unsigned virtual void volatile while
+                   ;; g++ needs this:
+                   typename))
+     do (insert-at
+         table
+         (symbol-name (cast word SYMBOL))
+         (cpp-yield-renamed-reserved-word word)))
+    ;; The next two are not really reserved identifiers, but
+    ;; they are renamed for readability (is this still needed?):
+    (insert-at table "++" (wrap-literal "stella_Increment"))
+    (insert-at table "--" (wrap-literal "stella_Decrement"))
+    (return table)))
+
+(defglobal *cpp-reserved-word-table*
+    (STRING-HASH-TABLE OF STRING STRING-WRAPPER)
+  (cpp-create-reserved-word-table))
+
+(defun (cpp-lookup-reserved-word-table STRING-WRAPPER) ((word SYMBOL))
+  ;; Check whether 'word' is a reserved C++ symbol, and if so, return
+  ;;    a properly renamed replacement.
+  ;; NOTE: We use the symbol name as the key instead of the symbol itself
+  ;;    to also make it work for symbols in different modules.  If at some
+  ;;    point the modules become part of identifier names this needs to
+  ;;    be fixed!
+  ;; TO DO: Maybe this should generate a warning.
+  (let ((entry (lookup *cpp-reserved-word-table* (symbol-name word))))
+    (if (defined? entry)
+        ;; Make sure we copy the wrapper:
+	(return (wrap-literal (wrapper-value entry)))
+      (return NULL))))
+    
+  ;;
+;;;;;; C++-translation of translation units:
+  ;;
+
+(defspecial *cpp-current-unit-module* MODULE NULL
+  :documentation "Home module of the currently translated unit.  Needed for
+proper name translation for units whose home module is different than the
+file module (occurs in some PowerLoom files - I thought we had outlawed that).")
+
+(defun (cpp-translate-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree representing a CL definition of
+  ;;    the object stored in 'unit'.
+  (special ((*cpp-current-unit-module* *module*))
+    (when (defined? (the-object unit))
+      (setq *cpp-current-unit-module* (home-module (the-object unit))))
+    (case (category unit)
+      (GLOBAL-VARIABLE
+       (return (cpp-translate-define-global-variable-unit unit)))
+      (CLASS
+       (return (cpp-translate-define-native-class-unit unit)))
+      (TYPE
+       (return NIL)) ;; ignore types for now
+      ((METHOD MACRO)
+       (return (cpp-translate-define-method-unit unit)))
+      (PRINT-METHOD
+       (return (cpp-translate-defprint-unit unit)))
+      ((STARTUP-TIME-PROGN VERBATIM)
+       (return (cpp-translate-a-tree (the-object unit)))))))
+
+  ;;
+;;;;;; 'cpp-translate-list-of-trees' and 'cpp-translate-a-tree'
+  ;;
+
+(defun (cpp-translate-list-of-trees CONS) ((trees CONS))
+  ;; Translate each parse tree in 'trees';
+  ;; Return the translated list of trees.
+  (let ((cursor trees))
+    (while (non-empty? cursor)
+      (setf (value cursor) (cpp-translate-a-tree (value cursor)))
+      (setq cursor (rest cursor)))
+    (return trees) ))
+
+
+(defun (cpp-translate-a-tree OBJECT) ((tree OBJECT))
+  ;; Translate 'tree', converting Stella constructs into constructs
+  ;;    which can be consumed by the C++ outputter.
+  ;; NOTE: CAREFUL ABOUT GARBAGE! FOR EVERY (REST ...) YOU HAVE
+  ;;   TO GC A CONS.  NEED TO MODIFY FUNCTIONS THAT ARE CALLED
+  ;;   TO RECEIVE ENTIRE TREE INSTEAD OF (REST TREE).
+  (typecase tree
+    (CONS
+     (when (nil? tree)
+       (return (cpp-translate-atomic-tree tree)))
+     (case (first tree)
+       ;; NOTE: specials aren't yet implemented
+       (SPECIAL (return (cpp-translate-special-tree tree)))
+       (VERBATIM (return (cpp-translate-verbatim-tree tree)))
+       (SYS-UNWIND-PROTECT (return (cpp-translate-unwind-protect tree)))
+       (SYS-SIGNAL (return (cpp-translate-signal tree)))
+       (SYS-HANDLER-CASE (return (cpp-translate-handler-case tree)))
+       (SYS-HANDLE-EXCEPTION (return (cpp-translate-handle-exception tree)))
+       (VOID-SYS (return (cpp-translate-void-sys tree)))
+       (BAD-SYS (return (cpp-translate-bad-sys tree)))
+       (TYPED-SYS            
+	(return (cpp-translate-typed-sys tree))) 
+       (SETQ (return (cpp-translate-setq-tree tree)))
+       (SYS-SLOT-VALUE
+	(return (cpp-translate-sys-slot-value tree)))
+       (SYS-REFERENCED-SLOT-VALUE
+	(return (cpp-translate-sys-referenced-slot-value tree)))
+       (SYS-SLOT-VALUE-SETTER
+	(return (cpp-translate-sys-slot-value-setter tree)))
+       (SYS-CALL-METHOD 
+	(return (cpp-translate-method-call (rest tree) FALSE)))
+       (SYS-REFERENCED-CALL-METHOD 
+	(return (cpp-translate-method-call (rest tree) TRUE)))
+       (SYS-CALL-FUNCTION
+	(return (cpp-translate-function-call (rest tree) NULL)))
+       (PROGN 
+	(return (cpp-translate-progn tree)))
+       (WITH-PROCESS-LOCK
+	(return (cpp-translate-with-process-lock tree)))
+       (LOOP				    
+	(return (cpp-translate-loop tree)))
+       (SYS-FOREACH
+	(return (cpp-translate-foreach-tree tree)))
+       (LET (return (cpp-translate-let-tree tree)))
+       (STARTUP-TIME-PROGN 
+	(return (cpp-translate-startup-time-progn tree)))
+       ((CAST SAFE-CAST) (return (cpp-translate-cast tree)))
+       (RETURN (return (cpp-translate-return-tree tree)))
+       (BREAK
+	(return (cpp-translate-break tree)))
+       (CONTINUE		
+	(return (cpp-translate-continue tree)))
+       (WHILE				
+	(return (cpp-translate-while tree)))
+       (IF (return (cpp-translate-if-tree tree)))
+       (CHOOSE (return (cpp-translate-choose-tree tree)))
+       (WHEN (return (cpp-translate-when-tree tree)))
+       (UNLESS (return (cpp-translate-unless-tree tree)))
+       ;; Q: ARE THESE HANDLED BY OPERATORS ALREADY?
+       ;; NOTE: NEED TO COMPLETE OPERATOR LIST
+       ((AND OR NOT EQ? > >= < <= ++ --)
+	(return (cpp-translate-operator-tree tree)))
+       (COND
+	(return (cpp-translate-cond-tree tree)))
+       (CASE                               
+	(return (cpp-translate-case-tree tree)))
+       (MAKE (return (cpp-translate-make-tree tree)))
+       (SYS-NEW (return (cpp-translate-sys-new tree)))
+       (MV-SETQ			
+	(return (cpp-translate-mv-setq tree)))
+       (SYS-CALL-FUNCTION-CODE
+	(return (cpp-translate-call-function-code tree)))
+       (SYS-CALL-METHOD-CODE
+	(return (cpp-translate-call-method-code tree)))
+       (SYS-INLINE-CALL
+        (return (cpp-translate-inline-call-tree tree)))
+       (THE-CODE
+	(return (cpp-translate-the-code tree)))
+       (SYS-POINTER-TO-FUNCTION
+	(return (cpp-translate-sys-pointer-to-function tree)))
+       ((INLINE IGNORE)			; NOT IMPLEMENTED
+	(return (cpp-translate-inline-tree tree)))    
+       (PRINT-STREAM (return (cpp-translate-print-stream tree)))
+       (PRINT-NATIVE-STREAM (return (cpp-translate-print-native-stream tree)))
+       ))
+    (otherwise
+     ;; CAREFUL: THIS MAY NOT WORK...
+     (when (null? tree) 
+       (return (cpp-translate-null)))
+     (return (cpp-translate-atomic-tree tree)))) )
+
+(defun (cpp-translate-verbatim-tree CONS) ((tree CONS))
+  ;; Return the code assigned to the :cpp option inside of '(rest tree)'.
+  (let ((cursor (rest tree))
+        (verbatimCode OBJECT NULL))
+    (while (non-empty? cursor)
+      (when (eq? (value cursor) :cpp)
+        (setq verbatimCode (value (rest cursor)))
+        (return (bquote (CPP_VERBATIM & verbatimCode))))
+      (setq cursor (rest (rest cursor))))
+    (error "Verbatim has no :cpp option")))
+
+(defun (cpp-translate-special-tree CONS) ((tree CONS))
+  ;; Translate a special tree into C++.
+  (safety 1 (eql? (special-implementation-style) :unbind-with-destructors)
+          "INTERNAL ERROR: Unexpected special implementation style")
+  (let ((oDeclarations CONS NIL)
+        (variable GLOBAL-VARIABLE NULL)
+        (variableName SYMBOL NULL)
+        (type TYPE-SPEC NULL)
+        (initialValueTree OBJECT NULL))
+    ;; this creates declarations of the form
+    ;;    BIND_STELLA_SPECIAL(oMY_SPECIALo, char*, val);
+    (foreach declaration in (cast (second tree) (CONS OF CONS))
+        do (setq variableName (first declaration))
+           (setq type (second declaration))
+           (setq initialValueTree (third declaration))
+           (setq variable (lookup-global-variable variableName))
+        collect
+          (bquote
+           (CPP_FUNCTION_CALL
+            (CPP_IDENT "BIND_STELLA_SPECIAL")
+            (CPP_ACTUALS
+             (CPP_IDENT
+              & (cpp-translate-global-name
+                 (cpp-fixup-name-symbol variableName (home-module variable))))
+             (CPP_IDENT & (cpp-translate-and-pointerize-type-spec type))
+             & (cpp-translate-a-tree initialValueTree))))
+        into oDeclarations)
+    (return
+      (bquote
+       (CPP_BLOCK ()
+        (CPP_STATEMENTS
+         && oDeclarations
+         && (cpp-translate-list-of-trees (rest (rest tree)))))))))
+
+(defun (cpp-translate-inline-tree CONS) ((tree CONS))
+  ;; Currently do nothing except stick tree in a comment
+  (ignore tree)
+  (return (bquote (CPP_COMMENT 
+		   & (wrap-literal "inline method")))) )
+
+(defun (tokenize-verbatim-method-body CONS) ((tree CONS))
+  ;; Tokenize the verbatim body of the method called in `tree' and determine
+  ;;    where the method's parameters are referenced.
+  ;; Returns a list of strings and CONSes where each string is a portion of
+  ;;    verbatim code that doesn't reference any parameters, and each CONS is
+  ;;    a (<parameter-name> <parameter-position>) pair.  Concatenating the
+  ;;    list of strings and embedded parameter names would yield the original
+  ;;    verbatim expression.
+  ;; Return NULL if any syntactic problems were encountered.
+  ;; This should work equally well for C++ and Java, however, it will
+  ;; lose if there is a function called whose name is the same as one of
+  ;;    the parameters (but that's also illegal in C++ so we don't care).
+  (let ((method METHOD-SLOT (slot-from-expression-tree tree))
+        (body
+         (wrapper-value
+          (cast
+           (lookup-verbatim-tree
+            (walk-verbatim-tree (inlinable-method-body method)) NULL)
+           VERBATIM-STRING-WRAPPER)))
+        (bodyStart 0)
+        (bodyLength (length body))
+        (parameters (new LIST))
+        (parameterPosition 0)
+        (identifierChars
+         ;; the `$' isn't really legal in C++, but hey...
+         "_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$")
+        (result NIL)
+        (ch CHARACTER NULL)
+        (cursor 0)
+        (end 0))
+    (foreach par in (method-parameter-names method)
+        collect (choose (eql? (translator-output-language) :cpp)
+                        (cpp-translate-name par)
+                        (java-translate-name par))
+        into parameters)
+    (loop
+      (when (>= cursor bodyLength)
+        (break))
+      (setq ch (nth body cursor))
+      (cond ((eql? ch #\/)
+             ;; we might have a comment:
+             (++ cursor)
+             (when (< cursor bodyLength)
+               (case (nth body cursor)
+                 (#\/
+                  ;; skip to the end of the line:
+                  (let ((comment (new STRING-INPUT-STREAM
+                                      :the-string (subsequence body cursor NULL))))
+                    (++ cursor (length (read-line comment)))))
+                 (#\*
+                  ;; skip to the close of the comment (we don't handle escapes):
+                  (setq cursor (string-search body "*/" cursor))
+                  (cond ((null? cursor)
+                         (walk-error "Illegal " (translator-output-language)
+                                     " verbatim code in " method)
+                         (return NULL))
+                        (otherwise
+                         (++ cursor 2))))
+                 (otherwise NULL))))
+            ((and (member? identifierChars ch)
+                  (not (digit-character? ch)))
+             ;; we are starting an identifier:
+             (setq end (1+ cursor))
+             (foreach i in (interval end (1- bodyLength))
+                 do (if (member? identifierChars (nth body i))
+                        (++ end)
+                      (break)))
+             (setq parameterPosition
+               (position parameters (subsequence body cursor end) NULL))
+             (when (defined? parameterPosition)
+               ;; we've found a parameter reference:
+               (pushq result (subsequence body bodyStart cursor))
+               (pushq result (bquote (& (nth parameters parameterPosition)
+                                        & parameterPosition)))
+               (setq bodyStart end))
+             (setq cursor end))
+            (otherwise
+             (++ cursor))))
+    (when (< bodyStart bodyLength)
+      (pushq result (subsequence body bodyStart bodyLength)))
+    (return (reverse result))))
+
+(defun (cpp-translate-inline-call-tree OBJECT) ((tree CONS))
+  ;; Inline a call to a function or method whose inlinable body
+  ;;    is a single verbatim expression.
+  (let ((callTree CONS (second tree))
+        (arguments
+         (choose (eql? (first callTree) (quote SYS-CALL-FUNCTION))
+                 (nth-rest callTree 2)
+                 (nth-rest callTree 3)))
+        (tokenizedBody (tokenize-verbatim-method-body callTree)))
+    (when (defined? tokenizedBody)
+      (let ((inlinedParameters (new LIST))
+            (inlinedBody STRING NULL)
+            (success? TRUE))
+	(special ((*current-stream* (new STRING-OUTPUT-STREAM)))
+	  (foreach token in tokenizedBody
+	      do (typecase token
+		   (STRING
+		    (print-stream *current-stream* (wrapper-value token)))
+		   (CONS
+		    (let ((parameter STRING-WRAPPER (first token))
+			  (position INTEGER-WRAPPER (second token))
+			  (argument (nth arguments position)))
+		      (when (not (side-effect-free-expression? argument))
+			(if (member? inlinedParameters parameter)
+                          (progn
+                            (setq success? FALSE)
+                            (break))
+			  (insert inlinedParameters parameter)))
+		      (unless (atomic-expression? argument)
+			;; parenthesize, to avoid precedence problems:
+			(print-stream *current-stream* "("))
+		      (cpp-output-statement
+		       (cpp-translate-a-tree
+			;; insulate us from destructiveness in case we have to punt:
+			(copy-cons-tree argument)))
+		      (unless (atomic-expression? argument)
+			(print-stream *current-stream* ")"))))))
+	  (setq inlinedBody
+	    (the-string (cast *current-stream* STRING-OUTPUT-STREAM)))
+	  (when success?
+	    (return (bquote (CPP_VERBATIM & (new VERBATIM-STRING-WRAPPER
+						 :wrapper-value inlinedBody))))))))
+    ;; Otherwise, we punt:
+    (return (cpp-translate-a-tree callTree))))
+
+(defun (cpp-translate-print-native-stream CONS) ((tree CONS))
+  ;; Translate "print-native-stream" statement.  Currently
+  ;;  almost identical to 'print-stream' except that we
+  ;;  label this code fragment "CPP_PRINT_NATIVE_STREAM" so
+  ;;  that a "->native_stream" doesn't get appended to the stream
+  ;;  in the stream body.
+  (let ((oTree (cpp-translate-print-stream tree)))
+    (setf (first oTree) (quote CPP_PRINT_NATIVE_STREAM))
+    (return oTree) ))
+
+(defun (cpp-translate-defprint-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Translate a print-object statement to a C++ angle-bracket overload
+  (let ((printForm (code-register unit))
+	(class CLASS (the-object unit))
+	(className STRING-WRAPPER NULL))
+    (setq className (cpp-translate-and-pointerize-type-spec
+		 (class-type class)))
+    (return
+      (bquote
+       (CPP_DEFPRINT
+	& className
+	(CPP_STATEMENTS
+	 & (cpp-translate-a-tree printForm) ;the print statment
+	 (CPP_RETURN (CPP_IDENT & (cpp-translate-name (quote stream)))))))) ))
+
+(defun (cpp-translate-signal CONS) ((tree CONS))
+  ;; Translate a signal statement into C++
+  ;; `tree' has form (sys-signal <exception-expression> <exception-type>)
+  (setf (first tree) (quote CPP_SIGNAL))
+  (setf (second tree)
+    (bquote
+     ;; we need to throw the exception object, not the pointer to it,
+     ;;    which means we need to dereference it here:
+     (CPP_DEREFERENCE
+      & (cpp-translate-a-tree (second tree)))))
+  (setf (rest (rest tree)) NIL)
+  (return tree) )
+
+(defun (cpp-translate-handler-case CONS) ((tree CONS))
+  (setf (first tree) (quote CPP_HANDLER_CASE))
+  (setf (rest tree)
+    (cpp-translate-list-of-trees (rest tree)))
+  (return tree))
+
+(defun (cpp-translate-handle-exception CONS) ((tree CONS))
+  ;; Input: (SYS-HANDLE-EXCEPTION (var type) code...).
+  ;; If `var' is NULL we don't need to access the exception object.
+  (let ((variableDecl CONS (second tree))
+        (variable (first variableDecl))
+        (exceptionType (second variableDecl))
+        (helperVariable STRING-WRAPPER NULL)
+        (helperVariableType STRING-WRAPPER NULL))
+    (setf (first tree) (quote CPP_CATCH))
+    ;; Slightly messy: if we have an exception variable, it has to be a
+    ;;    reference variable so we get all of the exception; however, the
+    ;;    STELLA functions operating on it expect a pointer type just as
+    ;;    they do for all other proper STELLA classes.  Therefore, we need
+    ;;    a helper variable here to do the type conversion.  Also,
+    ;;    `cpp-translate-and-pointerize-type-spec' needed to add a special
+    ;;    case to handle exception classes:
+    (when (defined? variable)
+      (setq helperVariable (concatenate "_" (cpp-translate-name variable)))
+      (setq helperVariableType
+        (string-concatenate (cpp-translate-type-spec exceptionType) "&")))
+    (setf (second tree)
+      (bquote
+       ((CPP_TYPE
+         & (choose (defined? variable)
+                   helperVariableType
+                   (cpp-translate-type-spec exceptionType)))
+        && (choose (defined? variable)
+                   (bquote ((CPP_IDENT & helperVariable)))
+                   NIL))))
+    (setf (rest (rest tree))
+      (cpp-translate-list-of-trees (rest (rest tree))))
+    (when (defined? variable)
+      (setf (rest (rest tree))
+        (bquote
+         ((CPP_LOCAL
+           & NULL
+           & (cpp-translate-and-pointerize-type-spec exceptionType)
+           (CPP_IDENT & (cpp-translate-name variable))
+           (CPP_IDENT & (string-concatenate "&" helperVariable)))
+           && (rest (rest tree))))))
+    (return tree)))
+
+(defun (cpp-translate-unwind-protect CONS) ((tree CONS))
+  (setf (first tree) (quote CPP_UNWIND_PROTECT))
+  (setf (rest tree)
+    (cpp-translate-list-of-trees (rest tree)))
+  (return tree))
+
+(defun (cpp-translate-cast CONS) ((tree CONS))
+  ;; Translate a cast
+  ;; `tree' has form (CAST <expression> <type>)
+  (let ((expression (second tree))
+        (type (type-spec-to-base-type (third tree))))
+    (when (and (subtype-of? type @FLOAT) (isa? expression @INTEGER-WRAPPER))
+      (return (cpp-translate-a-tree
+	       (wrap-literal (cast (wrapper-value (cast expression INTEGER-WRAPPER))
+				   @FLOAT)))))
+    (when (and (subtype-of? type @INTEGER) (isa? expression @FLOAT-WRAPPER))
+      (return (cpp-translate-a-tree
+	       (wrap-literal (cast (wrapper-value (cast expression FLOAT-WRAPPER))
+				   @INTEGER)))))
+    (setf (first tree) (quote CPP_CAST))
+    (setf (second tree) (cpp-translate-a-tree (second tree)))
+    (setf (third tree) (cpp-translate-and-pointerize-type-spec (third tree)))
+    (return tree) ))
+
+(defun (cpp-translate-mv-setq CONS) ((tree CONS))
+  ;; Translate a C++ multiple value setq
+  ;; "tree" has form '(MV-SETQ <variables> <statement>) 
+  ;; NOTE: THIS VERSION ASSUMES THAT <STATEMENT> IS A FUNCTION CALL!!
+  (let ((variables CONS (second tree))
+	(functionCall (third tree))
+	(oTree
+	 (bquote
+	  (CPP_ASSIGN 
+	   & (cpp-translate-a-tree (first variables))
+	   ;; NOTE: DON'T CALL CPP-TRANSLATE-A-TREE, AS WE WOULD
+	   ;;   IF SYS-MV-FUNCTION-CALL CAME OUT OF THE WALKER... 
+	   & (cpp-translate-mv-function-call functionCall (rest variables))))))
+    (return oTree) ))
+
+(defun (cpp-translate-mv-function-call CONS) 
+    ((functionCall CONS) (variables CONS))
+  ;; Translate a function call where the function returns multiple values
+  ;; Tack variables onto parameter list
+  (return (cpp-translate-a-tree
+	   (bquote (&& functionCall && variables)))) )
+
+(defun (cpp-translate-define-global-variable-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a parse tree declaring a global variable.  'tree'
+  ;;    has the form `(<global variable> <inital value>)'.
+  (let ((global GLOBAL-VARIABLE (the-object unit))
+        (type (global-variable-type-spec global))
+        (initialValueTree
+         (choose (eql? (code-register unit) :UNBOUND-SPECIAL-VARIABLE)
+                 NULL
+                 (cpp-translate-a-tree (code-register unit))))
+	(variableName
+	 (cpp-translate-global-name
+          (cpp-fixup-name-symbol
+           (variable-name global) (home-module global)))))
+    ;; disabled: this creates problems in C++, e.g. you can't return
+    ;;   a constant from a function that returns a non-constant.
+;    (when (variable-constant? global)
+;      (pushq typeList (wrap-literal "const")))
+    (cond ((variable-special? global)
+           (when (and (null? initialValueTree)
+                      (eql? (special-implementation-style)
+                            :unbind-with-destructors))
+             (setq initialValueTree
+               (cpp-translate-a-tree
+                (type-to-walked-null-value-tree
+                 (type-spec-to-base-type type)))))
+           (return
+             (bquote
+              (CPP_SPECIAL
+	       & (documentation global)
+               (CPP_TYPE & (cpp-translate-and-pointerize-type-spec type))
+               & variableName
+               && (choose (defined? initialValueTree)
+                          (cons initialValueTree NIL)
+                          NIL)))))
+          (otherwise
+           (return
+             (bquote
+              (CPP_GLOBAL 
+	       & (documentation global)
+               (CPP_TYPE & (cpp-translate-and-pointerize-type-spec type))
+               & variableName
+	       & initialValueTree)))))))
+
+(defun (symbol-case? BOOLEAN) ((keyform OBJECT))
+  ;; Return TRUE if the keyform of a case statement accesses the symbol-id
+  (typecase keyform
+    (CONS
+     (return 
+       (and (eql? (first keyform) (quote sys-slot-value))
+	    (eql? (third keyform) (quote symbol-id)))))
+    (otherwise
+     (return FALSE))) )
+
+(defun (cpp-yield-symbol-id-form CONS) ((symbolId INTEGER))
+  ;; Helping function for `cpp-translate-condition':
+  ;; Yield a form for the symbolic name of a symbol id given an integer
+  (let ((symbol (get-sym-from-offset symbolId)))
+    (return (bquote (CPP_IDENT & (cpp-translate-symbol-id symbol)))) ))
+
+(defun (cpp-translate-condition CONS) ((condition CONS) 
+					 (symbolCaseP BOOLEAN))
+  ;; Helping function for `cpp-translate-case-tree': translate
+  ;;   condition part of case.  If we're translating a symbol case,
+  ;;   translate integer offsets into symbolic constants.
+  (let ((translatedActions (bquote (CPP_STATEMENTS
+				    && (cpp-translate-list-of-trees 
+					(rest condition)))))
+	(keys (first condition))
+	(translatedKeys OBJECT NULL)
+	(translatedKeysList CONS NIL))
+    ;; If symbol case, keys are integers, translate them into symbolic ids
+    (if symbolCaseP
+      (if (cons? keys)
+	(progn            
+	  (foreach key in (cast keys CONS)
+		   collect (cpp-yield-symbol-id-form 
+			    (wrapper-value (cast key INTEGER-WRAPPER)))
+		   into translatedKeysList)
+	  (setq translatedKeys translatedKeysList))
+	(setq translatedKeys (cpp-yield-symbol-id-form 
+			      (wrapper-value (cast keys INTEGER-WRAPPER)))))
+      ;; Else we're not a symbol case
+      (setq translatedKeys
+	(choose (cons? keys)
+		(cpp-translate-list-of-trees 
+		 keys)
+		(cpp-translate-a-tree keys))))
+    (return (bquote ( & translatedKeys & translatedActions))) ))
+
+(defun (cpp-translate-case-tree CONS) ((tree CONS))
+  ;; Translate a case statement
+  (let ((otherwiseCondition CONS NULL)
+	(conditions CONS NIL)
+	(keyForm OBJECT NULL)
+	(symbolCaseP BOOLEAN FALSE))
+    (setq symbolCaseP (symbol-case? (second tree)))
+    (setq keyForm (cpp-translate-a-tree (second tree)))
+    (foreach condition in (rest (rest tree))
+	     do
+	     (typecase condition 
+		 (CONS
+		  (if (eq? (value condition) (quote OTHERWISE))
+		    (setq otherwiseCondition 
+		      (bquote 
+		       (CPP_STATEMENTS
+			&& (cpp-translate-list-of-trees (rest condition)))))
+		    
+		    (pushq
+		     conditions
+		     (cpp-translate-condition condition symbolCaseP))))))
+    ;; Clip for gc
+    (setf (rest (rest tree)) NIL)
+    (return (bquote (CPP_CASE 
+		     & keyForm
+		     & otherwiseCondition
+		     & (reverse conditions)))) ))
+
+(defun (cpp-translate-cond-tree CONS) ((tree CONS))
+  ;; Translate a cond statement
+  (let ((otherwiseCondition CONS NULL)
+	(conditions CONS NIL))
+    (foreach condition in (rest tree)
+	     do
+	     (typecase condition
+	       (CONS
+		(if (eq? (value condition) (quote OTHERWISE))
+		    (setq otherwiseCondition 
+		      (bquote 
+		       (CPP_PROGN
+			(CPP_STATEMENTS
+			 && (cpp-translate-list-of-trees (rest condition))))))
+	            (pushq
+		     conditions
+		     (bquote
+		      (& (cpp-translate-a-tree (first condition))
+			 (CPP_PROGN
+			  (CPP_STATEMENTS
+			   && (cpp-translate-list-of-trees 
+			       (rest condition)))))))))))
+    (return (bquote (CPP_COND & otherwiseCondition
+			      & (reverse conditions)))) ))
+
+(defun (cpp-translate-loop CONS) ((tree CONS))
+  ;; Translate a loop 
+  (let ((body (cpp-translate-list-of-trees (rest tree))))
+    (return
+      (bquote (CPP_LOOP
+	       (CPP_PROGN
+		(CPP_STATEMENTS 
+		 && body))))) ))
+
+(defun (cpp-translate-while CONS) ((tree CONS))
+  ;; Translate a while loop.
+  (let ((test (cpp-translate-a-tree (second tree)))
+        (body (cpp-translate-list-of-trees (rest (rest tree)))))
+    (setf (rest (rest tree)) NIL)      ; clip subtree before gc
+    (return
+      (bquote (CPP_WHILE
+	       & test
+	       (CPP_PROGN
+		(CPP_STATEMENTS
+		 && body))))) ))
+
+(defun (cpp-translate-progn CONS) ((tree CONS))
+  ;; Translate into a CPP_PROGN (i.e. a list of statements surround w/braces)
+  (return 
+    (bquote 
+     (CPP_PROGN 
+      (CPP_STATEMENTS
+       && (cpp-translate-list-of-trees (rest tree)))))) )
+
+(defun (cpp-translate-with-process-lock CONS) ((tree CONS))
+  ;; Translate into a CPP_WITH_PROCESS_LOCK (i.e. a list of synchronized statements
+  ;; surrounded w/braces guarded by a lock)
+  (return 
+    (bquote 
+     (CPP_WITH_PROCESS_LOCK
+      & (cpp-translate-a-tree (second tree))
+      (CPP_STATEMENTS
+       && (cpp-translate-list-of-trees (rest (rest tree))))))) )
+
+(defun (cpp-translate-break CONS) ((tree CONS))
+  ;; Translate a break statement within a loop
+  (setf (first tree) (quote CPP_BREAK))
+  (return tree) )
+
+(defun (cpp-translate-continue CONS) ((tree CONS))
+  ;; Translate a continue statement within a loop
+  (setf (first tree) (quote CPP_CONTINUE))
+  (return tree) )
+
+(defun (cpp-translate-if-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is an IF statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((test (cpp-translate-a-tree (second tree)))
+        (trueBody CONS (cpp-translate-a-tree (third tree)))
+	(falseBody CONS (cpp-translate-a-tree (fourth tree))))
+    (if (and (cons? (first trueBody))
+             (non-empty? (rest trueBody)))
+	(setq truebody (bquote (CPP_PROGN (CPP_STATEMENTS && trueBody))))
+        (setq truebody (bquote (CPP_PROGN (CPP_STATEMENTS & trueBody)))))
+    (if (and (cons? (first falseBody))
+             (non-empty? (rest falseBody)))
+	(setq falseBody (bquote (CPP_PROGN (CPP_STATEMENTS && falseBody))))
+        (setq falseBody (bquote (CPP_PROGN (CPP_STATEMENTS & falseBody)))))
+    (return 
+      (bquote (CPP_IF 
+	       & test 
+	       & truebody
+	       & falseBody))) ))
+
+(defun (cpp-translate-choose-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is a CHOOSE statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (return
+    (cpp-translate-operator-call 
+     (bquote (& (wrap-literal "?") & (wrap-literal ":")))
+     (rest tree)
+     3)))
+
+(defun (cpp-translate-when-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is a WHEN statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((test (cpp-translate-a-tree (second tree)))
+        (body (cpp-translate-list-of-trees (rest (rest tree)))))
+    (setf (rest (rest tree)) NIL)      ; detach before garbage collecting
+    (return 
+      (bquote (CPP_WHEN 
+	       & test 
+	       (CPP_STATEMENTS
+		&& body)))) ))
+
+(defun (cpp-translate-unless-tree CONS) ((tree CONS))
+  ;; Situation:  'tree' is a WHEN statement.
+  ;; Translate the test and body(ies) of 'tree'.
+  (let ((test (cpp-translate-a-tree (second tree)))
+        (body (cpp-translate-list-of-trees (rest (rest tree)))))
+    (setf (rest (rest tree)) NIL)      ; detach before garbage collecting
+    (return 
+      (bquote (CPP_UNLESS 
+	       & test 
+	       (CPP_STATEMENTS
+		&& body)))) ))
+
+(defun (cpp-translate-foreach-tree CONS) ((tree CONS))
+  ;; Translate a SYS-FOREACH tree.
+  ;; Tree has the form
+  ;;    (SYS-FOREACH ((<iterVar> <type> <constructor expression>)*)
+  ;;                 ((<cursorVar> <type> <next expression>)*)
+  ;;                 <continuation test> <body>)
+  (let ((iteratorBindings (CONS OF CONS) (second tree))
+        (cursorBindings (CONS OF CONS) (third tree))
+        (continuationTest (cpp-translate-a-tree (fourth tree)))
+        (body (cpp-translate-list-of-trees (nth-rest tree 4)))
+        (declaration NIL)
+        (declarations NIL)
+        (nextAssignments NIL)
+        (varArgsIterator SYMBOL NULL))
+    ;; Process cursor clauses (do this first, so user-supplied element
+    ;;    variables will appear first in the list of `declarations'):
+    (foreach binding in cursorBindings
+        do (pushq nextAssignments (cpp-translate-a-tree (third binding)))
+           (setq declaration
+             (bquote
+              (& (cpp-translate-and-pointerize-type-spec (second binding))
+                 & (cpp-translate-a-tree (first binding))
+                 & (cpp-translate-a-tree 
+                    (type-to-walked-null-value-tree
+                     (type-spec-to-base-type (second binding)))))))
+        collect declaration into declarations)
+    ;; Process iterator clauses:
+    (foreach binding in iteratorBindings
+        do (cond ((sub-type-spec-of? (second binding) @ARGUMENT-LIST-ITERATOR)
+                  ;; This implicitly handles `ARGUMENT-LIST.allocate-iterator'
+                  ;;    which should not be called explicitly anywhere else
+                  ;;    (see `cpp-translate-argument-list-tree'):
+                  (setq varArgsIterator (first binding))
+                  (setq declarations
+                    (concatenate
+                      declarations
+                      (cpp-yield-va-iterator-declarations varArgsIterator)))
+                  (continue))
+                 (otherwise
+                  (setq declaration
+                    (bquote
+                     (& (cpp-translate-and-pointerize-type-spec
+                         (second binding))
+                        & (cpp-translate-a-tree (first binding))
+                        & (cpp-translate-a-tree (third binding)))))))
+        collect declaration into declarations)
+    ;; Piece it all together:
+    (return
+      (bquote
+       (CPP_BLOCK
+        & declarations
+        (CPP_STATEMENTS
+         && (choose (defined? varArgsIterator)
+                    (cpp-yield-va-start-tree varArgsIterator)
+                    NIL)
+         (CPP_FOREACH & continuationTest
+                      & (reverse nextAssignments)
+                      & body)
+         && (choose (defined? varArgsIterator)
+                    (cpp-yield-va-end-tree varArgsIterator)
+                    NIL)))))))
+
+;;; Helper functions for iteration over a variable number of arguments:
+
+(defun (cpp-yield-va-start-tree CONS) ((iteratorVar SYMBOL))
+  ;; Helper function for `cpp-translate-foreach-tree'.
+  ;; Return a tree that generates a `va_start(<argPtr>, <firstArg>)'
+  ;;    statement necessary to initialize the iteration over a
+  ;;    variable number of arguments in C++.
+  (return
+    (bquote
+     ((CPP_FUNCTION_CALL
+       (CPP_IDENT & (cpp-translate-name (quote va_start)))
+       (CPP_ACTUALS
+        & (cpp-translate-a-tree iteratorVar)
+        & (cpp-translate-a-tree
+           (variable-arguments-name *methodBeingWalked*))))))))
+
+(defun (cpp-yield-va-end-tree CONS) ((iteratorVar SYMBOL))
+  ;; Helper function for `cpp-translate-foreach-tree'.
+  ;; Return a tree that generates a `va_end(<argPtr>)'
+  ;;    statement necessary to complete the iteration over a
+  ;;    variable number of arguments in C++.
+  (return
+    (bquote
+     ((CPP_FUNCTION_CALL
+       (CPP_IDENT & (cpp-translate-name (quote va_end)))
+       (CPP_ACTUALS & (cpp-translate-a-tree iteratorVar)))))))
+
+(defun (cpp-yield-va-iterator-helper-variable SYMBOL) ((iteratorVar SYMBOL))
+  ;; Helper function for `cpp-translate-foreach-tree'.
+  ;; Yield the name of an auxiliary variable to store the number of actual
+  ;;    arguments.  By using the helper variable instead of directly using
+  ;;    the parameter to control the loop, we can iterate over the argument
+  ;;    list multiple times.
+  (return (intern-symbol (concatenate (symbol-name iteratorVar) "-COUNT"))))
+
+(defun (cpp-yield-va-iterator-declarations CONS) ((iteratorVar SYMBOL))
+  ;; Helper function for `cpp-translate-foreach-tree'.
+  ;; Yield a list of declarations necessary to setup an iteration
+  ;;    over a variable arguments list.
+  (return
+    (bquote
+     ((& (cpp-translate-and-pointerize-type-spec @ARGUMENT-LIST-ITERATOR)
+         & (cpp-translate-a-tree iteratorVar))
+      (& (cpp-translate-and-pointerize-type-spec @INTEGER)
+         & (cpp-translate-a-tree
+            (cpp-yield-va-iterator-helper-variable iteratorVar))
+         & (cpp-translate-a-tree
+            (variable-arguments-name *methodBeingWalked*)))))))
+
+(defun (cpp-translate-argument-list-tree CONS)
+    ((operator SYMBOL) (owner TYPE) (argument OBJECT))
+  ;; Translate an argument-list related pseudo-method call.
+  (ignore owner)
+  (case operator
+    (ALLOCATE-ITERATOR
+     (walk-error "Cannot handle explicit calls to "
+                 "`ARGUMENT-LIST.ALLOCATE-ITERATOR' in C++")
+     (return
+       (cpp-translate-a-tree argument)))
+    (LENGTH
+     (return
+       (cpp-translate-a-tree
+        (variable-arguments-name *methodBeingWalked*))))
+    (NEXT?
+     (return
+       (bquote
+        (CPP_BINARY_OP
+         (CPP_UNARY_OP
+          & (cpp-translate-a-tree
+             (cpp-yield-va-iterator-helper-variable argument))
+          && (cpp-lookup-operator-table (quote --)))
+         && (cpp-lookup-operator-table (quote >))
+         (CPP_LITERAL & (wrap-literal 0))))))
+    (ARGUMENT
+     (return
+       (bquote
+        (CPP_FUNCTION_CALL
+         (CPP_IDENT & (cpp-translate-name (quote va_arg)))
+         (CPP_ACTUALS
+          & (cpp-translate-a-tree argument)
+          (CPP_IDENT
+           & (cpp-translate-and-pointerize-type-spec
+              (variable-arguments-type *methodBeingWalked*))))))))
+    (otherwise
+     (walk-error "Cannot translate call to " operator " on an `ARGUMENT-LIST'")
+     (return
+       (bquote
+        (CPP_FUNCTION_CALL
+         (CPP_IDENT & (cpp-translate-name operator))
+         (CPP_ACTUALS & (cpp-translate-a-tree argument))))))))
+
+(defun (cpp-translate-the-code CONS) ((tree CONS))
+  ;; Translate a pointer to code
+  (let ((oTree CONS NULL))
+    (case (second tree)
+      (:function
+       (setq oTree
+         (bquote
+          (CPP_CAST
+           (CPP_FUNCTION_POINTER 
+            & (cpp-translate-function-name-from-name (third tree)))
+           & (wrap-literal "cpp_function_code")))))
+      (:method
+       (setq oTree
+	 (bquote 
+	  (CPP_CAST
+	   (CPP_METHOD_POINTER
+	    & (cpp-translate-method-name-from-name (fourth tree) (third tree)))
+	   & (wrap-literal "cpp_method_code"))))))
+    (return oTree) ))
+
+(defun (cpp-translate-sys-pointer-to-function CONS) ((tree CONS))
+  ;; Translate a pointer to a function
+  (let ((functionName (wrapper-value (cpp-translate-name (second tree))))
+	(oTree CONS NULL))
+    (when (eql? (third tree) (quote true))
+      (setq functionName (concatenate functionName "_setter")))
+    (setq oTree (bquote (CPP_FUNCTION_POINTER & (wrap-literal functionName))))
+    (return oTree) ))
+    
+(defun (cpp-translate-sys-new CONS) ((tree CONS))
+  ;; Translate a NEW `tree' into a call to the appropriate constructor.
+  (let ((typeSpec TYPE-SPEC (second tree)))
+    (if (array-type-specifier? typeSpec)
+        (return (cpp-translate-new-array tree))
+      (return
+        (bquote (CPP_FUNCTION_CALL 
+                 (CPP_IDENT
+                  & (cpp-translate-name 
+                     (yield-constructor-name (type-spec-to-class typeSpec))))
+                 & (cpp-translate-actual-parameters (rest (rest tree)))))))))
+
+(defun (cpp-translate-new-array CONS) ((tree CONS))
+  ;; Translate a NEW `tree' for an array type.
+  (let ((arrayType PARAMETRIC-TYPE-SPECIFIER (second tree))
+        (initialElement
+         ;; NOTE: If this is `null?' as opposed to (quote NULL) or some other
+         ;;    value, it means we don't need to initialize the array:
+         ;; NOTE2: We ignore this for now until until we decide whether/how
+         ;;    to do that in C++ and Java.
+         (third tree))
+        (dimensions (cpp-translate-list-of-trees (rest (rest (rest tree)))))
+        (elementType (extract-parameter-type arrayType (quote ANY-VALUE))))
+    (return
+      (bquote
+       (CPP_FUNCTION_CALL
+        (CPP_IDENT
+         & (choose (cpp-use-garbage-collector?) "new (GC)" "new"))
+        (CPP_ACTUALS
+         (CPP_ARRAY_REFERENCE
+          (CPP_IDENT & (cpp-translate-and-pointerize-type-spec elementType))
+          && dimensions)))))))
+
+(defun (cpp-translate-void-sys CONS) ((tree CONS))
+  ;; Skip over SYS operator and translate the embedded tree.
+  ;; COMPARE WITH CL VERSION: THE SECOND LIST MEMBER ISN'T A TYPE
+  (return (cpp-translate-a-tree (second tree))))
+
+(defun (cpp-translate-typed-sys CONS) ((tree CONS))
+  ;; Translate a typed sys.  This can downcast method calls if
+  ;;   the return type of a method should be narrower than the declared
+  ;;   return type
+  (return (cpp-translate-a-tree (second tree))))
+
+(defun (cpp-translate-bad-sys OBJECT) ((tree CONS))
+  ;; Emit a tree that won't compile in C++.
+  (let ((returnType (third tree)))
+    (if (eql? returnType @VOID)
+      (return
+        (bquote
+         (CPP_FUNCTION_CALL
+          (CPP_IDENT
+           "illegal_stella_statement_flagged_by_the_translator"))))
+      (return
+        (bquote
+         (CPP_IDENT
+          "illegal_stella_expression_flagged_by_the_translator"))))))
+
+(defun (cpp-translate-sys-referenced-slot-value CONS) ((tree CONS))
+  ;; Translate a referenced slot-value statement, i.e., one whose
+  ;;   base object is a reference object, not a pointer.
+  (let ((objectRef (fourth tree))
+	(slotName (third tree)))
+    (return
+      (bquote (CPP_REFERENCED_SLOT_VALUE & (cpp-translate-a-tree objectRef)
+                                         & (cpp-translate-name slotName))))))
+
+(defun (cpp-translate-sys-slot-value CONS) ((tree CONS))
+  ;; Translate a slot-value statement.
+  (let ((objectType TYPE (second tree))
+	(objectRef (fourth tree))
+	(slotName (true-slot-name (third tree) objectType)))
+    (return
+      (bquote (CPP_SLOT_VALUE & (cpp-translate-a-tree objectRef)
+                              & (cpp-translate-name slotName))))))
+
+(defun (cpp-translate-sys-slot-value-setter CONS) ((tree CONS))
+  ;; Translate a slot-value-setter statement.
+  (let ((objectRef (fourth tree))
+	(objectType TYPE (second tree))
+	(slotName (true-slot-name (third tree) objectType))
+	(valueRef (cpp-translate-a-tree (fifth tree)))
+	(oTree
+	 (bquote (CPP_SLOT_VALUE_SETTER
+		  & (cpp-translate-a-tree objectRef)
+		  & (cpp-translate-name slotName)
+		  & valueRef))))
+    ;; Clip tree for GC
+    (setf (third tree) NULL)
+    (setf (fourth tree) NULL)
+    (setf (fifth tree) NULL)
+    (return oTree) ))
+
+(defun (cpp-translate-make-tree CONS) ((tree CONS))
+  ;; Translate a make statement into a call to `new'.
+  (let ((className SYMBOL (second tree))
+        (class (lookup-class className))
+        (nativeType (class-cpp-native-type class))
+        (arguments (cpp-translate-actual-parameters (rest (rest tree)))))
+    (cond ((null? nativeType)
+           (return
+             (bquote
+              (CPP_MAKE (CPP_IDENT & (cpp-translate-class-name className))
+                        & arguments))))
+          ((cpp-native-pointer-type? nativeType)
+           (return
+             (bquote
+              (CPP_MAKE (CPP_IDENT & (cpp-unpointerize-native-type nativeType))
+                        & arguments))))
+          (otherwise
+           ;; should we extend the definition of `CPP_MAKE' to handle this?
+           (return
+             (bquote
+              (CPP_FUNCTION_CALL
+               (CPP_IDENT & nativeType)
+               & arguments)))))))
+
+(defun (cpp-translate-startup-time-progn CONS) ((tree CONS))
+  ;; Translate initiialize time form
+  (let ((oTree (cpp-translate-a-tree (second tree))))
+    (setf (rest tree) NIL)
+    (return (bquote (CPP_STARTUP_TIME_PROGN & otree))) ))
+
+(defun (cpp-stream-is-standard-output? BOOLEAN) ((tree OBJECT))
+  ;; Return TRUE if 'tree' is the native STANDARD-OUTPUT stream.
+  (typecase tree
+    (CONS
+     (return
+       (equal-cons-trees?
+        tree
+        (quote
+         (SYS-SLOT-VALUE @OUTPUT-STREAM NATIVE-STREAM STANDARD-OUTPUT)))))
+    (otherwise (return FALSE))))
+
+(defun (cpp-translate-print-stream CONS) ((tree CONS))
+  ;; Translate a print statement to a C++ stream output statement.
+  (setf (first tree) (quote CPP_PRINT_STREAM))
+  (typecase (second tree)
+    (KEYWORD
+     (case (second tree)
+       ((:WARN :ERROR :CONTINUABLE-ERROR) 
+	(setf (second tree) (quote CPP_STANDARD_ERROR)))))
+    (otherwise
+     (if (cpp-stream-is-standard-output? (second tree))
+         ;; Special-case standard output:
+         (setf (second tree) (quote CPP_STANDARD_OUT))
+       (setf (second tree) (cpp-translate-a-tree (second tree))))))
+  (foreach it on (rest (rest tree))
+      do (if (eql? (value it) (quote EOL))
+             (setf (value it) (quote (CPP_IDENT "std::endl")))
+           (setf (value it) (cpp-translate-a-tree (value it)))))
+  (return tree))
+
+(defun (cpp-translate-setq-tree CONS) ((tree CONS))
+  ;; Translate a setq statement into a C++ assignment statement.
+  (let ((global (lookup-global-variable (cast (second tree) SYMBOL))))
+    (if (and (defined? global)
+             (variable-special? global)
+             (eql? (special-implementation-style) :unbind-with-destructors))
+        (return
+          (bquote
+           (CPP_REFERENCED_METHOD_CALL
+            NULL
+            (CPP_IDENT & (cpp-translate-name (quote set)))
+            (CPP_IDENT & (cpp-translate-global-name
+                          (cpp-fixup-name-symbol
+                           (second tree) (home-module global))))
+            (CPP_ACTUALS
+             & (cpp-translate-a-tree (third tree))))))
+      (return
+        (bquote (CPP_ASSIGN
+                 & (cpp-translate-a-tree (second tree))
+                 & (cpp-translate-a-tree (third tree))))))))
+
+(defun (cpp-translate-null CONS) ()
+  ;; Return a representation of NULL
+  (return (bquote (CPP_IDENT & (wrap-literal "NULL")))) )
+
+(defmethod (cpp-translate-atomic-tree CONS) ((tree OBJECT))
+  ;; Return the value of the atom wrapped in a list.  
+  (return (bquote (CPP_LITERAL & tree))) )
+
+(defmethod (cpp-translate-atomic-tree CONS) ((tree KEYWORD))
+  (if (use-hardcoded-symbols?)
+      (return (bquote (CPP_SYMBOL & tree)))
+    (return (cpp-translate-atomic-tree (yield-symbol-constant-name tree)))))
+
+(defmethod (cpp-translate-atomic-tree CONS) ((tree SURROGATE))
+  (if (use-hardcoded-symbols?)
+      (return (bquote (CPP_SYMBOL & tree)))
+    (return (cpp-translate-atomic-tree (yield-symbol-constant-name tree)))))
+
+(defmethod (cpp-translate-atomic-tree CONS) ((tree SYMBOL))
+  ;; Return the value of the atom wrapped in a list.  
+  (let ((globalVar (lookup-global-variable (soft-permanentify tree))))
+    (cond 
+     ;; Global variable?
+     ((defined? globalVar)
+      (let ((otree (bquote (CPP_IDENT & (cpp-translate-global-name tree)))))
+        (when (and (variable-special? globalVar)
+                   (eql? (special-implementation-style)
+                         :unbind-with-destructors))
+          (setq otree
+            (bquote
+             (CPP_REFERENCED_METHOD_CALL
+              NULL
+              (CPP_IDENT & (cpp-translate-name (quote get)))
+              & otree
+              (CPP_ACTUALS)))))
+        (return otree)))
+     (otherwise 
+      (return (bquote (CPP_IDENT & (cpp-translate-name tree))))))))
+
+(defmethod (cpp-translate-atomic-tree CONS) ((tree QUOTED-EXPRESSION))
+  ;; Special handling of quoted expressions: translate to the offset
+  ;;   that the quoted-expression represents.  
+  ;; CAREFUL: This changes the semantics of GET-QUOTE
+  ;; QUESTION: IN GENERAL, WHEN NON-LITERAL OBJECTS ARE BEING TRANSLATED,
+  ;;   HOW DO WE GET AT (I.E., OBTAIN REFERENCES TO) THOSE OBJECTS?
+  ;; TODO: SEE HOW LISP TRANSLATOR DOES IT.
+  (return (bquote (CPP_LITERAL 
+		   & tree))) )
+
+(defun (cpp-translate-let-tree CONS) ((tree CONS))
+  ;; Called by 'cpp-translate-a-tree'.
+  ;; Translate a let statement to a C++ block.
+  (let ((oDeclarations CONS NIL))
+    (foreach declaration in 
+	     (cast (second tree) CONS)	; translate each declaration:
+             do
+	     (let ((d CONS declaration))
+	       (pushq oDeclarations
+		      ;; TODO: CONDITIONALLY POINTERIZE TYPE-SPECS.
+		      ;;   NEED ROUTINE WHICH ABSTRACTS THIS.  DON'T
+		      ;;   WANT TO POINTERIZE INTS, ETC.
+		      (bquote (& (cpp-translate-and-pointerize-type-spec
+				  (second d))
+				 & (cpp-translate-a-tree (first d))
+				 & (cpp-translate-a-tree (third d)))))))
+    (return (bquote (CPP_BLOCK & (reverse oDeclarations) 
+                               (CPP_STATEMENTS
+                                && (cpp-translate-list-of-trees
+                                    (rest (rest tree)))))))))
+
+(defun (cpp-translate-type-spec STRING-WRAPPER) ((typeSpec TYPE-SPEC))
+  ;; Translate a type specifier to a C++ type.
+  ;; For now, convert parameteric types to their base types
+  (typecase typeSpec
+    (PARAMETRIC-TYPE-SPECIFIER
+     (when (array-type-specifier? typeSpec)
+       (return (cpp-translate-array-type typeSpec)))
+     (case (translator-output-language)
+       ;; If we're outputting "raw" (i.e. non-stella C++), output
+       ;;   parametric types as template:
+       (:cpp-standalone
+        (return
+          (concatenate
+            (wrapper-value
+             (cpp-translate-type-spec (specifier-base-type typeSpec)))
+            "<"
+            (cpp-translate-and-pointerize-type-spec
+             (first (specifier-parameter-types typespec)))
+            ">")))
+       (:cpp
+        (return (cpp-translate-type-spec (specifier-base-type typeSpec))))))
+    (TYPE
+     (cond
+      ((defined? (class-cpp-native-type (type-class typeSpec)))
+       (return (wrap-literal (class-cpp-native-type (type-class typeSpec)))))
+      (otherwise
+       ;; Do a double-dereference to get a class's true name
+       (return (cpp-translate-class-typename
+		(symbolize (class-type (type-class typeSpec)))))))) ))
+
+(defun (cpp-translate-and-pointerize-type-spec STRING-WRAPPER) 
+    ((typeSpec TYPE-SPEC))
+  ;; Convert a C++ type spec to a pointer to type-spec.
+  ;; This implements the conversion from implicit use of pointers
+  ;;   in Stella (and Lisp) to explicit use of pointers in C++
+  ;; NOTE: This does not pointerize non-object (i.e. literal) types
+  (let ((baseType TYPE (type-spec-to-base-type typeSpec))
+        (translatedType (cpp-translate-type-spec typeSpec)))
+
+    (when (or (create-native-class? (type-class baseType))
+              ;; Ugly, need to special-case native exception classes, since
+              ;;    their native type can't be a pointer type, but they need
+              ;;    to be pointerized just like the STELLA classes that
+              ;;    specialize them:
+              (exception-class? (type-class baseType)))
+      (setf (wrapper-value translatedType)
+	(concatenate (wrapper-value translatedType) "*")))
+    (return translatedType) ))
+
+(defun (cpp-translate-and-referencize-type-spec STRING-WRAPPER) 
+    ((typeSpec TYPE-SPEC))
+  ;; Convert a C++ type spec to a pointer to type-spec.
+  ;; This implements the conversion from implicit use of pointers
+  ;;   in Stella (and Lisp) to explicit use of pointers in C++
+  ;; NOTE: UNLIKE THE SIMILAR POINTERIZE ROUTINE, THIS *DOES*
+  ;;   REFERENCIZE NON-OBJECT (I. E. LITERAL) TYPES
+  (let ((baseType TYPE (type-spec-to-base-type typeSpec))
+        (translatedType (cpp-translate-type-spec typeSpec)))
+    (setf (wrapper-value translatedType)
+      (choose
+       (cpp-translated-array-type? translatedType)
+       (cpp-generate-array-typed-entity "&" translatedType)
+       (concatenate
+         (wrapper-value translatedType)
+         (choose (create-native-class? (type-class baseType))
+                 "*&"
+                 "&"))))
+    (return translatedType) ))
+
+(defun (cpp-translate-array-type STRING-WRAPPER)
+    ((arrayType PARAMETRIC-TYPE-SPECIFIER))
+  ;; Translate `arrayType' into an appropriate C++ type.
+  ;; We treat all array types as unspecified in the first dimension
+  ;;    by translating them into pointers.  This allows us to store
+  ;;    such partially unspecified array references in variables and
+  ;;    slots.  Only multi-dimensional arrays need to have their higher
+  ;;    dimensions specified.  For example:
+  ;;
+  ;;       (ARRAY () OF T)             T*
+  ;;       (ARRAY (()(10)) OF T)       T (*)[10]
+  ;;       (ARRAY (()(10)(20)) OF T)   T (*)[10][20]
+  ;;
+  ;; Unfortunately, C++ array types are absolutely bizarre and require
+  ;;    the variable name (or similar) to be folded inside of the type
+  ;;    specifier, e.g., `T (*foo)[10]', which breaks the standard
+  ;;    convention of `<type> <var>' for typing variables and makes it
+  ;;    necessary to handle them differently from everything else - arrgh.
+  ;; NOTE: Since we don't allow nested arrays, we don't have to deal with
+  ;;    the even more bizarre types that would result from them.
+  (let ((dimensions (array-type-dimensions arrayType))
+        (elementType (extract-parameter-type arrayType (quote ANY-VALUE)))
+        (translatedType "")
+        (temp STRING NULL))
+    (when (= (length dimensions) 1)
+      ;; special-case 1-dimensional arrays, since they look like normal types:
+      (return
+        (concatenate
+          (wrapper-value
+           (cpp-translate-and-pointerize-type-spec elementType)) "*")))
+    (foreach dim in dimensions
+        as i in (interval 0 NULL)
+        do (cond ((= i 0)
+                  (setq temp "(*)"))
+                 ((null? dim)
+                  (setq temp "[]"))
+                 (otherwise
+                  (setq temp (concatenate "[" (stringify dim) "]"))))
+           (setq translatedType (concatenate translatedType temp)))
+    (when (array-type-specifier? elementType)
+      ;; nested array types are already caught earlier, but just in case:
+      (walk-error "Can't yet handle nested arrays in C++: " arrayType)
+      (setq elementType @UNKNOWN))
+    (setq temp (cpp-translate-and-pointerize-type-spec elementType))
+    (setq translatedType (concatenate temp " " translatedType))
+    (return translatedType)))
+
+(defun (cpp-translated-array-type? BOOLEAN) ((translatedType OBJECT))
+  ;; Return true if `translatedType' is a translated array type.
+  (typecase translatedType
+    (CONS (return (cpp-translated-array-type? (last translatedType))))
+    (STRING
+     (let ((transType (wrapper-value translatedType)))
+       (return
+         (and (eql? (nth transType (1- (length transType))) #\])
+              (or (defined? (string-search transType "(*)" 0))
+                  (defined? (string-search transType "(*&)" 0)))))))
+    (otherwise NULL))
+  (return FALSE))
+
+(defun (cpp-generate-array-typed-entity STRING)
+    ((entity STRING) (translatedArrayType STRING))
+  ;; Type `entity' to be of `translatedArrayType' by folding it inside
+  ;;    at the appropriate position (needed, since those bizarre C++
+  ;;    array types wrap around objects instead of just preceding them).
+  (let ((referenceType?
+         (defined? (string-search translatedArrayType "(*&)" 0))))
+    (if referenceType?
+        (return
+          (replace-substrings
+           translatedArrayType (concatenate "(*&" entity ")") "(*&)"))
+      (return
+        (replace-substrings
+         translatedArrayType (concatenate "(*" entity ")") "(*)")))))
+
+(defun (cpp-native-pointer-type? BOOLEAN) ((nativeType STRING))
+  ;; Return true if `nativeType' is a native C++ pointer type.
+  ;; Needed by `cpp-translate-make-tree' to see what type of constructor
+  ;;    call is needed for a user-specified native type.
+  (let ((length (length nativeType)))
+    (foreach i in (interval 1 length)
+        do (case (nth nativeType (- length i))
+             ((#\Space #\Tab #\Linefeed #\Return)
+              (continue))
+             (#\*
+              (return TRUE))
+             (otherwise
+              (break))))
+    (return FALSE)))
+
+(defun (cpp-unpointerize-native-type STRING) ((nativeType STRING))
+  ;; If `nativeType' is a native C++ pointer type return its non-pointer
+  ;;    analogue; otherwise, return `nativeType'.
+  ;; Needed by `cpp-translate-make-tree'.
+  (let ((length (length nativeType)))
+    (foreach i in (interval 1 length)
+        do (case (nth nativeType (- length i))
+             ((#\Space #\Tab #\Linefeed #\Return)
+              (continue))
+             (#\*
+              (return (subsequence nativeType 0 (- length i))))
+             (otherwise
+              (break))))
+    (return nativeType)))
+
+
+;; Support for forbidden character substitution in C++ names:
+
+(defun (cpp-create-character-substitution-table STRING) ()
+  ;; Create a C++ character substitution table that can be used
+  ;;    to map illegal C++ characters onto legal replacements.
+  ;; Entry i in the table defines the substitution for the
+  ;;    character '(code-character i)'.
+  ;; Legal C++ characters are mapped onto #\= (instead of themselves)
+  ;;    to indicate that no substitution is necessary.
+  (let ((table (make-mutable-string 256 #\_))) ;; default substitution is #\_
+    ;; Legal characters are indicated with an #\= sign:
+    (foreach code in (interval (character-code #\0) (character-code #\9))
+             do (setf (nth table code) #\=))
+    (foreach code in (interval (character-code #\A) (character-code #\Z))
+             do (setf (nth table code) #\=))
+    (foreach code in (interval (character-code #\a) (character-code #\z))
+             do (setf (nth table code) #\=))
+    (setf (nth table (character-code #\_)) #\=)
+    ;; Mapping for other printing characters:
+    (setf (nth table (character-code #\ )) #\_)
+    (setf (nth table (character-code #\!)) #\X) ;; eXclamation
+    (setf (nth table (character-code #\")) #\_)
+    (setf (nth table (character-code #\#)) #\H) ;; Hash
+    (setf (nth table (character-code #\$)) #\B) ;; Buck
+    (setf (nth table (character-code #\%)) #\R) ;; peRcent
+    (setf (nth table (character-code #\&)) #\A) ;; Ampersand
+    (setf (nth table (character-code #\')) #\Q) ;; Quote
+    (setf (nth table (character-code #\()) #\_)
+    (setf (nth table (character-code #\))) #\_)
+    (setf (nth table (character-code #\*)) #\O) ;; simply cute
+    (setf (nth table (character-code #\+)) #\I) ;; Increase
+    (setf (nth table (character-code #\,)) #\_)
+    (setf (nth table (character-code #\-)) #\_)
+    (setf (nth table (character-code #\.)) #\D) ;; Dot
+    (setf (nth table (character-code #\/)) #\S) ;; Slash
+    ;; Here go #\0 to #\9.
+    (setf (nth table (character-code #\:)) #\C) ;; Colon
+    (setf (nth table (character-code #\;)) #\_)
+    (setf (nth table (character-code #\<)) #\L) ;; Less than
+    (setf (nth table (character-code #\=)) #\E) ;; Equal
+    (setf (nth table (character-code #\>)) #\G) ;; Greater than
+    (setf (nth table (character-code #\?)) #\P) ;; Predicate
+    (setf (nth table (character-code #\@)) #\M) ;; Monkey tail
+    ;; Here go #\A to #\Z.
+    (setf (nth table (character-code #\[)) #\J) ;; Arbitrary (array index?)
+    (setf (nth table (character-code #\\)) #\_)
+    (setf (nth table (character-code #\])) #\K) ;; Arbitrary (array index?)
+    (setf (nth table (character-code #\^)) #\U) ;; Up arrow
+    ;; Here goes #\_.
+    (setf (nth table (character-code #\`)) #\_)
+    ;; Here go #\a to #\z.
+    (setf (nth table (character-code #\{)) #\Y) ;; Arbitrary (adjacent free letter)
+    (setf (nth table (character-code #\|)) #\V) ;; Vertical bar
+    (setf (nth table (character-code #\})) #\Z) ;; Arbitrary (adjacent free letter)
+    (setf (nth table (character-code #\~)) #\T) ;; Tilde
+    (return table)))
+
+(defglobal *cpp-character-substitution-table* STRING
+  (cpp-create-character-substitution-table))
+
+(defun (replace-first-character-with-string STRING)
+    ((string STRING) (newPrefix STRING))
+  ;; Replace the first character of 'string' with 'newPrefix'.
+  ;; Similar to 'replace-character-with-substring'.
+  (return (string-concatenate newPrefix (subsequence string 1 NULL))))
+
+(defun (cpp-substitute-forbidden-characters STRING)
+    ((name STRING) (caseConvention KEYWORD))
+  ;; Substitute all forbidden characters in 'name' (e.g., '-', '*', etc.),
+  ;;    with legal C++ characters from *cpp-character-substitution-table*.
+  ;; 'caseConvention' indicates the case for 'name' and has to be one of
+  ;;    :uppercase, :lowercase, or :capitalized.  Replacement characters
+  ;;    will be changed into the opposite case to avoid name clashes.
+  ;; If no substitutions were necessary, the unmodified and uncopied
+  ;;    'name' will be returned.
+  (let ((result MUTABLE-STRING NULL)
+        (substitution CHARACTER NULL))
+    (case (nth name 0)
+      ;; Handle leading digits:
+      (#\0 (setq result (replace-first-character-with-string name "zero")))
+      (#\1 (setq result (replace-first-character-with-string name "one")))
+      (#\2 (setq result (replace-first-character-with-string name "two")))
+      (#\3 (setq result (replace-first-character-with-string name "three")))
+      (#\4 (setq result (replace-first-character-with-string name "four")))
+      (#\5 (setq result (replace-first-character-with-string name "five")))
+      (#\6 (setq result (replace-first-character-with-string name "six")))
+      (#\7 (setq result (replace-first-character-with-string name "seven")))
+      (#\8 (setq result (replace-first-character-with-string name "eight")))
+      (#\9 (setq result (replace-first-character-with-string name "nine")))
+      (otherwise (setq result name)))
+    (foreach
+     i in (interval 0 (- (length result) 1))
+     do
+     (setq substitution
+       (nth *cpp-character-substitution-table*
+            (character-code (nth result i))))
+     (when (not (eq? substitution #\=))
+       ;; We need a substitution.
+       (case caseConvention
+         (:uppercase (setf (nth result i) (downcase-character substitution)))
+         (:lowercase (setf (nth result i) (upcase-character substitution)))
+         (:capitalized
+          ;; TO DO: This should do something different at word boundaries.
+          (setf (nth result i) (upcase-character substitution))))))
+    (return result)))
+
+(defun (cpp-change-case STRING)
+    ((symbol GENERALIZED-SYMBOL) (caseConvention KEYWORD))
+  ;; Change the case of `symbol' according to `caseConvention' and return
+  ;;    a copy of the modified symbol name.
+  ;; Do not perform any case change if the home module of `symbol' is
+  ;;    case-sensitive, but still return a copy of the symbol name.
+  (return
+    (memoize (symbol caseConvention *module*)
+             :max-values 2000
+             (help-cpp-change-case symbol caseConvention))))
+
+(defun (help-cpp-change-case STRING)
+    ((symbol GENERALIZED-SYMBOL) (caseConvention KEYWORD))
+  ;; Helper function for `cpp-change-case' to allow memoization.
+  (let ((module (interned-in symbol))
+        (name (symbol-name symbol)))
+    (when (null? module)
+      (setq module *module*))
+    (when (or (case-sensitive? module)
+	      (not (eq? (compute-symbol-escape-code name false) :unescaped)))
+      (return 
+	(make-matching-name-full name
+				 :no :no "- "
+				 "" "" "" ""
+				 :preserve "_")))
+    (case caseConvention
+      (:uppercase 
+       (return (make-matching-name-full name
+					:no :no "- "
+					"" "" "" ""
+					:upcase "_")))
+      (:lowercase 
+       (return (make-matching-name-full name
+					:clever :clever "- "
+					"" "" "" ""
+					:titlecaseX "")))
+      (:capitalized 
+       (return (make-matching-name-full name
+					:clever :clever "- "
+					"" "" "" ""
+					:titlecase ""))) )))
+
+(defun (cpp-yield-namespace-prefix-from-module STRING) ((module MODULE))
+  ;; Generate a package prefix for definitions that reside in `module'
+  ;;    based on the module hierarchy and associated package specifications.
+  ;; The prefix is generated based on the following rules:
+  ;;    - If module is NULL the prefix for `*module*' will be generated.
+  ;;    - If module has a package specified explicitly, it will be used.
+  ;;    - Otherwise, the package of the closest parent of `module'
+  ;;      will be used plus a relative module path to disambiguate against
+  ;;      sibling modules.
+  ;; TO DO:
+  ;;    - THIS NEEDS WORK TO USE RELATIVE MODULE PATHS
+  (when (null? module)
+    (setq module *module*))
+  (let ((packagePrefix (cpp-package module))
+        (packagePrefixInherited?
+         ;; Use 'slot-value' to disable the default:
+         (null? (slot-value module module-cpp-package))))
+    (cond (packagePrefixInherited?
+           (let ((relativeModulePath
+                  ;; What we really want here is the relative name to the
+                  ;;    closest parent that has an explicit native package,
+                  ;;    and we also don't want slashes:
+                  (module-full-name module)))
+             (return
+               (concatenate
+                 packagePrefix
+                 (cpp-substitute-forbidden-characters
+                  (substitute (string-downcase relativeModulePath) #\_ #\/)
+                  :lowercase)))))
+          (otherwise
+           (return packagePrefix)))))
+
+(defun (cpp-yield-namespace-prefix STRING) ((symbol GENERALIZED-SYMBOL))
+  ;; Generate a package prefix for the global name `symbol' based on its
+  ;;    home module and any associated package specifications.
+  (return (cpp-yield-namespace-prefix-from-module (interned-in symbol))))
+
+;;; one of :FULL, :CLEVER or :NONE:
+(defspecial *cpp-name-qualification-mode* KEYWORD :CLEVER)
+
+(defun (cpp-name-qualification-mode KEYWORD) ()
+  :globally-inline? TRUE
+  (return *cpp-name-qualification-mode*))
+
+(defun (cpp-qualify-name? BOOLEAN) ((nameSymbol GENERALIZED-SYMBOL))
+  ;; Return TRUE if `nameSymbol' needs to be qualified with a namespace
+  ;;    prefix according to the current qualification mode and potential
+  ;;    ambiguities introduced by inherited symbols.
+  (let ((symbolModule (interned-in nameSymbol))
+        (namespaceModule (first-defined *cpp-current-unit-module* *module*)))
+    (when (or (null? symbolModule)
+              ;; are there others that we need to exclude?
+              (eql? nameSymbol (quote NULL)))
+      ;; transient symbol, must be a local variable:
+      (return FALSE))
+    (when (and (symbol? nameSymbol)
+               (native-name? nameSymbol :cpp NULL))
+      ;; we have a native C++ definition with the same name, avoid ambiguity:
+      (return TRUE))
+    (case (cpp-name-qualification-mode)
+      (:FULL (return TRUE))
+      (:NEVER (return FALSE))
+      (:CLEVER
+       ;; try to qualify the symbol only if we really need to:
+       (cond
+        ((eql? symbolModule namespaceModule)
+         (return FALSE))
+        ((not (visible-from? symbolModule namespaceModule))
+         (return TRUE))
+        (otherwise
+         (typecase nameSymbol
+           (SYMBOL
+            (return
+              (non-empty?
+               (rest (lookup-visible-symbols-in-module
+                      (symbol-name nameSymbol) namespaceModule FALSE)))))
+           (SURROGATE
+            (return
+              (non-empty?
+               (rest (lookup-visible-surrogates-in-module
+                      (symbol-name nameSymbol) namespaceModule FALSE))))))))))))
+
+(defglobal *cpp-namespace-separator* STRING "::")
+
+(defun (cpp-yield-qualified-name STRING) ((translatedName STRING)
+                                          (sourceSymbol GENERALIZED-SYMBOL))
+  ;; Return a qualified version of `translatedName' which is assumed to
+  ;;    be derived from `sourceSymbol'.
+  (unless (cpp-qualify-name? sourceSymbol)
+    (return translatedName))
+  (let ((prefix (cpp-yield-namespace-prefix sourceSymbol)))
+    (if (eql? prefix "")
+        (return translatedName)
+      (return (concatenate prefix *cpp-namespace-separator* translatedName)))))
+
+(defun (cpp-fixup-name-symbol SYMBOL) ((nameSymbol SYMBOL)
+                                       (homeModule MODULE))
+  ;; KLUDGE: If `nameSymbol' is interned in `homeModule', simply return it.
+  ;; Otherwise, return an uninterned symbol with the same name but whose
+  ;;    module is `homeModule'.
+  ;; This is needed to properly communicate the home module of a function
+  ;;    or variable to the name translation functions for cases where
+  ;;    the name symbol was inherited from a parent module.
+  ;; A better way to fix this would be to fixup the name symbol of the
+  ;;    corresponding function or variable, but see
+  ;;    `record-slot-home-module' why this currently is a problem.
+  (if (eql? (interned-in nameSymbol) homeModule)
+      (return nameSymbol)
+    (return (new SYMBOL
+                 :symbol-name (symbol-name nameSymbol)
+                 :interned-in homeModule))))
+
+(defun (cpp-translate-name STRING-WRAPPER) ((nameSymbol SYMBOL))
+  ;; Convert 'nameSymbol' representing an identifier to a C++ identifier.
+  ;; Make lowercase, and substitute forbidden characters.
+  (let ((reservedName (cpp-lookup-reserved-word-table nameSymbol)))
+    (when (null? nameSymbol)
+      (return (wrap-literal "NULL")))
+    (when (defined? reservedName)
+      (return reservedName))
+    (return
+      (cpp-substitute-forbidden-characters 
+       (cpp-change-case nameSymbol :lowercase) :lowercase))))
+
+(defun (cpp-translate-global-name STRING-WRAPPER) ((nameSymbol SYMBOL))
+  ;; Convert `nameSymbol' representing the name of a global variable
+  ;;    into a C++ identifier.
+  ;; Similar to `cpp-translate-name', except don't downcase name.
+  (when (null? nameSymbol)
+    (return (wrap-literal "NULL")))
+  (return
+    (cpp-yield-qualified-name
+     (cpp-substitute-forbidden-characters
+      (cpp-change-case nameSymbol :uppercase) :uppercase)
+     nameSymbol)))
+
+(defun (cpp-translate-class-parameter-name STRING-WRAPPER) ((nameSymbol SYMBOL))
+  ;; Convert 'nameSymbol' representing a class parameter name to a C++
+  ;;    class parameter name.
+  ;; Like 'cpp-translate-global-name'.
+  (return
+    (wrap-literal
+     (cpp-substitute-forbidden-characters 
+      (cpp-change-case nameSymbol :uppercase) :uppercase))))
+
+(defun (cpp-translate-return-parameter-name STRING-WRAPPER) 
+    ((nameSymbol SYMBOL) (parameterNumber INTEGER))
+  ;; Given a name (e.g. 'return) and a number (e.g. 3), create
+  ;;   a return parameter name (e.g. "return3")
+  (let ((returnSymbol 
+	 (intern-symbol (concatenate (symbol-name nameSymbol)
+			  (integer-to-string parameterNumber))))
+	(translatedName (cpp-translate-name returnSymbol)))
+    (return translatedName) ))
+
+(defun (cpp-translate-symbol-constant-name STRING-WRAPPER)
+    ((symbol GENERALIZED-SYMBOL))
+  ;; Convert 'symbol' representing a symbol/surrogate/keyword constant
+  ;;    into a C++ symbol/surrogate/keyword constant identifier.
+  (let ((prefix STRING NULL))
+    (typecase symbol
+      (SYMBOL
+       (setq prefix (concatenate "SYM_" (context-name (interned-in symbol)))))
+      (SURROGATE
+       (setq prefix (concatenate "SGT_" (context-name (interned-in symbol)))))
+      (KEYWORD
+       (setq prefix "KWD")))
+    (return
+      (wrap-literal
+       (cpp-substitute-forbidden-characters
+        (concatenate prefix (concatenate "_" (symbol-name symbol)))
+        :uppercase)))))
+
+(defun (cpp-translate-symbol-constant-id STRING-WRAPPER)
+    ((symbol GENERALIZED-SYMBOL))
+  ;; Convert a reference to the ID of 'symbol' into a C++
+  ;;    symbol-id identifier.
+  (let ((translatedSymbol (cpp-translate-symbol-constant-name symbol)))
+    (setf (wrapper-value translatedSymbol)
+      (concatenate (wrapper-value translatedSymbol) "_id"))
+    (return translatedSymbol)))
+
+(defun (cpp-translate-symbol-name STRING-WRAPPER) ((symbol SYMBOL))
+  ;; Convert 'symbol' representing a symbol constant to a C++
+  ;;    symbol constant identifier.
+  (return (cpp-translate-symbol-constant-name symbol)))
+
+(defun (cpp-translate-symbol-id STRING-WRAPPER) ((symbol SYMBOL))
+  ;; Convert a reference to the ID of 'symbol' into a C++
+  ;;    symbol-id identifier.
+  (return (cpp-translate-symbol-constant-id symbol)))
+
+(defun (cpp-translate-surrogate-name STRING-WRAPPER) ((surrogate SURROGATE))
+  ;; Convert 'surrogate' representing a surrogate constant to a C++
+  ;;    surrogate constant identifier.
+  (return (cpp-translate-symbol-constant-name surrogate)))
+
+(defun (cpp-translate-surrogate-id STRING-WRAPPER) ((surrogate SURROGATE))
+  ;; Convert a reference to the ID of 'surrogate' into a C++
+  ;;    surrogate-id identifier.
+  (return (cpp-translate-symbol-constant-id surrogate)))
+
+(defun (cpp-translate-keyword-name STRING-WRAPPER) ((keyword KEYWORD))
+  ;; Convert 'keyword' representing a keyword constant to a C++
+  ;;    keyword constant identifier.
+  (return (cpp-translate-symbol-constant-name keyword)))
+
+(defun (cpp-translate-keyword-id STRING-WRAPPER) ((keyword KEYWORD))
+  ;; Convert a reference to the ID of 'keyword' into a C++
+  ;;    keyword-id identifier.
+  (return (cpp-translate-symbol-constant-id keyword)))
+
+(defun (cpp-translate-class-typename STRING-WRAPPER)
+    ((nameSymbol GENERALIZED-SYMBOL))
+  ;; Convert a symbol representing a class name to a C++ class name.
+  ;; Capitalize, and substitute forbidden characters.
+  (let ((realNameSymbol
+         ;; This does the dereferencing of synonyms:
+         (class-type (type-class (surrogatify nameSymbol)))))
+    (return
+      (cpp-yield-qualified-name
+       (cpp-substitute-forbidden-characters
+        (cpp-change-case realNameSymbol :capitalized)
+        :capitalized)
+       realNameSymbol))))
+
+(defun (cpp-translate-class-name STRING-WRAPPER) ((nameSymbol GENERALIZED-SYMBOL))
+  ;; Convert a lisp symbol representing a class name to a C++ class name.
+  ;; Go via the type-spec to pick up native classes.
+  (return (cpp-translate-type-spec (surrogatify nameSymbol))))
+
+(defun (cpp-reference-type? BOOLEAN) ((typeSpec TYPE-SPEC))
+  ;; Helping function for `cpp-translate-function-parameter':
+  ;; Return true for certain types that should appear as reference
+  ;;   parameters, e.g., stream variables
+  ;; NOTE: for now, there are no types that should be referencized.
+  ;;   Eventually, may want to delete this.
+  (ignore typeSpec)
+  (return FALSE) )
+
+#|
+(defun (cpp-referencize-type STRING-WRAPPER) ((typeSpec TYPE-SPEC))
+  ;; Helping function for `cpp-translate-function-parameter':
+  ;; Assume we have a pointerized native type, force it to be a 
+  ;;   reference parameter
+  (let ((mutable-Name MUTABLE-STRING 
+		     (wrapper-value (cpp-translate-type-spec typeSpec)))
+	(return-Name STRING (substitute mutable-Name #\& #\*)))
+    (return return-Name)))
+|#
+
+(defun (cpp-referencize-type STRING-WRAPPER) ((typeSpec TYPE-SPEC))
+  ;; Helping function for `cpp-translate-function-parameter':
+  ;; Assume we have a pointerized native type, force it to be a 
+  ;;   reference parameter
+  (return
+    (wrap-literal 
+     (substitute 
+      (wrapper-value (cpp-translate-type-spec typeSpec))
+      #\& #\*))) )
+
+(defun (cpp-translate-function-parameter OBJECT)
+    ((name SYMBOL) (type TYPE-SPEC) (method METHOD-SLOT))
+  ;; Translate the formal parameter `name' of `method' whose type is `type'.
+  (setq type (compute-relative-type-spec type (slot-owner method)))
+  (when (and (method-variable-arguments? method)
+             (eql? (variable-arguments-name method) name)
+             (pass-variable-arguments-as-list? method))
+    (setq type (yield-listified-variable-arguments-type method)))
+  (return
+    (bquote (& (choose (cpp-reference-type? type)
+                       (cpp-referencize-type type)
+                       (cpp-translate-and-pointerize-type-spec type))
+               & (cpp-translate-name name)))))
+
+(defun (cpp-translate-return-parameter CONS) 
+    ((parameterNumber INTEGER) (parameterType TYPE-SPEC))
+  ;; Translate a return parameter specification, which consists of
+  ;;   a parameter number and a type.
+  (return
+    (bquote (& (cpp-translate-and-referencize-type-spec parameterType)
+	       & (cpp-translate-return-parameter-name (quote _return)
+		  parameterNumber)))) )
+
+(defun (cpp-translate-function-parameters CONS) ((method METHOD-SLOT))
+  ;; Translate the formal parameters of `method' into C++ parameters.
+  ;; Create reference parameters for additional return values.
+  (let ((skipFirstParameter? (not (cpp-method-object-is-function? method)))
+        (variableArguments?
+         (and (method-variable-arguments? method)
+              (not (pass-variable-arguments-as-list? method))))
+	(translatedParameters NIL))
+    (foreach pName in (method-parameter-names method)
+        as pType in (method-parameter-type-specifiers method)
+        as i in (interval 1 NULL)
+        where (and (or (not skipFirstParameter?)
+                       (> i 1))
+                   (or (not variableArguments?)
+                       (not (eql? pName (variable-arguments-name method)))))
+        collect (cpp-translate-function-parameter pName pType method)
+        into translatedParameters)
+    (foreach rType in (rest (method-return-type-specifiers method))
+        as rTypeIndex in (interval 1 NULL)
+        collect (cpp-translate-return-parameter rTypeIndex rType)
+        into translatedParameters)
+    (return
+      (bquote
+       (&& translatedParameters
+           && (choose
+               variableArguments?
+               (bquote
+                ((CPP_VAR_ARGS
+                  & (cpp-translate-name (variable-arguments-name method)))))
+               NIL))))))
+
+(defun (slot-reader-from-name? BOOLEAN) ((methodName SYMBOL)
+					 (methodOwner TYPE-SPEC))
+  ;; Given the name of a method and its owner, return
+  ;;   TRUE if its is a reader
+  (let ((ownerClass (type-class (cast methodOwner TYPE)))
+	(slot (safe-lookup-slot ownerClass methodName)))
+    (return (and (defined? slot) (isa? slot @STORAGE-SLOT))) ))
+
+(defun (slot-reader? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if a method is a slot reader
+  (let ((lookedUpSlot SLOT NULL))
+    (unless (method-function? method)
+      (setq lookedUpSlot 
+	(safe-lookup-slot (type-class (slot-owner method))
+			  (slot-name method))))
+    (return
+      (and (defined? lookedUpSlot)
+	   (isa? lookedUpSlot @STORAGE-SLOT))) ))
+
+(defun (cpp-translate-constructor-name STRING-WRAPPER) 
+    ((constructor METHOD-SLOT))
+  ;; Create a name for the C++ constructor defined by METHOD-SLOT.
+  (return (cpp-translate-class-name (slot-name constructor))) )
+
+(defun (cpp-translate-function-name-from-name STRING-WRAPPER)
+    ((functionName SYMBOL))
+  ;; Create an appropriate name for the C++ translation of the function
+  ;;    named `functionName'.
+  (let ((function (lookup-function functionName)))
+    (if (defined? function)
+        (return (cpp-translate-function-name function))
+      (return (cpp-translate-name functionName)))))
+    
+(defun (cpp-translate-function-name STRING-WRAPPER) ((function METHOD-SLOT))
+  ;; Create a name for the C++ function defined by METHOD-SLOT.
+  ;; Do not prefix the name with the method's class.
+  (let ((functionName
+         (yield-renamed-name-if-native (slot-name function) :cpp :function))
+	(translatedName STRING NULL))
+    (when (cpp-method-object-is-overloaded-function? function)
+      (setq functionName (cpp-create-overloaded-function-name 
+			  functionName (slot-owner function))))
+    (setq translatedName (wrapper-value (cpp-translate-name functionName)))
+    ;; KLUDGE: we generate reader names and setter names in the translator.
+    ;;   The walker generates setter names.  Should it also generate reader
+    ;;   names?
+    (when (method-setter? function)
+      (setq translatedName (concatenate translatedName "_setter")))
+    (when (slot-reader? function)
+      (setq translatedName (concatenate translatedName "_reader")))
+    (return
+      (cpp-yield-qualified-name
+       translatedName
+       (cpp-fixup-name-symbol (slot-name function) (home-module function))))))
+
+(defun (cpp-translate-method-name-from-name STRING-WRAPPER) 
+    ((methodName SYMBOL) (methodOwner TYPE-SPEC))
+  ;; Create an appropriate name for the C++ (member or non-member) 
+  ;;    function from `methodName' and `methodOwner'.
+  ;; KLUDGE: we generate reader names and setter names in the translator.
+  ;;    The walker generates setter names.  Should it generate reader names?
+  (let ((translatedName STRING
+          (cpp-translate-name
+           (yield-renamed-name-if-native methodName :cpp :function))))
+    (when (slot-reader-from-name? methodName methodOwner)
+      (setq translatedName (concatenate translatedName "_reader")))
+    (return
+      (concatenate (wrapper-value (cpp-translate-class-name methodOwner))
+                   "::"
+                   translatedName))))
+
+(defun (cpp-translate-method-name STRING-WRAPPER) ((method METHOD-SLOT))
+  ;; Create an appropriate name for the C++ (member or non-member) 
+  ;;   function from METHOD-SLOT
+  (let ((methodType (slot-owner method))
+	(translatedName (cpp-translate-function-name method)))
+    (if (cpp-method-object-is-function? method)
+        (return translatedName)
+      (return
+        (concatenate
+          (wrapper-value (cpp-translate-class-name (symbolize methodType)))
+          "::"
+          translatedName)))))
+
+(defun (delete-quoted-null-statements CONS) ((trees CONS))
+  ;; Return 'trees' with all (quote NULLs) deleted
+  (return (remove trees (quote NULL))) )
+
+(defun (cpp-method-object-is-function? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if `unit' is a function or if it is a method defined
+  ;;   on a native type
+  (return (or (method-function? method)
+	      (cpp-method-object-is-overloaded-function?  method))) )
+
+(defun (cpp-method-object-is-overloaded-function? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return true if `method' is a method defined on a native (or literal) type.
+  ;; Since C++ does not support methods on native types, such calls are
+  ;;   translated into (overloaded) function calls instead, unless they
+  ;;   are native methods on non-literal native classes.
+  (return
+    (and (not (method-function? method))
+         (defined? (class-cpp-native-type (type-class (slot-owner method))))
+	 (or (not (method-native? method))
+	     (subtype-of? (slot-owner method) @LITERAL)))))
+
+(defun (wrap-method-body-with-cpp-auxiliary-declarations CONS)
+    ((methodBody CONS) (declarations CONS))
+  ;; Helping function for `cpp-translate-function-call'
+  ;; When there are dummy arguments for unused multiple-value return
+  ;;   statements, create a let-block which declares (and frees) the
+  ;;   dummy arguments
+  (let ((oDeclarations CONS NIL)
+	(oTree CONS NULL))
+    (setq declarations (reverse declarations))
+    (foreach declaration in declarations ; translate each declaration:
+             do
+	     (let ((d CONS declaration))
+	       (pushq oDeclarations
+		      (bquote (& (cpp-translate-and-pointerize-type-spec
+				  (second d))
+				 & (cpp-translate-a-tree (first d))
+                                 && (choose
+                                     (defined? (third d))
+                                     (cons-list
+                                      (cpp-translate-a-tree (third d)))
+                                     NIL))))))
+    ;; TO DO: AVOID THE EXTRA BLOCK IF THE FUNCTION STARTS WITH A 'LET'.
+    (setq oTree (bquote (CPP_STATEMENTS
+			 (CPP_BLOCK & (reverse oDeclarations) 
+				    & methodBody))))
+    (return oTree) ))
+
+(defun (cpp-translate-define-method-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Translate a definition of a method, function, or operator into a
+  ;;    C++ parse tree definition.
+  ;; NOTE: THIS CODE IS SIMILAR TO "YIELD-CPP-MEMBER-FUNC-TREE".
+  ;;   MAY WANT TO MERGE THE SIMILAR PIECES INTO A SINGLE ROUTINE.
+  (special ((*methodBeingWalked* NULL)
+	    (*currentDummyIndex* 0)
+	    (*dummyDeclarations* NIL))
+    (let ((method METHOD-SLOT (the-object unit))
+	  (unitIsFunction (cpp-method-object-is-function? method))
+	  (bodyTree CONS (code-register unit))
+	  (returnType (CONS OF STRING-WRAPPER) NULL)
+	  (oTree NIL)
+	  (translatedMethodBody CONS NULL))
+
+      (setq *methodBeingWalked* method)
+
+      ;; Eliminate all null statements
+      (setq bodyTree (delete-quoted-null-statements bodyTree))
+
+      (when (not unitIsFunction)
+        ;; NOTE: Simply replacing all occurrences of the first argument with
+        ;;    'this' fails if somebody rebinds 'self' or uses the symbol in
+        ;;    a 'bquote', etc., so we don't do that anymore.
+	;;(substitute-cons-tree
+        ;;  bodyTree (quote this) (first (method-parameter-names method)))
+        ;; Instead, generate a local 'self' variable and bind it to 'this'
+        ;;    (this avoids the problems mentioned above and also allows
+        ;;    assignments to the self variable which is illegal in C++):
+        (pushq *dummyDeclarations*
+               (bquote (& (first (method-parameter-names method))
+                          & (slot-owner method)
+                          this))))
+
+      (setq translatedMethodBody
+	(bquote (CPP_STATEMENTS
+		 && (cpp-translate-list-of-trees bodyTree))))
+      ;; If the method body contains a method body with return parameters
+      ;;   that are not used, wrap the body in a block that creates the dummys
+      (unless (empty? *dummyDeclarations*)
+	(setq translatedMethodBody
+	  (wrap-method-body-with-cpp-auxiliary-declarations 
+	   translatedMethodBody *dummyDeclarations*)))
+
+      (when (defined? (documentation method))
+        ;; CAUTION: This assumes that we have a `CPP_STATEMENTS' tree:
+        (setf (rest translatedMethodBody)
+          (bquote ((CPP_COMMENT & (wrap-literal (documentation method)))
+                   && (rest translatedMethodBody)))))
+
+      (setq returnType 
+	(choose
+         (cpp-constructor? method)
+         NIL
+         (bquote
+          (& (cpp-translate-and-pointerize-type-spec
+              ;; Use most general return type of virtual method
+              ;;    (see comments in walk.ste):
+              (compute-most-general-return-type
+               method (compute-return-type-spec
+                       method (slot-owner method))))))))
+      (setq oTree
+	(bquote (& (choose unitIsFunction
+			   (quote CPP_FUNCTION)
+			   (quote CPP_METHOD))
+		   & returnType
+		   & (cpp-translate-method-name method)
+		   & (cpp-translate-function-parameters method)
+		   & translatedMethodBody)))
+      (return oTree) )))
+	      
+(defun (cpp-translate-return-tree CONS) ((tree CONS))
+  ;; Translate a return tree
+  ;; Tree has form "(return <exp1> <exp2> . . . <expn>)"
+  (let ((oTree CONS NULL)
+	(returnAssignments CONS NIL)
+	(returnVariables CONS NIL)
+        ;; If we're returning the results of a function which returns multiple 
+        ;;   values, we must approriately return each of the multiple values:
+	(methodOtherReturnTypes
+         (rest (method-return-type-specifiers *methodBeingWalked*)))
+	(returnExpression OBJECT NULL)
+	(translatedReturnExpression CONS NIL)
+        (needTemporaryReturnVariable? FALSE))
+    
+    ;; Generate return variables when returning multiple values
+    (foreach exp in (rest (rest tree))
+        as parameterNum in (interval 1 NULL)
+        do (when (not (side-effect-free-expression? exp))
+             (setq needTemporaryReturnVariable? TRUE))
+           (pushq returnAssignments 
+                  (bquote 
+                   (CPP_ASSIGN
+                    (CPP_IDENT
+                     & (cpp-translate-return-parameter-name
+                        (quote _return) parameterNum))
+                    & (cpp-translate-a-tree exp)))))
+
+    (setq returnAssignments (reverse returnAssignments))
+    (setq returnExpression (second tree))
+
+    ;; If we're returning the result of a function which returns
+    ;;   multiple values, pass this function's return variables to the callee
+    (if (and (> (length methodOtherReturnTypes) 0)
+	     (empty? (rest (rest tree)))
+	     (cons? returnExpression)
+	     (defined? (first (cast returnExpression CONS)))
+	     (or
+	      (eql? (first (cast returnExpression CONS))
+		    (quote SYS-CALL-FUNCTION))
+	      (eql? (first (cast returnExpression CONS))
+		    (quote SYS-CALL-METHOD))))
+	(progn
+	  (foreach type in methodOtherReturnTypes
+	        as parameterNum in (interval 1 NULL)
+	      do (ignore type)
+	      collect (intern-symbol 
+		       (wrapper-value
+			(cpp-translate-return-parameter-name 
+			 (quote _return) parameterNum)))
+		   into returnVariables)
+	  ;; NOTE: may need code for methods here, too
+	  (setq translatedReturnExpression
+	    (cpp-translate-mv-function-call returnExpression returnVariables)))
+        (setq translatedReturnExpression 
+	  (cpp-translate-a-tree returnExpression)))
+
+    (if (empty? returnAssignments)
+	(if (nil? (rest tree))
+	    (setq oTree
+	      (bquote (CPP_RETURN)))
+          (setq oTree 
+            (bquote (CPP_RETURN & translatedReturnExpression))))
+      (if needTemporaryReturnVariable?
+          (let ((tempVar "_return_temp"))
+            (setq oTree
+              (bquote
+               (CPP_BLOCK
+                ((& (cpp-translate-and-pointerize-type-spec
+                     (compute-return-type-spec
+                      *methodBeingWalked* (slot-owner *methodBeingWalked*)))
+                    (CPP_IDENT & tempVar)
+                    & translatedReturnExpression))
+                (CPP_STATEMENTS
+                 && returnAssignments
+                 (CPP_RETURN (CPP_IDENT & tempVar)))))))
+        (setq oTree
+          (bquote 
+           (CPP_STATEMENTS
+            && returnAssignments
+            (CPP_RETURN & translatedReturnExpression))))))
+    (return oTree) ))
+		
+(defun (cpp-translate-actual-parameters CONS) ((tree CONS))
+  ;; translate actual parameters used in a method or function call
+  (return (bquote (CPP_ACTUALS && (cpp-translate-list-of-trees tree)))) )
+
+(defun (cpp-translate-variable-length-actuals CONS)
+    ((actuals CONS) (method METHOD-SLOT))
+  ;; Translate a variable-length actual parameter list.
+  (let ((nofParameters (length (method-parameter-names method)))
+        (restArgumentStart
+         (choose (cpp-method-object-is-function? method)
+                 (- nofParameters 1)
+                 (- nofParameters 2)))
+	(oTree NIL)
+	(pushedDummy FALSE))
+    (foreach actual in actuals
+	     as i in (interval 0 NULL)
+	     do 
+	     ;; Insert a dummy parameter at point where variable length
+	     ;;   list starts: pass the number of optional arguments
+	     (when (eq? i restArgumentStart)
+	       (setq pushedDummy TRUE)
+	       (let ((result (- (length actuals) restArgumentStart)))
+		 (pushq oTree (bquote 
+			       (CPP_LITERAL 
+				& (wrap-literal 
+				   result))))))
+	     (pushq oTree (cpp-translate-a-tree actual)))
+    ;; If we haven't pushed a dummy, push one at the end of the actuals list:
+    (unless pushedDummy
+      (pushq oTree (bquote (CPP_LITERAL 0))))
+    (return (bquote (CPP_ACTUALS && (reverse oTree)))) ))
+
+(defun (cpp-translate-call-method-setter CONS) ((tree CONS))
+  ;; Translate a call to a method setter.
+  ;; 'tree' has the form '(SYS-CALL-METHOD-SETTER <ownerType> <methodName>
+  ;;                         <objRef> <valueRef> <slotName>)'.
+  (let ((methodName (third tree))
+	;; NOTE: Assume objectRef is a variable name.  May need more
+	;;  complex processing for more complex references.
+        (objectRef (cpp-translate-a-tree (fourth tree)))
+        (valueRef (cpp-translate-a-tree (fifth tree))))
+    (return (bquote (CPP_METHOD_SETTER_CALL 
+		     (CPP_IDENT & (cpp-translate-name methodName))
+		     & objectRef & valueRef))) ))
+
+(defun (cpp-create-overloaded-function-name SYMBOL) ((functionName SYMBOL)
+						     (classType TYPE))
+  ;; Create a name for overloaded function based on the original name
+  ;;   and a method's type
+  (return
+    (intern-symbol
+     (concatenate 
+       (symbol-name classType)
+       (concatenate "-" (symbol-name functionName))))) )
+
+(defun (cpp-translate-method-call CONS) ((tree CONS) (referenced? BOOLEAN))
+  ;; Translate a method call to appropriate C++ syntax.
+  ;; Optimize/inline/special-case the call for certain methods.
+  (let ((methodName SYMBOL (second tree))
+	(owner TYPE (first tree))
+        (arguments (rest (rest tree))))
+    (case methodName
+      ((DEFINED? NULL?)
+       (return
+         (cpp-translate-DEFINED?-method-call
+          owner (first arguments) (eql? methodName (quote NULL?)))))
+      ((NTH NTH-SETTER)
+       (return (cpp-translate-NTH-method-call methodName owner arguments)))
+      ((AREF AREF-SETTER)
+       (return (cpp-translate-AREF-method-call methodName owner arguments)))
+      (otherwise
+       (when (or (eql? owner @ARGUMENT-LIST)
+                 (eql? owner @ARGUMENT-LIST-ITERATOR))
+         (return
+           (cpp-translate-argument-list-tree
+            methodName owner (first arguments))))))
+    (return
+      (cpp-translate-normal-method-call
+       methodName owner arguments referenced?))))
+
+(defun (cpp-translate-normal-method-call CONS)
+    ((methodName SYMBOL) (owner TYPE) (arguments CONS) (referenced? BOOLEAN))
+  ;; Translate a normal method call to appropriate C++ syntax.
+  ;; TODO: - Use cpp-translate-method-name for 'methodName'.
+  ;;       - Cleanup method name translation and associated predicates.
+  ;; NOTE: If the 'object' is multiply inherited, C++ thinks the method
+  ;;   call is ambiguous if there is more than one path to the class
+  ;;   the method is defined on.  Currently, the solution is to prohibit
+  ;;   multiple inheritance where inheritance paths to a 
+  ;;   common ancestors can occur.
+  ;; An alternative solution would be to choose one parent to prefix
+  ;;   the method call with.  The problem is that we don't have the type
+  ;;   of the object that the method is called on.  This could be fixed
+  ;;   by making the walker provide that information.
+  (let ((slot (safe-lookup-slot (type-class owner) methodName))
+        (method METHOD-SLOT (choose (method-slot? slot) slot NULL))
+        (firstArg (first arguments))
+        (otherArgs (rest arguments)))
+
+    ;; Operators:
+    (let ((operator
+           (cpp-lookup-operator-table (soft-permanentify methodName))))
+      (when (defined? operator)
+        (return
+          (cpp-translate-operator-call
+           operator arguments (length arguments)))))
+
+    ;; Methods on literals and native types:
+    (when (and (defined? method)
+               (cpp-method-object-is-overloaded-function? method))
+      (return
+        (cpp-translate-function-call 
+         (bquote (& (cpp-create-overloaded-function-name methodName owner)
+                    && arguments))
+         method)))
+
+    ;; Normal methods:
+    (let ((translatedName
+           (cpp-translate-name
+            (yield-renamed-name-if-native methodName :cpp :function))))
+      (when (and (null? method) ;; avoid unnecessary slot lookup
+                 (slot-reader-from-name? methodName owner))
+        (setf (wrapper-value translatedName)
+          (concatenate (wrapper-value translatedName) "_reader")))
+      (return
+        (bquote
+         (& (choose referenced? 
+                    (quote CPP_REFERENCED_METHOD_CALL)
+                    (quote CPP_METHOD_CALL))
+            (CPP_IDENT
+             & (cpp-translate-class-name 
+                (symbolize owner)))
+            (CPP_IDENT & translatedName)
+            & (cpp-translate-a-tree firstArg)
+            & (choose (and (defined? method)
+                           (method-variable-arguments? method)
+                           (not (pass-variable-arguments-as-list? method)))
+                      (cpp-translate-variable-length-actuals otherArgs method)
+                      (cpp-translate-actual-parameters otherArgs))))))))
+
+(defun (cpp-translate-DEFINED?-method-call CONS)
+    ((argumentType TYPE) (argument OBJECT) (null? BOOLEAN))
+  ;; Translate a call to `defined?' or `null?' by generating
+  ;;    the necessary tests directly.
+  (let ((nullValue (type-to-walked-null-value-tree argumentType)))
+    (cond
+     ((and (optimize-boolean-tests?)
+	   (subtype-of? argumentType @OBJECT))
+      ;; Is this optimization too drastic, i.e., `(defined? x)'
+      ;;    is translated into `x', and `(null? x)' into `!x'?
+      (setq argument (bquote (cast & argument @BOOLEAN)))
+      (if null?
+	  (return
+	    (cpp-translate-operator-call
+	     (cpp-lookup-operator-table (quote NOT))
+	     (bquote (& argument)) 1))
+	(return (cpp-translate-a-tree argument))))
+     (otherwise
+      (return
+        (cpp-translate-operator-call 
+         (cpp-lookup-operator-table (choose null? (quote eq?) (quote !=)))
+         (bquote (& argument & nullValue))
+         2))))))
+
+(defun (cpp-translate-NTH-method-call CONS)
+    ((operator SYMBOL) (owner TYPE) (arguments CONS))
+  ;; Translate and possibly optimize a call to 'nth'.
+  (let ((setter? (eql? operator (quote NTH-SETTER)))
+        (collection (first arguments))
+        (position (last arguments))
+        (value (choose setter?
+                       (second arguments)
+                       NULL))
+        (tree CONS NULL))
+    (case owner
+      ((@STRING @MUTABLE-STRING @NATIVE-VECTOR)
+       (when (or (eql? owner @NATIVE-VECTOR)
+                 (method-call-inlining-enabled?))
+         (setq collection (cpp-translate-a-tree collection))
+         (setq tree
+           (bquote
+            (CPP_ARRAY_REFERENCE
+             & collection
+             & (cpp-translate-a-tree position))))
+         (when setter?
+           (setq tree
+             (bquote (CPP_ASSIGN & tree & (cpp-translate-a-tree value)))))
+         (return tree)))
+      (otherwise NULL))
+    (return
+      (cpp-translate-normal-method-call operator owner arguments FALSE))))
+
+(defun (cpp-translate-AREF-method-call CONS)
+    ((operator SYMBOL) (owner TYPE) (arguments CONS))
+  ;; Translate a call to `aref' or `aref-setter'.
+  (case owner
+    (@ARRAY
+     (let ((setter? (eql? operator (quote AREF-SETTER)))
+           (oTree (bquote
+                   (CPP_ARRAY_REFERENCE
+                    & (cpp-translate-a-tree (first arguments))
+                    && (cpp-translate-list-of-trees
+                        (choose setter?
+                                (rest (rest arguments))
+                                (rest arguments)))))))
+       (when setter?
+         (setq oTree
+           (bquote
+            (CPP_ASSIGN & oTree
+                        & (cpp-translate-a-tree (second arguments))))))
+       (return oTree)))))
+
+(defun (cpp-translate-code-signature CONS) ((signature CONS))
+  ;; Translate a function's signature
+  ;; `signature' has form
+  ;; ((<return type1> ... <return typen>) <param type1> ... <param typen>)
+  (let ((translatedReturnTypes CONS NIL)
+	(translatedParameterTypes CONS NIL))
+    (foreach returnType in (cast (first signature) CONS)
+	     collect (cpp-translate-and-pointerize-type-spec returnType)
+	     into translatedReturnTypes)
+    (foreach parameterType in (rest signature)
+	     collect (cpp-translate-and-pointerize-type-spec parameterType)
+	     into translatedParameterTypes)
+    (return (bquote (CPP_FUNCTION_SIGNATURE & translatedReturnTypes
+					    & translatedParameterTypes))) ))
+
+(defun (cpp-translate-method-code-signature CONS) ((signature CONS))
+  ;; Translate a method's signature
+  ;; `signature' has form
+  ;; ((<return type1> ... <return typen>) <param type1> ... <param typen>)
+  (let ((translatedReturnTypes CONS NIL)
+	(translatedParameterTypes CONS NIL)
+	(translatedObjectType (cpp-translate-type-spec
+			       (first (rest signature)))))
+    (foreach returnType in (cast (first signature) CONS)
+	     collect (cpp-translate-and-pointerize-type-spec returnType)
+	     into translatedReturnTypes)
+    
+    (foreach parameterType in (rest (rest signature))
+	     collect (cpp-translate-and-pointerize-type-spec parameterType)
+	     into translatedParameterTypes)
+    (return (bquote (CPP_METHOD_SIGNATURE & translatedReturnTypes
+					  & translatedObjectType
+					  & translatedParameterTypes))) ))
+
+(defun (cpp-translate-call-function-code CONS) ((tree CONS))
+  ;; Translate a funcall, including the signature
+  ;; `tree' has form 
+  ;; (((<return type1> ... <return typen>) <param type1> ... <param typen>)
+  ;;     <code expr>)
+  ;; NOTE: ideally this should be implemented using a cast, but
+  ;;   casts currently only handle simple types 
+  (let ((signature (cpp-translate-code-signature (second tree)))
+	(functionNameExpr (cpp-translate-a-tree (third tree)))
+	(functionArgs (rest (rest (rest tree)))))
+    (return
+      (bquote (CPP_FUNCALL
+	       & signature
+	       & functionNameExpr
+	       & (cpp-translate-actual-parameters functionArgs))))))
+
+(defun (cpp-translate-call-method-code CONS) ((tree CONS))
+  ;; Translate a method call, including the signature
+  ;; `tree' has form 
+  ;; (((<return type1> ... <return typen>) <param type1> ... <param typen>)
+  ;;     <code expr>)
+  ;; NOTE: ideally this should be implemented using a cast, but
+  ;;   casts currently only handle simple types 
+  (let ((signature (cpp-translate-method-code-signature (second tree)))
+	(methodNameExpr (cpp-translate-a-tree (third tree)))
+	(theObject (first (rest (rest (rest tree)))))
+	(methodArgs (rest (rest (rest (rest tree))))))
+    (return
+      (bquote (CPP_METHOD_CODE_CALL
+	       & signature
+	       & methodNameExpr
+	       & (cpp-translate-a-tree theObject)
+	       & (cpp-translate-actual-parameters methodArgs))))))
+
+(defun (get-last-n-elements CONS) ((list CONS) (n INTEGER))
+  ;; Return the last `n' elements of 'list'.
+  ;; NOTE: May want to put this in `conses.ste'...
+  ;; Danger: The old version reversed 'list' destructively!
+  (setq n (- (length list) n))
+  (when (< n 0) (setq n 0))
+  (return (nth-rest list n)))
+
+(defun (cpp-translate-function-call CONS) ((tree CONS) (method METHOD-SLOT))
+  ;; Translate a function call to appropriate C++ syntax
+  (let ((functionName SYMBOL (first tree))
+	(functionArgs (copy-cons-list (rest tree)))
+	(firstArg (first functionArgs))
+	;; NOTE: An already existing method can be passed in if we're
+	;;  calling an overloaded function in the guise of a method
+	;;  (see `cpp-translate-method-call')
+	(function (choose (defined? method)
+			  method
+			  (lookup-function-or-stella-function functionName)))
+	(operator (cpp-lookup-operator-table (soft-permanentify functionName)))
+	(oTree CONS NULL)
+	(dummyArgs CONS NIL)
+	(numberOfUnusedReturnParameters INTEGER 0)
+	(unusedReturnTypes CONS NIL)
+	(dummyName SYMBOL NULL))
+
+    ;; Special-case certain functions:
+    (case functionName
+      ((GET-SYM GET-KWD GET-SGT)
+       ;; NOTE: We check the type of the GET-xxx argument: If it's not an
+       ;;    integer, then we assume it is a normal call from STELLA code:
+       (typecase firstArg
+         (INTEGER-WRAPPER
+          (return
+            (cpp-translate-hardcoded-symbol-reference
+             functionName (wrapper-value firstArg))))
+         (otherwise NULL)))
+      (otherwise NULL))
+
+    ;; If some of the return values of this function are not used
+    ;;   (e.g., we're not being called inside a mv-setq), then add
+    ;;   dummy parameters
+    (setq numberOfUnusedReturnParameters
+      (- (+ (length (method-parameter-names function))
+	    (1- (length (method-return-type-specifiers function))))
+	 (length functionArgs)))
+    (when (> numberOfUnusedReturnParameters 0)
+      ;; Create list of dummy variables, one for each return value that is
+      ;;   not used
+      (setq unusedReturnTypes
+	(get-last-n-elements (rest (method-return-type-specifiers function))
+			     numberOfUnusedReturnParameters))
+
+      (foreach unusedParameterType in unusedReturnTypes
+	       do 
+	       (setq *currentDummyIndex* (+ *currentDummyIndex* 1))
+	       (setq dummyName (intern-symbol 
+				(wrapper-value
+				 (cpp-translate-return-parameter-name 
+				  (quote dummy) *currentDummyIndex*))))
+	       ;; NOTE: I tried using `collect', but that doesn't seem to work!
+	       (pushq *dummyDeclarations*
+		      (bquote (& dummyName & unusedParameterType)))
+	       (pushq dummyArgs dummyName))
+      (concatenate functionArgs (reverse dummyArgs)) )
+
+    ;; Operators (e.g., + and -) are translated so the operators are infix.
+    ;; Functions are translated with syntax "functionName(args)".
+    (if (defined? operator)
+	(setq oTree (cpp-translate-operator-call operator functionArgs
+						 (length functionArgs)))
+        (setq oTree 
+	  (bquote (CPP_FUNCTION_CALL 
+		   (CPP_IDENT
+		    & (cpp-translate-function-name function))
+		   & (choose (and (method-variable-arguments? function)
+                                  (not (pass-variable-arguments-as-list?
+                                        function)))
+			     (cpp-translate-variable-length-actuals 
+			      functionArgs function)
+			     (cpp-translate-actual-parameters functionArgs))))))
+    (return oTree) ))
+
+(defun (cpp-translate-operator-tree CONS) ((tree CONS))
+  ;; Translate a boolean operator (i.e. AND, OR or NOT)
+  (let ((operator (cpp-lookup-operator-table (first tree)))
+	(args (rest tree))
+	(arity INTEGER NULL))
+    (case (first tree)
+      ((AND OR EQ? > >= < <=) (setq arity 2))
+      ((NOT ++ --) (setq arity 1)))
+    (return (cpp-translate-operator-call operator args arity)) ))
+
+(defun (cpp-translate-operator-call CONS) ((operatorNames CONS)
+					   (arguments CONS)
+					   (arity INTEGER))
+  ;; Translate an operator call to appropriate C++ syntax
+  ;; Operators (e.g., + and -) are translated so the operators are infix.
+  ;; Assume binary operator.
+  ;; Called from either "cpp-translate-function-call" or
+  ;;   "cpp-translate-method-call" 
+  ;; CAREFUL: BASING ARITY ON # ARGUMENTS MAY BE DANGEROUS! 
+  (let ((oTree CONS NULL))
+    (case arity
+      (1 (setq oTree
+	   (bquote (CPP_UNARY_OP
+		    & (first operatorNames)
+		    & (cpp-translate-a-tree (first arguments))))))
+      ;; NOTE: Binary operators can be associative, so can have more
+      ;;   than 2 arguments.  In that case, recursively call this function.
+      (2 (if (> (length arguments) 2)
+	     (setq oTree
+	       (bquote (CPP_BINARY_OP
+			& (cpp-translate-a-tree (first arguments))
+			& (first operatorNames)
+			& (cpp-translate-operator-call 
+			   (copy-cons-tree operatorNames)
+                           (rest arguments) 2))))
+	     (setq oTree
+	       (bquote (CPP_BINARY_OP
+			& (cpp-translate-a-tree (first arguments))
+			& (first operatorNames)
+			& (cpp-translate-a-tree (second arguments)))))))
+      (3 (setq oTree
+	   (bquote (CPP_TERNARY_OP
+		    & (cpp-translate-a-tree (first arguments))
+		    & (first operatorNames)
+		    & (cpp-translate-a-tree (second arguments))
+		    & (second operatorNames)
+		    & (cpp-translate-a-tree (third arguments)))))))
+    (return oTree) ))
+
+(defun (cpp-translate-hardcoded-symbol-reference CONS)
+    ((operator SYMBOL) (offset INTEGER))
+  (let ((symbol GENERALIZED-SYMBOL NULL))
+    (case operator
+      (GET-SYM (setq symbol (get-sym-from-offset offset))) 
+      (GET-KWD (setq symbol (get-kwd-from-offset offset)))
+      (GET-SGT (setq symbol (get-sgt-from-offset offset))))
+    (return (bquote (CPP_SYMBOL & symbol)))))

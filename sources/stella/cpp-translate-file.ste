@@ -1,0 +1,667 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: cpp-translate-file.ste,v 1.62 2003/09/26 21:21:02 hans Exp
+
+;;; Translating Stella files into C++.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;; Current output stream, which might be a file or a string-stream.
+(defspecial *current-stream* OUTPUT-STREAM STANDARD-OUTPUT)
+
+;; Current extension for translated file names
+(defglobal *cpp-translated-file-suffix* STRING "")
+
+(defun cpptrans ((statement OBJECT))
+  :command? TRUE :public? TRUE :evaluate-arguments? FALSE
+  :documentation "Translate `statement' to C++ and print the result."
+  (special ((*translatorOutputLanguage* *translatorOutputLanguage*)
+	    (*current-stream* STANDARD-OUTPUT))
+    (set-translator-output-language :cpp)
+    (incrementally-translate statement)))
+
+(defun (cpp-make-code-output-file-name FILE-NAME) ((fileName FILE-NAME))
+  (return (make-file-name fileName :cpp-code FALSE)) )
+
+(defun (cpp-make-header-output-file-name FILE-NAME) ((fileName FILE-NAME))
+  (return (make-file-name fileName :cpp-header FALSE)))
+
+(defun cpp-output-file-header ((stream OUTPUT-STREAM) (file FILE-NAME))
+  ;; Output a header for the C++ `file' to `stream'.
+  (print-stream stream "//  -*- Mode: C++ -*-" EOL EOL)
+  (when (defined? file)
+    ;; Don't write the full file name so we won't get diffs just from
+    ;;    building a release in a different directory:
+    (print-stream stream "// " (file-name-without-directory file) EOL EOL))
+  (output-copyright-header stream))
+
+(defun cpp-output-include-directive
+    ((fileName FILE-NAME) (stripDirectory? BOOLEAN))
+  ;; Output an #include directive for `fileName'.
+  ;; If `stripDirectory?' is TRUE, strip the directory component of `fileName'.
+  ;;    This is useful to eliminate root pathnames introduced by `make-file-name'.
+  (when stripDirectory?
+    (setq fileName (file-name-without-directory fileName)))
+  (print-stream *current-stream* "#include \"" fileName "\"" EOL))
+  
+(defun cpp-standalone-output-import-declarations ((headerFileName FILE-NAME))
+  ;; Output appropriate header file include statements for the C++ standalone
+  ;;    file associated with `headerFileName'.
+  (cpp-output-include-directive
+   (make-file-name "cpp-standalone" :cpp-header TRUE) TRUE)
+  (cpp-output-include-directive headerFileName TRUE)
+  (print-stream *current-stream* EOL) )
+
+(defun (cpp-relativize-header-file FILE-NAME)
+    ((headerFile FILE-NAME) (systemName STRING))
+  ;; Relativize `headerFile' with the native top-level directory of
+  ;;    system `systemName' or the currently translated system if
+  ;;    `systemName' is NULL.
+  ;; E.g, for the system header file this generates a relative
+  ;;    `<system-name>/<system-name>-system.hh' file name.
+  ;; Relativizing in this way makes specifications of the -I path simpler,
+  ;;    and it still allows to move the native directory (absolute paths
+  ;;    wouldn't) while avoiding conflicts of header files with equal names
+  ;;    coming from different systems.
+  (when (null? systemName)
+    (setq systemName (name *currentSystemDefinition*)))
+  (with-system-definition systemName
+    (let ((directoryFile (make-file-name "dummy" :cpp-header TRUE)))
+      (setq headerFile
+        ;; This is a somewhat round-about but hopefully cleaner than using the
+        ;;    system name directly:
+        (relativize-file-name
+         headerFile
+         (directory-parent-directory directoryFile 2)))))
+  ;; return here to make Java happy:
+  (return headerFile))
+
+(defun cpp-output-import-declarations ((systemName STRING))
+  ;; Output appropriate header file include statements for system `systemName',
+  ;;    or the currently translated system if `systemName' is NULL.
+  (when (null? systemName)
+    (when (null? *currentSystemDefinition*)
+      ;; we must be translating a single file - punt for now:
+      (return))
+    (setq systemName (name *currentSystemDefinition*)))
+  (with-system-definition systemName
+    (cpp-output-include-directive
+     (cpp-relativize-header-file
+      (make-file-name
+       (cpp-yield-system-header-file-name systemName) :cpp-header TRUE)
+      systemName)
+     FALSE)
+    (print-stream *current-stream* EOL)))
+
+(defun cpp-output-class-head-declarations ((classes CONS))
+  ;; Output all classes in current file without their bodies.  This
+  ;;   enables forward referencing of classes within a file.
+  ;; THIS MIGHT BE OBSOLETE NOW.
+  (unless (empty? classes)
+    (print-stream *current-stream* "// Class headers:" EOL))
+  (foreach class in classes
+      do (print-stream *current-stream* "class "
+                       (wrapper-value (cast (second (cast class CONS))
+                                            STRING-WRAPPER))
+                       ";" EOL))
+  (print-stream *current-stream* EOL) )
+
+(defun cpp-output-namespace-header ((module MODULE))
+  ;; Print the header of the namespace definition representing `module'.
+  (print-stream *current-stream*
+                "namespace "
+                (cpp-yield-namespace-prefix-from-module module) " {" EOL)
+  (foreach usee in (reverse (rest (consify (visible-modules module))))
+      do (print-stream *current-stream*
+                       "  using namespace "
+                       (cpp-yield-namespace-prefix-from-module usee)
+                       ";" EOL))
+  (print-stream *current-stream* EOL))
+
+(defun cpp-output-namespace-footer ((module MODULE))
+  ;; Close the namespace definition representing `module'.
+  (print-stream *current-stream*
+                "} // end of namespace "
+                (cpp-yield-namespace-prefix-from-module module) EOL))
+
+(defun (cpp-unit-defines-main? BOOLEAN) ((unit TRANSLATION-UNIT))
+  ;; Return TRUE if `unit' defines the `main' function.
+  (return (and (eql? (category unit) (quote METHOD))
+               (eql? (slot-name (cast (the-object unit) METHOD-SLOT))
+                     (quote MAIN)))))
+
+(defun (cpp-yield-main-file-name FILE-NAME) ()
+  ;; Return the filename of the file that holds the `main' function.
+  ;; We need `main' to be in a separate file to avoid multiple definitions
+  ;;    in case of a derived system that has its own `main' function.
+  (return (make-file-name "main" :cpp-code TRUE)))
+
+(defun cpp-output-main ((unit TRANSLATION-UNIT))
+  ;; Output the definition of the `main' function which can't be defined
+  ;;    within a user-defined namespace.  Write the definition to its own file
+  ;;    so we don't run into problem when we need to link multiple systems
+  ;;    where more than one define a `main' function.
+  (special ((*current-stream*
+             (new FILE-OUTPUT-STREAM :filename (cpp-yield-main-file-name))))
+    (when (defined? *currentSystemDefinition*)
+      (print-stream *current-stream* "// main entry point for "
+                    (name *currentSystemDefinition*) " system" EOL EOL))
+    (cpp-output-import-declarations NULL)
+    (foreach usee in (reverse (consify (visible-modules *module*)))
+        do (print-stream *current-stream*
+                         "using namespace "
+                         (cpp-yield-namespace-prefix-from-module usee)
+                         ";" EOL))
+    (print-stream *current-stream* EOL)
+    (cpp-output-statement (translation unit))
+    (free *current-stream*)))
+
+(defun (cpp-sort-units-for-header-file (LIST OF (CONS OF TRANSLATION-UNIT)))
+    ((fileUnits (LIST OF TRANSLATION-UNIT)))
+  ;; Sort `fileUnits' into a list of buckets of units of particular categories.
+  ;; The result is a list of the following form:
+  ;;     (<includeStatements> <classes> <globals>
+  ;;      <methods> <auxiliaryGlobals> <main>)
+  (let ((globals nil)
+        (auxiliaryGlobals nil)
+	(methods nil)
+	(includeStatements nil)
+	(classes nil)
+        (main nil))
+    (foreach unit in fileUnits
+        do (case (category unit)
+             ((METHOD PRINT-METHOD MACRO)
+              (if (cpp-unit-defines-main? unit)
+                  (pushq main unit)
+                (pushq methods unit)))
+             (VERBATIM
+              (let ((translation CONS (translation unit))
+                    (code STRING (second translation)))
+                ;; cheesy convention: if the first character of the verbatim
+                ;;    is a `#' and the second character is not whitespace, we
+                ;;    output it in the .hh file.  This allows us to force
+                ;;    verbatim `# include's or `# define's in the code section
+                ;;    if we want to:
+                (when (and (eql? (nth code 0) #\#)
+                           (not (white-space-character? (nth code 1))))
+                  (pushq includeStatements
+                         (new TRANSLATION-UNIT
+                              :category (quote VERBATIM)
+                              :translation
+                              (copy-cons-tree (translation unit))))
+                  ;; avoid output in the code-file generation phase:
+                  (setf (second translation) ""))))
+             (CLASS
+              (pushq classes unit))
+             (GLOBAL-VARIABLE
+              (cond ((auxiliary-variable-unit? unit)
+                     (pushq auxiliaryGlobals unit)
+                     (setf (category unit) (quote AUXILIARY-VARIABLE)))
+                    (otherwise
+                     (pushq globals unit))))
+             (TYPE NULL))) ;; ignore types for now
+    (return (list (reverse includeStatements)
+                  (reverse classes)
+                  (reverse globals)
+                  (reverse methods)
+                  (reverse auxiliaryGlobals)
+                  main))))
+
+(defun cpp-output-namespace-change ((fromNamespace MODULE)
+                                    (toNamespace MODULE))
+  ;; Output a namespace change from `fromNamespace' (which might be NULL)
+  ;;    to `toNamespace' if necessary.
+  ;; If a switch is necessary, it is assumed that we are currently within
+  ;;    `fromNamespace' which needs to be closed (unless it is NULL).
+  (unless (or (eql? toNamespace fromNamespace)
+              (and (defined? fromNamespace)
+                   (eql? (cpp-yield-namespace-prefix-from-module
+                          fromNamespace)
+                         (cpp-yield-namespace-prefix-from-module
+                          toNamespace))))
+    (unless (null? fromNamespace)
+      (print-stream *current-stream* EOL)
+      (cpp-output-namespace-footer fromNamespace)
+      (print-stream *current-stream* EOL EOL))
+    (cpp-output-namespace-header toNamespace)))
+
+(defun cpp-output-all-units-to-file ((fileName FILE-NAME))
+  ;; Called by `translate-file' to produce a <fileName>.hh and <fileName>.cc
+  ;;    file by iterating over all current translation units and outputting
+  ;;    their translations.
+  (let ((codeOutputFile (make-file-name fileName :cpp-code FALSE))
+	(headerOutputFile (make-file-name fileName :cpp-header FALSE))
+        (codeOutputStream
+         (new OUTPUT-FILE-STREAM :filename codeOutputFile))
+        (headerOutputStream
+         (new OUTPUT-FILE-STREAM :filename headerOutputFile))
+        (headerUnits (cpp-sort-units-for-header-file *translationUnits*))
+        (auxiliaryGlobals (fifth headerUnits))
+        (main (first (nth headerUnits 5)))
+        (currentNamespaceModule MODULE NULL)
+        (currentUnitModule MODULE NULL))
+    (special ((*current-stream* headerOutputStream))
+      (inform "Writing " headerOutputFile "...")
+      (cpp-output-file-header headerOutputStream headerOutputFile)
+      (foreach bucket in headerUnits
+          do (foreach unit in bucket
+                 as i in (interval 1 NULL)
+                 do (when (and (defined? (the-object unit))
+                               (not (eql? (category unit) (quote VERBATIM))))
+                      (setq currentUnitModule (home-module (the-object unit)))
+                      (cpp-output-namespace-change
+                       currentNamespaceModule currentUnitModule)
+                      (setq currentNamespaceModule currentUnitModule))
+                    (case (category unit)
+                      (VERBATIM
+                       (when (= i 1)
+                         (print-stream *current-stream*
+                                       "// Header files and macros:" EOL))
+                       (cpp-output-statement (translation unit))
+                       (print-stream *current-stream* EOL))
+                      (CLASS
+                       (when (= i 1)
+                         (print-stream *current-stream*
+                                       "// Class definitions:" EOL))
+                       (cpp-output-class
+                        (rest (cast (translation unit) CONS))))
+                      (GLOBAL-VARIABLE
+                       (when (= i 1)
+                         (print-stream *current-stream*
+                                       "// Global declarations:" EOL))
+                       (cpp-output-global-declaration (translation unit)))
+                      ((METHOD PRINT-METHOD MACRO)
+                       (when (= i 1)
+                         (print-stream *current-stream*
+                                       "// Function signatures:" EOL))
+                       (let ((translation CONS (translation unit)))
+                         (case (first translation)
+                           (CPP_FUNCTION
+                            (cpp-output-function-signature (rest translation))
+                            (print-stream *current-stream* ";" EOL))
+                           (CPP_DEFPRINT
+                            (cpp-output-defprint-signature (rest translation))
+                            (print-stream *current-stream* ";" EOL))
+                           (otherwise
+                            ;; do nothing, e.g. DEFMETHOD
+                            NULL))))
+                      (AUXILIARY-VARIABLE
+                       (when (= i 1)
+                         (print-stream *current-stream*
+                                       "// Auxiliary global declarations:" EOL))
+                       (cpp-output-global-declaration (translation unit)))))
+             (print-stream *current-stream* EOL))
+      (cpp-output-namespace-footer currentNamespaceModule)
+      
+      (inform "Writing " codeOutputFile "...")
+      (setq *current-stream* codeOutputStream)
+      (cpp-output-file-header codeOutputStream codeOutputFile)
+      (case (translator-output-language)
+	(:cpp
+	 (cpp-output-import-declarations NULL))
+	(:cpp-standalone
+	 (cpp-standalone-output-import-declarations headerOutputFile)))
+      ;; For the code portion, preserve the original definition order,
+      ;;     but move those unsightly symbol variables to the very end:
+      (setq currentNamespaceModule NULL)
+      (foreach unit in *translationUnits*
+	  do (when (and (defined? (the-object unit))
+                        (not (eql? (category unit) (quote VERBATIM)))
+                        (not (eql? (category unit) (quote AUXILIARY-VARIABLE))))
+               (setq currentUnitModule (home-module (the-object unit)))
+               (cpp-output-namespace-change
+                currentNamespaceModule currentUnitModule)
+               (setq currentNamespaceModule currentUnitModule))
+             (case (category unit)
+	       ((METHOD PRINT-METHOD MACRO)
+                (if (eql? unit main)
+                    ;; since we output this unit twice, we need to copy so
+                    ;;    we won't lose due to destructive modification:
+                    (cpp-output-statement (copy-cons-tree (translation unit)))
+                  (cpp-output-statement (translation unit))))
+	       (VERBATIM
+		(cpp-output-verbatim  (second (cast (translation unit) CONS))))
+	       (GLOBAL-VARIABLE
+		(unless (auxiliary-variable-unit? unit)
+		  (cpp-output-variable-definition (translation unit))))
+	       (otherwise NULL)))
+      ;; output auxiliaries at the end:
+      (foreach unit in auxiliaryGlobals
+	  do (setq currentUnitModule (home-module (the-object unit)))
+             (cpp-output-namespace-change
+              currentNamespaceModule currentUnitModule)
+             (setq currentNamespaceModule currentUnitModule)
+             (cpp-output-variable-definition (translation unit)))
+      (cpp-output-namespace-footer currentNamespaceModule)
+      ;; Can't define `main' within a user namespace, so defer its output
+      ;;    to the very end:
+      (when (defined? main)
+        (print-stream *current-stream* EOL EOL)
+        (cpp-output-main main))
+
+      (free codeOutputStream)
+      (free headerOutputStream) )))
+
+(defun cpp-translate-file ((fileName FILE-NAME))
+  :public? TRUE
+  ;; Translate a stella file to C++.
+  (translate-file fileName :cpp FALSE) )
+
+(defun cpp-standalone-translate-file ((fileName FILE-NAME))
+  ;; Translate a Loom-to-Stella file to C++.
+  (translate-file fileName :cpp-standalone FALSE) )
+
+
+  ;;
+;;;;;; System translation support:
+  ;;
+
+(defun cpp-translate-system ((systemName STRING))
+  :documentation "Translate the system `systemName' to C++."
+  :public? TRUE
+  (translate-system systemName :cpp
+                    :two-pass? TRUE
+                    :force-translation? TRUE
+                    :production-settings? TRUE))
+
+(defun cpp-translate-walked-system-units ((systemUnits SYSTEM-UNITS-ALIST))
+  ;; Translate all walked translation units and output their translations.
+  ;;    `systemUnits' is the result of walking the files of the current system.
+  ;; NOTE: THIS WILL ALLOW US TO DO A BETTER JOB ON CLASS FORWARD DECLARATIONS
+  ;;    THAN WHAT'S CURRENTLY DONE BY `cpp-output-system-header-file'.
+  (special ((*currentFile* NULL)
+            (*translationUnits* NULL))
+    (foreach (file units) in systemUnits
+        do (setq *currentFile* (file-base-name file))
+           (setq *translationUnits* units)
+           (within-module (compute-file-units-module units)
+             ;; for now, this mirrors the old functionality:
+             (translate-and-output-units-to-file file "C++"))
+           (clean-up-translation-units-special))
+    (cpp-output-system-specific-files)))
+
+(defun cpp-output-system-specific-files ()
+  ;; Output all system-specific files for the currently translated system.
+  (cpp-output-system-header-file)
+  (cpp-output-system-Makefile))
+
+(defun (cpp-yield-system-header-file-name STRING) ((systemName STRING))
+  ;; Yield the basename of the system-wide header file for system `systemName'.
+  (return (concatenate (string-downcase systemName) "-system")))
+
+(defun (cpp-yield-system-header-file-guard STRING) ((systemName STRING))
+  ;; Yield the name of the guard variable to prevent multiple inclusion
+  ;;    of the header file for system `systemName'.
+  (return
+    (concatenate "_STELLA_" (string-upcase systemName) "_SYSTEM_HH")))
+
+(defun cpp-output-system-header-file ()
+  ;; Create a system-wide header file for the currently translated system.
+  (let ((system *currentSystemDefinition*)
+        (systemName (name system))
+        (headerOutputFile
+         (make-file-name (cpp-yield-system-header-file-name systemName)
+                         :cpp-header TRUE))
+        (headerOutputStream
+         (new OUTPUT-FILE-STREAM :filename headerOutputFile)))
+    (special ((*current-stream* headerOutputStream)
+              (*module* (get-cardinal-module *currentSystemDefinition*))
+              (*cpp-current-unit-module* NULL))
+      ;; Output file header:
+      (print-stream *current-stream* "// "
+		    (file-name-without-directory headerOutputFile) EOL EOL)
+      (print-stream *current-stream*
+                    "#ifndef "
+                    (cpp-yield-system-header-file-guard systemName) EOL
+                    "#define "
+                    (cpp-yield-system-header-file-guard systemName) EOL EOL)
+
+      ;; Include required systems (this might need some work to avoid multiple
+      ;;    inclusions of required systems):
+      (when (defined? (required-systems system))
+	(print-stream *current-stream* "// Required systems:" EOL)
+	(foreach reqSys in (required-systems system)
+	    do (cpp-output-import-declarations reqSys)))
+    
+      ;; Generate system-wide forward declarations for types:
+      ;; TO DO: Generalize this to pick up classes from all modules defined by
+      ;;    this system, not just its cardinal one:
+      (print-stream *current-stream* "// System-wide forward declarations:" EOL)
+      (let ((currentNamespaceModule MODULE NULL))
+        (foreach class in (all-classes *module* TRUE)
+            where (create-native-class? class)
+            do (setq *cpp-current-unit-module* (home-module class))
+               (cpp-output-namespace-change
+                currentNamespaceModule *cpp-current-unit-module*)
+               (setq currentNamespaceModule *cpp-current-unit-module*)
+               (print-stream *current-stream*
+                             "class "
+                             (wrapper-value
+                              (cpp-translate-class-name (class-type class)))
+                             ";" EOL))
+        (print-stream *current-stream* EOL)
+        (when (defined? currentNamespaceModule)
+          ;; we did output some forward declarations, write the footer:
+          (cpp-output-namespace-footer *cpp-current-unit-module*))
+        (print-stream *current-stream* EOL EOL))
+    
+      ;; Include header files of all system components:
+      (print-stream *current-stream* "// System components:" EOL)
+      ;; Special-case STELLA system:
+      (when (eql? systemName "stella")
+	(cpp-output-include-directive
+	 (cpp-relativize-header-file
+	  (make-file-name-from-relative-path
+	   (bquote ("cpp-lib" "cpp-primal")) :cpp-header)
+	  systemName)
+	 FALSE))
+      (foreach file in (files-plus-system-startup
+			(system-definition-source-files system))
+	  do (cpp-output-include-directive
+	      (cpp-relativize-header-file
+	       (make-file-name file :cpp-header TRUE)
+	       systemName)
+	      FALSE))
+      (print-stream *current-stream* EOL "#endif" EOL)
+      (free headerOutputStream) )))
+
+(defun (cpp-yield-SYSTEMS-ROOT-directory STRING) ()
+  ;; Return a directory pathname that can be used as the value of the
+  ;;    SYSTEMS-ROOT variable in system Makefile's.
+  ;; SYSTEMS-ROOT points to the directory that contains all C++-translated
+  ;;    STELLA systems, i.e., the `.../native/cpp' directory.
+  (with-system-definition "STELLA"
+    #|
+    ;; generates absolute pathname:
+    (return
+      (directory-file-name
+       (directory-parent-directory
+        (make-file-name "dummy" :cpp-code TRUE) 2)))
+        |#
+    ;; but we need a relative one to make it easy to move the directory
+    ;;    without having to edit Makefiles.  The pathname below is relative
+    ;;    to any top-level system Makefile and it assumes a Unix flavor
+    ;;    (which should be ok since Makefile's won't work anywhere else):
+    (return ".."))
+  ;; make Java happy:
+  (return NULL))
+
+(defun (cpp-yield-STELLA-ROOT-directory STRING) ()
+  ;; Return a directory pathname that can be used as the value of the
+  ;;    STELLA-ROOT variable in system Makefile's.
+  ;; STELLA-ROOT is the root directory of the C++ translation of STELLA,
+  ;;    i.e., the `.../native/cpp/stella' directory.
+  (with-system-definition "STELLA"
+    (return
+      ;; again, we want a relative pathname and we shamelessly assume Unix
+      ;;    since we are generating a Makefile:
+      (concatenate (cpp-yield-SYSTEMS-ROOT-directory)
+                   "/"
+                   (file-base-name
+                    (directory-file-name
+                     (directory-parent-directory
+                      (make-file-name "dummy" :cpp-code TRUE) 1))))))
+  ;; make Java happy:
+  (return NULL))
+
+(defun cpp-output-system-Makefile ()
+  ;; Create a Makefile for the currently translated system.
+  ;; This uses the file `Makfile.in' in the top-level system directory
+  ;;    as a template, or, if no local template exists, the file
+  ;;    `Makefile-default.in' in the STELLA directory.  The default
+  ;;    template should be sufficient for most cases.
+  ;; The actual Makefile is created by substituting the following
+  ;;    variables with appropriate values: SYSTEM-NAME, PROGRAM-NAME,
+  ;;    MAIN-NAME, SYSTEMS-ROOT, STELLA-ROOT, and SYSTEM-FILES.
+  ;;    In the template, references to template variables have to be
+  ;;    written as #$(VAR), e.g., #$(SYSTEM-NAME).
+  (let ((makefile (make-file-name "Makefile" :stella TRUE))
+        (templateFile
+         (concatenate (file-name-without-extension makefile) ".in"))
+        (system *currentSystemDefinition*))
+    (unless (probe-file? templateFile)
+      (with-system-definition "STELLA"
+        (setq makefile (make-file-name "Makefile-default" :stella TRUE))
+        (setq templateFile
+          (concatenate (file-name-without-extension makefile) ".in"))))
+    (let ((variables (new (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+          (systemFiles (new STRING-OUTPUT-STREAM))
+          (requiredSystems (new STRING-OUTPUT-STREAM)))
+      (insert-at variables "SYSTEM-NAME" (name system))
+      (insert-at variables "PROGRAM-NAME" (name system))
+      (insert-at variables "MAIN-NAME"
+                 (file-name-without-directory (cpp-yield-main-file-name)))
+      (insert-at variables "SYSTEMS-ROOT" (cpp-yield-SYSTEMS-ROOT-directory))
+      (insert-at variables "STELLA-ROOT" (cpp-yield-STELLA-ROOT-directory))
+      (foreach file in (files-plus-system-startup
+                        (system-definition-source-files system))
+          do (print-stream systemFiles
+                           (file-name-without-directory
+                            (make-file-name file :cpp-code TRUE))
+                           " "))
+      (insert-at variables "SYSTEM-FILES" (the-string systemFiles))
+      (when (defined? (required-systems system))
+        (foreach reqSys in (required-systems system)
+            do (print-stream requiredSystems (wrapper-value reqSys) " ")))
+      (insert-at variables "REQUIRED-SYSTEMS" (the-string requiredSystems))
+      (setq makefile
+        (file-name-without-extension
+         (make-file-name "Makefile" :cpp-code TRUE)))
+      (substitute-template-variables-to-Makefile
+       templateFile makefile variables))))
+
+
+  ;;
+;;;;;; Template file support
+  ;;
+
+(defglobal *makefile-template-variable-prefix* STRING "#$")
+
+(defun (substitute-template-variables-in-string STRING)
+    ((string STRING) (variables (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+  ;; Substitute all template `variables' in `string' with their supplied
+  ;;    values and return the result.
+  (let ((index 0)
+        (length (length string))
+        (result string)
+        (variableEnd 0)
+        (variableName STRING NULL)
+        (variableValue STRING-WRAPPER NULL))
+    (loop
+      (setq index (string-search result *makefile-template-variable-prefix* index))
+      (when (null? index)
+        (break))
+      (++ index 2)
+      (when (>= index length)
+        (warn "Illegal template variable syntax in" EOL "    " string)
+        (break))
+      (unless (eql? (nth result index) #\()
+        (warn "Illegal template variable syntax in" EOL "    " string)
+        (continue))
+      (setq variableEnd (position result #\) index))
+      (when (null? variableEnd)
+        (warn "Illegal template variable syntax in" EOL "    " string)
+        (continue))
+      (++ index)
+      (setq variableName (subsequence result index variableEnd))
+      (setq variableValue (lookup variables variableName))
+      (when (null? variableValue)
+        (warn "Undefined template variable: " variableName)
+        (continue))
+      (setq result
+        (concatenate
+          (subsequence result 0 (- index 3))
+          variableValue
+          (subsequence result (1+ variableEnd) NULL)))
+      (setq index (+ variableEnd 1 (- (length result) length)))
+      (setq length (length result)))
+    (return result)))
+
+(defun substitute-template-variables-to-stream
+    ((templateStream INPUT-STREAM)
+     (outputStream OUTPUT-STREAM)
+     (variables (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+  ;; Read input from `templateStream', substitute any defined template
+  ;;    `variables' with their supplied values and write the result to
+  ;;    `outputStream'.
+  (foreach line in (lines templateStream)
+      do (print-stream outputStream
+                       (substitute-template-variables-in-string
+                        line variables)
+                       EOL)))
+
+(defun substitute-template-variables-to-Makefile
+    ((templateFile STRING) (outputFile STRING)
+     (variables (KEY-VALUE-LIST OF STRING-WRAPPER STRING-WRAPPER)))
+  ;; Read `templateFile', substitute any defined template `variables'
+  ;;    with their supplied values and write the result to a Makefile
+  ;;    named `outputFile'.
+  (let ((out (new OUTPUT-FILE-STREAM :filename outputFile)))
+    (print-stream out "# This file has been generated automatically.  "
+                  "Modify at your own risk!" EOL EOL)
+    (substitute-template-variables-to-stream
+     (new INPUT-FILE-STREAM :filename templateFile) out variables)
+    (free out)))

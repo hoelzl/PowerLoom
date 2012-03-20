@@ -1,0 +1,1002 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: streams.ste,v 1.67 2003/07/23 23:34:20 tar Exp
+
+;;; Procedures that manipulate streams.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Stream Constants
+  ;;
+
+(defglobal EOL SYMBOL (quote EOL)
+  :documentation "Generates a newline character when passed to a stream."
+  :public? TRUE)
+
+(defglobal EOL-STRING STRING "
+"
+  :documentation "A string constant containing the character sequence
+necessary to generate a newline."
+  :public? TRUE)
+
+(defglobal STANDARD-INPUT INPUT-STREAM NULL
+  :documentation "Denotes the standard input stream for the host language."
+  :public? TRUE)
+
+(startup-time-progn :globals
+  (setq STANDARD-INPUT
+    (new INPUT-STREAM
+         :native-stream
+         (verbatim :common-lisp CL:*standard-input*
+                   :cpp "&std::cin"
+                   :java "new java.io.PushbackInputStream(java.lang.System.in)"))))
+
+(defglobal STANDARD-OUTPUT OUTPUT-STREAM NULL
+  :documentation "Denotes the standard output stream for the host language."
+  :public? TRUE)
+
+(startup-time-progn :early-inits
+  (setq STANDARD-OUTPUT
+    (new OUTPUT-STREAM
+         :native-stream
+         (verbatim :common-lisp CL:*standard-output*
+                   :cpp "&std::cout"
+                   :java "java.lang.System.out"))))
+
+(defglobal STANDARD-WARNING OUTPUT-STREAM NULL
+  :documentation "Denotes the standard warning stream for the host language."
+  :public? TRUE)
+(startup-time-progn :early-inits
+ (unless (defined? STANDARD-WARNING)
+   (setq STANDARD-WARNING
+     (new OUTPUT-STREAM
+          :native-stream
+          (verbatim :common-lisp CL:*error-output*
+		    :cpp "&std::cerr"
+		    :java "java.lang.System.err")))))
+
+(defglobal STANDARD-ERROR OUTPUT-STREAM NULL
+  :documentation "Denotes the standard error stream for the host language."
+  :public? TRUE)
+
+(startup-time-progn :early-inits
+  (setq STANDARD-ERROR
+    (new OUTPUT-STREAM
+         :native-stream
+         (verbatim :common-lisp CL:*error-output*
+                   :cpp "&std::cerr"
+                   :java "java.lang.System.err"))))
+
+
+;;; Used in walk.ste, but appears in expansions of :command? TRUE
+;;; forms, so we need to get it defined early in the load sequence.
+;;; Streams is the second file to load, so it goes here.
+
+(defspecial *ignoreTranslationErrors?* BOOLEAN TRUE
+  :documentation "If `true' all passes of a translation will always be performed
+regardless of whether any errors were encountered.  Otherwise, translation
+ends with the first pass that encountered an error."
+  :public? TRUE)
+
+
+
+  ;;
+;;;;;; Message and Error Handling Stream Routines
+  ;;
+
+(defglobal SINGLE-QUOTE-STRING STRING-WRAPPER (wrap-literal "'")
+  :documentation "Holds a string containing the single quote character.")
+(defglobal SINGLE-BQUOTE-STRING STRING-WRAPPER (wrap-literal "`")
+  :documentation "Holds a string containing the single backquote character.")
+
+(defun (format-message-arguments CONS) ((messageArgumentsTree CONS) (trailingEOL? BOOLEAN))
+  ;; Helping function for "warn", "error", and "cerror".
+  ;; Augment 'messageArguments' with additional arguments that place
+  ;;    single quotes around non-string arguments.
+  ;; If 'trailingEOL?', add a trailing end of line.
+  (let ((augmentedArguments NIL))
+    (foreach item in messageArgumentsTree
+             do
+             (cond
+              ((or (string? item)
+                   (eql? item EOL))
+               (pushq augmentedArguments item))
+	      ;; MUTABLE-STRING here? -tar
+              (otherwise
+               (pushq augmentedArguments SINGLE-BQUOTE-STRING)
+               (pushq augmentedArguments item)
+               (pushq augmentedArguments SINGLE-QUOTE-STRING))))
+    (when trailingEOL?
+      (pushq augmentedArguments EOL))
+    (return (reverse augmentedArguments)) ))
+
+(defmacro print (&body (body CONS))
+  :public? TRUE
+  :documentation "Print arguments to the standard output stream."
+  (return
+    (bquote (print-stream STANDARD-OUTPUT && body))) )
+
+(defmacro print-spaces (&body (body CONS))
+  :public? TRUE
+  :documentation "(print-spaces [stream] N) prints N spaces onto stream.  If
+no stream form is provided, then STANDARD-OUTPUT will be used."
+  (if (empty? (rest body))
+    (return (bquote (foreach i in (interval 1 & (first body))
+			do (ignore i)
+			   (print-stream STANDARD-OUTPUT " "))))
+    (return (bquote (foreach i in (interval 1 & (second body))
+			do (ignore i)
+			   (print-stream & (first body) " "))))))
+    
+
+(defmacro inform (&body (body CONS))
+  :public? TRUE
+  :documentation "Print informative message, placing non-string arguments in quotes,
+and terminating with a newline."
+  (setq body (format-message-arguments body TRUE))
+  (return
+   (bquote (print-stream STANDARD-OUTPUT && body))) )
+
+(defmacro warn (&body (body CONS))
+  :public? TRUE
+  :documentation "Signal warning message, placing non-string arguments in quotes."
+  (setq body (format-message-arguments body FALSE))
+  (if (eq? (translator-output-language) :common-lisp)
+      (return
+	(bquote (print-stream :warn && body)))
+    (return
+      (bquote (print-stream STANDARD-WARNING "Warning: " && body EOL)))))
+
+(defmacro signal ((type SYMBOL) &body (body CONS))
+  :public? TRUE
+  :documentation "Signal error message, placing non-string arguments in quotes."
+  (when (eq? type (quote NULL)) (setq type (quote STELLA-EXCEPTION)))
+  ;; Special handling of case of a simple string error:
+  (if (and (= (length body) 1)
+	   (isa? (first body) @STRING-WRAPPER))
+    (return 
+      (bquote (signal-exception (new & type :message & (first body)))))
+    (let ((streamVar (local-gensym "STREAM")))
+      (return 
+	(bquote
+	 (let ((& streamVar  (new OUTPUT-STRING-STREAM)))
+	   (print-stream & streamVar && (format-message-arguments body FALSE))
+	   (signal-exception (new & type :message (the-string & streamVar))))))) ))
+
+(defmacro error (&body (body CONS))
+  :public? TRUE
+  :documentation "Signal error message, placing non-string arguments in quotes."
+  (return (bquote (signal STELLA-EXCEPTION && body))))
+
+
+;; TO DO: FIGURE OUT IF C++ HAS AN ANALOGUE OF 'CL:cerror':
+(defmacro continuable-error (&body (body CONS))
+  :public? TRUE
+  :documentation "Signal error message, placing non-string arguments in quotes."
+  (setq body (format-message-arguments body FALSE))
+  (if (eq? (translator-output-language) :java)
+    ;; Special handling of case of a simple string error:
+    (if (and (= (length body) 1)
+	     (isa? (first body) @STRING-WRAPPER))
+      (return 
+	(bquote (let ((error_message_ & (wrapper-value (cast (first body) STRING-WRAPPER))))
+		  (verbatim :java "Native.continuableError(error_message_)"
+			    )) ))
+      (let ((streamVar (local-gensym "STREAM")))
+	(return 
+	  ;; Need to use nested LETs so that we don't have to worry about variable
+	  ;;  capture, since we can't get a GENSYM'd variable into a verbatim string.
+	  (bquote
+	   (let ((& streamVar  (new OUTPUT-STRING-STREAM)))
+	     (print-stream & streamVar && (format-message-arguments body FALSE))
+	     (let ((error_message_ (the-string & streamVar)))
+	       (verbatim :java "Native.continuableError(error_message_)"
+			 ) )) ))) )
+    (return
+      (bquote (print-stream :continuable-error && body)))) )
+
+(defmacro signal-read-error (&body (body CONS))
+  :public? TRUE
+  :documentation "Specialized version of `signal' that throws a READ-EXCEPTION."
+  (return (bquote (signal READ-EXCEPTION && body))))
+
+(defun (format-walk-message-arguments CONS) ((messageArgumentsTree CONS))
+  ;; Helping function for 'walk-error' and 'walk-inform'.
+  ;; Wrap de-uglify function around arguments in 'messageArgumentsTree'.
+  (foreach it on messageArgumentsTree
+           do
+           (let ((item (value it)))
+             (typecase item
+               (SYMBOL
+                (unless (eql? item EOL) 
+                  (setf (value it) (bquote (de-uglify-parse-tree & item)))))
+               (otherwise NULL))))
+  (return messageArgumentsTree) )
+
+(defmacro walk-error (&body (body CONS))
+  ;; Print out a warning of a translation error.
+  (let ((messageArguments (format-message-arguments 
+			   (format-walk-message-arguments body) FALSE)))
+    (return
+     (bquote
+      (special ((*printReadably?* TRUE))
+         (signal-translation-error)
+         (unless (suppress-warnings?)
+           (print-error-context ">> ERROR: " STANDARD-ERROR)
+           (print-stream STANDARD-ERROR EOL " " && messageArguments "." EOL))))) ))
+
+;;; PHASING THIS OUT:
+(defmacro walk-inform (&body (body CONS))
+  ;; Print out a warning of a translation error.
+  (let ((messageArguments (format-message-arguments
+			   (format-walk-message-arguments body) FALSE)))
+    (return
+     (bquote
+      (special ((*printReadably?* TRUE))
+         (signal-translation-warning)
+         (unless (suppress-warnings?)
+           (print-error-context ">> WARNING: " STANDARD-OUTPUT)
+           (print-stream STANDARD-OUTPUT EOL " " && messageArguments "." EOL))))) ))
+
+(defmacro walk-warn (&body (body CONS))
+  ;; Print out a warning of a translation error.
+  (let ((messageArguments (format-message-arguments
+			   (format-walk-message-arguments body) FALSE)))
+    (return
+     (bquote
+      (special ((*printReadably?* TRUE))
+         (signal-translation-warning)
+         (unless (suppress-warnings?)
+           (print-error-context ">> WARNING: " STANDARD-WARNING)
+           (print-stream STANDARD-WARNING EOL " " && messageArguments "." EOL))))) ))
+
+(defmacro safety ((level INTEGER-WRAPPER) (test OBJECT) &body (body CONS))
+  :public? TRUE
+  :documentation "Signal warning message, placing non-string arguments in quotes."
+  (when (> (wrapper-value level) *safety*)
+    (return NULL))
+  (setq body (format-message-arguments body FALSE))
+  (return
+   (bquote
+    (when (not & test)
+      (print-stream :error "Safety violation: " && body)))) )
+
+(defmacro evaluation-error (&body (body CONS))
+  ;; Specialized error handler for EVALUATION errors
+  (let ((streamVar (local-gensym "STREAM")))
+    (return 
+      (bquote
+       (let ((& streamVar  (new OUTPUT-STRING-STREAM)))
+	 (print-stream & streamVar "While evaluating '" *evaluationTree*)
+	 (when (defined? *evaluationParentTree*)
+	   (print-stream & streamVar EOL "' inside '" *evaluationParentTree*))
+	 (print-stream & streamVar "':" EOL)
+	 (print-stream & streamVar && (format-message-arguments body FALSE))
+	 (signal-exception (new EVALUATION-EXCEPTION :message (the-string & streamVar))))))))
+
+(defun (format-string-message-arguments CONS)
+    ((messageArguments CONS) (trailingEOL? BOOLEAN))
+  ;; Helping function for `message-to-string'.
+  ;; Similar to `format-message-arguments', but ensures that each
+  ;;    argument is converted into a string (once we have string
+  ;;    streams that could be done differently).
+  ;; If 'trailingEOL?', add a trailing end of line.
+  (let ((formattedArguments
+         (format-message-arguments messageArguments trailingEOL?)))
+    (foreach it on formattedArguments
+        do (typecase (value it)
+             (STRING-WRAPPER NULL)
+	     ;; MUTABLE-STRING or MUTABLE-STRING-WRAPPER here?
+             (LITERAL-WRAPPER
+              (setf (value it) (stringify (value it))))
+             (otherwise
+              (if (eql? (value it) (quote EOL))
+                  (setf (value it) EOL-STRING)
+                (setf (value it)
+                  (bquote (stringify & (value it))))))))
+    (return formattedArguments)))
+
+(defmacro message-to-string (&body (body CONS))
+  ;; Return the message contained in `body' as a string.
+  ;; Similar to an `inform' but simulates printing to a string stream.
+  (let ((messageArguments
+         (format-string-message-arguments body FALSE))
+        (messageVar (local-gensym "MESSAGE")))
+    (return
+     (bquote
+      (vrlet ((& messageVar STRING NULL))
+        (special ((*printReadably?* TRUE))
+          (setq & messageVar (concatenate && messageArguments)))
+        & messageVar)))))
+
+
+  ;;
+;;;;;; Opening and closing streams
+  ;;
+
+(defun (terminate-output-stream? BOOLEAN) ((self OUTPUT-STREAM))
+  ;; Close the native stream of 'self' before 'self' gets freed.
+  (let ((native-stream (native-stream self)))
+    (unless (eq? native-stream NULL)
+      (verbatim
+	  :common-lisp (CL:close native-stream)
+	  :cpp "delete nativeStream"
+	  :java "nativeStream.close()"))
+    (setf (native-stream self) NULL)
+    (setf (state self) :CLOSED)
+    (return TRUE)))
+
+(defun (terminate-input-stream? BOOLEAN) ((self INPUT-STREAM))
+  ;; Close the native stream of 'self' before 'self' gets freed.
+  (let ((native-stream (native-stream self)))
+    (unless (eq? native-stream NULL)
+      (verbatim
+	  :common-lisp (CL:close native-stream)
+	  :cpp "delete nativeStream"
+	  ;; Java needs the try statement for this type of native stream.
+	  :java "try {
+        nativeStream.close();
+      } catch (java.io.IOException e) {
+        java.lang.System.err.println(\"Error closing stream: \" + e);
+      }
+"))
+    (setf (native-stream self) NULL)
+    (setf (state self) :CLOSED)
+    (return TRUE)))
+
+;;; File streams are opened with a call to 'new', for example,
+;;;
+;;;   (new OUTPUT-FILE-STREAM :filename "foo.lisp")
+;;;
+;;; File streams are closed by either calling 'close-stream' on them,
+;;; or by calling 'free' in which case 'terminate-file-stream?' will
+;;; make sure the native file stream is closed before the Stella stream
+;;; is freed up.
+
+(defglobal *open-file-streams* (LIST OF STREAM) (new (LIST OF STREAM))
+  :documentation "List of file streams that are currently open.")
+
+(defun initialize-file-output-stream ((self FILE-OUTPUT-STREAM))
+  ;; Initialize the native stream of 'self' with an open file output stream.
+  (let ((filename (translate-logical-pathname (filename self)))
+        (ifExistsAction (symbol-name (if-exists-action self))))
+    (setf (native-output-stream self)
+      (verbatim
+        :common-lisp
+        (cl:open filename :direction :output
+                 :if-exists (CL:intern ifExistsAction "KEYWORD"))
+        ;; don't GC C++ streams, since it is unnecessary and can cause
+        ;;    problems during closing/deletion:
+        :cpp "(new std::ofstream(filename))"
+        :java "new java.io.PrintStream(Native.openOutputFileStream(filename))"))
+    (when (eq? (native-output-stream self) NULL)
+      (error "initialize-file-output-stream: Could not open " self))
+    (setf (state self) :OPEN)
+    (push *open-file-streams* self)))
+
+(defun (terminate-file-output-stream? BOOLEAN) ((self FILE-OUTPUT-STREAM))
+  ;; Close the native stream of 'self' before 'self' gets freed.
+  (let ((native-stream (native-output-stream self)))
+    (unless (eq? native-stream NULL)
+      (verbatim :common-lisp (CL:close native-stream)
+		:cpp "delete nativeStream"
+		:java "nativeStream.close()"))
+    (setf (native-output-stream self) NULL)
+    (setf (state self) :CLOSED)
+    (remove *open-file-streams* self)
+    (return TRUE)))
+
+(defun initialize-file-input-stream ((self FILE-INPUT-STREAM))
+  ;; Initialize the native stream of 'self' with an open file input stream.
+  (let ((filename (translate-logical-pathname (filename self)))
+        (ifNotExistsAction (symbol-name (if-not-exists-action self))))
+    (setf (native-input-stream self)
+      (verbatim
+        :common-lisp
+        (cl:open filename :direction :input
+                 :if-does-not-exist (CL:intern ifNotExistsAction "KEYWORD"))
+        ;; don't GC C++ streams, since it is unnecessary and can cause
+        ;;    problems during closing/deletion:
+        :cpp "(new std::ifstream(filename))"
+        :java "new java.io.PushbackInputStream(Native.openInputFileStream(filename))"))
+    (when (eq? (native-input-stream self) NULL)
+      (error "initialize-file-input-stream: Could not open " self))
+    (setf (state self) :OPEN)
+    (push *open-file-streams* self)))
+
+(defun (terminate-file-input-stream? BOOLEAN) ((self FILE-INPUT-STREAM))
+  ;; Close the native stream of 'self' before 'self' gets freed.
+  (let ((native-stream (native-input-stream self)))
+    (unless (eq? native-stream NULL)
+      (verbatim :common-lisp (CL:close native-stream)
+		:cpp "delete nativeStream"
+		;; Java needs the try statement for this type of native stream.
+		:java "try {
+          nativeStream.close();
+        } catch (java.io.IOException e) {
+          java.lang.System.err.println(\"Error closing file: \" + e);
+        }
+"))
+    (setf (native-input-stream self) NULL)
+    (setf (state self) :CLOSED)
+    (remove *open-file-streams* self)
+    (return TRUE)))
+
+(defun initialize-string-output-stream ((self STRING-OUTPUT-STREAM))
+  ;; Initialize the native stream of 'self' with a new string output stream.
+  (setf (native-stream self)
+    (verbatim
+      :common-lisp (CL:make-string-output-stream)
+      :cpp "(new (GC) std::ostringstream())"
+      :java "new #$(STELLAROOT).javalib.PrintStringStream()")))
+
+(defmethod (the-string-reader STRING) ((self STRING-OUTPUT-STREAM))
+  ;; Access method for `the-string' accumulated by `self'.
+  (let ((native-stream (native-stream self))
+        (string STRING NULL))
+    (verbatim
+      :common-lisp (setq string (CL:get-output-stream-string native-stream))
+      :cpp "string = ostringstream_to_c_string((std::ostringstream*)nativeStream)"
+      :java "string =((#$(STELLAROOT).javalib.PrintStringStream)nativeStream).toString()")
+    (when (null? string)
+      ;; C++ returns NULL for a never-written-to string stream:
+      (setq string ""))
+    (return string)))
+
+(defun initialize-string-input-stream ((self STRING-INPUT-STREAM))
+  ;; Initialize the native stream of 'self' with a new string input stream.
+  (let ((string (the-string self)))
+    (setf (native-stream self)
+      (verbatim
+        :common-lisp (CL:make-string-input-stream string)
+        :cpp "(new (GC) std::istringstream(string))"
+        :java "new java.io.PushbackInputStream(new java.io.StringBufferInputStream(string))"))))
+
+(defun close-stream ((self STREAM))
+  :documentation "Close the stream `self'."
+  :public? TRUE
+  (typecase self
+    (FILE-INPUT-STREAM (terminate-file-input-stream? self))
+    (FILE-OUTPUT-STREAM (terminate-file-output-stream? self))
+    (INPUT-STREAM (terminate-input-stream? self))
+    (OUTPUT-STREAM (terminate-output-stream? self))
+    (otherwise NULL)))
+
+(defun flush-output ((self OUTPUT-STREAM))
+  :documentation "Flush all buffered output of `self'."
+  :public? TRUE
+  (let ((native-stream (native-stream self)))
+    (verbatim
+      :common-lisp (CL:force-output native-stream)
+      :cpp "flush(*nativeStream)"
+      :java "nativeStream.flush()")))
+
+(defun close-all-files ()
+  :documentation
+  "Close all currently open file streams.  Use for emergencies or for cleanup."
+  :public? TRUE
+  (let ((openStreams (copy *open-file-streams*)))
+    (foreach stream in openStreams
+             do (close-stream stream))
+    (free openStreams)))
+
+(defun (open-network-stream INPUT-STREAM OUTPUT-STREAM) ((host STRING)
+                                                         (port INTEGER))
+  :documentation
+  "Open a TCP/IP network stream to `host' at `port' and return the result
+as an input/output stream pair."
+  :public? TRUE
+  (let ((in NATIVE-INPUT-STREAM NULL)
+        (out NATIVE-OUTPUT-STREAM NULL))
+    (verbatim
+      :common-lisp
+      "(setq in (%%open-network-stream host port))
+   (setq out in)
+"
+      ;; For Java, we need to convert to the appropriate native stream type
+      :java "try {
+        java.net.Socket s = new java.net.Socket(host, port);
+        in = new java.io.PushbackInputStream(s.getInputStream());
+        out = new java.io.PrintStream(s.getOutputStream());
+      } catch (java.net.UnknownHostException uhe) {
+        throw new RuntimeException(\"Unknown host: \" + host);
+      } catch (java.io.IOException ioe) {
+        throw new RuntimeException(\"IO Error: \" + ioe);
+      }
+"
+      :otherwise
+      (error "Network streams not yet implemented for this target language"))
+    (return (new INPUT-STREAM
+                 :native-input-stream in
+                 :state :OPEN)
+            (new OUTPUT-STREAM
+                 :native-output-stream out
+                 :state :OPEN))))
+
+(defmacro with-input-file ((binding CONS) &body (body CONS))
+  :public? TRUE
+  :documentation "Sets up an unwind-protected form which opens a file for
+input and closes it afterwards.  The stream for reading is bound to the
+variable provided in the macro form.
+Syntax is (WITH-INPUT-FILE (var filename) body+)"
+  (let ((var SYMBOL (first binding)))
+    (return
+      (bquote 
+       (let ((& var FILE-INPUT-STREAM NULL))
+	 (unwind-protect
+	     (progn 
+	       (setq & var (new FILE-INPUT-STREAM :filename & (second binding)))
+	       && body)
+	   (when (defined? & var)
+	     (free & var))))))))
+
+(defmacro with-output-file ((binding CONS) &body (body CONS))
+  :public? TRUE
+  :documentation "Sets up an unwind-protected form which opens a file for
+output and closes it afterwards.  The stream for writing is bound to the
+variable provided in the macro form.
+Syntax is (WITH-OUTPUT-FILE (var filename) body+)"
+  (let ((var SYMBOL (first binding)))
+    (return
+      (bquote 
+       (let ((& var FILE-OUTPUT-STREAM NULL))
+	 (unwind-protect
+	     (progn 
+	       (setq & var (new FILE-OUTPUT-STREAM :filename & (second binding)))
+	       && body)
+	   (when (defined? & var)
+	     (free & var))))))))
+
+(defmacro with-network-stream ((binding CONS) &body (body CONS))
+  ;; Sets up an unwind-protected form which opens a network stream
+  ;; for input and output and closes it afterwards.
+  :public? TRUE
+  :documentation  "Sets up an unwind-protected form which opens a network
+socket stream to a host and port for input and output and closes it afterwards.
+Separate variables as provided in the call are bound to the input and output
+streams. Syntax is (WITH-NETWORK-STREAM (varIn varOut hostname port) body+)"
+  (let ((var-in SYMBOL (first binding))
+        (var-out SYMBOL (second binding)))
+    (return
+      (bquote 
+       (let ((& var-in INPUT-STREAM NULL)
+             (& var-out OUTPUT-STREAM NULL))
+	 (unwind-protect
+	     (progn 
+	       (mv-setq (& var-in & var-out) 
+                        (open-network-stream & (third binding) & (fourth binding)))
+	       && body)
+	   (when (defined? & var-in)
+	     (free & var-in))
+           (when (defined? & var-out)
+	     (free & var-out))))))))
+
+  ;;
+;;;;;; Basic HTML & XML support:
+  ;;
+
+(defglobal *html-quoted-characters* STRING "><&\"")  ;; '
+
+(defun (expand-markup-tag-function CONS)
+    ((tag-and-stream CONS) (body CONS) (xml? BOOLEAN))
+  ;; Expands the markup tags based on the desired output style.
+  ;; Empty XML tags will end with />
+  ;; Empty HTML tags will end with >
+  ;; If a NULL tag is specified, then just body is returned.
+  (let ((tag (first tag-and-stream))
+	(tagvar SYMBOL NULL)
+	(tagvalue STRING NULL)
+	(stream OBJECT (second tag-and-stream))
+	(eolArgument OBJECT (third tag-and-stream))
+	(eol? BOOLEAN (and (defined? eolArgument)
+			   (coerce-to-boolean eolArgument))) )
+    (if (empty? body)
+      (typecase tag
+	(STRING-WRAPPER
+	 (if eol?
+	  (return
+	    (bquote
+	     (print-stream & stream
+			   & (concatenate "<" tag (choose xml? "/>" ">"))
+			   EOL)))
+	  (return
+	    (bquote
+	     (print-stream & stream
+			   & (concatenate "<" tag (choose xml? "/>" ">")))))))
+	(OBJECT
+	 (if eol?
+	  (return
+	    (bquote
+	     (print-stream & stream
+			   "<" & tag & (choose xml? "/>" ">") EOL)))
+	  (return
+	    (bquote
+	     (print-stream & stream
+			   "<" & tag & (choose xml? "/>" ">")))))))
+      (typecase tag
+	(STRING-WRAPPER
+	 (setq tagvalue (wrapper-value tag))
+	 (if eol?
+	   (return
+	     (bquote
+	      (progn (print-stream & stream & (concatenate "<" tagvalue ">"))
+		     && body
+		     (print-stream & stream 
+				   & (concatenate "</"
+						  (subsequence tagvalue 0
+							       (position tagvalue #\space 0))
+						  ">")
+				   EOL))))
+	   (return
+	     (bquote
+	      (progn (print-stream & stream & (concatenate "<" tagvalue ">"))
+		     && body
+		     (print-stream & stream
+				   & (concatenate "</"
+						  (subsequence tagvalue 0
+							       (position tagvalue #\space 0))
+						  ">")))))))
+	(SYMBOL
+	 (if eol?
+	   (return
+	     (bquote
+	      (progn
+		(print-stream & stream "<" & tag ">")
+		&& body
+		(print-stream & stream "</"
+			      (subsequence & tag 0 (position & tag #\space 0))
+			      ">" EOL))))
+	   (return
+	     (bquote
+	      (progn
+		(print-stream & stream "<" & tag ">")
+		&& body
+		(print-stream & stream "</"
+			      (subsequence & tag 0 (position & tag #\space 0))
+			      ">"))))))
+	(OBJECT 
+	 (setq tagvar (gensym "TAG"))
+	 (if eol?
+	   (return
+	     (bquote
+	      (let ((& tagvar STRING & tag))
+		(print-stream & stream "<" & tagvar ">")
+		&& body
+		(print-stream & stream "</"
+			      (subsequence & tagvar 0 (position & tagvar #\space 0))
+			      ">" EOL))))
+	   (return
+	     (bquote
+	      (let ((& tagvar STRING & tag))
+		(print-stream & stream "<" & tagvar ">")
+		&& body
+		(print-stream & stream "</"
+			      (subsequence & tagvar 0 (position & tagvar #\space 0))
+			      ">")))))))) ))
+
+(defmacro with-html-tag ((tag-and-stream CONS) &body (body CONS))
+  ;; (with-html-tag (<tag with attributes> <stream> [EOL?]) <body>)
+  ;;
+  ;; Writes an html tag pair around body, with an empty body producing an 
+  ;;   HTML-style empty tag.  An end of line will be added if the EOL? is
+  ;;   present and TRUE
+  (return (expand-markup-tag-function tag-and-stream body FALSE)))
+
+(defmacro with-xml-tag ((tag-and-stream CONS) &body (body CONS))
+  ;; (with-xml-tag (<tag with attributes> <stream> [EOL?]) <body>)
+  ;;
+  ;; Writes an html tag pair around body, with an empty body producing an 
+  ;;   XML-style empty tag.  An end of line will be added if the EOL? is
+  ;;   present and TRUE
+  (return (expand-markup-tag-function tag-and-stream body TRUE)))
+
+
+(defun (html-character-needs-quoting? BOOLEAN) ((ch CHARACTER))
+  (return (member? *html-quoted-characters*  ch)))
+
+(defun write-html-character-quoting-special-characters ((stream NATIVE-OUTPUT-STREAM) (ch CHARACTER))
+  :globally-inline? TRUE
+  (case ch
+    (#\>  (print-stream stream "&gt;"))
+    (#\<  (print-stream stream "&lt;"))
+    (#\&  (print-stream stream "&amp;"))
+    (#\"  (print-stream stream "&quot;"))
+    ;; If this is uncommented, also revise *HTML-QUOTED-CHARACTERS*
+    ;(#\'  (print-stream stream "&apos;"))
+    (otherwise (print-stream stream ch)))
+  (return))
+
+(defun write-html-quoting-special-characters ((stream NATIVE-OUTPUT-STREAM) (input STRING))
+  (foreach ch in input
+      do (write-html-character-quoting-special-characters stream ch))
+  (return))
+
+;; Characters from RFC 2396
+;;  
+(defun write-html-escaping-url-special-characters ((stream NATIVE-OUTPUT-STREAM) (input STRING))
+  :PUBLIC? TRUE
+  :documentation "Writes a string and replaces unallowed URL characters according to RFC 2396
+with %-format URL escape sequences."
+  (foreach ch in input
+      do (case ch
+	   (#\space (print-stream stream "%20"))
+	   (#\?  (print-stream stream "%3F"))
+	   (#\#  (print-stream stream "%23"))
+	   (#\=  (print-stream stream "%3D"))
+	   (#\&  (print-stream stream "%26"))
+	   (#\%  (print-stream stream "%25"))
+	   (#\+  (print-stream stream "%2B"))
+	   (#\<  (print-stream stream "%3C"))
+	   (#\>  (print-stream stream "%3E"))
+	   (#\/  (print-stream stream "%2F"))
+	   (#\:  (print-stream stream "%3A"))
+	   (#\"  (print-stream stream "%22"))
+	   (#\'  (print-stream stream "%27"))
+	   (otherwise (print-stream stream ch))))
+  (return))
+
+
+(defun (hex-character-value INTEGER) ((c CHARACTER))
+  :globally-inline? TRUE
+  (let ((v (position "0123456789ABCDEF" c 0)))
+    (when (null? v)
+      (setq v (position "0123456789abcdef" c 0)))
+    (return v)))
+
+(defun (unescape-url-string STRING) ((input STRING))
+  :PUBLIC? TRUE
+  :documentation "Takes a string and replaces %-format URL escape sequences with their real
+character equivalent according to RFC 2396."
+  (if (null? (position input #\% 0))
+    (return input)
+    (let ((result (make-raw-mutable-string (length input)))
+	  (i-out 0)
+	  (i-in 0)
+	  (char-save CHARACTER NULL)
+	  (char-value 0)
+	  (escape-value 0)
+	  (i-max (length input)))
+      (while (< i-in i-max)
+	(if (eq? (nth input i-in) #\%)
+	  (progn
+	    (++ i-in)
+	    (if (< i-in i-max)
+	      (progn
+		(setq char-save (nth input i-in))
+		(setq char-value (hex-character-value char-save))
+		(++ i-in)
+		(if (and (defined? char-value) ; legitimate hex character
+			 (< i-in i-max))
+		  (progn 
+		    (setq escape-value (* 16 char-value))
+		    (setq char-value (hex-character-value (nth input i-in)))
+		    (if (defined? char-value) ; legitimate hex character
+		      (progn		; Success, output escaped character
+			(setf (nth result i-out) (code-character (+ escape-value char-value))))
+		      (progn		; Fail:  Output % and 2 characters
+			(setf (nth result i-out) #\%)
+			(setf (nth result (++ i-out)) char-save)
+			(setf (nth result (++ i-out)) (nth input i-in)))))
+		  (progn		; Fail:  Output % and 1 character
+		    (setf (nth result i-out) #\%)
+		    (setf (nth result (++ i-out)) char-save)))
+		(++ i-out)
+		(++ i-in))
+	      (progn			; Fail:  Output %
+		  (setf (nth result i-out) #\%)
+		  (++ i-out))))
+	  (progn
+	    (setf (nth result i-out) (nth input i-in))
+	    (++ i-out)
+	    (++ i-in))))
+    (return (subsequence result 0 i-out)) )))
+
+
+(defglobal *HTML-escape-table* KEY-VALUE-LIST (new KEY-VALUE-LIST))
+
+(startup-time-progn :final
+  (insert-at *HTML-escape-table* (wrap-literal "lt") (wrap-literal #\<))
+  (insert-at *HTML-escape-table* (wrap-literal "gt") (wrap-literal #\>))
+  (insert-at *HTML-escape-table* (wrap-literal "amp") (wrap-literal #\&))
+  (insert-at *HTML-escape-table* (wrap-literal "quot") (wrap-literal #\"))
+  (insert-at *HTML-escape-table* (wrap-literal "apos") (wrap-literal #\'))
+  (insert-at *HTML-escape-table* (wrap-literal "nbsp") (wrap-literal #\Space))
+  (insert-at *HTML-escape-table* (wrap-literal "NBSP") (wrap-literal #\Space)))
+
+(defun (unescape-html-string STRING) ((input STRING))
+  :documentation "Replaces HTML escape sequences such as &amp; with their
+associated characters."
+  :public? TRUE
+  (let ((inCursor 0)
+        (outCursor 0)
+        (escapeStart (position input #\& inCursor))
+        (escapeEnd -1)
+        (inputLength -1)
+        (output MUTABLE-STRING NULL)
+        (character CHARACTER-WRAPPER NULL))
+    (loop
+      (when (null? escapeStart)
+        (if (null? output)
+            (return input)
+          (break)))
+      (setq escapeEnd (position input #\; escapeStart))
+      (when (null? escapeEnd)
+        (if (null? output)
+            (return input)
+          (break)))
+      (setq character
+        (lookup *HTML-escape-table*
+                (subsequence input (1+ escapeStart) escapeEnd)))
+      (when (null? character)
+        ;; not a valid escape sequence, look for the next one:
+        (setq escapeStart (position input #\& escapeEnd))
+        (continue))
+      (when (null? output)
+        ;; initialize output buffer:
+        (setq inputLength (length input))
+        (setq output (make-raw-mutable-string inputLength)))
+      ;; copy input up to escape character:
+      (while (< inCursor escapeStart)
+        (setf (nth output outCursor) (nth input inCursor))
+        (++ inCursor)
+        (++ outCursor))
+      ;; substitute character:
+      (setf (nth output outCursor) character)
+      (++ outCursor)
+      ;; scan for next escape sequence:
+      (setq inCursor (1+ escapeEnd))
+      (setq escapeStart (position input #\& escapeEnd)))
+    ;; copy remaining portion of the input:
+    (while (< inCursor inputLength)
+      (setf (nth output outCursor) (nth input inCursor))
+      (++ inCursor)
+      (++ outCursor))
+    ;; somewhat inefficient in Java, should implement string buffers in STELLA:
+    (return (subsequence (mutable-string-to-string output) 0 outCursor))))
+
+  ;;
+;;;;;; Stream iterators:
+  ;;
+
+(defclass STREAM-ITERATOR (ABSTRACT-ITERATOR)
+  :public? TRUE
+  :abstract? TRUE
+  :documentation "Iterator that yields tokens from an input stream."
+  :slots ((the-stream :type INPUT-STREAM))
+  :terminator terminate-stream-iterator?)
+
+(defclass S-EXPRESSION-ITERATOR (STREAM-ITERATOR)
+  :public? TRUE
+  :documentation "Iterator that yields s-expressions from an input stream."
+  :parameters ((any-value :type OBJECT)))
+
+(defclass LINE-ITERATOR (STREAM-ITERATOR)
+  :public? TRUE
+  :documentation "Iterator that yields lines from an input stream."
+  :parameters ((any-value :type STRING)))
+
+(defclass CHARACTER-ITERATOR (STREAM-ITERATOR)
+  :public? TRUE
+  :documentation "Iterator that yields characters from an input stream."
+  :parameters ((any-value :type CHARACTER)))
+
+(defun (terminate-stream-iterator? BOOLEAN) ((self STREAM-ITERATOR))
+  (when (defined? (the-stream self))
+    (free (the-stream self)))
+  (return TRUE))
+
+(defun (s-expressions S-EXPRESSION-ITERATOR) ((stream INPUT-STREAM))
+  :public? TRUE
+  (return (new S-EXPRESSION-ITERATOR :the-stream stream)))
+
+(defmethod (next? BOOLEAN) ((self S-EXPRESSION-ITERATOR))
+  :public? TRUE
+  ;; Returns the next s-expressions from a stream.
+  ;; Closes the stream on EOF.
+  (setf (first-iteration? self) FALSE)
+  (mv-bind (object eof?)
+      (read-s-expression (the-stream self))
+    (cond (eof?
+           (close-stream (the-stream self))
+           (return FALSE))
+          (otherwise
+           (setf (slot-value self value) object)
+           (return TRUE)))))
+
+(defun (lines LINE-ITERATOR) ((stream INPUT-STREAM))
+  :public? TRUE
+  (return (new LINE-ITERATOR :the-stream stream)))
+
+(defmethod (next? BOOLEAN) ((self LINE-ITERATOR))
+  :public? TRUE
+  ;; Returns the next line from an input stream.
+  ;; Closes the stream on EOF.
+  (setf (first-iteration? self) FALSE)
+  (mv-bind (line eof?)
+      (read-line (the-stream self))
+    (cond (eof?
+           (close-stream (the-stream self))
+           (return FALSE))
+          (otherwise
+           (setf (slot-value self value) line)
+           (return TRUE)))))
+
+(defun (characters CHARACTER-ITERATOR) ((stream INPUT-STREAM))
+  :public? TRUE
+  (return (new CHARACTER-ITERATOR :the-stream stream)))
+
+(defmethod (next? BOOLEAN) ((self CHARACTER-ITERATOR))
+  :public? TRUE
+  ;; Returns the next character from an input stream.
+  ;; Closes the stream on EOF.
+  (setf (first-iteration? self) FALSE)
+  (mv-bind (char eof?)
+      (read-character (the-stream self))
+    (cond (eof?
+           (close-stream (the-stream self))
+           (return FALSE))
+          (otherwise
+           (setf (slot-value self value) char)
+           (return TRUE)))))
+
+#|
+
+;; stream iterator tests:
+
+(defun print-sexps ((file STRING))
+  (foreach sexp in (s-expressions (new INPUT-FILE-STREAM :filename file))
+           do (print-stream STANDARD-OUTPUT sexp EOL)))
+
+(defun print-file ((file STRING))
+  (foreach line in (lines (new INPUT-FILE-STREAM :filename file))
+           do (print-stream STANDARD-OUTPUT line EOL)))
+
+(defun print-file2 ((file STRING))
+  (foreach char in (characters (new INPUT-FILE-STREAM :filename file))
+           do (print-stream STANDARD-OUTPUT char)))
+
+|#

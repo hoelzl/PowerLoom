@@ -1,0 +1,365 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: idl-class-out.ste,v 1.12 2003/04/18 21:14:58 hans Exp
+
+;;; IDL-specific routines for defining a IDL class based on a
+;;;    Stella class object.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Definition of IDL slots and classes
+  ;;
+
+(defun (idl-yield-initial-null-value CONS) ()
+  ;; Return a parse tree that defines a null initial value for the
+  ;;    slot 'slot'.
+  (return (idl-translate-a-tree NULL)) )
+					 
+(defun (idl-yield-attribute-tree CONS) ((slot STORAGE-SLOT)
+					 (class CLASS))
+  ;; Helping function for "idl-translate-define-native-class-unit".
+  ;; Return a parse tree that defines a IDL Member var corresponding to 'slot'.
+  ;; Slot options are generated for the keywords
+  ;;    :allocation, :initform, and :accessor.
+  (let ((slotName (true-slot-name (slot-name slot) (class-type class)))
+        (initialValueForm (initially slot))
+        (facetForm NIL)
+	(mostGeneralSlot SLOT NULL))
+
+    (when (eql? (idl-class-category class) (quote IDL_INTERFACE))
+      (if (slot-read-only? slot)
+	  (setq facetForm (bquote ("readonly" "attribute")))
+	(setq facetForm (bquote ("attribute")))))
+      
+    (unless (defined? initialValueForm)
+      (setq initialValueForm (idl-yield-initial-null-value)))
+
+    ;; Get most general slot so that (slot-base-type slot) is correct
+    (setq mostGeneralSlot slot)
+    ;; Why am I doing this?  Should this be deleted?  I think so -erm
+;    (loop
+;      (if (defined? (slot-direct-equivalent mostGeneralSlot))
+;          (setq mostGeneralSlot (slot-direct-equivalent mostGeneralSlot))
+;	(break)))			; exit loop when can't find more general slot
+    (return
+     (bquote 
+      ((&& facetForm & (idl-translate-type-spec (compute-return-type-spec mostGeneralSlot (class-type class))))
+       & (idl-translate-name slotName)
+       & initialValueForm))) ))
+
+(defun (idl-yield-parameterized-attribute-tree CONS) ((slot STORAGE-SLOT)
+						       (class CLASS))
+  ;; Helping function for "idl-translate-define-native-class-unit".
+  ;; Return a parse tree that defines a IDL Member var corresponding to 'slot'.
+  ;; `slot' should have a type parameterized by the class parameters.
+  ;; This is used when outputting template classes.
+  (let ((slotName (true-slot-name (slot-name slot) (class-type class)))
+        (initialValueForm (initially slot))
+        (allocation (allocation slot))
+        (allocationForm CONS NIL))
+
+    (unless (defined? initialValueForm)
+      (setq initialValueForm (idl-yield-initial-null-value)))
+    ;; convert :embedded allocation to :instance allocation:
+    ;; IS THIS CORRECT? -erm
+    (case allocation
+      (:embedded (setq allocationForm NIL))
+      (:instance (setq allocationForm NIL))
+      (:class (setq allocationForm (cons-list (wrap-literal "static"))))
+      (otherwise (setq allocationForm NIL)))
+
+    (return
+     (bquote 
+      ((&& allocationForm & (idl-translate-class-parameter-name 
+			     (get-slot-class-parameter-name slot)))
+       & (idl-translate-name slotName)
+       & initialValueForm))) ))
+
+(defun (idl-yield-static-member-allocation-tree CONS) ((slot STORAGE-SLOT)
+						       (class CLASS))
+  ;; Helping function for "idl-translate-define-native-class-unit".
+  ;; Return a parse tree that defines the storage allocation for static
+  ;;   member vars.
+  (let ((slotName (slot-name slot))
+        (initialValueForm (initially slot))
+        (allocationForm CONS NIL)
+	(mostGeneralSlot SLOT NULL))
+
+    (unless (defined? initialValueForm)
+      (setq initialValueForm (idl-yield-initial-null-value)))
+    ;; Get most general slot so that (slot-base-type slot) is correct
+    (setq mostGeneralSlot slot)
+    (loop
+      (if (defined? (slot-direct-equivalent mostGeneralSlot))
+          (setq mostGeneralSlot (slot-direct-equivalent mostGeneralSlot))
+	(break)))	   ; exit loop when can't find more general slot
+    (return
+     (bquote 
+      ((&& allocationForm & (idl-translate-type-spec (compute-return-type-spec mostGeneralSlot (class-type class))))
+       & (idl-translate-name slotName)
+       & initialValueForm))) ))
+
+(defun (idl-yield-operation-signature-tree CONS) ((method METHOD-SLOT))
+  ;; Helping function for "idl-translate-define-native-class-unit".
+  ;; Return a parse tree that declares the signature of a IDL 
+  ;;   member function represented by 'method'.
+  ;; NOTE: THIS CODE IS SIMILAR TO "IDL-TRANSLATE-DEFMETHOD-TREE".
+  ;;   MAY WANT TO MERGE THE SIMILAR PIECES INTO A SINGLE ROUTINE.
+  ;; TODO: HANDLE INLINED FUNCTIONS
+  (let ((mostGeneralMethod method)
+	(returnType TYPE-SPEC NULL))
+    (setq *methodBeingWalked* method)
+    ;; Get most general return type of virtual method: see comments 
+    ;;   for 'compute-idl-virtual-method-types' in walk.ste
+    (while (and (defined? (slot-direct-equivalent mostGeneralMethod))
+		(isa? (slot-direct-equivalent mostGeneralMethod) @METHOD-SLOT)
+		;; NOTE: This also used to check for anchored types,
+		;;  but I don't think I need that...
+		(not (method-contains-unknown-type?
+		      (slot-direct-equivalent mostGeneralMethod))))
+	   (setq mostGeneralMethod (slot-direct-equivalent mostGeneralMethod)))
+    (setq returnType (slot-base-type mostGeneralMethod))
+    (return (bquote 
+	     (& (choose (method-function? method)
+			 NULL
+			 (idl-translate-class-name
+                          (symbolize (slot-owner method))))
+		(& (idl-translate-type-spec returnType))
+		;; NOTE: 'idl-translate-function-name' does not prefix
+		;;   the function name with the function's owner class.
+		& (idl-translate-function-name method)
+		& (idl-translate-method-parameters method))))))
+
+(defun (idl-yield-constructor-signature-tree CONS) ((method METHOD-SLOT))
+  ;; Helping function for "idl-translate-define-native-class-unit".
+  ;; Return a parse tree that declares the signature of a IDL 
+  ;;   constructor
+  ;; NOTE: THIS CODE IS SIMILAR TO "IDL-TRANSLATE-DEFMETHOD-TREE".
+  ;;   MAY WANT TO MERGE THE SIMILAR PIECES INTO A SINGLE ROUTINE.
+  ;; TODO: HANDLE INLINED FUNCTIONS
+  (setq *methodBeingWalked* method)
+  (return (bquote 
+	   (& (idl-translate-class-name (symbolize (slot-owner method)))
+	      ()
+	      ;; NOTE: Modify to `idl-translate-constructor-name'
+	      & (idl-translate-constructor-name method)
+	      & (idl-translate-method-parameters method)))))
+
+(defun (illegal-idl-method? BOOLEAN) ((methodSlot METHOD-SLOT))
+  ;; Certain methods shouldn't be output in IDL because they're implemented
+  ;;   as overloaded functions
+  (return (member? (quote (DEFINED? NULL?)) (slot-name methodSlot))) )
+
+(defun (idl-get-parameterized-attribute-definitions CONS) ((class CLASS))
+  ;; Return lists of variables that are parameterized with class parameters,
+  ;;   i.e., for template classes
+  (let ((attributeDefs NIL))
+    (foreach slot in (class-local-slots class)
+             where (and (storage-slot? slot)
+                        (native-slot? slot)
+                        (slot-has-class-parameter-type? slot class))
+             collect (idl-yield-parameterized-attribute-tree slot class)
+             into attributeDefs)
+    (return attributeDefs) ))
+
+(defun (idl-get-attribute-definitions CONS) ((class CLASS))
+  ;; Return list of translated attributes
+  ;;   definitions, respectively.
+  (let ((attributeDefs NIL))
+    (foreach slot in (class-slots class)
+             where (and (storage-slot? slot)
+                        (native-slot? slot)
+                        (eql? (native-slot-home slot class) class))
+             do (pushq attributeDefs
+		       (idl-yield-attribute-tree slot class)))
+    (return (reverse attributeDefs))))
+
+(defun (idl-get-static-variable-definitions CONS) ((class CLASS))
+  ;; Return a lists of static variables on class
+  (let ((staticAttributeDefs NIL))
+    ;; Get most-specific static members
+    (foreach slot in (class-slots class)
+             where (and (storage-slot? slot)
+			(native-slot? slot)
+			(eql? (slot-allocation (cast slot STORAGE-SLOT)) 
+			      :CLASS)
+			(not (slot-has-unknown-type?
+			      slot class))
+			(not (slot-hardwired? 
+			      (cast slot STORAGE-SLOT)))
+                        (not (slot-marked? slot)))
+             do 
+	     (pushq staticAttributeDefs 
+		    (idl-yield-static-member-allocation-tree
+		     slot class)))
+    (return staticAttributeDefs) ))
+
+(defun (idl-constructor? BOOLEAN) ((method METHOD-SLOT))
+  ;; Return TRUE if 'method' represents a C++ constructor.
+  (return (and (eql? (type method) @VOID)
+               (eq? (length (method-parameter-names method)) 1)
+               (string-eql? (symbol-name (slot-owner method))
+                            (symbol-name (slot-name method)))
+               (eql? (interned-in (slot-owner method))
+                     (interned-in (slot-name method))))))
+
+(defun (idl-get-constructor-definitions CONS) ((class CLASS))
+  ;; Return a lists of constructors definitions
+  (let ((constructorDefs NIL))
+    (foreach slot in (class-slots class)
+             where (and (not (slot-marked? slot))
+			(eql? (primary-type slot) 
+			      @METHOD-SLOT)
+			(local-slot? slot class)
+		        (idl-constructor? (cast slot METHOD-SLOT)))
+             collect (idl-yield-constructor-signature-tree
+		      slot)
+             into constructorDefs) 
+    (return constructorDefs) ))
+
+(defun (idl-get-operation-definitions CONS) ((class CLASS))
+  ;; Return a list of translated operation signatures
+  (let ((operationDefs NIL))
+    ;; generate member function (i.e. method) definitions:
+    (foreach slot in (class-slots class)
+             where (and (not (slot-marked? slot))
+			(eql? (primary-type slot) 
+			      @METHOD-SLOT)
+			(local-slot? slot class)
+			(not (idl-constructor? (cast slot METHOD-SLOT)))
+			(not (method-function? (cast slot METHOD-SLOT)))
+			(not (illegal-idl-method? 
+			      (cast slot METHOD-SLOT)))
+			;; NOTE: I don't think I need this...
+			(not (method-contains-unknown-type?
+			      slot)))
+             collect (idl-yield-operation-signature-tree
+		      slot)
+             into operationDefs)
+
+    ;; generate auxiliary definitions:
+    (foreach auxiliary in (class-auxiliary-methods class)
+        collect (idl-yield-operation-signature-tree auxiliary)
+        into operationDefs)
+
+    (return operationDefs) ))
+
+(defun (idl-class-category SYMBOL) ((class CLASS))
+  ;; Return the idl category (e.g. interface, struct, etc) of `class'
+  (unless (defined? (properties class))
+    (return (quote IDL_INTERFACE)))
+  (case (first (properties class))
+    (|/IDL-THEORY/interface| (return (quote IDL_INTERFACE)))
+    (|/IDL-THEORY/struct| (return (quote IDL_STRUCT)))
+    (|/IDL-THEORY/enum| (return (quote IDL_ENUM)))
+    (|/IDL-THEORY/typedef| (return (quote IDL_TYPEDEF)))
+    (otherwise (return (quote IDL_INTERFACE)))))
+
+(defun (idl-translate-define-native-class-unit CONS) ((unit TRANSLATION-UNIT))
+  ;; Return a form that evaluates to a native (IDL) class definition.
+  (let ((class CLASS (the-object unit))
+	(derivedClasses NIL)
+        (parameterizedAttributeDefs NIL)
+	(attributeDefs NIL)
+	(operationDefs NIL)
+	(constructorDefs NIL)
+	(parameters NIL)
+	(staticAttributeDefs NIL))
+    (foreach super in (class-direct-supers class)
+             collect (idl-translate-class-name (symbolize super))
+	     into derivedClasses)
+
+    (foreach parameter in (class-parameters class)
+	     collect (idl-translate-class-parameter-name parameter)
+	     into parameters)
+
+    ;; generate member variable definitions:
+    ;; Q: CAN WE COMBINE THESE LOOPS INTO A SINGLE LOOP, I.E., W/MULTIPLE
+    ;;    "WHERE" CLAUSES?
+    ;; Mark all inherited renamed slots so we don't consider them
+    ;; NOTE: This is only used for accessor signatures: other slots use
+    ;;   `native-slot?' predicate.  This is because there can be accessors 
+    ;;   on dynamic slots.
+    (foreach slot in (class-slots class)
+	     do (setf (slot-marked? slot) FALSE))
+    (foreach slot in (class-slots class)
+             where (not (slot-marked? slot))
+             do 
+	     (when (and (defined? (slot-direct-equivalent slot))
+			(not (slot-renamed? (slot-direct-equivalent slot))))
+	       (mark-direct-equivalent-slot slot)
+	       (setf (slot-marked? slot) FALSE)))
+
+    (setq constructorDefs (idl-get-constructor-definitions class))
+    (setq parameterizedAttributeDefs 
+      (idl-get-parameterized-attribute-definitions class))
+    (setq attributeDefs (idl-get-attribute-definitions class))
+    (setq operationDefs (idl-get-operation-definitions class))
+    (setq staticAttributeDefs
+      (idl-get-static-variable-definitions class))
+
+    (return
+     (bquote
+      (& (idl-class-category class)
+       & (idl-translate-class-name (symbolize (class-type class)))
+       & parameters
+       & derivedClasses 
+       & staticAttributeDefs
+       && (choose (non-empty? parameterizedAttributeDefs)
+		  (bquote ((IDL_DECLARATIONS & parameterizedAttributeDefs)))
+		  NIL)
+       && (choose (non-empty? attributeDefs)
+		  (bquote ((IDL_DECLARATIONS & attributeDefs)))
+		  NIL)
+       && (choose (non-empty? constructorDefs)
+		  (bquote ((IDL_SIGNATURES & constructorDefs)))
+		  NIL)
+       && (choose (non-empty? operationDefs)
+		  (bquote ((IDL_SIGNATURES & operationDefs)))
+		  NIL))))))
+
+

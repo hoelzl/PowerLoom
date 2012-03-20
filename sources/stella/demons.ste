@@ -1,0 +1,806 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: demons.ste,v 1.35 2003/04/18 21:14:48 hans Exp
+
+;;; Demons (or triggers).
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; Demons come in two flavors: Class demons monitor creation
+;;;    and destruction of instances; slot demons monitor changes in
+;;;    slot values.  They use the same data structure, but class
+;;;    demons are passed two arguments <self, class>, while slot
+;;;    demons are passed four arguments <self, slot, oldVaue, newValue>.
+
+;;; Classes and slots can be 'active'.  
+;;; An active class supports:
+;;;    Demons that monitor object creation and destruction;
+;;;    Automatic insertion of objects into class extensions.
+;;; An active slot supports:
+;;;    Demons that monitor changes in slot values;
+;;;    Automatic initialization of collection-valued slots;
+;;;    Interpreted slot access: get-value, put-value, drop-value.
+
+(defglobal *demons-table* STRING-HASH-TABLE (new STRING-HASH-TABLE)
+  :documentation "Table containing all active and inactive demons, indexed
+on their names.")
+
+(defglobal *constructor-demons* (LIST OF DEMON) NULL
+  :documentation "These demons trigger every time an active instance is created.")
+
+(defglobal *destructor-demons* (LIST OF DEMON) NULL
+  :documentation "These demons trigger every time an active instance is destroyed.")
+
+(defglobal *all-slots-demons* (LIST OF DEMON) NULL
+  :documentation "These demons trigger every time a slot value is modified.")
+
+(defglobal *all-slots-guard-demons* (LIST OF DEMON) NULL
+  :documentation "These demons trigger every time a slot value is modified, and
+cancel slot update when they return `false'.")
+
+(defun (validate-demon-references? BOOLEAN) ((demon DEMON))
+  ;; Return TRUE iff the options are valid.
+  (let ((classRef (choose (defined? (demon-class-refs demon))
+                    (first (demon-class-refs demon))
+                    NULL))
+        (slotRef (choose (defined? (demon-slot-refs demon))
+                   (first (demon-slot-refs demon))
+                   NULL))
+        (slot SLOT NULL))
+    (when (and (null? classRef)
+               (null? slotRef))
+      (return TRUE))
+    (when (null? classRef)
+      (warn "Missing :class option in demon " demon)
+      (return FALSE))
+    (when (null? (type-class classRef))
+      (warn "Class " classRef " not yet defined.")
+      (return FALSE))
+    (when (eq? (demon-action demon) :modify)
+      (when (null? slotRef)
+        (warn "Missing :slot option in demon " demon)
+        (return FALSE))
+      (when (not (setq? slot (lookup-slot (type-class classRef) slotRef)))
+        (warn "No slot named " slotRef " exists on class " 
+              (type-class classRef) "." EOL "Can't create demon " demon)
+        (return FALSE))
+      (when (not (storage-slot? slot))
+        (warn "Can't install a demon on the method." slot)
+        (return FALSE)))
+    (return TRUE) ))
+
+(defun (incorporate-demon-options? BOOLEAN) ((demon DEMON) (options PROPERTY-LIST))
+  ;; Parse the options in 'options' and install them in 'demon'.
+  (cond
+   ((defined? (lookup options :create))
+    (setf (demon-action demon) :create))
+   ((defined? (lookup options :destroy))
+    (setf (demon-action demon) :destroy))
+   (otherwise
+    (setf (demon-action demon) :modify)))
+  (foreach (k v) in options
+           do
+           (case k
+             ((:create :destroy)
+              (setf (demon-action demon) k)
+              (if (eq? v :all)
+                (setf (demon-all? demon) TRUE)
+                (insert (demon-class-refs demon) (surrogatify v))))
+             (:class
+              (insert (demon-class-refs demon) (surrogatify v)))
+             (:slot
+              (if (eq? v :all)
+                (setf (demon-all? demon) TRUE)
+                (insert (demon-slot-refs demon) (permanentify v))))
+             (:code (setf (demon-code demon)
+                          (wrapper-value (cast v FUNCTION-CODE-WRAPPER))))
+             (:method (setf (demon-method demon) v))
+             (:guard? (setf (demon-guard? demon) TRUE))
+             (:inherited?
+              (setf (demon-inherit? demon) TRUE)
+              (inform "Inherit? not yet implemented for demons"))
+             (:documentation (setf (demon-documentation demon)
+                               (wrapper-value (cast v STRING-WRAPPER))))))
+  (when (defined? (demon-method demon))
+    (setf (demon-code demon) (function-code (demon-method demon))))
+  (free options)
+  (return (validate-demon-references? demon)) )
+
+(defun (lookup-demon DEMON) ((name STRING))
+  :documentation "Return the demon named `name'."
+  (return (lookup *demons-table* name)) )
+
+(defun (define-demon DEMON) ((name STRING) &rest (options OBJECT))
+  :documentation "Define a class or slot demon.  Options are :create,
+:destroy, :class, :slot, :guard?, :code, :method, :inherit?, and :documentation."
+  (let ((demon (new DEMON))
+        (pList (new PROPERTY-LIST))
+        (consList NIL)
+        (oldDemon DEMON NULL)
+        (activate? FALSE))
+    (foreach item in options collect item into consList)
+    (setf (the-plist pList) consList)
+    (setf (demon-name demon) name)
+    (setq activate? (eq? (remove-at pList :activate?) TRUE-WRAPPER))
+    (when (incorporate-demon-options? demon pList)
+      (when (setq? oldDemon (lookup-demon name))
+        (deactivate-demon oldDemon)           ; eliminate old demon with matching name
+        (free oldDemon))
+      (insert-at *demons-table* (demon-name demon) demon)
+      (when activate?
+        (activate-demon demon))
+      (return demon))
+    (free demon)                        ; bad demon definition
+    (return NULL) ))
+
+(defun (inject-demon (LIST OF DEMON)) ((demonList (LIST OF DEMON)) (demon DEMON))
+  ;; Called by `define-demon'.
+  ;; Add `demon' to `demonList' and return the list.
+  ;; If `demonList' is NULL, create a new list.
+  (when (null-list? demonList)
+    (setq demonList (new (LIST OF DEMON))))
+  ;; if demon with same name exists, replace it:
+  (foreach it on demonList
+           where (string-eql? (demon-name (value it)) (demon-name demon))
+           do
+           (setf (value it) demon)
+           (return demonList))
+  ;; no demon with the same name:
+  (insert demonList demon)
+  (return demonList) )
+
+(defun (eject-demon (LIST OF DEMON)) ((demonList (LIST OF DEMON)) (demon DEMON))
+  ;; Remove the demon with the same name as `demon' from `demonList', and
+  ;;    return the list, or return NULL if the list is now empty.
+  (when (null? demonList)
+    (return NULL))
+  (remove demonList demon)
+  (when (empty? demonList)              ; eliminate empty list to enable
+    (free demonList)                    ;    fast test for no demons
+    (setq demonList NULL))
+  (return demonList) )
+
+(defun activate-demon ((demon DEMON))
+  :documentation "Install `demon' in the location(s) specified by its internal
+structure."
+  (when (null? demon)
+    (return))
+  (case (demon-action demon)
+    (:modify
+     (if (demon-all? demon)
+       (if (demon-guard? demon)
+         (setq *all-slots-guard-demons*
+               (inject-demon *all-slots-guard-demons* demon))
+         (setq *all-slots-demons* (inject-demon *all-slots-demons* demon)))
+       (foreach
+         type in (demon-class-refs demon)
+         as slotName in (demon-slot-refs demon)
+         do
+         (let ((slot STORAGE-SLOT (safe-lookup-slot
+                                   (type-class type) slotName)))
+           (when (null? slot)
+             (warn "Can't install demon on non-existant slot " (type-class type)
+                   "." slotName)
+             (continue))
+           (if (demon-guard? demon)
+             (setf (slot-guard-demons slot)
+                   (inject-demon (slot-guard-demons slot) demon))
+             (setf (slot-demons slot) (inject-demon (slot-demons slot) demon)))))))
+    (:create
+     (if (demon-all? demon)
+       (setq *constructor-demons* (inject-demon *constructor-demons* demon))
+       (foreach
+         classRef in (demon-class-refs demon)
+         do
+         (let ((class (type-class classRef)))
+           (when (null? class)
+             (warn "Can't install demon on non-existant class " classRef)
+             (continue))
+           (if (demon-guard? demon)
+             (setf (class-guard-constructor-demons class)
+                   (inject-demon (class-guard-constructor-demons class) demon))
+             (setf (class-constructor-demons class) 
+                   (inject-demon (class-constructor-demons class) demon)))))))
+    (:destroy
+     (if (demon-all? demon)
+       (setq *destructor-demons* (inject-demon *destructor-demons* demon))
+       (foreach
+         classRef in (demon-class-refs demon)
+         do
+         (let ((class (type-class classRef)))
+           (when (null? class)
+             (warn "Can't install demon on non-existant class " classRef)
+             (continue))
+           (if (demon-guard? demon)
+             (setf (class-guard-destructor-demons class)
+                   (inject-demon (class-guard-destructor-demons class) demon))
+             (setf (class-destructor-demons class) 
+                   (inject-demon (class-destructor-demons class) demon)))))))) )
+
+(defun deactivate-demon ((demon DEMON))
+  :documentation "Detach `demon' from the location(s) specified by its internal
+structure."
+  ;; Note: The logic is identical to that in `activate-demon', except that it
+  ;;    calls `eject-demon' instead of `inject-demon'.
+  (when (null? demon)
+    (return))
+  (case (demon-action demon)
+    (:modify
+     (if (demon-all? demon)
+       (if (demon-guard? demon)
+         (setq *all-slots-guard-demons*
+               (eject-demon *all-slots-guard-demons* demon))
+         (setq *all-slots-demons* (eject-demon *all-slots-demons* demon)))
+       (foreach
+         type in (demon-class-refs demon)
+         as slotName in (demon-slot-refs demon)
+         do
+         (let ((slot STORAGE-SLOT (safe-lookup-slot
+                                   (type-class type) slotName)))
+           (when (null? slot)
+             (warn "Can't remove demon from non-existant slot " (type-class type)
+                   "." slotName)
+             (continue))
+           (if (demon-guard? demon)
+             (setf (slot-guard-demons slot)
+                   (eject-demon (slot-guard-demons slot) demon))
+             (setf (slot-demons slot) (eject-demon (slot-demons slot) demon)))))))
+    (:create
+     (if (demon-all? demon)
+       (setq *constructor-demons* (eject-demon *constructor-demons* demon))
+       (foreach
+         classRef in (demon-class-refs demon)
+         do
+         (let ((class (type-class classRef)))
+           (when (null? class)
+             (warn "Can't install demon on non-existant class " classRef)
+             (continue))
+           (if (demon-guard? demon)
+             (setf (class-guard-constructor-demons class)
+                   (eject-demon (class-guard-constructor-demons class) demon))
+             (setf (class-constructor-demons class) 
+                   (eject-demon (class-constructor-demons class) demon)))))))
+    (:destroy
+     (if (demon-all? demon)
+       (setq *destructor-demons* (eject-demon *destructor-demons* demon))
+       (foreach
+         classRef in (demon-class-refs demon)
+         do
+         (let ((class (type-class classRef)))
+           (when (null? class)
+             (warn "Can't install demon on non-existant class " classRef)
+             (continue))
+           (if (demon-guard? demon)
+             (setf (class-guard-destructor-demons class)
+                   (eject-demon (class-guard-destructor-demons class) demon))
+             (setf (class-destructor-demons class) 
+                   (eject-demon (class-destructor-demons class) demon)))))))) )
+
+(defun (destructure-defdemon-body
+        CONS                            ; list of options
+        CONS)                           ; demon body
+       ((demonTree CONS))
+  ;; Called by `defdemon'.  Return a list of demon options and
+  ;;    the subtree representing the procedural body of the demon.
+  (let ((optionsTree demonTree)
+        (bodyTree demonTree)
+        (trailingCursor CONS NULL))
+    (while (keyword? (first bodyTree))
+      (setq trailingCursor bodyTree)
+      (setq bodyTree (rest (rest bodyTree))))
+    (if (defined? trailingCursor)
+      (setf (rest (rest trailingCursor)) NIL)  ; terminate list of options
+      (setq optionsTree NIL))                  ; there are no options
+    (return optionsTree bodyTree) ))
+
+(defun in-place-normalize-demon-options ((optionsTree CONS))
+  ;; Called by `defdemon'.
+  ;; TO DO: Eventually validate options.
+  (foreach it on optionsTree
+           do (cond ((wrapper? (value it))
+                     (setf (value it) (bquote (wrap-literal & (value it)))))
+                    ((eq? (value it) (quote TRUE))
+                     (setf (value it) (bquote (wrap-boolean TRUE))))
+                    ((eq? (value it) (quote FALSE))
+                     (setf (value it) (bquote (wrap-boolean FALSE)))))))
+
+(defmacro defdemon ((name STRING-WRAPPER) (parametersTree CONS)
+                    &body (optionsAndBody CONS))
+  :documentation "Define a demon `name' and attach it to a class or slot."
+  :public? TRUE :lisp-macro? TRUE
+  (let ((firstParameter (first parametersTree))
+        (type TYPE NULL)
+        (demonFunctionName (intern-symbol (wrapper-value name))))
+    (when (not (cons? firstParameter))
+      (walk-error "Illegal first parameter in demon " name)
+      (return NIL))
+    (setq type (type-spec-to-base-type
+                (safe-yield-type-specifier
+                 (second (cast firstParameter CONS)))))
+    (when (null? (type-class type))
+      (walk-error "Demon defined on the non-existent class " type)
+      (return NIL))
+    (mv-bind (optionsTree bodyTree)
+        (destructure-defdemon-body optionsAndBody)
+      (in-place-normalize-demon-options optionsTree)
+      (return
+        (bquote
+         (progn
+           (defun & demonFunctionName & parametersTree && bodyTree)
+           (startup-time-progn
+            (define-demon
+              & name
+              && optionsTree
+              :code (wrap-literal
+                     (the-code :function & demonFunctionName))))))))))
+
+
+  ;;
+;;;;;; Interpreted read, write, put, and drop slot values
+  ;;
+
+(defun (read-slot-value OBJECT) ((self STANDARD-OBJECT) (slot STORAGE-SLOT))
+  :public? TRUE
+  ;; Return a (possibly wrapped) value for the slot `slot' on `self'.
+  ;; TO DO: UPGRADE THIS TO HANDLE EXTERNAL SLOTS WITH ACCESS METHODS
+  ;;        AS WELL AS RENAMED EXTERNAL SLOTS.
+  (let ((code (class-slot-accessor-code (type-class (slot-owner slot)))))
+    (when (defined? code)
+      (return (funcall code self (slot-name slot) (cast NULL OBJECT) FALSE)))
+    (if (subtype-of? (primary-type self) (slot-owner slot))
+        (warn "read-slot-value: No generic slot reader available for "
+              slot ".")
+      (warn "read-slot-value: Slot " slot " does not exist on" EOL
+            " object " self " of type " (primary-type self) "."))
+    (return NULL)))
+
+(defun (write-slot-value OBJECT)
+    ((self STANDARD-OBJECT) (slot STORAGE-SLOT) (value OBJECT))
+  :public? TRUE
+  ;; Write a (possibly wrapped) `value' for the slot `slot' on `self'.
+  ;; TO DO: UPGRADE THIS TO HANDLE EXTERNAL SLOTS WITH ACCESS METHODS
+  (let ((code (class-slot-accessor-code (type-class (slot-owner slot)))))
+    (when (defined? code)
+      (return (funcall code self (slot-name slot) value TRUE)))
+    (if (subtype-of? (primary-type self) (slot-owner slot))
+        (warn "write-slot-value: No generic slot writer available for "
+              slot ".")
+      (warn "write-slot-value: Slot " slot " does not exist on" EOL
+            " object " self " of type " (primary-type self) "."))
+    (return NULL)))
+
+(defun (put-slot-value OBJECT) 
+    ((self STANDARD-OBJECT) (slot STORAGE-SLOT) (value OBJECT))
+  :public? TRUE
+  ;; Set or insert `value' for the slot `slot' on `self'.
+  ;; CAUTION: Assumes that collection-valued slots are non-null.
+  (if (collection-valued? slot)
+      ;; TO DO: USE A MORE GENERIC COLLECTION TYPE HERE:
+      (let ((oldValues LIST (read-slot-value self slot)))
+        (insert oldValues value)
+        (return value))
+    (return (write-slot-value self slot value))))
+
+(defun drop-slot-value 
+    ((self STANDARD-OBJECT) (slot STORAGE-SLOT) (value OBJECT))
+  :public? TRUE
+  ;; Clear or remove `value' for the slot `slot' on `self'.
+  ;; CAUTION: Assumes that collection-valued slots are non-null.
+  ;; Odd assymetry: Single-valued case needs explicit check that `value'
+  ;;    equals the stored value.  For collections, this check occurs
+  ;;    inside of `remove'.  `put-slot' doesn't need an explicit check.
+  (if (collection-valued? slot)
+      ;; TO DO: USE A MORE GENERIC COLLECTION TYPE HERE:
+      (let ((oldValues LIST (read-slot-value self slot)))
+        (remove oldValues value))
+    (let ((oldValue (read-slot-value self slot)))
+      (when (eql? value oldValue)
+        ;; BUG: The NULL fails for literal slots:
+        (write-slot-value self slot NULL)))))
+
+
+  ;;
+;;;;; Routines that test demons and execute demons
+  ;;
+
+(defun (check-for-slot-demons? BOOLEAN) ((slot STORAGE-SLOT))
+  ;; Return TRUE if all-slots demons exist, or if guard or ordinary demons
+  ;;    are attached to `slot'.
+  ;; Called at runtime to avoid wrapping literals for a slot that
+  ;;    has no demons.
+  (return (or (defined? *all-slots-demons*)
+              (defined? *all-slots-guard-demons*)
+              (defined? (slot-guard-demons slot))
+              (defined? (slot-demons slot)))) )
+
+(defun (run-slot-guard-demons? BOOLEAN) 
+       ((self STANDARD-OBJECT) (slot STORAGE-SLOT)
+        (oldValue OBJECT) (newValue OBJECT))
+  ;; Return TRUE if all guard demons on `slot' return TRUE.
+  (when (defined? *all-slots-guard-demons*)
+    (foreach demon in *all-slots-guard-demons*
+             where (not (funcall (demon-code demon) self slot oldValue newValue))
+             do (return FALSE)))
+  (when (defined? (slot-guard-demons slot))
+    (foreach demon in (slot-guard-demons slot)
+             where (not (funcall (demon-code demon) self slot oldValue newValue))
+             do (return FALSE)))
+  (return TRUE) )
+
+(defun run-slot-demons ((self STANDARD-OBJECT) (slot STORAGE-SLOT)
+                        (oldValue OBJECT) (newValue OBJECT))
+  ;; Run all-slots demons and demons on `slot'.
+  (when (defined? *all-slots-demons*)
+    (foreach demon in *all-slots-demons*
+             do (funcall (demon-code demon) self slot oldValue newValue)))
+  (when (defined? (slot-demons slot))
+    (foreach demon in (slot-demons slot)
+             do (funcall (demon-code demon) self slot oldValue newValue))) )
+
+(defun run-constructor-demons ((self STANDARD-OBJECT))
+  ;; The object `self' has just been created.
+  ;; Run all-classes demons and demons local to `class' on `self'.
+  (let ((class (primary-class self)))
+    (when (defined? class)
+      (when (defined? *constructor-demons*)
+        (foreach demon in *constructor-demons*
+                 do (funcall (demon-code demon) self class)))
+      (when (defined? (class-constructor-demons class))
+        (foreach demon in (class-constructor-demons class)
+                 do (funcall (demon-code demon) self class))))))
+
+(defun run-destructor-demons ((self STANDARD-OBJECT))
+  ;; The object `self' has just been created.
+  ;; Run all-classes demons and demons local to `class' on `self'.
+  (let ((class (primary-class self)))
+    (when (defined? class)
+      (when (defined? *destructor-demons*)
+        (foreach demon in *destructor-demons*
+                 do (funcall (demon-code demon) self class)))
+      (when (defined? (class-destructor-demons class))
+        (foreach demon in (class-destructor-demons class)
+                 do (funcall (demon-code demon) self class))))))
+
+
+  ;;
+;;;;;; Functions for compiling or interpreting ACTIVE slots
+  ;;
+
+;; TO DO: INVENT COMPILE- AND RUN-TIME `PEEK' FUNCTIONS THAT ENABLE
+;;    QUERIES TO ACTIVE SLOTS WITHOUT CREATING EMPTY COLLECTIONS:
+(defun (yield-active-slot-reader-body CONS)
+       ((slot STORAGE-SLOT) (defaultExpression OBJECT))
+  ;; Called by `yield-slot-reader-method';
+  ;; Return a parse tree that insures to automatically initialize
+  ;;    collection-valued slots to an empty active collection upon
+  ;;    the first read.
+  (let ((slotName (slot-name slot)))
+    (if (not (collection-valued? slot))
+      (return (wrap-with-default-value-and-return-code slot defaultExpression))
+      (progn
+        (when (defined? defaultExpression)
+          (walk-error "Can't define a default value for the active "
+                      "collection-valued slot named." (slot-name slot)
+                      "Ignoring the default value."))
+        (return
+         (bquote
+          (let ((value (slot-value self & slotName)))
+            (when (defined? value)
+              (return value))
+            (setq value (new & (type-to-symbol (type slot))))    ; RMM 1/19/96
+            (setf (owner-instance value) self)
+            (setf (active-slot value)
+              (get-slot self (bquote & (slot-name slot))))
+            (setf (slot-value self & slotName) value)
+            (return value)))))) ))
+
+(defun cant-overwrite-active-collection-slot 
+       ((self STANDARD-OBJECT) (slotName SYMBOL))
+  ;; Signals illegal attempt to replace the collection within an active slot.
+  (warn "Can't replace the value of the active slot " slotName " on the object " EOL
+        self ".  Call `insert' or `remove' to add/remove slot values.") )
+
+(defun (yield-active-slot-writer-body CONS) ((slot STORAGE-SLOT))
+  ;; Called by `yield-slot-writer-method';
+  ;; Return a parse tree that writes a slot value and triggers
+  ;;    slot guards and slot demons.
+  (let ((slotName (slot-name slot))
+        (wrappingFunction (choose (eq? (slot-base-type slot) @BOOLEAN)
+                                  (quote wrap-boolean)
+                                  (quote wrap-literal))))
+    (cond
+     ((collection-valued? slot)
+      ;; disallow write to active collection-valued slot:
+      (return
+       (bquote
+        (progn
+          value                         ; make compiler shut up
+          (cant-overwrite-active-collection-slot self (bquote & slotName))
+          (return (slot-value self & (slot-name slot)))))))
+     ;; write to single-valued active slot:
+     ((subtype-of? (type slot) @LITERAL)
+      ;; include wrapper code
+      (return
+       (bquote
+        (let ((slot (get-slot self (bquote & slotName)))
+              (oldValue (slot-value self & slotName)))
+          (when (not (eql? oldValue value))
+            ;; wrapping is expensive, so we check for demons first:
+            (if (check-for-slot-demons? slot)
+              (let ((wrappedOldValue
+                     (choose (defined? oldValue)
+                             (& wrappingFunction oldValue)
+                             NULL))
+                    (wrappedNewValue
+                     (choose (defined? value)
+                             (& wrappingFunction value)
+                             NULL)))
+                (when (run-slot-guard-demons?
+                       self slot wrappedOldValue wrappedNewValue)
+                  (setf (slot-value self & slotName) value)
+                  (run-slot-demons self slot wrappedOldValue wrappedNewValue)
+                  (when (defined? wrappedOldValue)
+                    (free wrappedOldValue))
+                  (when (defined? wrappedNewValue)
+                    (free wrappedNewValue))
+                  (return value))
+                (return oldValue))
+              (return (setf (slot-value self & slotName) value))))))))
+     (otherwise                         ; single-valued, non-literal:
+      ;; no wrapping needed:
+      (return
+       (bquote
+        (let ((slot (get-slot self (bquote & slotName)))
+              (oldValue (slot-value self & slotName)))
+          (when (and (not (eq? oldValue value))
+                     (run-slot-guard-demons? self slot oldValue value))
+            (setf (slot-value self & slotName) value)
+            (run-slot-demons self slot oldValue value)
+            (return value))
+          (return oldValue)))))) ))
+
+(defmethod insert ((self ACTIVE-LIST) (value (LIKE (any-value self))))
+  ;; Insert `value' into `self', and run demons on the active slot
+  ;;    for `self'.  Duplicate values are allowed.
+  (let ((slot (active-slot self))
+        (owner (owner-instance self)))
+    (when (run-slot-guard-demons? owner slot self value)
+;        (increment-reference-count value)  ; HAPPENS IN '(setf (cons ...))'???
+      (pushf (the-cons-list self) value)
+      (run-slot-demons owner slot NULL value)) ))
+
+(defmethod insert ((self ACTIVE-SET) (value (LIKE (any-value self))))
+  ;; Insert `value' into `self' unless its a duplicate, and run demons on
+  ;;    the active slot for `self'.
+  (let ((slot (active-slot self))
+        (owner (owner-instance self)))
+    (unless (member? (the-cons-list self) value)
+      (when (run-slot-guard-demons? owner slot self value)
+;        (increment-reference-count value)  ; HAPPENS IN '(setf (cons ...))'???
+        (pushf (the-cons-list self) value)
+        (run-slot-demons owner slot NULL value))) ))
+
+(defmethod (remove ACTIVE-LIST)
+    ((self ACTIVE-LIST) (value (LIKE (any-value self))))
+  ;; Remove `value' from `self', and run demons on the active slot
+  ;;    for `self'.
+  (let ((slot (active-slot self))
+        (owner (owner-instance self)))
+    (when (member? (the-cons-list self) value)
+      (when (run-slot-guard-demons? owner slot value NULL)
+        (setf (the-cons-list self) (remove (the-cons-list self) value))
+;        (decrement-reference-count value)  ; HAPPENS IN '(setf (cons ...))'???
+        (run-slot-demons owner slot value NULL)))
+    (return self)))
+
+(defmethod (remove ACTIVE-SET)
+    ((self ACTIVE-SET) (value (LIKE (any-value self))))
+  ;; Remove `value' from `self', and run demons on the active slot
+  ;;    for `self'.
+  (let ((slot (active-slot self))
+        (owner (owner-instance self)))
+    (when (member? (the-cons-list self) value)
+      (when (run-slot-guard-demons? owner slot value NULL)
+        (setf (the-cons-list self) (remove (the-cons-list self) value))
+;        (decrement-reference-count value)  ; HAPPENS IN '(setf (cons ...))'???
+        (run-slot-demons owner slot value NULL)))
+    (return self)))
+
+
+;;; DEMON TEST CODE:
+#|
+
+(defclass SHIP (ACTIVE-OBJECT)
+  :documentation "The class of ships"
+  :extension SHIPS
+  :slots ((name :type STRING :required? TRUE)
+          (weight :type INTEGER :active? TRUE))
+  :print-form (print-native-stream stream "<Ship: " (name self) ">"))
+
+(defdemon "Advertise-New-Ship" ((self SHIP) (class CLASS))
+  :create @SHIP
+  :documentation "Prints a message whenever a SHIP object is created."
+  (ignore class)
+  (print ">>> Created '" self "'" EOL))
+
+(activate-demon (lookup-demon "Advertise-New-Ship"))
+
+(defglobal *ship* SHIP NULL)
+
+(eval (setq *ship* (new SHIP :name "Sea Star")))
+(eval (class-extension (type-class @SHIP)))
+
+(defdemon "Trace-Slot-Modification"
+    ((self OBJECT) (slot STORAGE-SLOT) (oldValue OBJECT) (newValue OBJECT))
+  :slot :all
+  :documentation "Traces modifications of any active slots."
+  (print ">>> Modified " self "." (slot-name slot)
+         " -- OLD: " oldValue "  NEW: " newValue EOL))
+
+(activate-demon (lookup-demon "Trace-Slot-Modification"))
+
+(eval (setf (weight *ship*) 10000))
+
+(defglobal *i1* OBJECT NULL)
+(defglobal *i2* OBJECT NULL)
+(defglobal *i3* OBJECT NULL)
+
+;; Until finalization is fixed, these classes have to be defined in the 
+;; following way: (1) Macroexpand them to create both class objects, (2)
+;; modify their docstrings to change their definition, (3) compile them.
+
+(defclass AA (ACTIVE-OBJECT)
+  :documentation "  "
+  :slots ((name :type STRING)
+          (s :type BB :active? TRUE))
+  :print-form (print-native-stream
+               stream (choose (defined? (name self))
+                              (name self) "|I|AA")))
+
+(defclass BB (ACTIVE-OBJECT)
+  :documentation "  "
+  :slots ((name :type STRING)
+          (s-inverse :type AA :inverse s))
+  :print-form (print-native-stream
+               stream (choose (defined? (name self))
+                              (name self) "|I|BB")))
+
+(defdemon "Advertise-Creations" ((self ACTIVE-OBJECT) (class CLASS))
+  :create :all
+  (ignore class)
+  (print ">>> Created " self EOL))
+
+(activate-demon (lookup-demon "Advertise-Creations"))
+
+(eval (setq *i1* (new AA :name "AA-1")))
+
+(deactivate-demon (lookup-demon "Advertise-Creations"))
+
+(eval (setq *i2* (new BB :name "BB-1")))
+
+(eval (s (cast *i1* AA)))
+(eval (s-inverse (cast *i2* BB)))
+(eval (slot-demons
+       (cast (lookup-slot (type-class @AA) (quote s)) STORAGE-SLOT)))
+(eval (slot-demons
+       (cast (lookup-slot (type-class @BB) (quote s-inverse)) STORAGE-SLOT)))
+(eval (setf (s (cast *i1* AA)) (cast *i2* BB)))
+(eval (s (cast *i1* AA)))
+(eval (s-inverse (cast *i2* BB)))
+(eval (setq *i3* (new BB :name "BB-2")))
+(eval (setf (s (cast *i1* AA)) (cast *i3* BB)))
+(eval (s (cast *i1* AA)))
+(eval (s-inverse (cast *i2* BB)))
+(eval (s-inverse (cast *i3* BB)))
+
+|#
+
+
+    ;;
+  ;;;;;;
+;;;;;;;;;; Hooks
+  ;;;;;;
+    ;;
+
+
+;;; Hook functions allow code to be invoked from modules other than the
+;;;    one originating some event.  This promotes greater code modularity.
+
+(defclass HOOK-LIST (KEY-VALUE-LIST)
+  :documentation "Each HOOK-LIST object contains a list of zero or
+more function codes that get funcall'd some procedure."
+  :parameters ((any-key :type SYMBOL)
+               (any-value :type FUNCTION-CODE-WRAPPER))
+  :slots  
+  ((signature :type STRING)
+   (documentation :type STRING)))
+
+(defun add-hook ((hookList HOOK-LIST) (hookFunction SYMBOL))
+  :public? TRUE
+  :documentation "Insert the function named `hookFunction' into `hookList'."
+  (let ((function (lookup-function hookFunction)))
+    (when (null? function)
+      (warn "Reference to non-existent hook function: `hookFunction'.")
+      (return))
+    (insert-at hookList hookFunction (function-code function)) ))
+
+(defun drop-hook ((hookList HOOK-LIST) (hookFunction SYMBOL))
+  :public? TRUE
+  :documentation "Remove the function named `hookFunction' from `hookList'."
+  (remove-at hookList hookFunction) )
+
+(defun run-hooks ((hookList HOOK-LIST) (argument OBJECT))
+  :documentation "Run all hook functions in `hooklist', applying
+each one to `argument'."
+  (foreach it on hookList
+           do (funcall (cast (value it) FUNCTION-CODE-WRAPPER) argument)) )
+
+(defglobal *change-module-hooks* HOOK-LIST (new HOOK-LIST)
+  :documentation "HOOK-LIST called by `in-module', applied to a
+`module' argument.")
+
+(defglobal *clear-module-hooks* HOOK-LIST (new HOOK-LIST)
+  :documentation "HOOK-LIST called by `clear-module', applied to a
+`module' argument.")
+
+(defglobal *destroy-context-hooks* HOOK-LIST (new HOOK-LIST)
+  :documentation "HOOK-LIST called by `clear-module', applied to a
+`module' argument.")
+
+(defglobal *redefine-relation-hooks* HOOK-LIST (new HOOK-LIST)
+  :documentation "HOOK-LIST is called by `undefine-old-class'.  Each
+hook function is passed a LIST of two RELATION objects; the first is the
+old relation object and the second is the new (redefined) relation object.
+The hook functions are expected to copy/transfer information from the
+old relation to the new relation so that it won't be lost.")
+
+(defglobal *finalize-relation-hooks* HOOK-LIST (new HOOK-LIST)
+  :documentation "HOOK-LIST is called by `finalize-one-class'
+and `finalize-local-slot', applied to a RELATION argument.")
+
+(defglobal *block-native-class-creation-hooks* HOOK-LIST (new HOOK-LIST)
+  :documentation "HOOK-LIST called by `create-native-class', applied to
+a STELLA class.  Return value of TRUE blocks creation.")

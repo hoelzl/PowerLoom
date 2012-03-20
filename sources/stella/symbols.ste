@@ -1,0 +1,1538 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: symbols.ste,v 1.69 2003/07/16 03:29:20 hans Exp
+
+;;; Procedures that manipulate keywords and symbols.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+  ;;
+;;;;;; Symbolic Arrays
+  ;;
+
+(defun (next-free-offset INTEGER) ((self EXTENSIBLE-SYMBOL-ARRAY))
+  ;; Return the location of the next free offset for insertion into 'self'.
+  (let ((topOffset (top-symbol-offset self))
+        (freeOffset (1+ topOffset)))
+    (foreach i in (interval (potential-free-symbol-offset self) topOffset)
+        where (null? (nth self i))
+        do (setq freeOffset i)
+           (break))
+    (setf (potential-free-symbol-offset self) (1+ freeOffset))
+    (return freeOffset)))
+
+(defun free-symbol-offset ((self EXTENSIBLE-SYMBOL-ARRAY) (offset INTEGER))
+  ;; Reset the location at 'offset' in 'self' to NULL.
+  (setf (nth self offset) NULL)
+  (when (< offset (potential-free-symbol-offset self))
+    (setf (potential-free-symbol-offset self) offset)))
+
+(defun add-to-symbol-array-at ((array EXTENSIBLE-SYMBOL-ARRAY)
+                               (offset INTEGER) (symbol GENERALIZED-SYMBOL))
+  ;; Add 'symbol' to 'array' at offset 'offset'.
+  (insert-at array offset symbol)
+  (setf (symbol-id symbol) offset) )
+
+(defun (add-to-symbol-array INTEGER)
+       ((array EXTENSIBLE-SYMBOL-ARRAY) (symbol GENERALIZED-SYMBOL))
+  ;; Add 'symbol' to 'array' at the next free entry.
+  (let ((offset (next-free-offset array)))
+    (add-to-symbol-array-at array offset symbol)
+    (return offset) ))
+
+(defun (legal-symbol-array-offset? BOOLEAN) 
+       ((array EXTENSIBLE-SYMBOL-ARRAY) (offset INTEGER))
+  ;; Return TRUE if 'offset' is within bounds.
+  (return (<= offset (top-symbol-offset array))) )
+
+
+;;; Symbols are either transient or permanent.  Permanent symbols
+;;;    exist for the lifetime of a STELLA application.  They
+;;;    are allocated when they appear within 'case' statements or
+;;;    within quoted expressions.
+;;; Keywords are symbols that also occupy permanent storage in a
+;;;    Stella application.  A STELLA keyword is prefixed by a
+;;;    colon `:'.
+;;; All other symbols are transient objects whose lifetime is
+;;;    bounded by the extent of the current transient computation.
+
+
+  ;;
+;;;;;; Symbol and keyword declarations and functions
+  ;;
+
+;;; Permanent symbols are stored in the array *symbol-array*.
+;;; Each module contains a  'symbol-offset-table' slot that maps a 
+;;;    symbol name to a *symbol-array* offset;  evaluating the array 
+;;;    offset returns a symbol.
+;;; The purpose of the double indirection is to allow for 
+;;;    insertion of symbol pointers into source code, the form
+;;;    '(get-sym offset)' represents a symbol pointer.
+;;; A new symbol name is assigned the next entry in *symbol-array*.
+;;; Transient symbols are accessed through the hash table
+;;;    *transient-symbol-lookup-table*.
+;;; Surrogates are symbols that used for embedding pointers in code;
+;;;    the 'get-sgt' function is used to retrieve them.
+;;; Keywords are stored and accessed similarly, except that there is
+;;;    only one offset table, stored in the global *keyword-offset-table*.
+
+;;; Array of symbols; array of keywords:
+(defglobal *symbol-array* (EXTENSIBLE-SYMBOL-ARRAY OF SYMBOL) NULL
+  :public? TRUE)
+(defglobal *surrogate-array* (EXTENSIBLE-SYMBOL-ARRAY OF SURROGATE) NULL
+  :public? TRUE)
+(defglobal *keyword-array* (EXTENSIBLE-SYMBOL-ARRAY OF KEYWORD) NULL
+  :public? TRUE)
+
+;;; Map name to offset in *keyword-array*:
+(defglobal *keyword-offset-table* STRING-TO-INTEGER-HASH-TABLE NULL)
+
+;;; THESE AREN'T USED MUCH YET:
+(defglobal *fixed-symbol-array* (EXTENSIBLE-SYMBOL-ARRAY OF SYMBOL) NULL)
+(defglobal *fixed-surrogate-array* (EXTENSIBLE-SYMBOL-ARRAY OF SURROGATE) NULL)
+(defglobal *fixed-keyword-array* (EXTENSIBLE-SYMBOL-ARRAY OF KEYWORD) NULL)
+
+;;; Parsing tables -- Indices to transient symbols and Common Lisp
+;;;    symbols and transient keywords.
+(defglobal *transient-symbol-lookup-table* STRING-HASH-TABLE NULL)
+(defglobal *common-lisp-symbol-lookup-table* STRING-HASH-TABLE NULL)
+
+;;; Bootstrap case variables.  Because keywords are not "up" at
+;;;   bootstrap time, so we use constants in case statements in this file:
+
+(defconstant SYMBOL-SYM INTEGER 0)
+(defconstant SURROGATE-SYM INTEGER 1)   ; was "1" before merge with SYMBOL
+(defconstant KEYWORD-SYM INTEGER 2)
+
+
+  ;;
+;;;;;; Context and Module variables
+  ;;
+
+;;; Global variables used by the module module.  We define them
+;;;    up front to avoid undeclared variable messages.  Within this file,
+;;;    they are referenced principally by the function
+;;;    'initialize-foundation-module'.
+
+(defglobal *root-module* MODULE NULL
+  :public? TRUE
+  :documentation "Pointer to the top-most module ROOT-MODULE.")
+
+(defglobal *stella-module* MODULE NULL
+  :public? TRUE
+  :documentation "Pointer to the module STELLA containing definitions of 
+STELLA classes and methods.")
+
+(defglobal *common-lisp-module* MODULE NULL
+  :public? TRUE
+  :documentation "Pointer to the module COMMON-LISP containing Common
+Lisp symbols (and maybe other things).")
+
+(defglobal *alternate-stella-module* MODULE NULL
+  :documentation "Pointer to the module ALTERNATE-STELLA containing
+definitions of STELLA classes and methods generated during the
+translation of STELLA files.")
+
+;; *CONTEXT* needs to be set to be unbound, because it is
+;; initialized specially by the boostrap startup, and we
+;; don't want to overwrite its initial value (which is set before
+;; globals are normally initialized)
+(defspecial *context* CONTEXT :UNBOUND-SPECIAL-VARIABLE
+  :documentation "Points to the current context (either a module or a
+world).  Set by calls to `change-world' and `change-module'."
+  :public? TRUE)
+
+;; *MODULE* needs to be set to be unbound, because it is
+;; initialized specially by the boostrap startup, and we
+;; don't want to overwrite its initial value (which is set before
+;; globals are normally initialized)
+(defspecial *module* MODULE :UNBOUND-SPECIAL-VARIABLE
+  :documentation "Points to the current module.  Set by calls to
+`change-context' and `change-module'."
+  :public? TRUE)
+
+(defconstant SURROGATE-PREFIX-CHARACTER CHARACTER #\@
+  :documentation "Character used to prefix the name of a surrogate.")
+
+(defconstant MODULE-SEPARATOR-CHARACTER CHARACTER #\/
+  :documentation "Character used to concatenate a module name
+to a symbol or surrogate name to form a qualified name.")
+
+(defconstant MODULE-SEPARATOR-STRING STRING "/"
+  :documentation "String containing character used to concatenate a module name
+to a symbol or surrogate name to form a qualified name.")
+
+
+  ;;
+;;;;;; Symbol processing functions
+  ;;
+
+(defun (get-sym SYMBOL) ((offset INTEGER))
+  ;; Given an integer offset, return a (permanent) symbol.
+  (return (nth *fixed-symbol-array* offset)) )
+
+(defun (get-sgt SURROGATE) ((offset INTEGER))
+  ;; Given an integer offset, return a rigid surrogate.
+  (return (nth *fixed-surrogate-array* offset)) )
+
+(defun (get-kwd KEYWORD) ((offset INTEGER))
+  ;; Given an integer offset, return a keyword.
+  (return (nth *fixed-keyword-array* offset)) )
+
+(defun (get-generalized-symbol-from-offset GENERALIZED-SYMBOL)
+       ((symbolArray EXTENSIBLE-SYMBOL-ARRAY) (offset INTEGER))
+  ;; Variant of 'get-sym', 'get-sgt', etc. that accesses tables
+  ;;    that are not fixed.
+  (return (nth symbolArray offset)) )
+
+(defun (get-sym-from-offset SYMBOL) ((offset INTEGER))
+  (return (get-generalized-symbol-from-offset *symbol-array* offset)) )
+
+(defun (get-sgt-from-offset SURROGATE) ((offset INTEGER))
+  (return (get-generalized-symbol-from-offset *surrogate-array* offset)) )
+
+(defun (get-kwd-from-offset KEYWORD) ((offset INTEGER))
+  (return (get-generalized-symbol-from-offset *keyword-array* offset)) )
+
+(defun (select-symbol-offset-table STRING-TO-INTEGER-HASH-TABLE)
+       ((module MODULE) (kindOfSym INTEGER))
+  ;; Return the offset table embedded in 'module' associated with
+  ;;    'kindOfSym'.
+  (case kindOfSym
+    (0 (return (symbol-offset-table module)))
+    (1 (return (surrogate-offset-table module)))
+    (2 (return *keyword-offset-table*))) )
+
+(defun (select-symbol-array EXTENSIBLE-SYMBOL-ARRAY) ((kindOfSym INTEGER))
+  ;; Return an array appropriate to SYMBOL-SYM, SURROGATE-SYM, or
+  ;;    KEYWORD-SYM.
+  (case kindOfSym
+    (0 (return *symbol-array*))
+    (1 (return *surrogate-array*))
+    (2 (return *keyword-array*))) )
+
+
+  ;;
+;;;;;; Low-level symbol lookup functions
+  ;;
+
+(defun (lookup-rigid-symbol-locally GENERALIZED-SYMBOL)
+       ((name STRING) (module MODULE) (kindOfSym INTEGER))
+  ;; Look only in the symbol table attached to 'module' for a 
+  ;;    symbol of type 'kindOfSym' with name 'name'.
+  (let ((offsetTable (select-symbol-offset-table module kindOfSym))
+        (offset (lookup offsetTable name)))
+    (when (defined? offset)
+      (case kindOfSym
+        (0 (return (get-sym-from-offset offset)))
+        (1 (return (get-sgt-from-offset offset)))
+        (2 (return (get-kwd-from-offset offset)))))
+    (return NULL) ))
+
+(defun (yield-visible-rigid-symbols-wrt-module (CONS OF GENERALIZED-SYMBOL))
+       ((name STRING) (module MODULE) (kindOfSym INTEGER))
+  ;; Starting at 'module', run up the module hierarchy collecting symbols
+  ;;    named 'name'.  Return a list of matching symbols, in order.
+  (let ((listOfSymbols NIL)
+        (symbol GENERALIZED-SYMBOL NULL))
+    (foreach visibleModule in (visible-modules module)
+        do (when (setq? symbol (lookup-rigid-symbol-locally
+                                name visibleModule kindOfSym))
+             (pushq listOfSymbols symbol)))
+    (return (reverse listOfSymbols)) ))
+
+(defun (visible-rigid-symbols-wrt-module (ITERATOR OF GENERALIZED-SYMBOL))
+       ((name STRING) (module MODULE) (kindOfSym INTEGER))
+  ;; Generate a sequence of symbols with name 'name' visible from 'module'.
+  (return (allocate-destructive-list-iterator
+           (yield-visible-rigid-symbols-wrt-module name module kindOfSym))) )
+
+(defun (remove-shadowed-symbols (CONS OF GENERALIZED-SYMBOL))
+    ((visibleSymbols (CONS OF GENERALIZED-SYMBOL)))
+  ;; `visibleSymbols' is a list of visible symbols as generated by a call
+  ;;    to `yield-visible-rigid-symbols-wrt-module'.
+  ;; Remove all symbols that are shadowed due to a :SHADOW declaration and
+  ;;    return the result.
+  (when (empty? (rest visibleSymbols))
+    (return visibleSymbols))
+  (let ((shadowingModules (CONS OF MODULE) NIL))
+    (foreach symbol in visibleSymbols
+        where (shadowed-symbol? symbol)
+        collect (interned-in symbol) into shadowingModules)
+    (when (non-empty? shadowingModules)
+      (let ((unshadowedSymbols NIL))
+        (foreach symbol in visibleSymbols
+            where (not (exists module in shadowingModules
+                         where (and (not (eql? module (interned-in symbol)))
+                                    (visible-from? (interned-in symbol)
+                                                   module))))
+            collect symbol into unshadowedSymbols)
+        (setq visibleSymbols unshadowedSymbols)))
+    (return visibleSymbols)))
+
+(defun (lookup-rigid-symbol-offset-wrt-module INTEGER)
+       ((name STRING) (module MODULE) (kindOfSym INTEGER))
+  ;; Starting at 'module', run up the module hierarchy looking for a symbol
+  ;;    named 'name'.  Return its symbol-array offset it one is found.
+  ;; NOTE: We optimize lookup in the current module, since 'visible-modules'
+  ;;    incurs some overhead.  If this turns out to cause performance problems
+  ;;    it might be worthwhile to cache 'visible-modules' inside a module.
+  (let ((offsetTable (select-symbol-offset-table module kindOfSym))
+        (offset (lookup offsetTable name)))
+    (when (defined? offset)
+      (return offset))
+    (foreach super in (advance (visible-modules module) 1)
+        do (setq offset
+             (lookup (select-symbol-offset-table super kindOfSym) name))
+           (when (defined? offset)
+             (return offset)))
+    (return NULL) ))
+
+(defun (lookup-rigid-symbol-wrt-module GENERALIZED-SYMBOL)
+       ((name STRING) (module MODULE) (kindOfSym INTEGER))
+  ;; Return the (permanent) symbol with name 'name' visible from
+  ;;    the module 'module'.
+  (let ((offset (lookup-rigid-symbol-offset-wrt-module
+                 name module kindOfSym)))
+    (if (defined? offset)
+      (case kindOfSym
+        (0 (return (get-sym-from-offset offset)))
+        (1 (return (get-sgt-from-offset offset)))
+        (2 (return (get-kwd-from-offset offset))))
+      (return NULL)) ))
+
+(defun (lookup-rigid-symbol GENERALIZED-SYMBOL)
+       ((name STRING) (kindOfSym INTEGER))
+  :documentation "Return the symbol named `name'.  Case sensitive."
+  ;; Return the permanent symbol with name 'name' visible from
+  ;;    the current module.
+  (let ((module *module*))
+    (when (qualified-name? name)
+      (mv-setq (module name)
+               (compute-module-and-bare-name name)))
+    (if (defined? module)
+      (return (lookup-rigid-symbol-wrt-module name module kindOfSym))
+      (return NULL)) ))
+
+;;; Top-level symbol lookup functions
+
+(defun (lookup-symbol SYMBOL) ((name STRING))
+  :documentation
+  "Return the first symbol with `name' visible from the current module."
+  :public? TRUE
+  (return (lookup-rigid-symbol-wrt-module name *module* SYMBOL-SYM)))
+
+(defun (lookup-symbol-in-module SYMBOL)
+    ((name STRING) (module MODULE) (local? BOOLEAN))
+  :documentation "Return the first symbol with `name' visible from `module'.
+If `local?' only consider symbols directly interned in `module'.
+If `module' is `null', use `*MODULE*' instead."
+  :public? TRUE
+  (when (null? module)
+    (setq module *module*))
+  (if local?
+      (return (lookup-rigid-symbol-locally name module SYMBOL-SYM))
+    (return (lookup-rigid-symbol-wrt-module name module SYMBOL-SYM))))
+
+(defun (lookup-visible-symbols-in-module (CONS OF SYMBOL))
+    ((name STRING) (module MODULE) (enforceShadowing? BOOLEAN))
+  :documentation "Return the list of symbols with `name' visible from `module'.
+More specific symbols (relative to the module precedence order defined by
+`visible-modules') come earlier in the list.  If `module' is `null', start
+from `*MODULE*' instead.  If `enforceShadowing?' is true, do not return any
+symbols that are shadowed due to some :SHADOW declaration."
+  :public? TRUE
+  (let ((visibleSymbols
+         (yield-visible-rigid-symbols-wrt-module name module SYMBOL-SYM)))
+    (if (and enforceShadowing?
+             (non-empty? (rest visibleSymbols)))
+        (return (remove-shadowed-symbols visibleSymbols))
+      (return visibleSymbols))))
+
+(defun (lookup-surrogate SURROGATE) ((name STRING))
+  :documentation
+  "Return the first surrogate with `name' visible from the current module."
+  :public? TRUE
+  (return (lookup-rigid-symbol-wrt-module name *module* SURROGATE-SYM)))
+
+(defun (lookup-surrogate-in-module SURROGATE)
+    ((name STRING) (module MODULE) (local? BOOLEAN))
+  :documentation "Return the first surrogate with `name' visible from `module'.
+If `local?' only consider surrogates directly interned in `module'.
+If `module' is `null', use `*MODULE*' instead."
+  :public? TRUE
+  (when (null? module)
+    (setq module *module*))
+  (if local?
+      (return (lookup-rigid-symbol-locally name module SURROGATE-SYM))
+    (return (lookup-rigid-symbol-wrt-module name module SURROGATE-SYM))))
+
+(defun (lookup-visible-surrogates-in-module (CONS OF SURROGATE))
+    ((name STRING) (module MODULE) (enforceShadowing? BOOLEAN))
+  :documentation
+  "Return the list of surrogates with `name' visible from `module'.
+More specific surrogates (relative to the module precedence order defined by
+`visible-modules') come earlier in the list.  If `module' is `null', start
+from `*MODULE*' instead.  If `enforceShadowing?' is true, do not return any
+surrogates that are shadowed due to some :SHADOW declaration."
+  :public? TRUE
+  (let ((visibleSurrogates
+         (yield-visible-rigid-symbols-wrt-module name module SURROGATE-SYM)))
+    (if (and enforceShadowing?
+             (non-empty? (rest visibleSurrogates)))
+        (return (remove-shadowed-symbols visibleSurrogates))
+      (return visibleSurrogates))))
+
+(defun (lookup-keyword KEYWORD) ((name STRING))
+  :documentation "Return the keyword with `name' if it exists."
+  :public? TRUE
+  (return (lookup-rigid-symbol name KEYWORD-SYM)))
+
+
+  ;;
+;;;;;; Internment of symbols
+  ;;
+
+(defun (help-intern-generalized-symbol GENERALIZED-SYMBOL)
+       ((name STRING) (kindOfSym INTEGER)
+        (array EXTENSIBLE-SYMBOL-ARRAY) (offset INTEGER) (module MODULE))
+  ;; Create a new symbol named 'name', intern it
+  ;;    into 'array' at offset 'offset', add it to the offset
+  ;;    table for 'module' and point the new symbol at 'module'.
+  (let ((symbol GENERALIZED-SYMBOL NULL)
+        (table (select-symbol-offset-table module kindOfSym)))
+    (case kindOfSym
+      (0
+       (setq symbol (new SYMBOL :symbol-name name))
+       (insert-at table name offset)
+       (setf (home-context symbol) module))
+      (1
+       (setq symbol (new SURROGATE :symbol-name name))
+       (insert-at table name offset)
+       (setf (home-context symbol) module))
+      (2
+       (setq symbol (new KEYWORD :symbol-name name))
+       (insert-at table name offset)
+       (setf (home-context symbol) NULL)))
+    (add-to-symbol-array-at array offset symbol)
+    (return symbol) ))
+
+(defun (intern-rigid-symbol-wrt-module GENERALIZED-SYMBOL) 
+       ((name STRING) (module MODULE) (kindOfSym INTEGER))
+  :public? TRUE
+  :documentation "Return a newly-created or existing rigid symbol with
+name `name'."
+  ;; Side-effect: If a symbol with name 'name' does not exist, create one.
+  (when (null? module)
+    (setq module *module*))
+  (let ((offset (lookup-rigid-symbol-offset-wrt-module
+                 name module kindOfSym)))
+    (when (defined? offset)
+      (case kindOfSym
+        (0 (return (get-sym-from-offset offset)))
+        (1 (return (get-sgt-from-offset offset)))
+        (2 (return (get-kwd-from-offset offset)))))
+    (let ((array (select-symbol-array kindOfSym)))
+      (setq offset (next-free-offset array))
+      (return (help-intern-generalized-symbol
+               name kindOfSym array offset module)))) )
+
+(defun (intern-rigid-symbol-locally GENERALIZED-SYMBOL)
+       ((name STRING) (module MODULE) (kindOfSym INTEGER))
+  :public? TRUE
+  :documentation "Return a newly-created or existing rigid symbol
+interned into the module `module' with name `name'."
+  (when (null? module)
+    (setq module *module*))
+  (let ((symbol (lookup-rigid-symbol-locally name module kindOfSym)))
+    (when (defined? symbol)
+      (return symbol))
+    (let ((array (select-symbol-array kindOfSym)))
+      (return (help-intern-generalized-symbol
+               name kindOfSym array (next-free-offset array) module)))) )
+
+(defun (intern-rigid-symbol-case-sensitively GENERALIZED-SYMBOL)
+    ((name STRING) (kindOfSym INTEGER) (tryUpcasing? BOOLEAN))
+  :public? TRUE
+  ;; Return a newly-created or existing symbol with `name' without
+  ;;    converting the case of `name'.
+  ;; If `tryUpcasing?' is TRUE, try to find a symbol with a fully
+  ;;    upcased version of `name' before creating a new one.  This
+  ;;    allows one to see inherited symbols like `SETQ' in a case-
+  ;;    sensitive module without having to write them in uppercase.
+  (let ((symbol GENERALIZED-SYMBOL NULL))
+    (setq symbol (lookup-rigid-symbol name kindOfSym))
+    (when (defined? symbol)
+      (return symbol))
+    (when (and *transientObjects?*
+               (= kindOfSym SYMBOL-SYM))
+      (setq symbol (lookup-transient-symbol name))
+      (when (defined? symbol)
+        (return symbol)))
+    (when tryUpcasing?
+      ;; Check for upcased permanent symbols inherited by the current module:
+      (setq symbol (lookup-rigid-symbol (string-upcase name) kindOfSym))
+      (when (defined? symbol)
+        (return symbol)))
+    (case kindOfSym
+      (0 (if *transientObjects?*
+             (return (intern-transient-symbol name))
+           (return (intern-permanent-symbol name))))
+      (1 (return (intern-rigid-symbol-wrt-module name *module* SURROGATE-SYM))))))
+
+
+  ;;
+;;;;;; Top-level internment functions
+  ;;
+
+(defun (intern-permanent-symbol SYMBOL) ((name STRING))
+  :public? TRUE
+  :documentation "Return a newly-created or existing permanent symbol with
+name `name'."
+  ;; Side-effect:  Newly-created symbols are added to the symbol array.
+  (return (intern-rigid-symbol-wrt-module name *module* SYMBOL-SYM)) )
+
+(defun (intern-symbol SYMBOL) ((name STRING))
+  :documentation "Return a newly-created or existing symbol with name `name'."
+  :public? TRUE
+  ;; Side-effect:  Newly-created symbols are added to the symbol array.
+  (if (case-sensitive? *module*)
+    (return (intern-rigid-symbol-case-sensitively name SYMBOL-SYM FALSE))
+    (if *transientObjects?*
+      (return (intern-transient-symbol (string-upcase name)))
+      (return (intern-permanent-symbol (string-upcase name))))))
+
+(defun (intern-symbol-in-module SYMBOL)
+    ((name STRING) (module MODULE) (local? BOOLEAN))
+  :documentation "Look for a symbol named `name' in `module' (if `local?' do
+not consider inherited modules).  If none exists, intern it locally in
+`module'.  Return the existing or newly-created symbol."
+  :public? TRUE
+  (when (null? module)
+    (setq module *module*))
+  (if local?
+      (return (intern-rigid-symbol-locally name module SYMBOL-SYM))
+    (return (intern-rigid-symbol-wrt-module name module SYMBOL-SYM))) )
+
+(defun (intern-derived-symbol SYMBOL)
+    ((baseSymbol GENERALIZED-SYMBOL) (newName STRING))
+  :public? TRUE
+  :documentation "Return a newly-created or existing symbol with name
+`newName' which is interned in the same module as `baseSymbol'."
+  (let ((currentModule *module*))
+    (special ((*module* (interned-in baseSymbol)))
+      (when (defined? *module*)
+        (return (intern-rigid-symbol-locally
+                 (choose (case-sensitive? *module*)
+                         newName
+                         (string-upcase newName))
+                 *module*
+                 SYMBOL-SYM)))
+      (setq *module* currentModule)
+      (return (intern-symbol newName)))))
+
+(defun (intern-surrogate SURROGATE) ((name STRING))
+  :documentation "Return a newly-created or existing surrogate with name `name'."
+  :public? TRUE
+  ;; Side-effect:  Newly-created symbols are added to the surrogate array.
+  (if (case-sensitive? *module*)
+    (return (intern-rigid-symbol-case-sensitively name SURROGATE-SYM FALSE))
+    (return
+     (intern-rigid-symbol-wrt-module
+      (string-upcase name) *module* SURROGATE-SYM))))
+
+(defun (intern-surrogate-in-module SURROGATE)
+    ((name STRING) (module MODULE) (local? BOOLEAN))
+  :documentation "Look for a symbol named `name' in `module' (if `local?' do
+not consider inherited modules).  If none exists, intern it locally in
+`module'.  Return the existing or newly-created symbol."
+  :public? TRUE
+  (when (null? module)
+    (setq module *module*))
+  (if local?
+      (return (intern-rigid-symbol-locally name module SURROGATE-SYM))
+    (return (intern-rigid-symbol-wrt-module name module SURROGATE-SYM))) )
+
+(defun (intern-derived-surrogate SURROGATE)
+    ((baseSymbol GENERALIZED-SYMBOL) (newName STRING))
+  :public? TRUE
+  :documentation "Return a newly-created or existing surrogate with name
+`newName' which is interned in the same module as `baseSymbol'."
+  (let ((currentModule *module*))
+    (special ((*module* (interned-in baseSymbol)))
+      (when (defined? *module*)
+        (return (intern-rigid-symbol-locally
+                 (choose (case-sensitive? *module*)
+                         newName
+                         (string-upcase newName))
+                 *module*
+                 SURROGATE-SYM)))
+      (setq *module* currentModule)
+      (return (intern-surrogate newName)))))
+
+(defun (intern-keyword KEYWORD) ((name STRING))
+  :documentation "Return a newly-created or existing keyword with name
+`name'.  Storage note: a COPY of `name' is stored in the keyword"
+  :public? TRUE
+  ;; Side-effect:  Newly-created keywords are added to the keyword array.
+  (return
+   (intern-rigid-symbol-wrt-module (string-upcase name) *module* KEYWORD-SYM)))
+
+  ;;
+;;;;;; import
+  ;;
+
+(defun (import-symbol SYMBOL) ((symbol SYMBOL) (module MODULE))
+  :documentation
+  "Import `symbol' into `module' and return the imported `symbol'.
+Signal an error if a different symbol with the same name already exists
+locally in `module'.  Any symbol with the same name visible in `module' by
+inheritance will be shadowed by the newly imported `symbol'."
+  :public? TRUE
+  (let ((name (symbol-name symbol))
+        (moduleSymbol (lookup-symbol-in-module name module TRUE)))
+    (when (null? (interned-in symbol))
+      (error "Can't import the TRANSIENT symbol " name " into " module))
+    (when (not (eql? moduleSymbol symbol))
+      (when (defined? moduleSymbol)
+        (error "Can't import, a symbol with name " name
+               " already exists in " module))
+      (when (defined? symbol)
+        (insert-at (select-symbol-offset-table module SYMBOL-SYM)
+                   name
+                   (symbol-id symbol))))
+    (return symbol)))
+
+(defun (import-surrogate SURROGATE) ((surrogate SURROGATE) (module MODULE))
+  :documentation
+  "Import `surrogate' into `module' and return the imported `surrogate'.
+Signal an error if a different surrogate with the same name already exists
+locally in `module'.  Any surrogate with the same name visible in `module' by
+inheritance will be shadowed by the newly imported `surrogate'."
+  :public? TRUE
+  (let ((name (symbol-name surrogate))
+        (moduleSurrogate (lookup-surrogate-in-module name module TRUE)))
+    (when (not (eql? moduleSurrogate surrogate))
+      (when (defined? moduleSurrogate)
+        (error "Can't import, a surrogate with name " name
+               " already exists in " module))
+      (when (defined? surrogate)
+        (insert-at (select-symbol-offset-table module SURROGATE-SYM)
+                   name
+                   (symbol-id surrogate))))
+    (return surrogate)))
+
+(defun (safe-import-symbol SYMBOL) ((symbol SYMBOL) (module MODULE))
+  :documentation
+  "Safe version of `import-symbol' (which see).  Only imports `symbol' if
+no symbol with that name is currently interned or visible in `module'.
+Returns `symbol' if it was imported or the conflicting symbol in `module'
+otherwise."
+  :public? TRUE
+  (let ((name (symbol-name symbol))
+        (moduleSymbol (lookup-symbol-in-module name module FALSE)))
+    (if (or (defined? moduleSymbol)
+            ;; can't import transient symbols:
+            (null? (interned-in symbol)))
+        (return moduleSymbol)
+      (return (import-symbol symbol module)))))
+
+(defun (safe-import-surrogate SURROGATE) ((surrogate SURROGATE) (module MODULE))
+  :documentation
+  "Safe version of `import-surrogate' (which see).  Only imports `surrogate' if
+no surrogate with that name is currently interned or visible in `module'.
+Returns `surrogate' if it was imported or the conflicting surrogate in `module'
+otherwise."
+  :public? TRUE
+  (let ((name (symbol-name surrogate))
+        (moduleSurrogate (lookup-surrogate-in-module name module FALSE)))
+    (if (defined? moduleSurrogate)
+        (return moduleSurrogate)
+      (return (import-surrogate surrogate module)))))
+
+;;; We could have `shadowing-import-XXX' versions also, but those are highly
+;;; unsafe, so we wait and see whether there is really a need.
+
+
+  ;;
+;;;;;; unintern
+  ;;
+
+;;; TO DO:
+;;; - now that we can import symbols, should we have unintern version that
+;;;   are specific to a particular module?
+;;; - since an uninterned symbol might have been imported into various other
+;;;   modules, should we check them all and unintern from there also?
+
+(defun unintern-symbol ((self SYMBOL))
+  :documentation "Remove `self' from its home module and the symbol table."
+  :public? TRUE
+  (let ((symbolArray (select-symbol-array SYMBOL-SYM))
+        (offsetTable
+         (choose (defined? (interned-in self))
+                 (select-symbol-offset-table (interned-in self) SYMBOL-SYM)
+                 NULL))
+        (symbolId (symbol-id self))
+        (realSymbol (get-sym-from-offset symbolId)))
+    (when (eql? self realSymbol)
+      (free-symbol-offset symbolArray symbolId))
+    (when (and (defined? offsetTable)
+               (eq? symbolId (lookup offsetTable (symbol-name self))))
+      (remove-at offsetTable (symbol-name self)))
+    ;; mark 'self' as deleted:
+    (setf (symbol-id self) -1)
+    (setf (symbol-value-and-plist self) NULL)))
+
+(defun unintern-surrogate ((self SURROGATE))
+  :documentation "Remove `self' from its home module and the surrogate table."
+  (let ((surrogateArray (select-symbol-array SURROGATE-SYM))
+        (offsetTable
+         (choose (defined? (interned-in self))
+                 (select-symbol-offset-table (interned-in self) SURROGATE-SYM)
+                 NULL))
+        (surrogateId (symbol-id self))
+        (realSurrogate (get-sgt-from-offset surrogateId)))
+    (when (eql? self realSurrogate)
+      (free-symbol-offset surrogateArray surrogateId))
+    (when (and (defined? offsetTable)
+               (eq? surrogateId (lookup offsetTable (symbol-name self))))
+      (remove-at offsetTable (symbol-name self)))
+    ;; mark 'self' as deleted:
+    (setf (symbol-id self) -1)
+    (setf (surrogate-value self) NULL)))
+
+(defmethod (deleted? BOOLEAN) ((self GENERALIZED-SYMBOL))
+  :globally-inline? TRUE
+  (return (eql? (symbol-id self) -1)) )
+
+  ;;
+;;;;;; Symbol table bootstrap code
+  ;;
+
+(defun (intern-bootstrap-symbol-at GENERALIZED-SYMBOL)
+       ((name STRING) (offset INTEGER) (kindOfSym INTEGER))
+  :documentation "Interns a symbol, or keyword with
+`name' and symbol-id `offset'.
+If a symbol with that ID already existed, an error is signaled.  This
+function is used to recreate the symbol table in a way where symbol IDs
+which got hardwired into translated code will refer to the correct objects."
+  (let ((symbolArray EXTENSIBLE-SYMBOL-ARRAY NULL)
+        (symbol GENERALIZED-SYMBOL NULL))
+    (case kindOfSym
+      (0 (setq symbol (lookup-symbol name)))
+      (1 (setq symbol (lookup-surrogate name)))
+      (2 (setq symbol (lookup-keyword name))))
+    (when (defined? symbol)
+      (unless (eq? (symbol-id symbol) offset)
+        (warn "intern-bootstrap-symbol-at: " symbol
+              " is already interned at offset " (symbol-id symbol)))
+      (return symbol))
+    (setq symbolArray (select-symbol-array kindOfSym))
+    (when (and (legal-symbol-array-offset? symbolArray offset)
+               (defined? (get-generalized-symbol-from-offset
+                          symbolArray offset)))
+      (setq symbol (get-generalized-symbol-from-offset symbolArray offset))
+      (warn "intern-bootstrap-symbol-at: " symbol
+            " is already interned at offset " offset)
+      (return symbol))
+    (let ((array (select-symbol-array kindOfSym)))
+      (return (help-intern-generalized-symbol
+               name kindOfSym array offset *module*))) ))
+
+(defun (intern-symbol-at SYMBOL) ((name STRING) (offset INTEGER))
+  (return (intern-bootstrap-symbol-at name offset SYMBOL-SYM)) )
+
+(defun (intern-surrogate-at SURROGATE) ((name STRING) (offset INTEGER))
+  (return (intern-bootstrap-symbol-at name offset SURROGATE-SYM)) )
+
+(defun (intern-keyword-at KEYWORD) ((name STRING) (offset INTEGER))
+  (return (intern-bootstrap-symbol-at name offset KEYWORD-SYM)) )
+
+
+  ;;
+;;;;;; Initialization of symbol tables and modules
+  ;;
+
+(defglobal *context-number-counter* INTEGER -2
+  :documentation "Contains the number of the last-created
+context (all 'live' contexts are even-numbered).")
+
+;;; Bootstrap construction of ROOT-MODULE and STELLA modules.
+
+;;; The module ROOT-MODULE exists mostly to point to top-level modules,
+;;;    which are called 'cardinal' modules.
+;;; The module STELLA contains the bulk of the STELLA class
+;;;    definitions.  We need to construct both modules now, "by hand", since
+;;;    the symbol machinery depends on them being there before symbols
+;;;    can be interned.
+
+(defun initialize-kernel-module
+       ((module MODULE) (name STRING) (fullName STRING) (parent MODULE))
+  ;; Initialize slots in ROOT or STELLA module.
+  (setf (module-name module) name)
+  (setf (module-full-name module) fullName)
+  (when (defined? parent)
+    ;; STELLA and Common-Lisp modules only:
+;    (insert (parent-modules module) parent)
+    (insert (child-contexts parent) module)
+    (setf (cardinal-module module) module))
+  (setf (symbol-offset-table module) (new STRING-TO-INTEGER-HASH-TABLE))
+  (setf (surrogate-offset-table module) (new STRING-TO-INTEGER-HASH-TABLE))
+  (setf (all-super-contexts module) NIL)
+;        (choose (defined? parent) (cons-list parent) NIL)
+  (setf (base-module module) module)
+  (setq *context-number-counter* (+ *context-number-counter* 2))
+  (setf (context-number module) *context-number-counter*)
+  (setf (stringified-options module) "") )
+    
+(defun initialize-kernel-modules ()
+  ;; Hand-build the ROOT and STELLA modules.
+  (setq *root-module* (new MODULE))
+  (initialize-kernel-module *root-module* "ROOT-MODULE" "/" NULL)
+  (setq *stella-module* (new MODULE))
+  (initialize-kernel-module *stella-module* "STELLA" "/STELLA" *root-module*)
+  (setq *common-lisp-module* (new MODULE))
+  (initialize-kernel-module 
+   *common-lisp-module* "COMMON-LISP" "/COMMON-LISP" *root-module*)
+  (setf (module-lisp-package *common-lisp-module*) "CL")  
+  ;; kludge so that the system doesn't go catatonic in the root module:
+  (setf (cardinal-module *root-module*) *stella-module*)
+  ;; The following needs the Java verbatim code to setup the initial
+  ;; values properly, since these values must supersede the definition's
+  ;; initial values of NULL.
+  (setq *module* *stella-module*)
+  (verbatim :java "Stella.$MODULE$.setDefaultValue(Stella.$STELLA_MODULE$)"
+    :otherwise NULL)
+  (setq *context* *module*)
+  (verbatim :java "Stella.$CONTEXT$.setDefaultValue(Stella.$MODULE$.get())"
+    :otherwise NULL))
+
+;;; do this out here, since we need symbols to be up for dynamic slots:
+(startup-time-progn :globals
+  (setf (java-package *stella-module*) "edu.isi.stella")
+  (setf (module-lisp-package *stella-module*) "STELLA")
+  (setf (module-cpp-package *stella-module*) "stella")
+  (setf (code-only? *root-module*) TRUE)
+  (setf (code-only? *stella-module*) TRUE)
+  (setf (code-only? *common-lisp-module*) TRUE) )
+
+(defun initialize-symbols-and-kernel-modules ()
+  ;; Initialize the symbol and keyword arrays that contains permanent
+  ;;    symbol and keyword records.
+  ;; This function should only be called once, since the offsets
+  ;;    are in-lined into compiled code and would become invalidated
+  ;;    if the symbol and keyword arrays were recreated.
+  ;; create *keyword-array* table and *keyword-offset-table*:
+  (setq *fixed-symbol-array*
+    (new (EXTENSIBLE-SYMBOL-ARRAY OF SYMBOL) :array-size 100))
+  (setq *fixed-surrogate-array*
+    (new (EXTENSIBLE-SYMBOL-ARRAY OF SURROGATE) :array-size 100))
+  (setq *fixed-keyword-array*
+    (new (EXTENSIBLE-SYMBOL-ARRAY OF KEYWORD) :array-size 100))
+  (setq *keyword-offset-table* (new STRING-TO-INTEGER-HASH-TABLE))
+  (setq *symbol-array* *fixed-symbol-array*)
+  (setq *surrogate-array* *fixed-surrogate-array*)
+  (setq *keyword-array* *fixed-keyword-array*)
+  (initialize-kernel-modules) )
+
+(startup-time-progn :early-inits
+ (when (null? *fixed-symbol-array*)
+   (initialize-symbols-and-kernel-modules)))
+
+  ;;
+;;;;;; Transient symbols and keywords
+  ;;
+
+(defun (lookup-transient-symbol SYMBOL) ((name STRING))
+  ;; Return a transient symbol with name 'name' if one exists.
+  (if (defined? *transient-symbol-lookup-table*)
+    (return (lookup *transient-symbol-lookup-table* name))
+    (progn
+      (warn "Looking for a transient symbol when the parsing tables have
+not been initialized.")
+      (return NULL))) )
+
+(defun (intern-transient-symbol SYMBOL) ((name STRING))
+  ;; Return a symbol with name 'name'.
+  ;; If a permanent symbol with the same name already exists, return it.
+  ;; Otherwise, the symbol is allocated from a transient storage pool,
+  ;;    and recorded (for later garbage collection) in the table
+  ;;    *transient-symbol-lookup-table*.
+  ;; Assumes 'name' is already uppercased if *module* is not case-sensitive.
+  (let ((symbol (lookup-symbol-in-module name *module* FALSE)))
+    (when (defined? symbol)
+      (return symbol))
+    (setq symbol (lookup-transient-symbol name))
+    (when (defined? symbol)
+      (return symbol))
+    (setq symbol (new TRANSIENT-SYMBOL :symbol-name name))
+    ;; Explicitly undo the initial value from CONTEXT-SENSITIVE-OBJECT:
+    (setf (interned-in symbol) NULL)
+    (insert-at *transient-symbol-lookup-table* name symbol)
+    (return symbol) ))
+
+(defun free-transient-symbols ()
+  ;; Release all transient symbols.
+  (initialize-hash-table *transient-symbol-lookup-table*))
+
+
+  ;;
+;;;;;; Symbols denoting Common Lisp symbols
+  ;;
+
+;;; When parsing, if we encounter a Common Lisp symbol, we
+;;;   intern it into the COMMON-LISP module.
+
+(defun (intern-common-lisp-symbol SYMBOL) ((name STRING))
+  ;; Return a symbol with name 'name'.
+  ;; The symbol is allocated from a permanent symbol storage pool.
+  (let ((symbol SYMBOL (lookup-rigid-symbol-wrt-module
+                        name *common-lisp-module* SYMBOL-SYM)))
+    (when (defined? symbol)
+      (return symbol))
+    ;; Try again with a guaranteed uppercase version.
+    (setq name (string-upcase name))
+    (setq symbol (lookup-rigid-symbol-wrt-module
+		  name *common-lisp-module* SYMBOL-SYM))
+    (when (defined? symbol)
+      (return symbol))
+    ;; Intern using the uppercase name, since all CL symbols are uppercase.
+    (setq symbol (intern-rigid-symbol-wrt-module
+                  name *common-lisp-module* SYMBOL-SYM))
+    (return symbol) ))
+
+(defun (symbol-common-lisp? BOOLEAN) ((self SYMBOL))
+  (return (eql? (interned-in self) *common-lisp-module*)))
+
+(defun (common-lisp-symbol? BOOLEAN) ((self OBJECT))
+  (return (and (symbol? self)
+               (symbol-common-lisp? self))))
+
+
+  ;;
+;;;;;; initialization of symbol tables
+  ;;
+
+(defun initialize-parsing-tables ()
+  :documentation "Create indices for recording transient symbols and
+Common Lisp symbols while parsing."
+  (setq *transient-symbol-lookup-table* (new STRING-HASH-TABLE))
+  (setq *common-lisp-symbol-lookup-table* (new STRING-HASH-TABLE)))
+
+(startup-time-progn :early-inits
+ (initialize-parsing-tables))
+
+
+  ;;
+;;;;;; gensym
+  ;;
+
+(defglobal *gensym-counter* INTEGER 0
+  :documentation "Incremented once for each gensym call.")
+
+(defglobal *gensym-mask* STRING "-000"
+  :documentation "Defines the separator character for gensyms,
+and the fill digits.")
+
+(defun (yield-gensym-name STRING) ((prefix STRING) (counter INTEGER))
+  ;; Yield a gensym name derived from 'prefix' and 'counter'.
+  (let ((suffix (integer-to-string counter))
+        (maskEnd (- 4 (length suffix))))
+    (when (< maskEnd 1)
+      (setq maskEnd 1))
+    (return
+     (concatenate prefix (subsequence *gensym-mask* 0 maskEnd) suffix))))
+
+(defun (yield-unique-gensym-name STRING) ((prefix STRING) (module MODULE))
+  (let ((gensym-name (yield-gensym-name prefix (++ *gensym-counter*))))
+    (while (defined? (lookup-symbol-in-module gensym-name module FALSE))
+      (setq gensym-name (yield-gensym-name prefix (++ *gensym-counter*))))
+    (return gensym-name)))
+
+(defun (gensym SYMBOL) ((prefix STRING))
+  :documentation "Return a transient symbol with a name beginning with
+`prefix' and ending with a globally gensym'd integer."
+  :public? TRUE
+  (return (intern-transient-symbol (yield-unique-gensym-name prefix *module*))))
+
+  ;;
+;;;;;; Utility functions used during parsing of class and method definitions
+  ;;
+
+(defun (surrogate-to-symbol SYMBOL) ((self SURROGATE))
+  :public? TRUE
+  ;; Return a symbol with the same name as 'self'.
+  ;; Tricky: This conversion loses the significance of the
+  ;;    home context for 'self', under the assumption that the
+  ;;    home context of a symbol is NOT significant.  Instead,
+  ;;    we pick a visible symbol (inherited or local), if one exists,
+  ;;    or else we create a new one.
+  (return (intern-symbol-in-module (symbol-name self) *module* FALSE)) )
+
+(defun (type-to-symbol SYMBOL) ((type TYPE))
+  :documentation "Convert `type' into a symbol with the same name and module."
+  ;; NOTE: This does preserve the module information as opposed to
+  ;;    `surrogate-to-symbol' which doesn't.
+  :public? TRUE :globally-inline? TRUE
+  (return
+    (intern-symbol-in-module (symbol-name type) (interned-in type) TRUE)))
+
+(defun (symbolize SYMBOL) ((surrogate SURROGATE))
+  :documentation
+  "Convert `surrogate' into a symbol with the same name and module."
+  :public? TRUE :globally-inline? TRUE
+  ;; NOTE: This does preserve the module information as opposed to
+  ;;    `surrogate-to-symbol' which doesn't.
+  (return (type-to-symbol surrogate)))
+
+(defun (string-to-surrogate SURROGATE) ((self STRING))
+  :public? TRUE
+  ;; Return a surrogate with the same name as 'self'.
+  ;; Very tricky: The logic is designed to avoid returning
+  ;;    an inherited surrogate that has no value.  In that case,
+  ;;    a new local surrogate is created that shadows the inherited
+  ;;    surrogate.
+  (let ((surrogate
+         (intern-surrogate-in-module self *module* FALSE)))
+    (when (or (eql? (home-context surrogate) *module*)
+              (defined? (surrogate-value surrogate)))
+      (return surrogate))
+    (return (intern-surrogate-in-module self *module* TRUE)) ))
+
+(defun (symbol-to-surrogate SURROGATE) ((self SYMBOL))
+  :public? TRUE
+  ;; Return a surrogate with the same name as 'self'.
+  ;; Very tricky: The logic is designed to avoid returning
+  ;;    an inherited surrogate that has no value.  In that case,
+  ;;    a new local surrogate is created that shadows the inherited
+  ;;    surrogate.  Unlike 'string-to-surrogate', the search
+  ;;    starts first from the home context of 'self', and
+  ;;    if that fails, then it restarts  in *module*.
+;  (when (explicitly-qualified-symbol? self)
+;    (within-module (home-context self)
+;       (return (string-to-surrogate (symbol-name self)))))
+  (let ((surrogate (lookup-surrogate-in-module
+                    (symbol-name self) (home-context self) FALSE)))
+    (when (and (defined? surrogate)
+               (defined? (surrogate-value surrogate)))
+      (safety 3 (not (deleted? surrogate)) "HIT DELETED SURROGATE")
+      (return surrogate))
+    ;; mildly tricky: still need to avoid returning inherited
+    ;;    surrogate with NULL value:
+    (return (string-to-surrogate (symbol-name self))) ))
+
+;;; 'surrogatify' converts 'self' into a surrogate, even when
+;;;    it's a symbol or a string.
+(defmethod (surrogatify SURROGATE) ((self SURROGATE))
+  :public? TRUE
+  (return self) )
+
+(defmethod (surrogatify SURROGATE) ((self SYMBOL))
+  :public? TRUE
+  ;; Turn transient symbols into permanent ones.
+  ;; Make sure the generated surrogate lives in the same module as 'self'
+  ;;    and is not inherited from a parent module.
+  (return (symbol-to-surrogate self)) )
+
+(defmethod (surrogatify SURROGATE) ((self STRING))
+  :public? TRUE
+  (return (intern-surrogate self)) )
+
+(defmethod (surrogatify SURROGATE) ((self CONS))
+  :public? TRUE
+  ;; Catch case of NIL
+  (if (nil? self)
+    (return (intern-surrogate "NIL"))
+    (error "Cons passed to 'surrogatify'")) )
+
+(defmethod (surrogatify SURROGATE) ((self OBJECT))
+  :public? TRUE
+  (error "OBJECT passed to 'surrogatify'")
+  ; (return NULL)
+  )
+
+(defun (typify TYPE) ((self OBJECT))
+  :public? TRUE
+  ;; Convert transient type to permanent type (assuming
+  ;;    'with-transient-objects' is not in effect).
+  (return (surrogatify self)) )
+
+;;; 'keywordify' converts 'self' into a keyword, even when
+;;;    it's a symbol or a string.
+(defmethod (keywordify KEYWORD) ((self KEYWORD))
+  :public? TRUE
+  (return self) )
+(defmethod (keywordify KEYWORD) ((self GENERALIZED-SYMBOL))
+  :public? TRUE
+  (return (intern-keyword (symbol-name self))) )
+(defmethod (keywordify KEYWORD) ((self STRING-WRAPPER))
+  :public? TRUE
+  (return (intern-keyword self)) )
+(defmethod (keywordify KEYWORD) ((self STRING))
+  :public? TRUE
+  (return (intern-keyword self)) )
+
+(defun in-place-objects-to-symbols ((consList CONS))
+  ;; Destructively replace each item in the cons list 'consList' by a
+  ;;    permanent symbol.
+  (let ((cursor consList))
+    (while (non-empty? cursor)
+      (setf (value cursor) (permanentify (value cursor)))
+      (setq cursor (rest cursor))) ))
+
+(defun in-place-objects-to-types ((consList CONS))
+  ;; Destructively replace each item in the cons list 'consList' by a
+  ;;    permanent type.
+  (let ((cursor consList))
+    (while (non-empty? cursor)
+      (setf (value cursor) (typify (value cursor)))
+      (setq cursor (rest cursor))) ))
+
+
+  ;;
+;;;;;;  'intern-generalized-symbol' and friends (minus qualified pathnames)
+  ;;
+
+(defun (surrogate-name? BOOLEAN) ((name STRING))
+  :public? TRUE
+  ;; Return TRUE if name is prefixed by 'SURROGATE-PREFIX-CHARACTER'.
+  (return (and (> (length name) 0)
+               (eq? (nth name 0) SURROGATE-PREFIX-CHARACTER))) )
+
+(defun (qualified-name? BOOLEAN) ((name STRING))
+  :public? TRUE
+  ;; Return TRUE if 'name' contains the character MODULE-SEPARATOR-CHARACTER,
+  ;;    or if it begins with a DOT (so that "." and ".." are found).
+  ;; We reject the name "/", since the divide character needs to be
+  ;;    accessible.
+  ;; We als reject module names that begin with a digit or .<digit> to
+  ;;    allow numbers with unit information such as `0.5km/h'.
+  (cond ((= (length name) 0) (return FALSE))
+        ((member? name MODULE-SEPARATOR-CHARACTER)
+         (when (> (length name) 1)
+           (when (digit-character? (nth name 0))
+             (return FALSE))
+           (when (and (eql? (nth name 0) #\.)
+                      (digit-character? (nth name 1)))
+             (return FALSE))
+           (return TRUE)))
+        ((eq? (nth name 0) #\.)
+         (case (length name)
+           (1 (return TRUE))
+           (2 (when (eql? (nth name 1) #\.)
+                (return TRUE)))
+           (otherwise NULL))))
+  (return FALSE))
+
+(defun (keyword-name? BOOLEAN) ((name STRING))
+  :public? TRUE
+  ;; Return TRUE if name is prefixed by ':'.
+  (return (and (> (length name) 0)
+               (eq? (nth name 0) #\:))) )
+
+(defun (intern-generalized-symbol GENERALIZED-SYMBOL) ((name STRING))
+  :public? TRUE
+  ;; Return a symbol or keyword.
+  (cond
+   ((qualified-name? name)          ; contains #\/ ?
+    (return (intern-qualified-name name TRUE)))
+   ((keyword-name? name)                ; prefixed by #\: ?
+    (return (intern-keyword (rest name))))
+   ((surrogate-name? name)          ; prefixed by #\@ ?
+    (return (intern-surrogate (rest name))))
+   (otherwise
+    (return (intern-symbol name)))) )
+
+(defun (compute-full-name STRING) ((name STRING) (module MODULE))
+  :public? TRUE
+  ;; Return a string representing the name 'name' prefixed by the path
+  ;;    to the module 'module'.
+  (cond
+   ((null? module)
+    (return name))
+   ((eql? name "")
+    ;; bootstrap code for the `module-full-name' slot:
+    (let ((pathName ""))
+      (while (defined? module)
+        (setq pathName
+          (concatenate MODULE-SEPARATOR-STRING (module-name module) pathName))
+        (setq module (first (parent-modules module))))
+      (return pathName)))
+   (otherwise
+    (let ((moduleFullName (module-full-name module)))
+      (when (null? moduleFullName)
+        ;; Should we ever get here, and if so, should we cache the result?
+        (setq moduleFullName (compute-full-name "" module)))
+      (return (concatenate moduleFullName MODULE-SEPARATOR-STRING name))))))
+
+(defmethod (local-print-name STRING) ((self GENERALIZED-SYMBOL))
+  ;; Return the name of 'self'.
+  (return (symbol-name self)) )
+
+(defmethod (local-print-name STRING) ((self SURROGATE))
+  ;; Return the name of 'self' prefixed by 'SURROGATE-PREFIX-CHARACTER'.
+  (return (concatenate "@" (symbol-name self))) )
+
+(defmethod (relative-name STRING) ((self GENERALIZED-SYMBOL))
+  ;; Return a string that either is the name of 'self', if 'self'
+  ;;    is interned in the current module, or otherwise, the full path name
+  ;;    of 'self'.
+  (let ((string STRING NULL))
+    (if (eq? (interned-in self) *module*)
+      (setq string (local-print-name self))
+      (setq string
+            (compute-full-name (local-print-name self) (interned-in self))))
+    (when (deleted? self)
+      (setq string (concatenate "<<UNINTERNED>>/" string)))
+    (return string) ))
+
+;; REDEFINING THE NOTION OF 'visible' TO MEAN BOTH THAT THE MODULE
+;;    OF THE GENERALIZED SYMBOL IS VISIBLE, *AND* THAT THERE IS NO
+;;    INTERVENING SYMBOL THAT SHADOWS 'self':
+
+(defun (visible-symbol? BOOLEAN) ((self SYMBOL))
+  :documentation "Return `true' if `self' is visible from the current module."
+  :globally-inline? TRUE :public? TRUE
+  (return (eql? self (lookup-symbol-in-module (symbol-name self) *module* FALSE))))
+
+(defun (visible-surrogate? BOOLEAN) ((self SURROGATE))
+  :documentation "Return `true' if `self' is visible from the current module."
+  :globally-inline? TRUE :public? TRUE
+  (return
+    (eql? self (lookup-surrogate-in-module (symbol-name self) *module* FALSE))))
+
+(defmethod (visible-name STRING) ((self GENERALIZED-SYMBOL))
+  :public? TRUE
+  ;; Return a string that either is the name of 'self', if 'self'
+  ;;    is visible from the current module, or otherwise, the full path name
+  ;;    of 'self'.
+  (let ((visible? BOOLEAN NULL))
+    (typecase self
+      (SYMBOL
+       (setq visible? (visible-symbol? self)))
+      (SURROGATE
+       (setq visible? (visible-surrogate? self))))
+    (if visible?
+      (return (local-print-name self))
+      (return
+       (compute-full-name (local-print-name self) (interned-in self)))) ))
+
+
+  ;;
+;;;;;; Symbol value and property list support
+  ;;
+
+;;; Here is some support for Common-Lisp-style symbol values and
+;;; plists to make Common-Lisp programmers happy.  Storing information
+;;; in symbol plists is deprecated, however, once in a while it can be
+;;; justified, since it is very convenient and fast.  The "right" way
+;;; would be to use special-purpose objects to store the information,
+;;; and to use a special-purpose input parser to create those objects
+;;; (instead of relying on 'quote' and 'bquote').  Hashtables are also
+;;; an option, but they might be too slow for certain applications.
+
+;;; Since we don't expect this facility to be used very much, we store
+;;; both the symbol value and the plist in a single slot (with the
+;;; help of special accessors).  This wastes one pointer for symbols
+;;; that don't have a value but do have a plist.  We use CONS as the
+;;; underlying representation, to allow a more Lisp-like interface
+;;; (e.g., then one can use 'bquote' to define a plist as a whole).
+;;; Using KV-CONSes would be more space efficient, but they are a
+;;; little bit more tedious to work with.  Should we ever decide to
+;;; use Lisp conses to implement Stella CONSes, then we could map the
+;;; operations below directly onto Common-Lisp functions (which
+;;; wouldn't be possible with KV-CONSs).
+
+(defun (symbol-value OBJECT) ((symbol SYMBOL))
+  :documentation "Return the value of `symbol'.  Note, that this value is not
+visible to code that references a variable with the same name as `symbol'.
+The `symbol-value' is simply a special property that can always be accessed
+in constant time.  The `symbol-value' of a symbol can be changed with `setf'."
+  :public? TRUE
+  :globally-inline? TRUE  ;; eventually, the walker will honor this
+  (return (value (symbol-value-and-plist symbol))))
+
+(defun (symbol-value-setter OBJECT) ((symbol SYMBOL) (value OBJECT))
+  ;; Set the 'symbol-value' of 'symbol' to 'value'.
+  (let ((vpList (symbol-value-and-plist symbol)))
+    (when (eql? vpList NIL)
+      (setq vpList (cons NULL NIL))
+      (setf (symbol-value-and-plist symbol) vpList))
+    (return (setf (value vpList) value))))
+
+(defun (symbol-plist CONS) ((symbol SYMBOL))
+  :documentation "Return the property list of `symbol'.  The `symbol-plist'
+of a symbol can be set with `setf'.  IMPORTANT: Property list are modified 
+destructively, hence, if you supply it as a whole make sure to always supply
+a modfiable copy, e.g., by using `bquote'."
+  :public? TRUE
+  :globally-inline? TRUE  ;; eventually, the walker will honor this
+  (return (rest (symbol-value-and-plist symbol))))
+
+(defun (symbol-plist-setter CONS) ((symbol SYMBOL) (pList CONS))
+  ;; Set the property list of 'symbol' to 'pList'.
+  (safety 3 (even? (length pList)) "Attempt to supply an odd-length p-list.")
+  (let ((vpList (symbol-value-and-plist symbol)))
+    (when (eql? vpList NIL)
+      (setq vpList (cons NULL NIL))
+      (setf (symbol-value-and-plist symbol) vpList))
+    (return (setf (rest vpList) pList))))
+
+(defun (symbol-property OBJECT) ((symbol SYMBOL) (key STANDARD-OBJECT))
+  :documentation "Return the property of `symbol' whose key is `eq?' to `key'.
+Symbol properties can be set with `setf'."
+  ;; NOTE: Using 'STANDARD-OBJECT' as the type for 'key' allows the walker
+  ;;    to use an 'eq?' test for the 'eql?' test below.
+  (let ((pList (rest (symbol-value-and-plist symbol))))
+    (while (not (eql? pList NIL))
+      (when (eql? (value pList) key)
+        (return (value (rest pList))))
+      (setq pList (rest (rest pList))))
+    (return NULL)))
+
+(defun (symbol-property-setter OBJECT)
+    ((symbol SYMBOL) (value OBJECT) (key STANDARD-OBJECT))
+  ;; Set the property of 'symbol' whose key is 'eq?' to 'key' to 'value'.
+  ;; If 'value' is NULL that entry is removed from the property list of
+  ;;    'symbol' (in most cases) to save space and speed-up access to
+  ;;    other entries.
+  ;; NOTE: Using 'STANDARD-OBJECT' as the type for 'key' allows the walker
+  ;;    to use an 'eq?' test for the 'eql?' test below.
+  (let ((vpList (symbol-value-and-plist symbol))
+        (pList (rest vpList)))
+    (while (not (eql? pList NIL))
+      (when (eql? (value pList) key)
+        (cond ((defined? value)
+               (setf (value (rest pList)) value))
+              ;; Destructively remove entry if 'value' was NULL to
+              ;; save space and speed up access to other entries:
+              ((not (eql? (rest (rest pList)) NIL))
+               (let ((restpList (rest pList)))
+                 (setf (value pList) (value (rest restpList)))
+                 (setf (rest pList) (rest (rest restpList)))))
+              ;; 'plist' only contained one entry:
+              ((eql? plist (rest vpList))
+               (setf (rest vpList) NIL))
+              (otherwise
+               ;; Give up if the entry was at the very end (keeping a
+               ;; second pointer or scanning twice is too much effort):
+               (setf (value (rest pList)) value)))
+        (return value))
+      (setq pList (rest (rest pList))))
+    (when (defined? value)
+      (when (eql? vpList NIL)
+        (setq vpList (cons NULL NIL))
+        (setf (symbol-value-and-plist symbol) vpList))
+      (setf (rest vpList)
+        (cons key (cons value (rest vpList)))))
+    (return value)))
+
+  ;;
+;;;;;; Printing
+  ;;
+
+(defun (symbol-constituent-character? BOOLEAN) ((character CHARACTER))
+  ;; True if 'character' is a regular Stella symbol constituent.
+  (case (aref *character-type-table* (character-code character))
+    ((:LETTER :DIGIT :SYMBOL-CONSTITUENT)
+     (return TRUE))
+    (otherwise
+     (return FALSE))))
+
+(defglobal *symbol-escape-code-table* STRING
+           (initialize-symbol-escape-code-table FALSE))
+(defglobal *case-sensitive-symbol-escape-code-table* STRING
+           (initialize-symbol-escape-code-table TRUE))
+
+(defun (initialize-symbol-escape-code-table STRING) ((caseSensitive? BOOLEAN))
+  ;; We use 4 type codes to classify characters in a symbol name:
+  ;;    0: Never needs to be escaped
+  ;;    1: Might need escaping if at the beginning of a symbol
+  ;;       (e.g., to deal with symbolized numbers - note: `@' and `:' are
+  ;;       already classified as non-symbol-constitutents and taken care of).
+  ;;    2: Needs simple escaping via vertical bars
+  ;;    3: Needs complex escaping, since it is an escape character.
+  (let ((buffer (make-mutable-string 256 NULL)))
+    (foreach i in (interval 0 255)
+        do (case (aref *character-type-table* i)
+             (:DIGIT
+              (setf (nth buffer i) (code-character 1)))
+             ((:LETTER :SYMBOL-CONSTITUENT)
+              (if (and (not caseSensitive?)
+                       (lower-case-character? (code-character i)))
+                  (setf (nth buffer i) (code-character 2))
+                (setf (nth buffer i) (code-character 0))))
+             (otherwise
+              (setf (nth buffer i) (code-character 2)))))
+    (foreach ch in ".+-"
+        do (setf (nth buffer (character-code ch)) (code-character 1)))
+    (setf (nth buffer (character-code #\\)) (code-character 3))
+    (setf (nth buffer (character-code #\|)) (code-character 3))
+    (return buffer)))
+
+(defun (compute-symbol-escape-code KEYWORD)
+    ((name STRING) (caseSensitive? BOOLEAN))
+  ;; Scan `name' and return a code indicating how the symbol needs to be
+  ;;    escaped when printed readably.
+  ;; Return :UNESCAPED if `name' need not be escaped, :ESCAPED if `name' can be
+  ;;    escaped with a pair of vertical bars, or :COMPLEX-ESCAPED if `name'
+  ;;    contains escape characters that themselves need to be escaped.
+  ;; `caseSensitive?' indicates whether the read-time module is assumed to
+  ;;    be case-sensitive or not.
+  ;; This properly handles escaping of mixed-case symbols in case-insensitive
+  ;;    modules, as well as symbols containing special characters, looking
+  ;;    like numbers, etc.
+  (let ((table (choose caseSensitive?
+                       *case-sensitive-symbol-escape-code-table*
+                       *symbol-escape-code-table*))
+        (escapeCode 0)
+        (maxEscapeCode 0)
+        (firstChar? TRUE)
+        (couldBeNumber? TRUE))
+    (foreach ch in name
+        do (setq escapeCode (character-code (nth table (character-code ch))))
+           (cond ((= escapeCode 0)
+                  (when (and couldBeNumber?
+                             (not (eql? ch #\E))
+                             (not (eql? ch #\e)))
+                    (setq couldBeNumber? FALSE)))
+                 (firstChar?
+                  (setq maxEscapeCode escapeCode)
+                  (setq couldBeNumber? (= escapeCode 1)))
+                 (otherwise
+                  (when (and (> escapeCode 1)
+                             (> escapeCode maxEscapeCode))
+                    (setq maxEscapeCode escapeCode))))
+           (setq firstChar? FALSE))
+    (if firstChar?
+        ;; `name' was the empty symbol:
+        (return :ESCAPED)
+      (case maxEscapeCode
+        (0 (return :UNESCAPED))
+        (1 (when couldBeNumber?
+             ;; we really have to parse it to figure out whether it is a number
+             ;;    or not; this is the cheapest way to do this:
+             (with-stella-tokenizer name
+               (get-next-stella-token)
+               (when (eql? (get-stella-token-type) :SYMBOL)
+                 (setq couldBeNumber? FALSE))))
+           (if couldBeNumber?
+               ;; NOTE: KEYWORDS AND SURROGATES WOULD NOT NEED ESCAPING HERE,
+               ;;    BUT FOR SIMPLICITY WE TREAT THEM JUST LIKE SYMBOLS:
+               (return :ESCAPED)
+             (return :UNESCAPED)))
+        (2 (if (and (eql? (nth name 0) #\/) ; cheap guard
+                    (eql? name "/"))
+               ;; special-case division symbol:
+               (return :UNESCAPED)
+             (return :ESCAPED)))
+        (3 (return :COMPLEX-ESCAPED))))))
+
+(defun print-symbol-name-readably
+    ((name STRING) (stream NATIVE-OUTPUT-STREAM) (caseSensitive? BOOLEAN))
+  ;; Print a symbol's `name' onto `stream', so that it can be read back
+  ;;    into an identical symbol.
+  ;; `caseSensitive?' indicates whether the read-time module is assumed to
+  ;;    be case-sensitive or not.
+  ;; This properly handles escaping of mixed-case symbols in case-insensitive
+  ;;    modules, as well as symbols containing special characters, looking
+  ;;    like numbers, etc.
+  (case (compute-symbol-escape-code name caseSensitive?)
+    (:UNESCAPED (print-stream stream name))
+    (:ESCAPED (print-stream stream "|" name "|"))
+    (:COMPLEX-ESCAPED
+     (print-stream stream "|")
+     ;; printing character-by-character is not very fast,
+     ;;    but this case should be pretty rare:
+     (foreach ch in name
+         do (when (or (eql? ch #\\)
+                      (eql? ch #\|))
+              (print-stream stream "\\"))
+            (print-stream stream ch))
+     (print-stream stream "|"))))
+
+(defun print-symbol ((self SYMBOL) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print 'self' onto 'stream'.
+  (let ((visible? (visible-symbol? self))
+        (module (interned-in self)))
+    (when (not visible?)
+      (if (deleted? self)
+          (print-stream stream "<<UNINTERNED>>/")
+        (when (defined? module)
+          (if (and *printReadably?*
+                   (eql? module *common-lisp-module*))
+              (progn
+                ;; special-case this, since CL symbols are always simple:
+                (print-stream stream "CL:" (symbol-name self))
+                (return))
+            (print-stream stream (module-full-name module) "/")))))
+    (if *printReadably?*
+        (print-symbol-name-readably
+         (symbol-name self) stream (case-sensitive? *module*))
+      (print-stream stream (symbol-name self)))))
+
+(defun print-surrogate ((self SURROGATE) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print 'self' onto 'stream'.
+  (let ((visible? (visible-surrogate? self))
+        (module (interned-in self)))
+    (when (not visible?)
+      (if (or (deleted? self)
+              (null? module)) ;; for robustness
+          (print-stream stream "<<UNINTERNED>>/")
+        (print-stream stream (module-full-name module) "/")))
+    (print-stream stream "@")
+    (if *printReadably?*
+        (print-symbol-name-readably
+         (symbol-name self) stream (case-sensitive? *module*))
+      (print-stream stream (symbol-name self)))))
+
+(defun print-keyword ((self KEYWORD) (stream NATIVE-OUTPUT-STREAM))
+  ;; Print 'self' onto 'stream'.
+  (print-stream stream ":")
+  (if *printReadably?*
+      ;; Adapt this if keywords ever become case-sensitive:
+      (print-symbol-name-readably (symbol-name self) stream FALSE)
+    (print-stream stream (symbol-name self))))

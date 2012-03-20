@@ -1,0 +1,361 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: idl-output.ste,v 1.12 2003/04/18 21:14:59 hans Exp
+
+;;; Routines for outputing a formatted IDL program.
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+
+;;; Output an IDL program.
+
+;; Number of characters to indent the current line.
+(defspecial *idl-indent-chars* INTEGER 0)
+
+
+(defun idl-output-parse-tree ((consTree CONS))
+  ;; Top level function to output a IDL program.
+  (special ((*idl-indent-chars* 0))
+    (idl-output-statement consTree)))
+
+(defun idl-output-statement ((statement OBJECT))
+  ;; Output a IDL statement, which involves interpreting the IDL
+  ;;   parse tree
+  (typecase statement
+    (CONS
+     (when (nil? statement) (return))
+     (if (or (cons? (first statement)) (null? (first statement)))
+	 ;; Take care of the case where statement consists of nested stmts.
+	 (progn
+	   (idl-output-statement (first statement))
+	   (idl-output-statement (rest statement)))
+         (case (first statement)
+	   (IDL_COMMENT (idl-output-comment (second statement)))
+	   (IDL_TYPEDEF (idl-output-typedef (rest statement)))
+	   (IDL_ENUM (idl-output-enum (rest statement)))
+	   (IDL_INTERFACE (idl-output-interface 
+			   (cast (rest statement) (CONS OF STRING-WRAPPER))))
+	   (IDL_STRUCT (idl-output-struct 
+			(cast (rest statement) (CONS OF STRING-WRAPPER))))
+	   (IDL_DECLARATIONS 
+	    (idl-output-declarations (cast (second statement) (CONS OF CONS))))
+	   (IDL_IDENT (idl-output-identifier (second statement)))
+	   (IDL_TYPE (idl-output-type-expression 
+		      (cast (rest statement) (CONS OF STRING-WRAPPER))))
+	   (IDL_SIGNATURES 
+	    (idl-output-signatures (cast (second statement) CONS))))))
+    (otherwise		
+     (when (null? statement)
+       (return))
+     (idl-output-atomic-expression statement))))
+
+(defun idl-indent ()
+  ;; Indent a line.
+  (print-spaces *current-stream* *idl-indent-chars*) )
+
+(defun idl-bump-indent ()
+  ;; Bump the indent level 
+  (setq *idl-indent-chars* (+ *idl-indent-chars* 2)) )
+
+(defun idl-unbump-indent ()
+  ;; Bump the indent level 
+  (setq *idl-indent-chars* (- *idl-indent-chars* 2)) )
+
+(defun idl-output-typedef ((typedef CONS))
+  (print-stream *current-stream* "typedef " 
+		(wrapper-value (cast (second typedef) STRING-WRAPPER))
+		" " (wrapper-value (cast (first typedef) STRING-WRAPPER))
+		";" EOL EOL))
+
+
+(defun idl-output-enumerands ((enumerands (CONS OF CONS)))
+  ;; Output a list of idl enuerands (represented as slots)
+    (when (defined? (first enumerands))
+      (print-stream *current-stream*
+                    (wrapper-value (cast (second (first enumerands))
+                                         STRING-WRAPPER))))
+    (foreach enumerand in (rest enumerands)
+	     do
+	     ;; I THINK THIS HAS TO BE UPDATED....
+	     (print-stream 
+	      *current-stream* 
+	      ", "
+	      (wrapper-value (cast (second enumerand) STRING-WRAPPER)))))
+
+(defun idl-output-enum ((enum CONS))
+  ;; Output idl enumerated type 
+  (print-stream *current-stream* "enum {")
+  (idl-output-enumerands (second (cast (nth enum 4) CONS)))
+  (print-stream *current-stream* "};" EOL EOL))
+
+(defun idl-output-type-expression ((typeExpression 
+				    (CONS OF STRING-WRAPPER)))
+  ;; Output a type expression, which is a list of type tokens
+  ;;   (e.g., (static long int))
+  (foreach typeExpr in typeExpression
+	   do
+	   (print-stream *current-stream* (wrapper-value typeExpr) " ")) )
+
+(defmethod idl-output-literal ((object OBJECT))
+  ;; Dummy method on abstract class
+  NULL
+  )
+
+(defmethod idl-output-literal ((string STRING))
+  ;; Output string
+  ;; NOTE: Need to insert '\' before double quotes and \s and insert 
+  ;;  \n in place of return
+  (print-stream *current-stream* #\" 
+		(replace-character-with-substring
+		 (replace-character-with-substring
+		  (replace-character-with-substring
+		   (replace-substrings string "\\\\" "\\")
+		   "\\\"" #\")
+		  "\\n" #\LINEFEED)
+		 "\\r" #\RETURN)
+		#\") )
+
+(defmethod idl-output-literal ((string STRING-WRAPPER))
+  ;; Output string
+  ;; NOTE: Need to insert '\' before double quotes and \s and insert 
+  ;;  \n in place of return
+  (idl-output-literal (wrapper-value string)) )
+
+(defmethod idl-output-literal ((string MUTABLE-STRING-WRAPPER))
+  ;; Output string
+  ;; NOTE: Need to insert '\' before double quotes and \s and insert 
+  ;;  \n in place of return
+  (idl-output-literal (mutable-string-to-string (wrapper-value string))) )
+
+(defmethod idl-output-literal ((tree QUOTED-EXPRESSION))
+  ;; Output a quoted expression.
+  ;; NOTE: for now, its just a string.  Eventually we want
+  ;;   a real reference to the quoted expression.
+  (print-stream *current-stream* "\"" tree "\"") )
+
+(defmethod idl-output-literal ((symbol SYMBOL))
+  ;; Output symbol.  NOTE: We assume that a macro definition
+  ;;   of the form SYM_<symbol name> exists which implements the getting 
+  ;;   of the actual symbol
+  (print-stream *current-stream* 
+		(wrapper-value (idl-translate-symbol-name symbol))) )
+
+(defmethod idl-output-literal ((surrogate SURROGATE))
+  ;; Output surrogate  NOTE: We assume that a macro definition
+  ;;   of the form SGT_<surrogate name> exists which implements the getting 
+  ;;   of the actual kewyord.
+  (print-stream *current-stream* 
+		(wrapper-value (idl-translate-surrogate-name 
+				surrogate))) )
+
+(defmethod idl-output-literal ((keyword KEYWORD))
+  ;; Output Keyword.  NOTE: We assume that a macro definition
+  ;;   of the form KWD_<kwd name> exists which implements the getting 
+  ;;   of the actual kewyord.
+  (print-stream *current-stream* 
+		(wrapper-value (idl-translate-keyword-name keyword))) )
+
+(defun idl-output-atomic-expression ((atom OBJECT))
+  ;; Output a IDL token.  Do special printing on certain symbols.
+  (idl-output-literal atom))
+
+(defun idl-output-comment ((tree STRING-WRAPPER))
+  (print-stream *current-stream* "// " (wrapper-value tree) EOL) )
+
+(defun idl-output-identifier ((identifier STRING-WRAPPER))
+  (print-stream *current-stream* (wrapper-value identifier)) )
+
+(defun idl-output-derived-classes ((class-list (CONS OF STRING-WRAPPER)))
+  ;; Output a list of derived classes
+    (when (defined? (first class-list))
+      (print-stream *current-stream* (wrapper-value (first class-list))))
+    (foreach class in (rest class-list)
+	     do
+	     (print-stream *current-stream* ", " (wrapper-value class)))
+    (print-stream *current-stream*  " "))
+
+(defun idl-output-template-parameters ((parameters (CONS OF STRING-WRAPPER)))
+  ;; Output a list of class parameters
+  (when (non-empty? parameters)
+    (print-stream *current-stream* 
+                  "template <class "
+                  (wrapper-value (first parameters)))
+    (foreach parameter in (rest parameters)
+             do
+             (print-stream *current-stream* 
+                           ", class " (wrapper-value parameter)))
+    (print-stream *current-stream* ">" EOL)))
+
+(defun (idl-output-template-classes? BOOLEAN) ()
+  ;; Return TRUE if we are outputting parameterized classes as templates
+  (return TRUE) )
+
+(defun idl-output-interface ((classDef CONS))
+  ;; Output a IDL interface definition
+  (when (idl-output-template-classes?)
+    (idl-output-template-parameters (second classDef)))
+  (print-stream *current-stream* "interface "
+		(wrapper-value (cast (first classDef) STRING-WRAPPER)) " ")
+  (when (non-empty? (cast (third classDef) CONS))
+    (print-stream *current-stream* ": ")
+    (idl-output-derived-classes (third classDef)))
+  (print-stream *current-stream* "{" EOL)
+  
+  (foreach statement in 
+	   (nth-rest classDef 4)
+	   do
+	   (idl-output-statement statement))
+  (print-stream *current-stream* "};" EOL EOL) )
+
+(defun idl-output-struct ((classDef CONS))
+  ;; Output a IDL struct definition- nearly identical to 
+  ;; `idl-output-interface'
+  (when (idl-output-template-classes?)
+    (idl-output-template-parameters (second classDef)))
+  (print-stream *current-stream* "struct "
+		(wrapper-value (cast (first classDef) STRING-WRAPPER)) " ")
+  (when (non-empty? (cast (third classDef) CONS))
+    (print-stream *current-stream* ": ")
+    (idl-output-derived-classes (third classDef)))
+  (print-stream *current-stream* "{" EOL)
+  
+  (foreach statement in 
+	   (nth-rest classDef 4)
+	   do
+	   (idl-output-statement statement))
+  (print-stream *current-stream* "};" EOL EOL) )
+
+(defun idl-output-one-formal-parameter ((parameter (CONS OF STRING-WRAPPER)))
+  (print-stream 
+   *current-stream* 
+   (wrapper-value (first parameter))
+   " " 
+   (wrapper-value (second parameter))
+   " " 
+   (wrapper-value (third parameter))))
+
+(defun idl-output-formal-parameters ((parameters (CONS OF CONS)))
+  ;; Output IDL formal parameters
+  (let ((n-parameters (length parameters)))
+    (print-stream *current-stream* "(")
+    ;; The last parameter needs special handling to allow
+    ;; for variable arguments (?? is this allowed in IDL?)
+    (foreach parameter in parameters
+             as n in (interval 1 n-parameters)
+             do (if (= n n-parameters)  ; last parameter
+                  ;; NOTE: Variable length parameter (i.e. &rest) *must* be at
+                  ;;    the end of the parameter list
+                  (if (eql? (first parameter) (quote IDL_VAR_ARGS))
+	            (progn
+	              (print-stream *current-stream* "int ")
+	              (print-stream *current-stream* (wrapper-value 
+					              (cast (second parameter)
+						            STRING-WRAPPER)))
+	              (print-stream *current-stream* ", ..."))
+                    (idl-output-one-formal-parameter parameter))
+                  (progn
+                    (idl-output-one-formal-parameter parameter)
+                    (print-stream *current-stream* ", "))))
+    (print-stream *current-stream* ")")))
+
+(defun idl-output-function-signature ((function CONS))
+  ;; Output the signature for a function. 
+  (idl-output-type-expression (first function))
+  (print-stream *current-stream* (wrapper-value 
+				  (cast (second function)
+					STRING-WRAPPER)))
+  (idl-output-formal-parameters (third function)) )
+
+(defun idl-output-declarations ((declarations (CONS OF CONS)))
+  ;; Output a list of declarations.  Declarations of the form
+  ;;   (TYPE VAR INIT), where TYPE is a list of type expressions
+  ;;   (e.g., (static long int)), VAR is the name of a variable
+  ;;   (e.g., x) or a function (e.g., f()), and INIT is the initial
+  ;;   value.
+  ;;
+  (idl-bump-indent)
+  (foreach declaration in declarations 
+	   do
+	   (idl-indent)
+	   (idl-output-type-expression (first declaration))
+	   (print-stream *current-stream* (wrapper-value 
+					   (cast (second declaration)
+						 STRING-WRAPPER)))
+	   (print-stream *current-stream* ";" EOL)
+	   ;; NOTE: INITIAL VALUES AREN'T INITIALIZED HERE, SINCE
+	   ;;   INITIALIZERS AREN'T ALLOWED IN CLASS DECLARATIONS.
+	   ;;   DO THEY NEED TO BE PUT IN CONSTRUCTORS?  OR IS THIS
+	   ;;   HANDLED BY THE WALKER ALREADY?
+	   )
+  
+  (idl-unbump-indent) )
+
+(defun idl-output-signature ((signature CONS) (outputMethodClass? BOOLEAN))
+  ;; Output a IDL signature.
+  ;;   `signature' is of the form
+  ;;   (<methodClass> <return-type> <function-name> <parameters>)    
+  (idl-output-type-expression (second signature))
+  (when (and outputMethodClass?
+	     (defined? (first signature)))
+    (print-stream *current-stream* (wrapper-value 
+				    (cast (first signature)
+					  STRING-WRAPPER)))
+    (print-stream *current-stream* "::"))
+  (print-stream *current-stream* (wrapper-value 
+				  (cast (third signature)
+					STRING-WRAPPER)))
+  (idl-output-formal-parameters (fourth signature)) )
+
+(defun idl-output-signatures ((signatures CONS))
+  ;; Output a list of signatures (i.e. function prototypes).
+  ;;   Signatures are of the form (RETURN-TYPE FUNCTION-NAME PARAMETERS)
+  (idl-indent)
+  (idl-bump-indent)
+  (foreach signature in signatures 
+	   do
+	   (idl-indent)
+	   (idl-output-signature signature FALSE)
+	   (print-stream *current-stream* ";" EOL))
+  (idl-unbump-indent) )

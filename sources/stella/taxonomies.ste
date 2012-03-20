@@ -1,0 +1,1171 @@
+;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: taxonomies.ste,v 1.16 2003/04/18 21:15:38 hans Exp
+
+;;; Data structures and procedures that efficiently manage 
+;;;    transitive relationships (e.g. isa hierarchies).
+;;;
+;;; Based on algorithms presented in "Efficient Management of Transitive 
+;;;    Relationships in Large Data and Knowledge Bases", by R. Agrawal,
+;;;    A. Borgida, and H. Jagadish.  In Proc. of 1989 SIGMOD, pp.253-262
+
+(in-package "STELLA")
+
+(in-module "/STELLA")
+
+#|
+API: 
+
+;; Graph creation and manipulation:
+(new TAXONOMY-GRAPH)
+create-taxonomy-node
+add-taxonomy-node
+remove-taxonomy-node
+link-taxonomy-nodes
+unlink-taxonomy-nodes
+
+;; Finalization:
+finalize-taxonomy-graph
+finalize-taxonomy-graph-nonincrementally
+
+;; Subsumption test:
+taxonomy-subnode-of?
+
+;; Customizable TAXONOMY-GRAPH slots:
+renumber-if-out-of-numbers? graph)
+renumber-ratio
+
+;; Globals:
+*numbering-interval*
+
+;; Utilities:
+find-taxonomy-node
+print-taxonomy-graph
+print-taxonomy-spanning-tree
+|#
+
+
+(defglobal *numbering-interval* INTEGER 100
+  :public? TRUE
+  :documentation "Spacing between postorder numbers for nodes.  Allows limited
+incremental insertions without having to renumber the whole graph.")
+
+
+  ;;
+;;;;;; Creating and modifying graphs
+  ;;
+
+(defun (taxonomy-root? BOOLEAN) ((node TAXONOMY-NODE))
+  :documentation "Return `true' if `node' is a taxonomy root node."
+  :globally-inline? TRUE
+  (return (empty? (parents node))))
+
+;; PERFORMANCE NOTE: Currently, the set of roots of a taxonomy graph
+;; is managed as a list, which is problematic for large sets of roots
+;; with frequent insertions and deletions.  If this becomes too much
+;; of a performance problem, we have to manage them with a hash index.
+
+(defun add-taxonomy-root ((graph TAXONOMY-GRAPH) (root TAXONOMY-NODE))
+  :documentation "Add `root' as a root node to `graph'.  Only do this if
+`root' does not have any parents and is not a `graph' root already."
+  :public? TRUE
+  (insert-new (roots graph) root))  ;; REVISIT, slow
+
+(defun remove-taxonomy-root ((graph TAXONOMY-GRAPH) (root TAXONOMY-NODE))
+  :documentation "Remove `root' from `graph's root nodes."
+  :public? TRUE
+  (unless (deleted? root)
+    (remove (roots graph) root)))  ;; REVISIT, slow
+
+(defun update-taxonomy-roots ((graph TAXONOMY-GRAPH) (node TAXONOMY-NODE))
+  :documentation "Update `graph's roots according to `node's current state."
+  :public? TRUE
+  (if (taxonomy-root? node)
+      (add-taxonomy-root graph node)
+    (remove-taxonomy-root graph node)))
+
+(defun (create-taxonomy-node TAXONOMY-NODE)
+    ((graph TAXONOMY-GRAPH) (node TAXONOMY-NODE)
+     (nativeObject OBJECT) (root? BOOLEAN))
+  :documentation "Link the taxonomy node `node' to `nativeObject' and add it
+to `graph'.  If it is `null', a new node will be created.  Mark it as a root
+node if `root?' is `true'.  Return the node."
+  :public? TRUE
+  (cond ((null? node)
+         (setq node (new TAXONOMY-NODE :native-object nativeObject)))
+        (otherwise
+         (initialize-taxonomy-node node)
+         (setf (native-object node) nativeObject)))
+  (add-taxonomy-node graph node root?)
+  (return node))
+
+(defun add-taxonomy-node
+    ((graph TAXONOMY-GRAPH) (node TAXONOMY-NODE) (root? BOOLEAN))
+  :documentation "Add `node' to `graph'.  Mark it as a root node if `root?'
+is `true'.  Even though this is part of the API, it should rarely be needed,
+since `create-taxonomy-node' does everything that's necessary."
+  :public? TRUE
+  (when root?
+    (add-taxonomy-root graph node))
+  (setf (number-of-nodes graph) (1+ (number-of-nodes graph))))
+
+(defun remove-taxonomy-node ((graph TAXONOMY-GRAPH) (node TAXONOMY-NODE))
+  :public? TRUE
+  :documentation "Remove `node' from `graph' and disconnect incident links."
+  (let ((parentsCopy (copy-cons-list (parents node)))
+	(childrenCopy (copy-cons-list (children node))))
+    (foreach parent in parentsCopy
+        do (unlink-taxonomy-nodes graph parent node))
+    (foreach child in childrenCopy
+        do (unlink-taxonomy-nodes graph node child))
+    (setf (intervals node) NIL)
+    (setf (native-object node) NULL)
+    (setf (deleted? node) TRUE)
+    (remove-taxonomy-root graph node)
+    (setf (number-of-nodes graph) (1- (number-of-nodes graph)))))
+
+(defun create-taxonomy-link
+    ((graph TAXONOMY-GRAPH) (parent TAXONOMY-NODE) (child TAXONOMY-NODE))
+  :public? TRUE
+  ;; Helping function for `link-taxonomy-nodes'.
+  ;; Create a link between `parent' and `child' in `graph'.
+  (remove-taxonomy-root graph child)
+  (pushf (parents child) parent)
+  (pushf (children parent) child))
+
+(defun link-taxonomy-nodes
+    ((graph TAXONOMY-GRAPH) (parent TAXONOMY-NODE) (child TAXONOMY-NODE))
+  :documentation "Cross-link `parent' and `child' in `graph'.
+IMPORTANT: This will automatically insert a backlink from `child' to
+`parent', so, for maximum efficiency it should not be called a second time
+with the arguments reversed."
+  :public? TRUE
+  (when (memb? (children parent) child)
+    (return))
+  (if (incremental-mode? graph)
+      (push (added-links graph) (cons parent (cons child NIL)))
+    ;; Create the actual graph link:
+    (create-taxonomy-link graph parent child)))
+
+(defun incrementally-link-taxonomy-nodes
+    ((graph TAXONOMY-GRAPH) (parent TAXONOMY-NODE) (child TAXONOMY-NODE))
+  ;; Incrementally link the nodes `parent' and `child' in `graph'.
+  ;; There are the following cases:
+  ;; case | parent | child  | action
+  ;; -------------------------------
+  ;;   1  | exists | exists | propagate child's intervals to its new parent
+  ;;   2  | new    | exists | propagate child's intervals to its new parent
+  ;;   3  | exists | new    | addition of a tree arc, allocate new interval
+  ;;   4  | new    | new    | new tree in the forest, allocate new intervals
+  (when (memb? (children parent) child)
+    (return))
+  ;; Create the actual graph link:
+  (create-taxonomy-link graph parent child)
+  (let ((interval INTERVAL NULL)
+        (parentExists? (defined? (initial-interval parent)))
+        (childExists? (defined? (initial-interval child))))
+    (cond
+     (childExists?
+      ;; Cases 1 and 2:
+      (when (not parentExists?)
+        ;; Case 2 (parent starts a new tree in the forest):
+        (setq interval (create-next-postorder-interval graph))
+        (setf (initial-interval parent) interval)
+        (setf (label parent) (upper-bound interval))
+        (add-taxonomy-node-interval parent interval))
+      (foreach interval in (all-taxonomy-node-intervals child)
+          do (propagate-foreign-interval parent interval)))
+     (otherwise
+      ;; Cases 3 and 4:
+      (when (not parentExists?)
+        ;; Case 4:
+        (setq interval (create-next-postorder-interval graph))
+        (setf (initial-interval parent) interval)
+        (setf (label parent) (upper-bound interval))
+        (add-taxonomy-node-interval parent interval))
+      ;; Child is a new leaf node, try allocating a new interval:
+      (setq interval (allocate-interval-for-new-leaf-node parent))
+      (when (null? interval)
+        ;; No free tree numbers:
+        (when (renumber-if-out-of-numbers? graph)
+          (finalize-taxonomy-graph-nonincrementally graph)
+          (return))
+        ;; Otherwise, we create a foreign interval:
+        (setq interval (create-next-postorder-interval graph)))
+      (setf (initial-interval child) interval)
+      (setf (label child) (upper-bound interval))
+      (add-taxonomy-node-interval child interval)
+      (setf (tree-children parent)
+        (concatenate (tree-children parent) (cons child nil)))
+      ;; If we were able to allocate an interval somewhere in a gap of
+      ;;    `parent's children, then we don't really need to propagate,
+      ;;    but in that case propagation will stop after one step anyway:
+      (propagate-foreign-interval parent interval)))))
+
+(defun (create-next-postorder-interval INTERVAL) ((graph TAXONOMY-GRAPH))
+  ;; Allocate a new interval at top of the postorder number range of `graph'.
+  (setf (number-of-foreign-interval-nodes graph)
+    (1+ (number-of-foreign-interval-nodes graph)))
+  (let ((newInterval (new interval)))
+    (setf (lower-bound newInterval)
+      (+ (largest-postorder-number graph) 1))
+    (setf (upper-bound newInterval) 
+      (+ (largest-postorder-number graph) *numbering-interval*))
+    (setf (largest-postorder-number graph)
+      (upper-bound newInterval))
+    (return newInterval)))
+
+(defun (allocate-interval-for-new-leaf-node INTERVAL) ((parent TAXONOMY-NODE))
+  ;; Allocate an interval for a new leaf node whose parent is `parent'
+  ;;    based on unused interval numbers.
+  ;; Return NULL if there isn't enough room available anymore.
+  (let ((parentInterval (initial-interval parent)))
+    (when (empty? (tree-children parent))
+      ;; `parent' is a leaf: try to allocate left half of parent's interval:
+      (when (eql? (lower-bound parentInterval)
+		  (upper-bound parentInterval))
+        ;; no more room:
+	(return NULL))
+      (return
+        (new INTERVAL
+             :lower-bound (lower-bound parentInterval)
+             :upper-bound (floor (/ (+ (lower-bound parentInterval)
+                                       (upper-bound parentInterval))
+                                    2)))))
+    ;; `parent' isn't a leaf: try to allocate half of the interval
+    ;;    between `parent's rightmost child and `parent':
+    (let ((rightChild (last (tree-children parent)))
+	  (rightChildInterval (initial-interval rightChild)))
+      (when (>= (upper-bound rightChildInterval)
+		(1- (upper-bound parentInterval)))
+        ;; no more room:
+	(return NULL))
+      (return (new INTERVAL
+		   :lower-bound (+ (upper-bound rightChildInterval) 1)
+		   :upper-bound (ceiling
+				 (/ (+ (upper-bound parentInterval)
+				       (upper-bound rightChildInterval))
+				    2)))))))
+
+(defun unlink-taxonomy-nodes
+    ((graph TAXONOMY-GRAPH) (parent TAXONOMY-NODE) (child TAXONOMY-NODE))
+  :documentation "Remove link between `parent' and `child'."
+  :public? TRUE
+  (when (not (memb? (children parent) child))
+    (return))
+  (when (incremental-mode? graph)
+    ;; Don't yet know how to do this incrementally:
+    ;(push (removed-links graph) (cons parent (cons child NIL)))
+    (setf (incremental-mode? graph) FALSE))
+  (setf (children parent) (remove (children parent) child))
+  (setf (tree-children parent)
+    (remove (tree-children parent) child))
+  (setf (parents child) (remove (parents child) parent))
+  (update-taxonomy-roots graph child))
+
+(defun incrementally-unlink-taxonomy-nodes
+    ((graph TAXONOMY-GRAPH) (parent TAXONOMY-NODE) (child TAXONOMY-NODE))
+  ;; THIS IS UNTESTED, LEFTOVER CODE WHICH IS COMPLETELY WRONG!!
+  (error "incrementally-unlink-taxonomy-nodes: Rewrite me!")
+#|
+  (let ((treeLink? (memb? (tree-children parent) child)))
+    (setf (children parent) (remove (children parent) child))
+    (when treeLink?
+      (setf (tree-children parent)
+	(remove (tree-children parent) child)))
+    (setf (parents child) (remove (parents child) parent))
+    (update-taxonomy-roots graph child)
+    (when treeLink?
+      ;; If link was a tree link, do nothing:
+      (return))
+    ;; Otherwise, recompute intervals of ancestors:
+    (setf (intervals parent) (bquote (& (initial-interval parent))))
+    (foreach child in (children parent)
+        do (foreach interval in (intervals child)
+	do (propagate-foreign-interval parent interval))))
+|#	
+	)
+
+
+  ;;
+;;;;;; Iteration
+  ;;
+
+(defun (all-taxonomy-nodes (ITERATOR OF TAXONOMY-NODE))
+    ((graph TAXONOMY-GRAPH))
+  :documentation "Given a taxonomy `graph' that has been finalized,
+return an iterator that generates all the graph's nodes."
+  :public? TRUE
+  ;; NOTE: Once we have a proper graph finalization function, we
+  ;;       should call it in here.
+  (return
+    (new ALL-PURPOSE-ITERATOR
+         :iterator-object (copy (roots graph))
+         :iterator-next-code
+         (the-code :function all-taxonomy-nodes-next?))))
+
+(defun (all-taxonomy-nodes-next? BOOLEAN)
+    ((self (ALL-PURPOSE-ITERATOR OF TAXONOMY-NODE)))
+  (let ((roots (LIST OF TAXONOMY-NODE) (iterator-object self)))
+    (when (empty? roots)
+      (return FALSE))
+    (setf (slot-value self value) (pop roots))
+    (foreach child in (tree-children (slot-value self value))
+        do (push roots child))
+    (return TRUE)))
+
+(defun (find-taxonomy-node TAXONOMY-NODE)
+    ((graph TAXONOMY-GRAPH) (label INTEGER))
+  :documentation "Return some node in `graph' with label `label'."
+  :public? TRUE
+  (foreach node in (all-taxonomy-nodes graph)
+      where (eql? (label node) label)
+      do (return node))
+  (return NULL))
+
+
+  ;;
+;;;;;; Labeling of spanning trees
+  ;;
+
+(defconstant MARKER-LABEL INTEGER -99
+  :documentation "Dummy label used for marking a node")
+
+(defconstant DELETED-LABEL INTEGER -99
+  :documentation "Label used for marking deleted nodes")
+
+(defun (labeled-taxonomy-node? BOOLEAN) ((node TAXONOMY-NODE))
+  :globally-inline? TRUE
+  (return (defined? (label node))))
+
+(defmethod (deleted? BOOLEAN) ((self TAXONOMY-NODE))
+  :globally-inline? TRUE
+  (return (eql? (label self) DELETED-LABEL)))
+
+(defmethod (deleted?-setter BOOLEAN) ((self TAXONOMY-NODE) (value BOOLEAN))
+  (if value
+      (setf (label self) DELETED-LABEL)
+    (setf (label self) NULL))
+  (return value))
+
+(defun clear-taxonomy-node ((node TAXONOMY-NODE))
+  :documentation "Clear all taxonomy-graph-specific information of `node',
+but retain information about the native object and associated links."
+  :public? TRUE
+  (setf (label node) NULL)
+  (setf (intervals node) NIL)
+  (setf (initial-interval node) NULL)
+  (setf (first-interval-lower-bound node) -1)
+  (setf (first-interval-upper-bound node) -1)
+  (setf (tree-children node) NIL)
+  (setf (total-ancestors node) 1))  ;; counts the virtual root
+
+(defun initialize-taxonomy-node ((node TAXONOMY-NODE))
+  :documentation "Completely clear and initialize `node'."
+  :public? TRUE
+  (clear-taxonomy-node node)
+  (setf (parents node) NIL)
+  (setf (children node) NIL)
+  (setf (native-object node) NULL))
+  
+(defun help-clear-taxonomy-graph ((node TAXONOMY-NODE))
+  ;; Clear the subtree starting at `node', skipping nodes that have
+  ;;    already been cleared.
+  (when (labeled-taxonomy-node? node)
+    (clear-taxonomy-node node)
+    (foreach child in (children node)
+        do (help-clear-taxonomy-graph child))))
+
+(defun clear-taxonomy-graph ((graph TAXONOMY-GRAPH))
+  :documentation "Clear all taxonomy-graph-specific information of `graph',
+but retain information about the native network and associated links."
+  :public? TRUE
+  (foreach root in (remove-deleted-members (roots graph))
+      do (help-clear-taxonomy-graph root))
+  (setf (incremental-mode? graph) FALSE)
+  (setf (number-of-foreign-interval-nodes graph) 0)
+  (clear (broken-links graph)))
+
+(defun initialize-taxonomy-graph ((graph TAXONOMY-GRAPH))
+  :documentation "Completely clear the taxonomy graph `graph'.
+NOTE: Any nodes associated with `graph' will not be cleared.  If they are
+to be reused, they have to be cleared with `initialize-taxonomy-node'."
+  :public? TRUE
+  (setf (incremental-mode? graph) FALSE)
+  (setf (renumber-if-out-of-numbers? graph) FALSE)
+  (setf (largest-postorder-number graph) 0)
+  (setf (number-of-nodes graph) 0)
+  (setf (number-of-foreign-interval-nodes graph) 0)
+  (setf (renumber-ratio graph) 0.10)
+  (setf (roots graph) (new LIST))
+  (setf (broken-links graph) (new LIST))
+  (setf (added-links graph) (new LIST))
+  (setf (removed-links graph) (new LIST)))
+
+(defspecial *taxonomy-postorder-number* INTEGER NULL)
+
+(defun (help-create-taxonomy-tree-intervals INTEGER) ((self TAXONOMY-NODE))
+  ;; Do a postorder traversal of the subtree rooted at `self'.
+  ;; Create interval for `self' (see `create-taxonomy-tree-intervals').
+  ;; Return the lowest postorder value of a descendant (i.e. the label
+  ;;    of the leftmost child).
+  (let ((minChildLabel INTEGER NULL)
+	(myLabel INTEGER NULL)
+	(prevPostNumber *taxonomy-postorder-number*))
+    (unless (empty? (tree-children self))
+      (setq minChildLabel
+	(help-create-taxonomy-tree-intervals (first (tree-children self)))))
+    (foreach child in (rest (tree-children self))
+        do (help-create-taxonomy-tree-intervals child))
+    (setq *taxonomy-postorder-number*
+      (+ *taxonomy-postorder-number* *numbering-interval*))
+    (setq myLabel *taxonomy-postorder-number*)
+    (when (empty? (tree-children self))
+      (setq minChildLabel (+ prevPostNumber 1)))
+    ;; Intern a new interval and record it as the initial interval that
+    ;;     was created for this node.  This is needed for the foreign-interval
+    ;;     propagation phase, where we need to know which interval on a node
+    ;;     hasn't yet been propagated:
+    (setf (initial-interval self)
+      (intern-taxonomy-node-interval self minChildLabel myLabel))
+    (setf (label self) myLabel)
+    (return minChildLabel)))
+
+(defun create-taxonomy-tree-intervals ((graph TAXONOMY-GRAPH))
+  ;; Create an initial set of intervals for the spanning forest of graph.
+  ;; Assume the spanning forest has been computed.
+  (special ((*taxonomy-postorder-number* 0))
+    (foreach root in (roots graph)
+        do (help-create-taxonomy-tree-intervals root))
+    (setf (largest-postorder-number graph) *taxonomy-postorder-number*)))
+
+
+  ;;
+;;;;;; Interval propagation and maintenance
+  ;;
+
+(defmethod (member? BOOLEAN) ((interval INTERVAL) (n INTEGER))
+  ;; Return TRUE if `n' is contained in `interval'.
+  :globally-inline? TRUE
+  (return 
+    (and (>= n (lower-bound interval))
+	 (<= n (upper-bound interval)))))
+
+(defun (subinterval-of? BOOLEAN)
+    ((subInterval INTERVAL) (superInterval INTERVAL))
+  ;; Return TRUE if `superInterval' includes `subInterval'.
+  :globally-inline? TRUE
+  (return
+    (and (<= (upper-bound subInterval) (upper-bound superInterval))
+         (>= (lower-bound subInterval) (lower-bound superInterval)))))
+
+(defun (merge-intervals INTERVAL)
+    ((leftInterval INTERVAL) (rightInterval INTERVAL))
+  ;; Return a new interval, representing the merge of 
+  ;;    `leftInterval' with `rightInterval'.
+  :globally-inline? TRUE
+  (return (new INTERVAL
+	       :lower-bound (lower-bound leftInterval)
+	       :upper-bound (upper-bound rightInterval))))
+
+(defun (all-taxonomy-node-intervals (CONS OF INTERVAL)) ((node TAXONOMY-NODE))
+  ;; Return all intervals associated with `node'.
+  ;; This should now be obsolete, since we don't special-case the first
+  ;;    interval anymore.
+  :globally-inline? TRUE
+  (return (intervals node)))
+
+(defun (intern-taxonomy-node-interval INTERVAL)
+    ((node TAXONOMY-NODE) (lowerBound INTEGER) (upperBound INTEGER))
+  ;; Create a new interval with `lowerBound' and `upperBound',
+  ;;    add it to `node', and return it.
+  (let ((interval
+         (new INTERVAL :lower-bound lowerBound :upper-bound upperBound)))
+    (add-taxonomy-node-interval node interval)
+    (return interval)))
+
+(defun add-taxonomy-node-interval ((node TAXONOMY-NODE) (interval INTERVAL))
+  ;; Add `interval' to `node' without any optimization.
+  (pushf (intervals node) interval)
+  ;; Cache bounds of the first interval to optimize single-inheritance cases:
+  (setf (first-interval-lower-bound node) (lower-bound interval))
+  (setf (first-interval-upper-bound node) (upper-bound interval)))
+
+(defun remove-taxonomy-node-interval ((node TAXONOMY-NODE) (interval INTERVAL))
+  ;; Remove `interval' from `node'.
+  (let ((intervals (intervals node)))
+    (setq intervals
+      (setf (intervals node) (remove intervals interval)))
+    ;; Update first-interval cache:
+    (cond ((empty? intervals)
+           (setf (first-interval-lower-bound node) -1)
+           (setf (first-interval-upper-bound node) -1))
+          (otherwise
+           (setf (first-interval-lower-bound node)
+             (lower-bound (first intervals)))
+           (setf (first-interval-upper-bound node)
+             (upper-bound (first intervals)))))))
+
+(defun (adjoin-taxonomy-node-interval? BOOLEAN)
+    ((node TAXONOMY-NODE) (interval INTERVAL))
+  ;; Add a new `interval' to `node', subsuming or merging with other
+  ;;   intervals as appropriate.
+  ;; Return TRUE if `interval' added something new to `node', i.e., it
+  ;;    was not already subsumed by some of its existing intervals.
+  ;; NOTE: This could be optimized by ordering intervals.
+  (let ((intervalsToRemove NIL))
+    ;; NOTE: For efficiency we don't use interval comparison predicates:
+    (foreach int in (all-taxonomy-node-intervals node)
+        do (if (< (lower-bound int) (lower-bound interval))
+               (if (>= (upper-bound int) (upper-bound interval))
+                   ;; `int' subsumes `interval':
+                   (return FALSE)
+                 (when (<= (lower-bound interval) (1+ (upper-bound int)))
+                     ;; Intervals overlap or are adjacent:
+                   (remove-taxonomy-node-interval node int)
+                   ;; Recursive call, since the merged interval might
+                   ;;    subsume others  (this will also remove intervals
+                   ;;    already scheduled for removal - optimize?):
+                   (adjoin-taxonomy-node-interval?
+                    node (merge-intervals int interval))
+                   (return TRUE)))
+             (if (>= (upper-bound interval) (upper-bound int))
+                 ;; `interval' subsumes `int':
+                 ;; Have to delay removal, since the destructive modification
+                 ;;    of the `intervals' slot would screw up iteration:
+                 (pushq intervalsToRemove int)
+               (when (<= (lower-bound int) (1+ (upper-bound interval)))
+                 ;; Intervals overlap or are adjacent:
+                 (remove-taxonomy-node-interval node int)
+                 (adjoin-taxonomy-node-interval?
+                  node (merge-intervals interval int))
+                 (return TRUE)))))
+    (foreach int in intervalsToRemove
+        do (remove-taxonomy-node-interval node int))
+    (add-taxonomy-node-interval node interval)
+    (return TRUE)))
+
+(defun propagate-foreign-interval ((node TAXONOMY-NODE) (interval INTERVAL))
+  ;; Add an `interval' to `node' and propagate it to all its ancestors.
+  (when (eql? (marker node) interval)
+    (return))
+  (setf (marker node) interval)
+  (when (adjoin-taxonomy-node-interval? node interval)
+    (foreach parent in (parents node)
+        do (propagate-foreign-interval parent interval))))
+
+
+  ;;
+;;;;;; Creating spanning trees
+  ;;
+
+(defun uncompute-total-ancestors ((node TAXONOMY-NODE))
+  ;; Mark `total-ancestors' slots with -1 to avoid recomputation
+  ;;    in multiple-inheritance hierarchies.
+  (when (< (total-ancestors node) 0)
+    (return))
+  (setf (total-ancestors node) -1)
+  (foreach child in (children node)
+      do (uncompute-total-ancestors child)))
+
+(defun help-compute-total-ancestors ((node TAXONOMY-NODE))
+  ;; Compute the total # of ancestors for `node' and its descendants.
+  ;; Assume parent's total ancestors have been computed.
+  (when (>= (total-ancestors node) 0)
+    ;; Already computed.
+    (return))
+  (let ((totalAncestors 0)
+        (parentAncestors 0))
+    (foreach parent in (parents node)
+        do (setq parentAncestors (total-ancestors parent))
+           (when (< parentAncestors 0)
+             ;; Parent not yet computed (came down the wrong way):
+             (return))
+           (setq totalAncestors (+ totalAncestors parentAncestors)))
+    (setf (total-ancestors node) (1+ totalAncestors))
+    (foreach child in (children node)
+        do (help-compute-total-ancestors child))))
+
+(defun compute-total-ancestors ((node TAXONOMY-NODE))
+  ;; Compute the total # of ancestors for `node' and its descendants.
+  ;; Assume parent's total ancestors have been computed.
+  (uncompute-total-ancestors node)
+  (help-compute-total-ancestors node))
+
+(defun create-taxonomy-spanning-tree
+    ((graph TAXONOMY-GRAPH) (node TAXONOMY-NODE))
+  ;; Traverse a subtree starting at `node', breaking links to parents
+  ;;     with few ancestors.
+  ;; Record broken links, and mark `node' as traversed.
+  (when (labeled-taxonomy-node? node)
+    (return))
+  (setf (label node) MARKER-LABEL)
+  (let ((maxParent TAXONOMY-NODE NULL)
+	(maxParentValue INTEGER NULL))
+    (foreach parent in (parents node)
+        do (when (or (null? maxParentValue)
+                     (> (total-ancestors parent) maxParentValue))
+             (setq maxParent parent)
+             (setq maxParentValue (total-ancestors parent))))
+    ;; MaxParent-node links gets to be in spanning tree, otherwise
+    ;;    the link is broken:
+    (foreach parent in (parents node)
+        do (if (eql? parent maxParent)
+               (pushf (tree-children parent) node)
+             (push (broken-links graph)
+                   (cons parent (cons node NIL)))))
+    (foreach child in (children node)
+        do (create-taxonomy-spanning-tree graph child))))
+    
+(defun create-taxonomy-spanning-forest ((graph TAXONOMY-GRAPH))
+  ;; Traverse `graph' breaking links to nodes with few ancestors.
+  (clear-taxonomy-graph graph)
+  (setf (incremental-mode? graph) FALSE)
+  (foreach root in (roots graph)
+      do (compute-total-ancestors root)
+         (create-taxonomy-spanning-tree graph root))
+  (create-taxonomy-tree-intervals graph)
+  (foreach link in (broken-links graph)
+      do (propagate-foreign-interval
+          (first link) (initial-interval (second link))))
+  (clear (broken-links graph))
+  (setf (incremental-mode? graph) TRUE))
+
+
+  ;;
+;;;;;; Finalization
+  ;;
+
+(defun finalize-taxonomy-graph ((graph TAXONOMY-GRAPH))
+  :documentation "Finalize the taxonomy graph `graph'."
+  :public? TRUE
+  (cond ((and (incremental-mode? graph)
+	      (> (number-of-nodes graph) 0)
+              (< (/ (max (number-of-foreign-interval-nodes graph)
+                         (length (added-links graph)))
+                    (number-of-nodes graph))
+                 (renumber-ratio graph)))
+         (foreach link in (added-links graph)
+             do (incrementally-link-taxonomy-nodes
+                 graph (first link) (second link)))
+         (clear (added-links graph)))
+        (otherwise
+         ;; Recompute the whole thing from scratch:
+         (setf (incremental-mode? graph) FALSE)
+         (foreach link in (added-links graph)
+             do (link-taxonomy-nodes graph (first link) (second link)))
+         (clear (added-links graph))
+         (create-taxonomy-spanning-forest graph))))
+
+(defun finalize-taxonomy-graph-nonincrementally ((graph TAXONOMY-GRAPH))
+  (setf (incremental-mode? graph) FALSE)
+  (finalize-taxonomy-graph graph))
+
+
+  ;;
+;;;;;; Subsumption (transitivity) tests
+  ;;
+
+(defun (taxonomy-subnode-of? BOOLEAN)
+    ((sub-node TAXONOMY-NODE) (super-node TAXONOMY-NODE))
+  :documentation "Return TRUE if `sub-node' is a descendant of `super-node'."
+  :public? TRUE
+  (let ((sub-node-label (label sub-node)))
+    (foreach interval in (intervals super-node)
+        where (and (>= sub-node-label (lower-bound interval))
+                   (<= sub-node-label (upper-bound interval)))
+        do (return TRUE))
+    (return FALSE)))
+
+(defun (slow-taxonomy-subnode-of? BOOLEAN)
+    ((subNode TAXONOMY-NODE) (superNode TAXONOMY-NODE))
+  ;; Return TRUE if `subNode' is a descendant of `superNode'.
+  ;; This answers the question in the conventional way by chasing links.
+  (when (eql? subNode superNode)
+    (return TRUE))
+  (foreach parent in (parents subNode)
+      do (when (slow-taxonomy-subnode-of? parent superNode)
+           (return TRUE)))
+  (return FALSE))
+
+
+  ;;
+;;;;;; Printing
+  ;;
+
+(defun print-taxonomy-tree
+    ((node TAXONOMY-NODE) (indent INTEGER) (stream OUTPUT-STREAM))
+  ;; Print a subtree of a graph rooted at `node'
+  ;;   (i.e., follow graph links).
+  (print-spaces stream indent)
+  (print-stream stream node EOL)
+  (foreach child in (children node)
+      do (print-taxonomy-tree child (+ indent 2) stream)))
+
+(defun print-taxonomy-graph ((graph TAXONOMY-GRAPH) (stream OUTPUT-STREAM))
+  ;; Print out each tree in `graph' starting at a root
+  ;;   (i.e., follow graph links).
+  (foreach root in (roots graph)
+      do (print-taxonomy-tree root 0 stream)
+         (print-stream stream EOL)))
+
+(defun print-taxonomy-spanning-tree
+    ((node TAXONOMY-NODE) (indent INTEGER) (stream OUTPUT-STREAM))
+  ;; Print a subtree of a graph rooted at `node' (i.e., follow tree links).
+  (print-spaces stream indent)
+  (print-stream stream node EOL)
+  (foreach child in (tree-children node)
+      do (print-taxonomy-spanning-tree child (+ indent 2) stream)))
+
+(defun print-taxonomy-spanning-forest
+    ((graph TAXONOMY-GRAPH) (stream OUTPUT-STREAM))
+  ;; Print out each spanning tree in `graph' (i.e., follow tree links).
+  (foreach root in (roots graph)
+      do (print-taxonomy-spanning-tree root 0 stream)
+         (print-stream stream EOL)))
+
+
+  ;;
+;;;;;; Testing
+  ;;
+
+#|
+
+(defglobal graph TAXONOMY-GRAPH NULL)
+(defglobal n1 TAXONOMY-NODE NULL)
+(defglobal n2 TAXONOMY-NODE NULL)
+(defglobal n3 TAXONOMY-NODE NULL)
+(defglobal n4 TAXONOMY-NODE NULL)
+(defglobal n5 TAXONOMY-NODE NULL)
+(defglobal n6 TAXONOMY-NODE NULL)
+(defglobal n7 TAXONOMY-NODE NULL)
+
+(defun (create-sample TAXONOMY-GRAPH) ()
+  (let ((graph (new TAXONOMY-GRAPH)))
+    (setq n5 (intern-taxonomy-node graph NULL NULL))
+    (setq n4 (intern-taxonomy-node graph n5 NULL))
+    (setq n3 (intern-taxonomy-node graph n5 NULL))
+    (setq n2 (intern-taxonomy-node graph n3 NULL))
+    (setq n1 (intern-taxonomy-node graph n3 NULL))
+    (setq n7 (intern-taxonomy-node graph NULL NULL))
+    (setq n6 (intern-taxonomy-node graph n7 NULL))
+    (link-taxonomy-nodes graph n6 n3)
+    (return graph)))
+
+(defun (pick-random-element (LIKE (any-value self))) ((self CONS))
+  ;; Pick a random element out of a list
+  (return (nth self (random (length self)))))
+
+(defun add-new-links ((graph TAXONOMY-GRAPH) (numNewParents INTEGER))
+  ;; Helping function for `build-random-dag'
+  ;; Add random links between nodes in a forest of spanning trees
+  (let ((pcPairs (create-random-node-pairs numNewParents graph)))
+    (foreach pair in pcPairs
+	     do
+	     (when (and (not (slow-taxonomy-subnode-of? (first pair) (second pair)))
+			(not (slow-taxonomy-subnode-of? (first pair) (second pair))))
+	       (link-taxonomy-nodes graph (first pair) (second pair))))))
+
+(defun (build-random-dag TAXONOMY-GRAPH)
+    ((size INTEGER) (numRoots INTEGER) (avgNumParents FLOAT)
+     (incremental? BOOLEAN) (renumberIfOutOfNumbers? BOOLEAN))
+  ;; Create a dag for purposes of benchmarking isa? tests
+  ;;   and dag creation
+  ;; `size' is number of nodes, `numRoots' is number of roots,
+  ;;   `avgNumParents' is the requested avergage number of parents 
+  ;;   (e.g., 1.5). Note that the actual # of parents will be less,
+  ;;   because we filter out candidates that are already related
+  ;;   if `incremental?' is TRUE, we go into incremental mode after
+  ;;   building a forest and before adding links.  If 
+  ;;   `renumberIfOutOfNumbers?' is TRUE, we relabel the entire
+  ;;   spanning tree when we run out of numbers, otherwise we create
+  ;;   a new interval.
+  (let ((graph (new TAXONOMY-GRAPH 
+		    :renumber-if-out-of-numbers? renumberIfOutOfNumbers?))
+	(nodes NIL)
+	(numNonRoots (- size numRoots))
+	(numNewParents (ceiling (* (1- avgNumParents) numNonRoots))))
+    ;; Create roots
+    (foreach i in (interval 1 numRoots)
+	     collect (intern-taxonomy-node graph NULL NULL)
+	     into nodes)
+    (foreach i in (interval 1 numNonRoots)
+	     do 
+	     (pushq nodes
+		    (intern-taxonomy-node 
+		     graph 
+		     (pick-random-element nodes)
+		     NULL)))
+    ;; At this point, we have a collection of unconnected trees
+    ;; Create random links between nodes, being careful not 
+    ;; to create cycles
+    (if incremental?
+	(progn
+	  (create-spanning-forest graph)
+	  (setf (incremental-mode? graph) TRUE))
+      (setf (incremental-mode? graph) FALSE))
+    (add-new-links graph numNewParents)
+    (create-spanning-forest graph)
+    (return graph)))
+
+(defun test-fast-isas ((nodePairs (CONS OF (CONS OF TAXONOMY-NODE))))
+  ;; Do a list of random taxonomy-node-subclass-ofs
+  (foreach pair in nodePairs
+	   do
+	   (taxonomy-subnode-of? (first pair) (second pair))))
+
+(defun test-slow-isas ((nodePairs (CONS OF (CONS OF TAXONOMY-NODE))))
+  ;; Do a list of random slow-taxonomy-node-subclass-ofs
+  (foreach pair in nodePairs
+	   do
+	   (slow-taxonomy-subnode-of? (first pair) (second pair))))
+
+(defun (create-random-class-pairs (CONS OF (CONS OF CLASS)))
+    ((n INTEGER))
+  ;; Create a list of size `n' of class pairs
+  (let ((classes (the-cons-list (listify (all-classes NULL FALSE))))
+	(result NIL))
+    (foreach i in (interval 1 n)
+	     collect
+	     (bquote
+	      (& (pick-random-element classes)
+		 & (pick-random-element classes)))
+	     into result)
+    (return result)))
+
+(defun test-taxonomy-subclasses ((classPairs (CONS OF (CONS OF CLASS))))
+  ;; For comparison of taxonomy-node-subclass-ofs vs previous fast-isas
+  (foreach pair in classPairs
+	   do
+	   (subclass-of? (first pair) (second pair))))
+
+(defun (slow-subclass-of? BOOLEAN) ((sub CLASS) (super CLASS))
+  ;; For comparison of taxonomy-node-subclass-ofs vs previous fast-isas
+  (return
+    (or (eql? sub super)
+	(member? (class-all-super-classes sub) super))))
+
+(defun (slow-subclass-of2? BOOLEAN) ((sub CLASS) (super CLASS))
+  ;; For comparison of taxonomy-node-subclass-ofs vs previous fast-isas
+  (return
+    (or (eql? sub super)
+	(memb? (class-all-super-classes sub) super))))
+
+(defun verify-class-hierarchy ()
+  ;; Check whether taxonomy isa and slow isa match for all classes.
+  (let ((counter 0))
+    (foreach class1 in (all-classes NULL TRUE)
+        do (foreach class2 in (all-classes NULL TRUE)
+               do (when (not (eql? (slow-subclass-of2? class1 class2)
+                                   (subclass-of? class1 class2)))
+                    (print "Mismatch on classes " class1
+                           " and " class2 EOL))
+                  (++ counter)
+                  (when (= (mod counter 1000) 0)
+                    (print ".")
+                    (CL:force-output))))))
+
+(defun (compute-percentage-of-successes FLOAT)
+    ((classPairs (CONS OF (CONS OF CLASS))))
+  ;; Return the percentage of isa tests between pairs in `classPairs'
+  ;;   that succeed
+  (let ((totalSuccesses 0))
+    (foreach pair in classPairs
+	     where (subclass-of? (value pair) (value (rest pair)))
+	     do (++ totalSuccesses))
+    (return (/ totalSuccesses (length classPairs)))))
+
+(defun (collect-successes (CONS OF (CONS OF CLASS)))
+    ((classPairs (CONS OF (CONS OF CLASS))))
+  ;; Return the successful pairs of isa tests
+  (let ((result NIL))
+    (foreach pair in classPairs
+	     where (fast-subclass-of? (value pair) (value (rest pair)))
+	     collect pair 
+	     into result)
+    (return result)))
+
+(defun compare-taxonomy-and-fast-isas ((classPairs (CONS OF (CONS OF CLASS)))
+                                        (n INTEGER))
+  ;; Run each subclass test 'n' times.
+  (let ((sub CLASS NULL)
+        (super CLASS NULL))
+    (foreach pair in classPairs
+             do
+             (setq sub (value pair))
+             (setq super (value (rest pair)))
+             (foreach i in (interval 1 n)
+                      do
+		      ;;(slow-subclass-of? sub super)
+		      ;(slow-subclass-of2? sub super)
+		      (subclass-of? sub super)		      
+		      (fast-subclass-of? sub super)))))
+
+(defun (verify-that-isas-match (CONS OF (CONS OF BOOLEAN))) 
+    ((graph TAXONOMY-GRAPH) (n INTEGER))
+  ;; Test to ensure that slow and fast isas produce identical results
+  (let ((result NIL)
+	(pairs (create-random-node-pairs n graph)))
+    (foreach pair in pairs
+	     collect
+	     (bquote ( & (taxonomy-subnode-of? (first pair) (second pair))
+			 & (slow-taxonomy-subnode-of? (first pair) (second pair))))
+	     into result)
+    (return result)))
+			 
+(defun (all-pairs-are-equal? BOOLEAN) ((pairs (CONS OF CONS)))
+  ;; Return TRUE if we have a list of pairs where the first
+  ;; element of each pair equals the second
+  (return (not (exists pair in pairs
+		       where
+		       (not (eql? (first pair) (second pair)))))))
+
+(defun dummy-print-simulation-result ((self SIMULATION-RESULT) 
+				      (stream NATIVE-OUTPUT-STREAM))
+  ;; Dummy printer for objects of class `SIMULATION-RESULT'
+  ;; Real one is `print-simulation-result'
+  (print-native-stream stream "|SR|"))
+
+(defun print-simulation-result ((self SIMULATION-RESULT) 
+				(stream NATIVE-OUTPUT-STREAM))
+  ;; Printer for objects of class `SIMULATION-RESULT'
+  (print-native-stream stream "Simulation Result" EOL  "-----------------" EOL
+		       "Nodes          : " (num-nodes self) EOL
+		       "Roots          : " (num-roots self) EOL
+		       "AvgParents     : " (avg-parents self) EOL
+		       "Isas           : " (num-isas self) EOL
+		       "Incremental?   : " (incremental? self) EOL   
+		       "RenumberIfOut? : " (renumber-if-out-of-numbers? self) 
+		       EOL
+		       "Depth          : " (graph-depth self) EOL
+		       "AvgIntvlLength : " (avg-interval-length self) EOL))
+
+(defclass SIMULATION-RESULT (STANDARD-OBJECT)
+  :slots
+  ((graph :type TAXONOMY-GRAPH)
+   (num-nodes :type INTEGER)
+   (num-roots :type INTEGER)
+   (avg-parents :type FLOAT)
+   (num-isas :type INTEGER)
+   (incremental? :type BOOLEAN)   
+   (renumber-if-out-of-numbers? :type BOOLEAN)
+   (graph-depth :type INTEGER)
+   (avg-interval-length :type FLOAT))
+  ;; There's a bug... it seems that cl:force-output doesn't work right...
+  ;; So we call a dummy for now
+  :print-form (dummy-print-simulation-result self stream))
+
+(defmethod (compute-depth INTEGER) ((node TAXONOMY-NODE))
+  (when (empty? (tree-children node))
+    (return 1))
+  (let ((maxChildDepth 0)
+	(childDepth INTEGER NULL))
+    (foreach child in (tree-children node)
+	     do
+	     (setq childDepth (compute-depth child))
+	     (when (> childDepth maxChildDepth)
+	       (setq maxChildDepth childDepth)))
+    (return (1+ maxChildDepth))))
+
+(defmethod (compute-depth INTEGER) ((graph TAXONOMY-GRAPH))
+  (let ((maxDepth 0)
+	(depth INTEGER NULL))
+    (foreach root in (roots graph)
+	     do
+	     (setq depth (compute-depth root))
+	     (when (> depth maxDepth)
+	       (setq maxDepth depth)))
+    (return maxDepth)))
+
+(defun (create-random-node-pairs (CONS OF (CONS OF TAXONOMY-NODE)))
+    ((n INTEGER) (graph TAXONOMY-GRAPH))
+  ;; Create a list of size `n' of node pairs from `graph'
+  (let ((nodes (the-cons-list (listify (all-taxonomy-nodes graph))))
+	(result NIL))
+    (foreach i in (interval 1 n)
+	     collect
+	     (bquote
+	      (& (pick-random-element nodes)
+		 & (pick-random-element nodes)))
+	     into result)
+    (return result)))
+
+(defun (create-random-node-pairs-no-isas (CONS OF (CONS OF TAXONOMY-NODE)))
+    ((n INTEGER) (graph TAXONOMY-GRAPH))
+  ;; Create a list of size `n' of node pairs from `graph', ensuring that
+  ;;   pairs aren't isa-related
+  (let ((nodes (all-taxonomy-nodes graph))
+	(parent TAXONOMY-NODE NULL)
+	(child TAXONOMY-NODE NULL)
+	(result NIL))
+    (while (> n 0)
+	   (setq parent (pick-random-element nodes))
+	   (setq child (pick-random-element nodes))
+	   (when (and (not (slow-taxonomy-subnode-of? parent child))
+		      (not (slow-taxonomy-subnode-of? child parent)))
+	     (pushq result
+		    (bquote
+		     (& parent & child)))
+	     (-- n)))
+    (return result)))
+
+(defun (get-classes-with-long-intervals (CONS OF CLASS)) 
+    ((classList (CONS OF CLASS)))
+  (let ((result NIL)) 
+    (foreach c in classList
+	     where (> (length (all-taxonomy-node-intervals (class-taxonomy-node c))) 1)
+	     collect c into result)
+    (return result)))
+
+(defun (average-interval-length FLOAT) ((graph TAXONOMY-GRAPH))
+  ;; Return the average interval length in `graph'
+  (let ((numberOfIntervals 0)
+        (numberOfNodes 0))
+    (foreach node in (all-taxonomy-nodes graph)
+        do (setq numberOfIntervals
+             (+ numberOfIntervals (length (all-taxonomy-node-intervals node))))
+           (++ numberOfNodes))
+    (return (/ numberOfIntervals numberOfNodes))))
+
+(defun print-nodes-with-multiple-intervals
+    ((graph TAXONOMY-GRAPH) (threshold INTEGER))
+  ;; Prints nodes in `graph' with at least `threshold' intervals.
+  (when (null? threshold)
+    (setq threshold 2))
+  (foreach node in (all-taxonomy-nodes graph)
+      where (>= (length (all-taxonomy-node-intervals node)) threshold)
+      do (print (native-object node) " ")))
+
+(defun print-node-statistics ((graph TAXONOMY-GRAPH))
+  ;; Prints statistics of how many nodes have how many intervals.
+  (let ((maxIntervals 0)
+        (count 0))
+    (foreach node in (all-taxonomy-nodes graph)
+        do (setq maxIntervals
+             (max maxIntervals (length (all-intervals node)))))
+    (foreach i in (interval 0 maxIntervals)
+        do (setq count 0)
+           (foreach node in (all-taxonomy-nodes graph)
+               where (= i (length (all-intervals node)))
+               do (++ count))
+           (print count " nodes with " i " intervals" EOL))))
+
+(defun new-print-node-statistics ((graph TAXONOMY-GRAPH))
+  ;; Prints statistics of how many nodes have how many intervals.
+  (let ((maxIntervals 0)
+        (count 0))
+    (foreach node in (all-taxonomy-nodes graph)
+        do (setq maxIntervals
+             (max maxIntervals (length (all-taxonomy-node-intervals node)))))
+    (foreach i in (interval 0 maxIntervals)
+        do (setq count 0)
+           (foreach node in (all-taxonomy-nodes graph)
+               where (= i (length (all-taxonomy-node-intervals node)))
+               do (++ count))
+           (print count " nodes with " i " intervals" EOL))))
+
+(defun (collect-class-tree-taxonomy-nodes (CONS OF CLASS)) ((class CLASS))
+  ;; Return a list of the subtree below `class'
+  (let ((result NIL))
+    (foreach sub in (class-direct-subs class)
+	     do
+	     (setq result
+	       (concatenate result 
+		 (collect-class-tree-taxonomy-nodes (type-class sub)))))
+    (return (cons class result))))
+
+;(defun (average-interval-length-in-subtree FLOAT) ((class CLASS))
+;  ;; Return the average interval length of taxonomy-nodes
+;  ;;   associated with subclasses of `class'
+;  (let ((sum 0)
+;	(nodes NIL))
+;    (foreach c in (collect-class-tree-taxonomy-nodes class)
+;	     collect (class-taxonomy-node c)
+;	     into nodes)
+;    (foreach length in (interval-lengths nodes)
+;	     do
+;	     (when (> length 1)
+;	       (cl:break))
+;	     (setq sum (+ sum length)))
+;    (return (/ sum (length nodes)))))
+
+(defun (simulate-taxonomy SIMULATION-RESULT) ()
+  ;; Create a random dag and do fast and slow isa tests
+  ;; Return the result of the simulation
+  (let (
+	;; Simulation parameters
+	;; ---------------------
+	(numNodes 1000)
+	(rootRatio 0.2)
+	(avgParents 1.5)
+	(numIsas 10000)
+	(incremental? TRUE)
+	(renumberIfOutOfNumbers? FALSE)
+	;; ---------------------
+	(graph TAXONOMY-GRAPH NULL)
+	(nodes (CONS OF TAXONOMY-NODE) NULL)
+	(numRoots (ceiling (* rootRatio numNodes)))
+	(nodePairs (CONS OF (CONS OF TAXONOMY-NODE)) NULL)
+	(result SIMULATION-RESULT NULL))
+    (setq graph
+      (build-random-dag numNodes numRoots avgParents
+			incremental? renumberIfOutOfNumbers?))
+    (setq nodes (all-taxonomy-nodes graph))
+    (setq result
+      (new SIMULATION-RESULT
+	   :graph graph
+	   :num-nodes (length nodes)
+	   :num-roots numRoots
+	   :avg-parents avgParents
+	   :num-isas numIsas
+	   :incremental? incremental?
+	   :renumber-if-out-of-numbers? renumberIfOutOfNumbers?
+	   :graph-depth (compute-depth graph)
+	   :avg-interval-length (average-interval-length graph)))
+
+    (setq nodePairs (create-random-node-pairs numIsas graph))
+    (test-fast-isas nodePairs)
+    (test-slow-isas nodePairs)
+    (return result)))
+
+|#

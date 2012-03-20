@@ -1,0 +1,556 @@
+;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                                                            ;
+; Version: MPL 1.1/GPL 2.0/LGPL 2.1                                          ;
+;                                                                            ;
+; The contents of this file are subject to the Mozilla Public License        ;
+; Version 1.1 (the "License"); you may not use this file except in           ;
+; compliance with the License. You may obtain a copy of the License at       ;
+; http://www.mozilla.org/MPL/                                                ;
+;                                                                            ;
+; Software distributed under the License is distributed on an "AS IS" basis, ;
+; WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License   ;
+; for the specific language governing rights and limitations under the       ;
+; License.                                                                   ;
+;                                                                            ;
+; The Original Code is the STELLA Programming Language.                      ;
+;                                                                            ;
+; The Initial Developer of the Original Code is                              ;
+; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
+; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
+;                                                                            ;
+; Portions created by the Initial Developer are Copyright (C) 1996-2003      ;
+; the Initial Developer. All Rights Reserved.                                ;
+;                                                                            ;
+; Contributor(s):                                                            ;
+;                                                                            ;
+; Alternatively, the contents of this file may be used under the terms of    ;
+; either the GNU General Public License Version 2 or later (the "GPL"), or   ;
+; the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),   ;
+; in which case the provisions of the GPL or the LGPL are applicable instead ;
+; of those above. If you wish to allow use of your version of this file only ;
+; under the terms of either the GPL or the LGPL, and not to allow others to  ;
+; use your version of this file under the terms of the MPL, indicate your    ;
+; decision by deleting the provisions above and replace them with the notice ;
+; and other provisions required by the GPL or the LGPL. If you do not delete ;
+; the provisions above, a recipient may use your version of this file under  ;
+; the terms of any one of the MPL, the GPL or the LGPL.                      ;
+;                                                                            ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;; Version: name-utility.ste,v 1.9 2003/04/18 21:15:24 hans Exp
+
+(in-package "STELLA")
+
+(in-module "STELLA")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;;  EXTERNAL INTERFACE
+;;;
+;;;   MAKE-MATCHING-NAME  string
+;;;                       &key break-on-cap break-on-number 
+;;;                            break-on-separators
+;;;                            remove-prefix remove-suffix
+;;;                            add-prefix add-suffix
+;;;                            case separator
+;;;
+;;;   DECOMPOSE-NAMESTRING string
+;;;                        &key break-on-cap break-on-number
+;;;                             break-on-separators
+;;;
+;;;
+;;;   COMPOSE-NAMESTRING  cons-of-strings
+;;;                       &key prefix suffix case separator
+;;;			       acronym-table use-acronym-heuristics-p
+;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun (make-matching-name STRING) ((original STRING) &rest (options OBJECT))
+  :public? TRUE
+  :documentation "Keyword options:
+  :break-on-cap    one of  :YES :NO :CLEVER         default is :CLEVER
+  :break-on-number one of  :YES :NO :CLEVER         default is :CLEVER
+  :break-on-separators string                       default is \"-_ \"
+  :remove-prefix   string
+  :remove-suffix   string
+  
+  :case            one of  :UPCASE :TitleCase :titleCaseX :downcase :Capitalize :preserve
+                                                     default is :TitleCase
+  :separator       string                            default is \"\"
+  :add-prefix      string
+  :add-suffix      string
+
+  MAKE-MATCHING-NAME returns a matching name (a string) for the input name (a string).
+A matching name is constructed by breaking the input into 'words' and then applying
+appropriate transforms.  The arguments are used as follows:
+  `original'         is the input name.  It is a string.
+  :break-on-cap    is a keyword controlling whether changes in capitalization is used
+                   to indicate word boundaries.  If :YES, then all capitalization
+                   changes delineate words.  If :CLEVER, then unbroken runs of
+                   capitalized letters are treated as acronyms and remain grouped.
+                   If :NO or NULL, there is no breaking of words based on capitalization.
+  :break-on-number is a flag controlling whether encountering a number indicates
+                   a word boundary.  If :YES, then each run of numbers is treated as
+		   a word separate from surrounding words.  If :CLEVER, then an 
+		   attempt is made to recognize ordinal numbers (ie, 101st) and
+		   treat them as separate words.  If :NO or NULL, there is no breaking
+                   of words when numbers are encountered.
+  :break-on-separators   A string of characters which constitute word delimiters in
+                         the input word.  This is used to determine how to break
+                   the name into individual words.  Defaults are space, '-' and '_'.
+  :remove-prefix   Specifies a prefix or suffix that is stripped from the input
+  :remove-suffix   name before any other processing.  This allows the removal of
+                   any naming convention dictated prefixes or suffixes.
+  :add-prefix      Specifies a prefix or suffix that is added to the output name
+  :add-suffix      after all other processing.  This allows the addition of any
+                   naming convention dictated prefixes or suffixes.
+  :case            The case of the resulting name.  This is applied to the name 
+                   before adding prefixes or suffixes.  The two title case options 
+                   differ only in how the first word of the name is treated.
+                   :TitleCase capitalizes the first letter of the first word and
+                       also the first letter of all other words.
+                   :TitleCaseX does not capitalizes the first letter of the first
+		       word but capitalizes the first letter of all subsequent words.
+		   :preserve results in no change in case.
+  :separator       This is a string specifying the word separator to use in the
+                   returned name.  An empty string (the default) means that the
+                   resulting words are concatenated without any separation.  This
+                   normally only makes sense when using one of the title case values
+                   for the case keyword."
+  (let ((plist (new PROPERTY-LIST :the-plist (coerce-&rest-to-cons options)))
+	(breakOnCap :CLEVER)
+	(breakOnNumber :CLEVER)
+	(breakOnSeparators "-_ ")
+	(removePrefix "")
+	(removeSuffix "")
+	(addPrefix "")
+	(addSuffix "")
+	(outputCase :TitleCase)
+	(outputSeparator ""))
+
+    ;; Process keyword options:
+    (vet-options 
+     plist (quote (:break-on-cap :break-on-number :break-on-separators
+				 :remove-prefix :remove-suffix :add-prefix :add-suffix
+				 :case :separator)))
+    (foreach (key value) in plist
+	do (case key 
+	     (:break-on-cap
+	      (if (defined? value)
+		  (setq breakOnCap (cast value KEYWORD))
+		  (setq breakOnCap :NO)))
+	     (:break-on-number
+	      (if (defined? value)
+		  (setq breakOnNumber (cast value KEYWORD))
+		  (setq breakOnNumber :NO)))
+	     (:break-on-separators
+	      (setq breakOnSeparators (wrapper-value (cast value STRING-WRAPPER))))
+	     (:remove-prefix
+	      (setq removePrefix (wrapper-value (cast value STRING-WRAPPER))))
+	     (:remove-suffix
+	      (setq removeSuffix (wrapper-value (cast value STRING-WRAPPER))))
+	     (:add-prefix
+	      (setq addPrefix (wrapper-value (cast value STRING-WRAPPER))))
+	     (:add-suffix
+	      (setq addSuffix (wrapper-value (cast value STRING-WRAPPER))))
+	     (:case
+	      (setq outputCase (cast value KEYWORD)))
+	     (:separator
+	      (setq outputSeparator (wrapper-value (cast value STRING-WRAPPER))))))
+    (return
+      (make-matching-name-full original
+			       breakOnCap
+			       breakOnNumber
+			       breakOnSeparators
+			       removePrefix
+			       removeSuffix
+			       addPrefix
+			       addSuffix
+			       outputCase
+			       outputSeparator)) ))
+
+
+(defun (decompose-namestring (CONS OF STRING-WRAPPER)) 
+    ((namestring STRING) &rest (options OBJECT))
+  :documentation "Keyword options:
+  :break-on-cap    one of  :YES :NO :CLEVER         default is :CLEVER
+  :break-on-number one of  :YES :NO :CLEVER         default is :CLEVER
+  :break-on-separators string                       default is \"-_ \"
+
+  DECOMPOSE-NAMESTRING returns a cons of STRING-WRAPPERS that are the decomposition of the
+input STRING.  The arguments are used as follows:
+  `namestring'       is the input string.
+  :break-on-cap    is a keyword controlling whether changes in capitalization is used
+                   to indicate word boundaries.  If :YES, then all capitalization
+                   changes delineate words.  If :CLEVER, then unbroken runs of
+                   capitalized letters are treated as acronyms and remain grouped.
+                   If :NO or NULL, there is no breaking of words based on capitalization.
+  :break-on-number is a flag controlling whether encountering a number indicates
+                   a word boundary.  If :YES, then each run of numbers is treated as
+		   a word separate from surrounding words.  If :CLEVER, then an 
+		   attempt is made to recognize ordinal numbers (ie, 101st) and
+		   treat them as separate words.  If :NO or NULL, there is no breaking
+                   of words when numbers are encountered.
+  :break-on-separators   A string of characters which constitute word delimiters in
+                         the input word.  This is used to determine how to break
+                   the name into individual words.  Defaults are space, '-' and '_'."
+
+  (let ((plist (new PROPERTY-LIST :the-plist (coerce-&rest-to-cons options)))
+	(breakOnCap :CLEVER)
+	(breakOnNumber :CLEVER)
+	(breakOnSeparators "-_ "))
+
+    ;; Process keyword options:
+    (vet-options 
+     plist (quote (:break-on-cap :break-on-number :break-on-separators)))
+    (foreach (key value) in plist
+	do (case key 
+	     (:break-on-cap
+	      (if (defined? value)
+		  (setq breakOnCap (cast value KEYWORD))
+		  (setq breakOnCap :NO)))
+	     (:break-on-number
+	      (if (defined? value)
+		  (setq breakOnNumber (cast value KEYWORD))
+		  (setq breakOnNumber :NO)))
+	     (:break-on-separators
+	      (setq breakOnSeparators (wrapper-value (cast value STRING-WRAPPER))))))
+    (return
+      (decompose-namestring-full namestring breakOnCap breakOnNumber breakOnSeparators)) ))
+
+
+(defun (compose-namestring STRING) 
+    ((name-components (CONS OF STRING-WRAPPER)) &rest (options OBJECT))
+  :PUBLIC? TRUE
+  :documentation "`name-components' is a cons to be processed into a namestring.
+':prefix' and ':suffix' are strings that will NOT be case-converted.
+':case' is one of :UPCASE :TitleCase :titleCaseX :downcase :Capitalize
+        default is :TitleCase
+':separator' is a string that should separate word elements.  It does not
+       separate the prefix or suffix.  Default is \"\"
+':translation-table' should be a STRING-HASH-TABLE hash table that strings into their
+       desired printed representation as a string.  In general the argument
+       will be strings, but that is not strictly necessary.
+"
+  (let ((plist (new PROPERTY-LIST :the-plist (coerce-&rest-to-cons options)))
+	(prefix "")
+	(suffix "")
+	(outputCase :TitleCase)
+	(outputSeparator "")
+	(translation-table STRING-HASH-TABLE NULL)
+	(use-acronym-heuristics? FALSE))
+    ;; Process keyword options:
+    (vet-options 
+     plist (quote (:prefix :suffix :case :separator 
+			   :translation-table :use-acronym-heuristics?)))
+    (foreach (key value) in plist
+	do (case key 
+	     (:prefix
+	      (setq prefix (wrapper-value (cast value STRING-WRAPPER))))
+	     (:suffix
+	      (setq suffix (wrapper-value (cast value STRING-WRAPPER))))
+	     (:case
+	      (setq outputCase (cast value KEYWORD)))
+	     (:separator
+	      (setq outputSeparator (wrapper-value (cast value STRING-WRAPPER))))
+	     (:translation-table
+	      (setq translation-table (cast value STRING-HASH-TABLE)))
+	     (:use-acronym-heuristics?
+	      (setq use-acronym-heuristics? (eq? value TRUE-WRAPPER)))))
+    (return
+      (compose-namestring-full name-components prefix suffix outputCase outputSeparator 
+			       translation-table use-acronym-heuristics?)) ))
+
+;;;
+;;;  Internal and program-level calls:
+;;;
+
+
+(defun (make-matching-name-full STRING)
+    ((originalName STRING)
+     (breakOnCap KEYWORD)
+     (breakOnNumber KEYWORD)
+     (breakOnSeparators STRING)
+     (removePrefix STRING)
+     (removeSuffix STRING)
+     (addPrefix STRING)
+     (addSuffix STRING)
+     (outputCase KEYWORD)
+     (outputSeparator STRING))
+  :public? TRUE
+  :documentation "Non-keyword version of `make-matching-name', which will probably be
+easier to use when called from non-Lisp languages."
+  (let ((prefixLength (length removePrefix))
+	(suffixLength (length removeSuffix))
+	(result-string STRING originalName)
+	(result-length 0))
+
+    ;; Process for prefix and suffix removal:
+    (when (and (> prefixLength 0)
+	       (<= prefixLength (length originalName))
+	       (eql? removePrefix (subsequence originalName 0 prefixLength)))
+      (setq result-string (subsequence originalName prefixLength NULL)))
+    (setq result-length (length result-string))
+    (when (and (> suffixLength 0)
+	       (<= suffixLength result-length)
+	       (eql? removeSuffix (subsequence result-string
+					       (- result-length suffixLength)
+					       result-length)))
+      (setq result-string
+	(subsequence result-string 0 (- result-length suffixLength))))
+    ;; Sanity check: if the originalName is just removePrefix + removeSuffix, 
+    ;; then don't remove either prefix or suffix.  Use original name.
+    (when (eql? result-string "")
+      (setq result-string originalName))
+    
+    ;; Build new name as string
+    (setq result-string 
+      (compose-namestring-full
+       (decompose-namestring-full
+	result-string breakOnCap breakOnNumber breakOnSeparators)
+       addPrefix addSuffix outputCase outputSeparator NULL FALSE))
+    ;; Make sure the transformation hasn't gotten rid of the
+    ;; name entirely.
+    (if (eql? result-string "")
+      (return originalName)
+      (return result-string))
+    ))
+
+
+(defun (decompose-namestring-full (CONS OF STRING-WRAPPER))
+    ((namestring STRING)
+     (break-on-cap KEYWORD)
+     (break-on-number KEYWORD)
+     (break-on-separators STRING))
+  :public? TRUE
+  :documentation "Non-keyword version of `decompose-namestring', which will probably be
+easier to use when called from non-Lisp languages."
+
+  (let ((len (length namestring))
+	(result NIL)
+	(lag 0)
+	(lead 0)
+	(inCapRun? FALSE)
+	(inNumber? FALSE))
+    ;; This uses the "inCapRunP" flag to allow groups
+    ;;   of capital letters together form a single
+    ;;   acronym instead of being considered separate
+    ;;   words.  (i.e,  "BigCAPLaunch" => "Big" "CAP" "Launch")
+    ;; The "inNumberP" flag is used to collect digits into a
+    ;;   single number.
+    ;; Lag will not be greater than lead unless we are skipping characters.
+    (foreach c in namestring
+	do (cond ((exists sep in break-on-separators
+                    where (eql? sep c))
+		  (pushq result (subsequence namestring lag lead))
+		  (setq lag (1+ lead))
+		  (setq inNumber? FALSE)
+		  (setq inCapRun? FALSE))
+		 ;; This only occurs when we can skip because of look ahead
+		 ;;  in the code below.  Right now this only happens for
+		 ;;  ordinal numbers.
+		 ((> lag lead) NULL)
+		 ((digit-character? c)
+		  (cond ((and (not inNumber?)
+                              (not (eq? break-on-number :no)))
+			 (unless (= lead lag)
+			   (pushq result (subsequence namestring lag lead))
+			   (setq lag lead)))
+			(otherwise NULL))
+		  (setq inCapRun? FALSE)
+		  (setq inNumber? TRUE))
+		 ((lower-case-character? c)
+		  (when (and inNumber? (not (eq? break-on-number :no)))
+		    (cond ((= lead lag) NULL)
+			  ((not (eq? break-on-number :clever))
+			   (pushq result (subsequence namestring lag lead))
+			   (setq lag lead))
+			  ((and (< lead (- len 1))
+				(ordinal-number-string?
+				 (subsequence namestring lag (+ lead 2))))
+			   (pushq result (subsequence namestring lag (+ lead 2)))
+			   (setq lag (+ lead 2)))
+			  (otherwise
+			   (pushq result (subsequence namestring lag lead))
+			   (setq lag lead))))
+		  (cond ((> lag lead) NULL) ; Handle ordinal skip!
+			((eq? break-on-cap :no) NULL)
+			((not (eq? break-on-cap :clever)) NULL)
+			(inCapRun?
+			 (unless (= lead (1+ lag))
+			   (pushq result (subsequence namestring lag (1- lead)))
+			   (setq lag (1- lead)))))
+		  (setq inNumber? FALSE)
+		  (setq inCapRun? FALSE))
+		 ((upper-case-character? c)
+		  (when (and inNumber? (not (eq? break-on-number :no)))
+		    (cond ((= lead lag) NULL)
+			  ((not (eq? break-on-number :clever))
+			   (pushq result (subsequence namestring lag lead))
+			   (setq lag lead))
+			  ((and (< lead (- len 1))
+				(ordinal-number-string?
+				 (subsequence namestring lag (+ lead 2))))
+			   (pushq result (subsequence namestring lag (+ lead 2)))
+			   (setq lag (+ lead 2)))
+			  (otherwise
+			   (pushq result (subsequence namestring lag lead))
+			   (setq lag lead))))
+		  (cond ((> lag lead) NULL)  ;; Handle ordinal skip!
+			((eq? break-on-cap :no) NULL)
+			((not (eq? break-on-cap :clever))
+			 (unless (= lead lag)
+			   (pushq result (subsequence namestring lag lead))
+			   (setq lag lead)))
+			(inCapRun? NULL)
+			(otherwise
+			 (unless (= lead lag)
+			   (pushq result (subsequence namestring lag lead))
+			   (setq lag lead))
+			 (setq inCapRun? TRUE)))
+		  (setq inNumber? FALSE))
+		 )
+	   (++ lead))
+    (unless (< lead lag) (pushq result (subsequence namestring lag NULL)))
+    (return (reverse result))))
+
+(defun (suffix-matches? BOOLEAN) ((testString STRING) (suffix STRING))
+  ;; Returns TRUE if "suffix" is matches the end of "testString"
+  (let ((stringLength (length testString))
+	(suffixLength (length suffix)))
+    (return (and (<= suffixLength stringLength)
+		 (eql? suffix
+		       (subsequence testString (- stringLength suffixLength) NULL)))) )) 
+
+(defun (ordinal-number-string? BOOLEAN) ((testString STRING))
+  ;; Returns a TRUE if "string" is an ordinal number.  
+  ;; For the purposes of this routine, an ordinal number is a string of digits
+  ;;  followed by one of "st" "nd" "rd" "th".
+  (let ((len (length testString))
+	;; teen? = TRUE if the number part ends with 1x.
+	(teen? (and (> len 3)  
+		    (eq? #\1 (nth testString (- len 4)))))
+	(suffix STRING "th"))
+    (when (< len 3)
+      (return FALSE))
+    ;; Make sure all but last two characters are digits:
+    (foreach c in testString
+	as i in (interval 0 (- len 3))
+	do (ignore i)
+	   (unless (digit-character? c) (return FALSE)))
+    ;; Adjust for special cases unless the numbers are teens:
+    (unless teen?
+      (case (nth testString (- len 3))
+	(#\1 (setq suffix "st"))
+	(#\2 (setq suffix "nd"))
+	(#\3 (setq suffix "rd"))
+	(otherwise NULL)))
+    ;; Test suffix match:
+    (return (suffix-matches? testString suffix)) ))
+
+(defun (heuristic-acronym? BOOLEAN) ((itemString STRING))
+  ;; Returns TRUE if ITEMSTRING is heuristically an acronym, otherwise FALSE.
+  ;; A string is heuristically an acronym if it consists solely of letters and
+  ;;   numbers (but at least one of each), and it doesn't qualify as a ordinal number.
+  ;; The punctuation characters #\. #\- and #\/ are allowed and count as numbers.
+  (let ((letterFound? FALSE)
+	(numberFound? FALSE))
+    (foreach c in itemString
+	do (cond ((digit-character? c)
+		  (setq numberFound? TRUE))
+		 ((or (lower-case-character? c)
+		      (upper-case-character? c))
+		  (setq letterFound? TRUE))
+		 ((member? (quote (#\. #\- #\/)) c)
+		  (setq numberFound? TRUE))
+		 (otherwise (return FALSE))))
+    (return (and numberFound?
+		 letterFound?
+		 (not (ordinal-number-string? itemString)))) ))
+
+(defun (compose-namestring-full STRING)
+    ((strings (CONS OF STRING-WRAPPER))
+     (prefix STRING)
+     (suffix STRING)
+     (outputCase KEYWORD)
+     (outputSeparator STRING)
+     (translationTable STRING-HASH-TABLE)
+     (useAcronymHeuristics? BOOLEAN))
+  :public? TRUE
+  :documentation "Non-keyword version of `compose-namestring', which will probably be
+easier to use when called from non-Lisp languages."
+
+  (let ((n 0)
+        (i 0)
+        (out MUTABLE-STRING NULL)
+	(separator-length (choose (defined? outputSeparator) 
+				  (length outputSeparator)
+				  0))
+	(firstTime? TRUE)
+	(s STRING NULL)
+	(s-len 0))
+
+    ;; Preprocess translations so we know the correct output
+    ;; strings:
+    (when (defined? translationTable)
+      (let ((temp strings))
+	(setq strings NIL)
+	(foreach sw in temp
+	    where (defined? (lookup translationTable sw))
+	    collect (lookup translationTable sw) into strings)))
+
+    ;; Calculate length of resulting string:
+    (when (defined? prefix) (++ n (length prefix)))
+    (when (defined? suffix) (++ n (length suffix)))
+    (foreach sw in strings
+	do (++ n (length (wrapper-value sw))))
+    (++ n (* (- (length strings) 1) separator-length))
+
+    (setq out (make-raw-mutable-string n))
+
+    (when (defined? prefix)
+      (setq i (insert-string prefix 0 NULL out i :preserve)))
+    (foreach sw in strings
+	do (setq s (wrapper-value sw))
+	   (setq s-len (length s))
+	   (unless firstTime?
+	     (when (> separator-length 0)
+	       (setq i (insert-string outputSeparator 0 (1- separator-length)
+				      out i :preserve))))
+	   (cond ((= s-len 0) NULL)
+		 ((and useAcronymHeuristics?
+		       (heuristic-acronym? s))
+		  (setq i (insert-string s 0 (1- s-len) out i :preserve)))
+		 (otherwise
+		  (case outputCase
+		    ((:ALLCAPS :UPCASE)
+		     (setq i (insert-string s 0 (1- s-len) out i :upcase)))
+		    (:DOWNCASE
+		     (setq i (insert-string s 0 (1- s-len) out i :downcase)))
+		    (:TitleCase
+		     (setq i (insert-string s 0 (1- s-len) out i :capitalize)))
+		    (:titleCaseX
+		     (if firstTime?
+			 (setq i (insert-string s 0 (1- s-len) out i :downcase))
+			 (setq i (insert-string s 0 (1- s-len) out i :capitalize))))
+		    (:capitalize
+		     (if firstTime?
+		       (setq i (insert-string s 0 (1- s-len) out i :capitalize))
+		       (setq i (insert-string s 0 (1- s-len) out i :downcase))))
+		    (:preserve
+		     (setq i (insert-string s 0 (1- s-len) out i :preserve))))))
+	   (setq firstTime? FALSE))
+    (when (defined? suffix)
+      (setq i (insert-string suffix 0 NULL out i :preserve)))
+    (return out)))
+
+
+#|
+;; Example
+(compose-namestring
+ (decompose-namestring "AbCd-ccDBCDee" :break-on-cap :CLEVER )
+ :separator " " :case :preserve)
+|#
