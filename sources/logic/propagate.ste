@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: propagate.ste,v 1.61 2010/09/10 01:16:59 hans Exp
+;;; Version: propagate.ste,v 1.64 2010/12/07 01:24:51 tar Exp
 
 ;;; Evaluator routines that compute forward propagation for the
 ;;;    propositional calculus.
@@ -597,7 +597,8 @@ chaining.")
 ;             assertedValue EOL
 ;             "   but somehow they are both attached to the skolem " self EOL)
 ;      (yes-or-no? "STOP AND SEE HOW THIS CAME ABOUT, AND TELL BOB.")
-      (equate-values (value-of assertedValue) derivedValue))
+      ;; NOTE: Should this use (defining-proposition self) instead of NULL?
+      (equate-values NULL (value-of assertedValue) derivedValue))
     ;; Note, we include unknown propositions below, since they might
     ;;    depend on `self', and, hence, change their assertion status:
     (foreach prop in (unfiltered-dependent-propositions self NULL)
@@ -891,7 +892,7 @@ chaining.")
       ;; NOTE: ONCE WE KNOW HOW TO DO THIS RIGHT, `all-clashing-propositions'
       ;;    AND ITS CALLERS NEED TO BE FIXED ACCORDINGLY!!!!
       (when (unequate-conflicting-default-values? self)
-        (equate-values firstArg secondArg))
+        (equate-values self firstArg secondArg))
       |#
 
       ;#|
@@ -907,10 +908,10 @@ chaining.")
         (foreach type1 in firstArgTypes
             where (exists type2 in secondArgTypes
                     where (disjoint-terms? type1 type2))
-            do (signal-unification-clash firstArg secondArg)))
+            do (signal-unification-clash self firstArg secondArg)))
       ;|#
       
-      (equate-values firstArg secondArg))
+      (equate-values self firstArg secondArg))
      ((eql? firstArg secondArg)
       (assign-truth-value self TRUE))
      ((and (not (skolem? firstArg))
@@ -968,7 +969,8 @@ chaining.")
                   as i in (interval 1 NULL)
                   where (not (eql? i nofArgs))
                   always (eql? (innermost-of arg1) (innermost-of arg2)))
-        do (equate-values (innermost-of (last (arguments self)))
+        do (equate-values self
+                          (innermost-of (last (arguments self)))
                           (innermost-of (last (arguments prop)))))
     (free candidatePropositions)))
 
@@ -1011,7 +1013,7 @@ chaining.")
 ;                 ;; computation succeeded:
 ;                 (let ((storedValue (value-of (nth permutedArguments lastIndex))))
 ;                   (when (not (eql? computedValue storedValue))
-;                     (equate-values computedValue storedValue)))
+;                     (equate-values NULL computedValue storedValue)))
 ;                 ;; successful exit:
 ;                 (break)))) ))
 
@@ -1045,7 +1047,7 @@ chaining.")
           (return))
         (setq storedValue (value-of (nth (arguments self) missingValueIndex)))
         (when (not (eql? computedValue storedValue))
-          (equate-values computedValue storedValue)))
+          (equate-values self computedValue storedValue)))
       (return))
     (setq code (lookup-computation description))
     (when (defined? code)
@@ -1059,7 +1061,7 @@ chaining.")
       (setq storedValue (value-of (last-argument self)))
       (when (and (not (eql? computedValue storedValue))
                  (defined? computedValue))
-        (equate-values computedValue storedValue)))) )
+        (equate-values self computedValue storedValue)))) )
 
 (defun evaluate-PREDICATE-proposition ((self PROPOSITION))
   :public? TRUE
@@ -1136,8 +1138,32 @@ the setting or changing of its truth value."
   ;;
 
 (defglobal *just-in-time-forward-inference?* BOOLEAN TRUE
+  :public? TRUE
   :documentation "If TRUE, ensures that forward propagation has
 been applied to each instance 'touched' during a query.")
+
+;; TODO: Figure out when to reset this.
+(defglobal *clash-exceptions* (LIST OF EXCEPTION-RECORD) (new LIST)
+  :public? TRUE
+  :documentation "Collects clash exceptions that occur during inference.")
+
+(defun reset-clash-exceptions ()
+  :public? TRUE
+  :documentation "Resets the collection of clash exceptions"
+  (setq *clash-exceptions* (new LIST)))
+
+(defun (exception-record-matches-context? BOOLEAN) ((record EXCEPTION-RECORD))
+  (return (eql? (context record) *context*)))
+
+(defun cull-clash-exceptions ((self CONTEXT))
+  ;; Clear clash exceptions belonging to 'self'.
+  (within-context self
+     (remove-if *clash-exceptions* 
+                (the-code :function exception-record-matches-context?))))
+
+(startup-time-progn
+  (add-hook *destroy-context-hooks* (quote cull-clash-exceptions)))
+
 
 (defun recursively-react-to-inference-update ((self PROPOSITION))
   ;; Helping function for 'elaborate-instance'.  Call 
@@ -1187,6 +1213,10 @@ been applied to each instance 'touched' during a query.")
                    (clear (deferred-default-propositions environment))
                    (execute-constraint-propagation-queues)))
              (CLASH (e)
+               (push *clash-exceptions* (new EXCEPTION-RECORD
+                                              :exception e
+                                              :context *context*
+                                              :module *module*))
                (print-stream STANDARD-ERROR (exception-message e) EOL))))))
        ;; don't elaborate non-LOGIC-OBJECT:
       (otherwise NULL))) )
@@ -1387,12 +1417,14 @@ forward chainer has been run then in one where it has not (see
       (return NULL))))
 
 (defun print-facts ((instanceRef OBJECT))
-  :documentation "Like ALL-FACTS-OF, but prints each fact on a separate 
-line on the standard output stream."
+  :documentation "Like `all-facts-of', but sorts and prints each fact
+on a separate line on the standard output stream."
   :command? TRUE :public? TRUE :evaluate-arguments? FALSE
   (let ((instance (coerce-to-instance instanceRef NULL)))
-    (foreach fact in (all-facts-of-instance instance false false)
-	do (print fact EOL))))
+    (foreach fact in (sort (all-facts-of-instance instance false false)
+                           (the-code :function proposition-less-than?))
+	do (pretty-print-logical-form fact STANDARD-OUTPUT)
+           (print EOL))))
 
 (defun (call-all-facts-of (LIST OF PROPOSITION)) ((instanceRef OBJECT))
   :command? TRUE :public? TRUE :evaluate-arguments? TRUE
@@ -1629,7 +1661,7 @@ that reference the instance `instanceRef'."
 (defun (all-facts-of-n (CONS OF PROPOSITION)) ((n INTEGER)
                                                &rest (instanceRefs NAME))
   :command? TRUE :public? TRUE :evaluate-arguments? FALSE
-  :documentation
+  :documentation 
   "This is a generalization of `all-facts-of' (which see).  With `n' = 0
 and only one instance this command behaves just like `all-facts-of'.
 Otherwise, returns a cons list of all definite (TRUE or FALSE) propositions

@@ -1,0 +1,941 @@
+@c -*-texinfo-*-
+
+@c Version: gui-manual-chapter.texi,v 1.1 2010/10/15 01:59:37 hans Exp
+
+@c TexInfo formatting notes:
+@c
+@c - After updates do the following to update the node & menu structure:
+@c   - insert node lines with titles taken from section headings via
+@c         C-x h C-u M-x texinfo-insert-node-lines
+@c   - link all nodes via
+@c         M-x texinfo-every-node-update
+@c   - create or update menus via
+@c         M-x texinfo-all-menus-update
+@c
+@c - Don't fiddle with nodes and menus before the overall structure isn't
+@c   pretty much determined (one can run `makeinfo' even without nodes)
+@c - Node names have to be unique
+@c - Node names should be short, keep details in their explanations -
+@c   this makes the menus look better
+
+@node PowerLoom GUI, Ontosaurus, Built-In Relations, Top
+@chapter PowerLoom GUI
+
+The PowerLoom GUI (or knowledge editor) is a Java-based graphical client
+for PowerLoom.  The GUI is implemented as a Swing-based Java application
+which communicates with an embedded or remote PowerLoom server using a
+SOAP communication layer over HTTP.
+
+The architecture of the PowerLoom GUI most closely resembles the
+traditional two-tier client/server model.  Since the GUI does not
+contain a great deal of business logic (e.g., it does not know how to do
+inferencing), it does not directly map onto the traditional notion of a
+smart client.  Similarly, since PowerLoom is much ``smarter'' than a
+typical DBMS, it does not cleanly map onto a traditional backend server.
+However, since the GUI contains the presentation logic, it is more
+similar to a 2-tier model than a 3-tier model where the presentation
+logic resides in a middle tier.
+
+Communication between the GUI and PowerLoom is done via the XML-based
+SOAP protocol.  In order to effectively communication via SOAP, a Web
+service layer was built on top of PowerLoom.  This layer provides
+support for marshaling and unmarshaling of PowerLoom objects to/from
+XML, and also provides a PowerLoom API that is accessible as a web
+service.  The Java client uses JAXM and the Castor framework (see
+@url{http://www.castor.org}) to support SOAP communication.
+
+@menu
+* Invoking the GUI::            
+* GUI Design Goals::            
+* GUI Overview::                
+* GUI Features::                
+* Future Work::                 
+@end menu
+
+
+@node Invoking the GUI, GUI Design Goals, PowerLoom GUI, PowerLoom GUI
+@section Invoking the GUI
+The PowerLoom GUI can be started in a variety of ways.  The easiest
+way is to use the top-level @code{powerloom} script (@pxref{Running
+PowerLoom}) and supply the @code{--gui} option.  This will start the
+Java version of PowerLoom, start a standalone embedded PowerLoom Web
+server, launch the GUI application and connect from it to the
+PowerLoom server (using port 9090 by default):
+
+@example
+% powerloom --gui
+Running Java version of PowerLoom...
+Initializing STELLA...
+Initializing PowerLoom...
+Loading required system webtools
+Loading required system ontosaurus
+
+    Welcome to PowerLoom 4.0.0
+
+Copyright (C) USC Information Sciences Institute, 1997-2010.
+PowerLoom is a trademark of the University of Southern California.
+PowerLoom comes with ABSOLUTELY NO WARRANTY!
+Type `(copyright)' for detailed copyright information.
+Type `(help)' for a list of available commands.
+Type `(demo)' for a list of example applications.
+Type `bye', `exit', `halt', `quit', or `stop', to exit.
+
+
+PL-USER |= 
+@end example
+
+Alternatively, PowerLoom can be started in its standard command loop
+mode and then the GUI can be started with the
+@code{start-powerloom-gui} command.  This is useful if the GUI becomes
+necessary at some point during development or if a different port should
+be used.  For example:
+
+@example
+% powerloom
+Initializing STELLA...
+Initializing PowerLoom...
+
+    Welcome to PowerLoom 3.2.52
+
+Copyright (C) USC Information Sciences Institute, 1997-2010.
+PowerLoom is a trademark of the University of Southern California.
+PowerLoom comes with ABSOLUTELY NO WARRANTY!
+Type `(copyright)' for detailed copyright information.
+Type `(help)' for a list of available commands.
+Type `(demo)' for a list of example applications.
+Type `bye', `exit', `halt', `quit', or `stop', to exit.
+
+
+PL-USER |= (start-powerloom-gui :port 9092)
+
+Loading required system webtools
+Loading required system ontosaurus
+
+PL-USER |= 
+@end example
+
+When the GUI is run against an embedded server as in the examples
+above, it is run asynchronously and commands can be executed at the
+PowerLoom command loop at any time.  Moreover, when the GUI is exited,
+the command loop stays active until it is exited explicitly as well.
+
+The GUI can also be run standalone in which case the user needs to
+connect to a running PowerLoom server.  For example:
+
+@example
+% powerloom --gui-only
+Running standalone PowerLoom GUI...
+@end example
+
+Once the GUI is initialized, the user can connect to a server via the
+@code{File -> Connect to Server} menu item.  After the first
+connection, the host and port of the last used server will be
+remembered for the next startup.  If during the next startup that
+server is not active anymore, an error will be signaled and the user
+can connect to a different server instead.
+
+@menu
+* Starting a PowerLoom Server::  
+@end menu
+
+@node Starting a PowerLoom Server,  , Invoking the GUI, Invoking the GUI
+@subsection Starting a PowerLoom Server
+The GUI always connects to a PowerLoom server which can be embedded in
+the same Java process (as in the examples above), or can be run in a
+separate Lisp or Java process or as part of a Tomcat server (a C++
+Web server is not currently supported).  To start a PowerLoom server
+do the following.  Start the Java version of PowerLoom via the
+@code{powerloom} script or start a Lisp version of PowerLoom that
+supports a Web server such as Allegro CL or a Lisp that supports
+Portable AServe.  Once PowerLoom is up and running, issue the
+following command:
+
+@example
+PL-USER |= (start-powerloom-server)
+
+Loading required system webtools
+Loading required system ontosaurus
+
+PL-USER |= 
+@end example
+
+The command also accepts a @code{:port} option to make the server
+listen to a different port.
+
+Alternatively, the PowerLoom Web Archive available in
+@example
+powerloom-x.y.z/native/java/lib/ploom.war
+@end example
+can be deployed in an Apache Tomcat server by copying it into the
+server installation's @file{webapps} directory.  The GUI can then
+connect to it at the server port used by Tomcat.
+
+
+@node GUI Design Goals, GUI Overview, Invoking the GUI, PowerLoom GUI
+@section GUI Design Goals
+The choice of technology was driven by a number of design goals which
+are summarized below.  Note that the most of the GUI code was developed
+back in 2002 and is therefore somewhat outdated with respect to today's
+Java and Web-based human interface technologies.
+
+@strong{Visibility}: Knowledge Bases are complex and loosely structured
+entities.  It is often desirable to simultaneously maintain multiple
+views of a KB, and to simultaneously perform multiple complementary task
+such as browsing, editing, querying, and searching a KB.  With Swing's
+MDI (Multiple Document Interface) mode, many internal frames can be open
+at the same time within a single ``desktop'' frame.  Swing also offers a
+very rich set of components and UI mechanisms which facilitate efficient
+use of screen real estate.
+
+We designed the GUI to take advantage of Swing's presentation strengths.
+We used the MDI mode, so browsers, editors, etc. can coexist on the same
+desktop.  Additionally, multiple knowledge browsers can be open at the
+same time to present different views of a KB.  The Knowledge Browser
+itself consists of multiple collapsible and resizable subpanes, which in
+turn are composed of scrollable lists and trees.  This allows a
+``birds-eye'' view of a Powerloom KB, in which many modules, concepts,
+relations, instances, propositions, and rules can be displayed at the
+same time.
+
+@strong{Navigability}: When exploring a KB, it is imperative that a user
+interface allows easy navigation between related objects.  The PowerLoom
+GUI has extensive navigation capabilities, which are as good or better
+than browser based applications.  For example, a user may click on a
+query result to instantly update the Knowledge Browser to display the
+selected object.  Also, a user can right-click on a relation or argument
+in a proposition, and navigate to the clicked-on object.
+
+@strong{Responsiveness}: For the best possible user experience, a user
+interface should be highly responsive to a user's input gestures.
+For example, (1) after initiating a gesture such as a mouse click or
+keypress, there should be a minimal delay before the appliction performs
+the intended action, and (2) ``Power Users'' should be able to perform
+complex tasks with a minimum number of mouse clicks, key presses, etc.
+
+The PowerLoom GUI attempts to minimize network round-trips by caching
+large amounts of data.  For example, when a user points the Knowledge
+Browser to a module, a large chunk of the module is retrieved from the
+server and cached in the client.  Hence, when the user expands a tree in
+the browser, the GUI will not need to retrieve more data from the
+server.  Also, the GUI takes full advantage of Swing's ability to
+control the application via keyboard input.  For example, to create a
+new instance named @code{newName}, a user needs to simply type the key
+sequence @kbd{Ctrl-I newName RET}.
+
+@strong{Context Sensitivity}: For any given object that is displayed in
+a user interface, there is a set of actions that can be performed on
+that object.  Additionally, the actions that can be performed on an
+object depend on where the object is displayed.  Therefore, the GUI
+pervasively supports context-sensitive popup menus.  When users
+right-click on an object, a list of appropriate actions will be
+presented in a menu.  For example, when a user right-clicks on a concept
+in the Knowledge Browser, the list of possible actions shown in
+@ref{fig:context-menu} is presented.
+
+@float Figure,fig:context-menu
+@c we use this directory syntax, so we can include this file from other places:
+@image{../../../sources/powerloom-gui/doc/images/gui-context-menu,5in}
+@caption{Context-specific menu of possible actions on a concept}
+@end float
+
+@strong{Editability}: Applications that support text editing often need
+capabilities above and beyond the baseline copy, cut and paste
+capabilities that all text widgets support.  In particular, applications
+that allow editing of text with a regular structure such as source code
+or Lisp expressions may take advantage of special key bindings which
+augment basic navigation and editing capabilities.
+
+The PowerLoom GUI makes use of Swing's powerful text components by
+implementing a full set of Emacs-style keybindings.  These keybindings
+allow a user to perform such operations as navigating up and down a
+subexpression hierarchy, selecting entire subexpressions, and completing
+incomplete symbols.  In addition, matching parenthesis are automatically
+highlighted in the GUI's text components.
+
+@strong{Extensibility}: While it is not easy to claim that Swing
+applications are inherently more extensible than Web applications,
+Swing's MDI architecture and pull-down menu framework allows new
+features to be added with little disruption to the rest of the
+application.  In particular, using modern GUI design tools that are part
+of IDE's such as Netbeans or Eclipse, it is fairly easy to add new
+components and functionality to the PowerLoom GUI.  It is also
+conceivable that the GUI code could be used as the basis for a more
+specific application which would have its own application-specific menus
+and windows, but would retain the general-purpose browsing, querying,
+and editing tools for direct manipulation of the knowledge base.
+
+
+@node GUI Overview, GUI Features, GUI Design Goals, PowerLoom GUI
+@section GUI Overview
+An example screen shot of the PowerLoom GUI is shown in @ref{fig:gui}.
+The main application frame consists of pull-down menus, a toolbar, and a
+status bar.
+
+@float Figure,fig:gui
+@image{../../../sources/powerloom-gui/doc/images/gui,6in}
+@caption{The PowerLoom GUI}
+@end float
+
+The menu bar contains the following menus:
+
+@itemize
+@item @b{KB} - menu items for connecting to a
+server, loading, saving, and clearing KBs, and opening browser and
+console windows.
+
+@item @b{Edit} - menu items for cutting, copying,
+pasting, and deleting, and also an item which opens a
+preferences dialog.
+
+@item @b{Objects} - menu items for opening editors
+on various KB objects, including modules, concepts, relations,
+instances, and propositions.  This menu also contains an item to
+edit the currently selected object.  
+
+@item @b{Query} - menu items for querying the KB,
+searching the KB, and editing a relation's extension.
+
+@item @b{View} - this menu contains various items for updating the
+appearance of the application, including a refresh item to bring the GUI
+up-to-date with the state of the KB on the server, and menu items for
+showing/hiding the application's toolbar and status bar.  This menu also
+contains items for changing the application's font, for example, the
+Demo Theme changes all fonts to a large bold font suitable for demo
+presentations.
+
+@item @b{Navigate} - contains menu items for navigating
+backward and forward in a browser's selection history.
+
+@item @b{Window} - contains a list of the currently
+open windows on the desktop. Selecting a window brings the window to the
+top of the window stack, and if the window is iconified, it is
+de-iconified.
+
+@item @b{Help} - contains an item to open an HTML help
+browser, and an item to open an About box which contains information
+about the PowerLoom GUI.
+@end itemize
+
+Most menu items have accelerator keys that allow an item to be executed
+by a combination of keystrokes.  The toolbar contains several buttons
+which provide shortcuts to menu items.  There are currently toolbar
+buttons for cutting, copying, pasting, deleting, editing an object, and
+opening a query dialog.  The toolbar may be undocked from its default
+position by dragging it anywhere on the desktop.  It may also be hidden
+and unhidden by selecting the @code{View -> Toolbar} menu item.
+
+The status bar at the bottom of the application contains information on
+the current status of the application.  The status bar is divided into
+two sections.  The leftmost section displays the last module that was
+selected by a user.  The application keeps track of the current module
+in order to provide continuity between operations.  For example, if a
+user opens a browser and browses the AIRCRAFT-KB, and then opens a
+query dialog, it makes sense for the query dialog to use the
+AIRCRAFT-KB module instead of some other module.  
+
+The rightmost section of the status bar contains messages that pertain
+to the current state of the application.  For example, if a user
+selects a concept and then clicks the cut toolbar button, a message
+will appear in the rightmost status bar prompting the user to select
+another concept and perform a paste action.  The status bar may be
+hidden and unhidden by selecting the @code{View -> Statusbar} menu
+item.
+
+@ref{fig:gui} shows a few internal frames that are open.  The
+function of each frame is identified in the frame's title bar, and
+each type of frame has a unique icon in it's upper left-hand corner.
+In this example, the three open frames are used to browse the KB,
+query the KB, and edit an instance.
+
+A user typically follows a workflow cycle similar to the following
+sequence:
+
+@enumerate
+@item The user launches the GUI by executing the @code{powerloom}
+script, clicking on a desktop icon or on a hyperlink in a browser.
+
+@item The GUI is loaded on the user's machine.  If the GUI
+was launched via Java Web Start (not yet fully supported), the entire
+application may need to be downloaded or updated before execution
+begins.
+
+@item The GUI reads a preferences file stored in a default location on the
+user's local machine.  If this is the first time the application is
+being executed, a default preferences file is used.  The preferences
+file includes among other things the PowerLoom server that was last
+accessed.
+
+@item If the preferences file contains the last-accessed server, the GUI attempts
+to connect to the server and query the server for a description of the
+server's capabilities.  If connection is successful, a browser window
+will open displaying the modules that are currently loaded in the server
+instance.
+
+@item The user selects any KB files (s)he wishes to load, and instructs the
+server to load the files.
+
+@item The user performs some browsing, querying, and editing of the loaded
+KB.
+
+@item If any changes were made, the user saves the KB to a new or
+existing file.
+
+@item The user repeats steps 5-7 as needed, and then exits the application.
+@end enumerate
+
+
+@node GUI Features, Future Work, GUI Overview, PowerLoom GUI
+@section GUI Features
+This section provides a detailed description of the features that are
+available in the GUI application.  We describe general application-wide
+functionality as well as the functionality of specific components.
+
+@menu
+* Connect to Server::           
+* Edit Preferences::            
+* KB Load/Save::                
+* Browsing::                    
+* Editing::                     
+* Choosers::                    
+* Extension Editor::            
+* Ask and Retrieve Queries::    
+* Search::                      
+* Console::                     
+* Cut/Copy/Paste/Delete::       
+@end menu
+
+@node Connect to Server, Edit Preferences, GUI Features, GUI Features
+@subsection Connect to Server
+The first time the GUI is started, it will not attempt to connect to any
+server.  To establish a server connection, the user must select the
+@code{KB -> Connect to Server} menu item.  This will open a dialog
+prompting for a host name and port.  After the user enters this
+information, a connection will be attempted.  If the connection is
+successful, the server information will be stored in the preferences
+file and used next time the application starts up.
+
+@node Edit Preferences, KB Load/Save, Connect to Server, GUI Features
+@subsection Edit Preferences
+A preferences dialog can be opened by selecting the @code{Edit -> Edit
+Preferences} menu item.  Currently, the only preference that a user can
+edit is whether or not to open a browser when the application is
+started.  The dialog contains a checkbox asking whether or not the
+preferences should be saved.  If the checkbox is not checked, the
+preferences will remain in effect for the duration of the current
+session, but will not be in effect when the application is restarted.
+
+@node KB Load/Save, Browsing, Edit Preferences, GUI Features
+@subsection KB Load/Save
+In its standard configuration, PowerLoom stores knowledge bases via flat
+files.  The user can load one or more KB files from the local file
+system which will be transferred across the network and loaded into the
+server instance via PowerLoom's @code{load} command.  Conversely, a
+modified knowledge base can be saved to a local file on a per-module
+basis (using a version of PowerLoom's @code{save-module} command).
+Future versions of PowerLoom will support more sophisticated persistence
+that will go directly to a database or other persistent store.
+
+@node Browsing, Editing, KB Load/Save, GUI Features
+@subsection Browsing
+The knowledge browser window, shown in @ref{fig:browser}, can be opened
+by selecting the @code{KB -> Browse} menu item or typing @kbd{Ctrl-b}.
+The browser provides a visual overview of all knowledge in the KB, and
+is capable of launching specialized tools such as editors, search
+dialogs, etc.
+
+@float Figure,fig:browser
+@image{../../../sources/powerloom-gui/doc/images/gui-knowledge-browser,6in}
+@caption{Knowledge Browser}
+@end float
+
+The browser consists of several subpanes which we refer to as navigation
+panes.  Each navigation pane consists of a title pane, a toolbar, and a
+content pane.  The title pane contains a title indicating what is
+displayed in the content pane.  The toolbar consists of zero or more
+buttons which perform actions relevant to the navigation pane.
+Currently, two toolbar buttons are present: "Add" and "Search".  "Add"
+(indicated by a +-sign icon) adds an object associated with the type of
+navigation pane.  "Search" (indicated by a flashlight icon) searches for
+objects associated with the type of navigation pane.  The content pane
+contains the actual knowledge to be displayed, such as a list of
+instances or propositions.
+
+There is one navigation pane for each type of KB object: Modules,
+Concepts, Relations, Instances, Rules, and Propositions.  Each internal
+pane is resizable by dragging the movable divider between the panes.
+Panes may be hidden completely by clicking the "Collapse" arrow on the
+adjacent divider.  Clicking the "Expand" arrow will unhide the pane.
+
+@strong{Visual Cues}:
+Navigation panes employ several visual cues to enhance the
+identifiability of object attributes.  Object types are indicated by an
+icon to the left of the object's name.  For example, modules are
+represented by a blue @code{M}, concepts by a red @code{C}, etc.  The
+status of propositions is also indicated visually.  An italicized
+proposition indicates that the proposition was derived instead of
+asserted.  Grey propositions indicate that their truth value is a
+default value instead of a strict value.
+
+The main method for filling the contents of a navigation pane is to
+select some object in a navigation pane that is to the left or above it.
+This is discussed in more detail in the section below.  However, in some
+cases, it is possible to modify the contents of a navigation pane
+without performing a selection.  For example, in the instance navigation
+pane, it is possible to show derived or inherited instances by
+right-clicking on the instance list and selecting an appropriate menu
+item.  Similarly, the relation navigation pane can toggle between direct
+or inherited relations.  Propositions and rules are by default displayed
+according to the module that is currently selected.  However, the
+contents of the proposition or rule navigation pane can be updated by
+selecting a more specific module in the View From Module combobox
+contained in the navigation pane's title bar.
+
+@strong{Selection}:
+When the browser is initially opened, a tree of modules is displayed in
+the module navigation pane, and all other navigation panes are empty.
+When a module is selected, the remaining subpanes are populated with
+knowledge that is contained in that module.  Similarly, selecting a
+concept in the concept navigation pane populates the relation,
+proposition, and instance panes with knowledge that is relevant to the
+selected concept.  In general, selecting an object in a given
+navigation pane may affect the contents of navigation panes to the
+right and/or below it.  More specifically, the rules for object
+selection are as follows:
+
+@itemize
+@item Selecting a module populates the concept, relation, and instance
+subpanes with knowledge contained in the module.
+
+@item Selecting a concept populates the relation subpane with relations that
+use the concept as a domain type, and populates the instance subpane
+with the concept's extension.  The proposition and rule subpanes are
+populated with propositions and rules associated with the concept.
+
+@item Selecting a relation populates the proposition and rule subpanes with
+propositions and rules associated with the relation.
+
+@item Selecting an instance with no selected relation populates the
+proposition subpane with propositions that refer to the selected
+instance.
+
+@item Selecting an instance and a relation populates the proposition subpane
+with propositions that contain the relation as a predicate, and the
+instance as an argument.
+
+@item De-selecting an object will update the state of the browser
+appropriately.  For example, after selecting a module and a concept,
+deselecting the concept will refresh the concept, relation, instance,
+proposition and rule subpanes to display the knowledge contained in the
+selected module.
+@end itemize
+
+The title pane in each navigation pane displays a description of the
+source of the subpane's contents.  For example, if both the relation
+@code{WINGSPAN} and the instance @code{AGM-130} were selected, the
+proposition subpane would contain the title ``Propositions for WINGSPAN
+and AGM-130''.
+
+Each selection event is recorded in a selection history which can be
+rolled back and forward.  For example, assume the user selects the
+@code{AIRCRAFT-KB} module and then selects the @code{GUIDANCE-TYPE}
+concept.  If the user then selects the @code{Navigate -> Back} menu
+item, the selection history will be rolled back so that only
+@code{AIRCRAFT-KB} is selected.  If the user then selects @code{Navigate
+-> Forward}, the selection history will be rolled forward to its
+original state so that both @code{AIRCRAFT-KB} and @code{GUIDANCE-TYPE}
+are selected.
+
+@strong{Navigation}:
+Knowledge can be explored by expanding and collapsing nodes in
+hierarchical navigation panes such as the concept and module navigation
+panes.  If a tree or list is not fully visible, the user may use the
+scrollbar on the navigation pane's right-hand side to scroll through the
+contents of the pane.  Detailed views of objects such as concepts and
+relations can be obtained by right-clicking the object and selecting the
+@code{Edit} menu item.  To navigate to a constituent of a proposition,
+the user can right-click the constituent and then select the
+@code{Navigate to...} menu item.  For example, right-clicking on the
+@code{GUIDANCE} argument in the proposition @code{(NTH-DOMAIN GUIDANCE 1
+GUIDANCE-TYPE)} presents a popup menu which displays (among other items)
+the item @code{Navigate to GUIDANCE}.  Selecting this menu item will
+cause the browser to display and select the @code{GUIDANCE} relation.
+
+Actions external to the browser may also update the browser's contents.
+For example, clicking on an instance in a list of query results will
+cause the browser to navigate to the selected instance.
+
+@strong{Actions}:
+Right-clicking inside the browser will present a menu of actions that is
+relevant to the subpane that contains the mouse pointer.  The list of
+items will depend on whether the mouse is over a specific item or if it
+is over the background of the subpane's list or tree.  For example, when
+the mouse is over a specific concept, the menu will contain items for
+cutting, pasting, instantiating, etc., but when the mouse is over the
+background of the concept tree, the only menu item presented will be
+to add a new concept.
+
+The set of actions available for each subpane are as follows:
+
+@itemize
+@item @b{Module} - @code{Add Module}, @code{Edit Module},
+@code{Load Module}, @code{Save Module}, @code{Clear Module},
+@code{Copy}.
+
+@item @b{Concept} - @code{Add Concept}, @code{Edit Concept},
+@code{Edit Extension}, @code{Instantiate}, @code{Cut}, @code{Copy},
+@code{Paste}, @code{Delete}. If multiple concepts are selected,
+selecting @code{Create New Concept} from the background menu will create
+a concept that contains the selected concepts as parents.
+
+@item @b{Relation} - @code{Add Relation}, @code{Edit Relation},
+@code{Edit Extension}, @code{Copy}, @code{Delete}, @code{Show
+Inherited/Direct Relations}.
+
+@item @b{Instance} - @code{Add Instance}, @code{Edit Instance},
+@code{Copy}, @code{Delete}, @code{Show Direct/Derived
+Instances}.
+
+@item @b{Propositions} - @code{Add Proposition}, @code{Edit
+Proposition}, @code{Copy}, @code{Delete}, @code{Navigate to
+Constituent}, @code{Edit Constituent}.
+
+@item @b{Rules} - @code{Add Rule}, @code{Edit Rule}, @code{Copy},
+@code{Delete}, @code{Navigate to Constituent}, @code{Edit Constituent}.
+@end itemize
+
+@node Editing, Choosers, Browsing, GUI Features
+@subsection Editing
+Objects may be edited by right-clicking them and selecting the
+@code{Edit...} menu item in the popup menu.  Alternatively, an object
+may be selected, and then the @code{Objects -> Edit Object} menu item
+or the the edit toolbar button can be pressed.  Object editors do
+double-duty as object viewers, since all relevant object information
+is present in each editor.
+
+There are several common user actions that are available in edit
+dialogs.  For example, hitting @kbd{RET} while the cursor is positioned
+in the name field of the editor commits the concept.  Most editors
+have @code{OK} and @code{Cancel} buttons at the bottom  to
+commit or abort edits.  Lists of items commonly have @code{+} and
+@code{--} buttons at the top that allow one to add a new item
+or delete the selected item.  When the @code{+} button is pressed,
+either a chooser dialog (@pxref{Choosers}) or a specialized
+editor will be opened.  Similar to the browser, list items can be
+right-clicked to display a list of possible actions.  For example, a
+superconcept can be clicked in a concept editor to immediately edit the
+concept's parent.
+
+@float Figure,fig:instedit
+@image{../../../sources/powerloom-gui/doc/images/gui-instance-editor,4.5in}
+@caption{Instance Editor}
+@end float
+
+Each type of object has a specialized editor.  For example, an
+instance editor is shown in @ref{fig:instedit}.  There are
+separate editors for modules, concepts, relations, instances, and
+propositions/rules, which are described below.
+
+@strong{Module Editor}: The module editor contains a number of fields
+and components used to enter information relevant for a new or
+existing module.  Examples of values that can be edited are a module's
+name, its documentation and its includes (or supermodules) list.
+
+@strong{Concept Editor}: The concept editor allows editing of concept
+attributes such as a concept's supertypes, its name, its associated
+propositions, etc.  In addition to the inherent attributes of a
+concept, all relations which have the concept as a domain type are
+displayed and may be edited.  Clicking the @code{+} button above the
+relation list opens a new relation editor with default values filled
+in.  Similarly, clicking the @code{+} button above the proposition
+list opens a proposition editor.
+
+@strong{Relation Editor}: The relation editor allows the user to enter
+a list of variables and types for the relation's arguments, and allows
+the setting of various relation attributes, e.g., whether the relation
+is closed, functional, etc.  Similar to the concept editor,
+propositions and rules associated with a relation can be edited.
+
+@strong{Instance Editor}: The instance editor allows the user to input
+an instance's name, documentation, and associated propositions.  If a
+proposition uses the relation @code{image-url}, an image will be
+retrieved from the server and presented in the editor window.
+
+@strong{Proposition editor}: The proposition editor, shown in
+@ref{fig:propedit}, consists of a text field for entering the
+proposition, and a set of buttons for performing actions on the
+proposition.  The buttons allow a user to assert, deny, or retract the
+typed proposition.  There are several text-based facilities which
+support efficient editing of propositions.  First, the editor supports
+many Emacs-style keybindings which facilitate editing of Lisp-like
+expressions, including selecting entire parenthesis-delimited
+subexpressions, jumping backward and forward over subexpressions, and
+navigating up and down expression trees.
+
+@float Figure,fig:propedit
+@image{../../../sources/powerloom-gui/doc/images/gui-proposition-editor,4.5in}
+@caption{Proposition Editor}
+@end float
+
+In addition to Emacs keybindings, the proposition editor has a matching
+parenthesis highlighter.  When the cursor is placed before a left
+parenthesis, the matching right parenthesis is highlighted, and when
+the cursor is placed after a right parenthesis, the matching left
+parenthesis is highlighted.
+
+The proposition editor also supports symbol completion.  The GUI uses
+a predictive backtracking parser to analyze partial input of
+propositions.  Based on the analysis, the parser is able to recommend
+appropriate completions.  For example, if the user types @code{(f} and
+then selects the completion action by typing @kbd{Ctrl-right}, the parser
+will recommend a list of completions including the @code{forall}
+symbol and all concepts and relations that begin with the letter
+@code{f}.
+
+@node Choosers, Extension Editor, Editing, GUI Features
+@subsection Choosers
+In a number of situations, an object of a specific type must be
+selected.  For example, when selecting a superconcept in a concept
+editor, the user should be presented with a list of existing concepts.
+In these cases, a chooser dialog is presented to the user which
+displays a filterable list of candidate objects.  As the user types a
+name of the object in the name text field, the list of objects is
+filtered so that only objects which begin with the typed prefix are
+displayed.  Choosers are available for modules, concept,
+instances, and relations.  A variable chooser allows the user to type
+a variable name and select a type from a concept from a list.
+
+@float Figure,fig:extedit
+@image{../../../sources/powerloom-gui/doc/images/gui-extension-editor,4.5in}
+@caption{Extension Editor}
+@end float
+
+@node Extension Editor, Ask and Retrieve Queries, Choosers, GUI Features
+@subsection Extension Editor
+The extension editor, shown in @ref{fig:extedit}, allows editing of a
+concept or relation's extension.  It can be opened by right-clicking
+on a concept or relation in the browser or by selecting the
+@code{Query -> Edit Extension} menu item.  The extension editor
+presents a relation's extension as a list of tuples in table format.
+The user may add new tuples by typing names of instances at the bottom
+of the table, and may alter existing tuples by double-clicking on a
+table cell and typing in a new value.  Instance name completion is
+available while typing instance names by typing @kbd{Ctrl-right}.
+A user may choose to abort the edited extension by clicking
+the @code{Cancel} button.  If the user clicks the @code{Commit}
+button, the relation's extension will be updated by asserting and
+retracting appropriate propositions.
+
+@node Ask and Retrieve Queries, Search, Extension Editor, GUI Features
+@subsection Ask and Retrieve Queries
+@float Figure,fig:query
+@image{../../../sources/powerloom-gui/doc/images/gui-query-dialog,4in}
+@caption{Query Dialog}
+@end float
+
+The Query dialog, shown in @ref{fig:query}, can be opened by selecting
+the @code{Query -> Query} menu item, by typing @kbd{Ctrl-Q} or by
+pressing the query toolbar button.  The Query dialog consists of a
+text area for typing the query, a results table for displaying the
+results of the query, a query list for saving and selecting pre-saved
+queries, and an options subpane for configuring various query
+parameters.
+
+The query input pane supports features similar to that of the
+proposition editor, including Emacs key bindings, parenthesis matching
+and completion.  Queries can be executed by typing @kbd{Ctrl-RET} or
+by clicking on the @code{Execute} button at the bottom of the dialog.
+After a query has executed, results will be displayed in the results
+table or a ``No results found'' indicator will flash.  The column
+headers for the results will display the corresponding free variables
+in the query.  Results may be sorted by clicking on a column header.
+Doing so will sort the results by using the clicked column as an
+index.  Users may toggle ascending/descending sort order by clicking
+the header multiple times.
+
+If the query contains no free variables, it is effectively a
+true/false @code{ASK} operation as opposed to a @code{RETRIEVE}.  In
+this case, the result will be a truth value, and the column header
+will be labeled @code{TRUTH-VALUE}.  If the query is the result of a
+partial retrieve operation, an additional column containing the match
+score will be displayed.
+
+If the user clicks on a cell in the results table, the topmost browser
+will be updated to display the selected item.  Right-clicking on a
+query result brings up a context menu which currently only contains an
+@code{Explain result} menu item.  Selecting this will present an HTML
+explanation in a separate window.  The displayed explanation may
+contain hyperlinked objects.  Clicking on a hyperlinked object will
+update the topmost browser to display the object.
+
+Users may save frequently-executed queries in a query list by clicking
+the @code{Save} button at the top of the options panel which will
+prompt them for a query name.  Saved queries will be stored
+in the preferences file using an XML representation.  Saved queries are
+stored in the combobox to the left of the save button.  Selection of a
+saved query will prefill the query dialog with the query and all saved
+parameters.
+
+Most important PowerLoom query options are controllable in the options
+dialog, such as number of results to retrieve, inference control
+options such as inference level, timeout, moveout and various others.
+
+@node Search, Console, Ask and Retrieve Queries, GUI Features
+@subsection Search
+Users may search for objects in the KB by entering strings which match
+the name of the object.  A search dialog as shown in @ref{fig:search}
+can be opened by selecting the @code{Query -> Search} menu item, by
+typing @kbd{Ctrl-f}, or by pushing a search toolbar button (marked by
+a flashlight icon) inside the browser.  If the user activates a search
+toolbar button inside a navigation pane, the search dialog will be
+configured to search for objects associated with the type of object
+displayed in that pane.  For example pushing the search button inside
+the concept navigation pane will configure the search dialog to look
+for concept objects only.
+
+Searches may be constrained in several ways.  First, the module may be
+specified or the user may specify that the search should be across all
+modules.  Second, the types of objects to be searched is configurable.
+For example, users may search for concepts and instances, instances
+only, etc.  Finally, users may specify that an object's name must
+match the beginning or end of the search string, or match the search
+string exactly.
+
+@float Figure,fig:search
+@image{../../../sources/powerloom-gui/doc/images/gui-search-dialog,4.5in}
+@caption{Search Dialog}
+@end float
+
+When the user executes the search by hitting @kbd{RET} or selecting
+the @code{OK} button, a list of results is presented.  These results
+are provided in a table format where one column is the name of the
+retrieved object, another column contains the module that the object
+resides in, and the final column specifies the type of the object
+(i.e., concept, instance, etc).  As is the case with query results,
+clicking on a search result item will update the topmost browser to
+display the selected object.
+
+@node Console, Cut/Copy/Paste/Delete, Search, GUI Features
+@subsection Console
+The console window, as shown in @ref{fig:console}, can be opened by
+selecting the @code{KB -> Open PowerLoom Console} menu item or by typing
+@kbd{Ctrl-p}.  This opens an internal window, which allows PowerLoom
+commands to be typed directly and sent to the PowerLoom server.  The
+response generated by PowerLoom is sent back to the GUI and printed
+below the prompt.  This functionality is similar to that of a LISP
+listener.
+
+@float Figure,fig:console
+@image{../../../sources/powerloom-gui/doc/images/gui-console,4.5in}
+@caption{PowerLoom Console}
+@end float
+
+@node Cut/Copy/Paste/Delete,  , Console, GUI Features
+@subsection Cut/Copy/Paste/Delete
+The PowerLoom GUI supports cut, copy, paste, and delete operations.
+These operations can be used to edit text, and in some cases they can
+be used to edit objects in lists or trees.  For example, the concept
+hierarchy can be edited within the browser by selecting a concept,
+executing a cut operation, selecting another concept, and then
+executing paste.  This sequence of operations will delete the concept
+from it's original position in the hierarchy, and make it a subconcept
+of the concept that was selected when the paste operation was
+performed.
+
+The GUI implements a robust data transfer framework that is capable of
+recognizing the types of objects that are being transferred, and the
+types of potential transfer sources and destinations.  This allows the
+application to prohibit nonsensical data transfers such as cutting a
+concept in a concept navigation pane and then trying to paste it into a
+module pane.  It also allows data transfer operations to be context
+sensitive.  For example, cutting a concept in a concept navigation
+pane means that a move operation is being initiated, while cutting a
+concept in a concept editor's superconcept list means
+that the concept should be removed from the list.  Additionally,
+copying an object such as a concept, then executing a paste inside a
+text window will paste the name of the object.
+
+As one would expect, text may be cut, copied and pasted between the
+GUI and outside applications.
+
+
+@node Future Work,  , GUI Features, PowerLoom GUI
+@section Future Work
+There are many areas where further development and improvement is
+needed, including:
+
+@menu
+* Large KBs::                   
+* Undo::                        
+* Drag and Drop::               
+* Scrapbook::                   
+* Instance Cloning::            
+* Security::                    
+* Multiple Users::              
+@end menu
+
+@node Large KBs, Undo, Future Work, Future Work
+@subsection Large KBs
+Currently, when a module is selected, the GUI attempts to retrieve all
+concepts, relations, and instances that are contained in that module.
+For large knowledge bases that might contain millions of objects and
+assertions, this is clearly infeasible.  To handle such situations we
+need to develop more sophisticated retrieval and caching strategies to
+only materialize partial views of a KB in the GUI.  Scrolling down a
+list, for example, might then trigger the retrieval and display of
+additional objects on demand, while older, inactive objects are being
+flushed from the cache.
+
+@node Undo, Drag and Drop, Large KBs, Future Work
+@subsection Undo
+There is currently no undo facility and changes to the KB are written
+through to the server as soon as a user clicks @code{OK} in an editing
+dialog.  To support this properly, we would need a snapshot mechanism
+that would allow rollback to earlier states of the KB.
+
+@node Drag and Drop, Scrapbook, Undo, Future Work
+@subsection Drag and Drop
+Adding a drag and drop capability would make ontology editing easier
+than is currently possible.  For example, one concept could be dragged
+on top of another to move the object from its current position.  We
+believe that the existing data transfer framework could be leveraged
+to implement a robust drag and drop facility.
+
+@node Scrapbook, Instance Cloning, Drag and Drop, Future Work
+@subsection Scrapbook
+In creating and editing ontologies, it is sometimes desirable to
+maintain heterogeneous scraps of information.  We envision a scrapbook
+feature where text and objects of various types could be dragged to
+and organized visually for later use.
+
+@node Instance Cloning, Security, Scrapbook, Future Work
+@subsection Instance Cloning
+It is often useful to create new instances that are similar to
+existing instances.  We would like to implement a cloning facility in
+which a wizard-like series of dialogs would step the user through the
+process of copying information from one object to a new object.  For
+example, the dialogs would prompt the user for propositions to
+transfer from the old instance to the new instance, and allow the user
+to modify the propositions in the process of transferring them.
+
+@node Security, Multiple Users, Instance Cloning, Future Work
+@subsection Security
+There is currently no authentication and access control mechanisms in
+the PowerLoom GUI.  The GUI client assumes that is communicating with
+a trusted host over a secure network.  Similarly, the PowerLoom server
+assumes that it is communicating with a friendly client that has full
+access to the server.  In the future, we need to add security
+mechanisms which allow clients to be authenticated, and resources on
+the server to be made accessible to authorized users only.  In
+addition, we need to implement encryption mechanisms so that clear
+text is not sent over insecure networks, potentially compromising
+sensitive data.
+
+@node Multiple Users,  , Security, Future Work
+@subsection Multiple Users
+Although the client/server model allows multiple GUI clients to
+concurrently share the same server, there is only very weak support
+for synchronizing clients and ensuring that users don't accidentally
+step on each other.  We need to improve our infrastructure to handle
+notification of KB updates, add support for transactions and KB
+locking, and improve our caching mechanisms to detect when the GUI
+state is out of sync with respect to the server.

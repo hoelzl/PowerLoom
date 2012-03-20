@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: query.ste,v 1.190 2010/09/10 02:30:11 hans Exp
+;;; Version: query.ste,v 1.191 2010/12/07 01:26:40 tar Exp
 
 ;;; Incremental backward chaining.
 
@@ -287,6 +287,7 @@ the appropriate truth-value and justification support.")
                      :documentation "If TRUE, then singleton result tuples are
 consified (and printed) as atoms instead of singleton lists.")
    ;; bookkeeping:
+   (debug-id :type STRING :initially "Top")
    (query-context :type CONTEXT)
    (base-control-frame :type CONTROL-FRAME)
    (current-control-frame :type CONTROL-FRAME)
@@ -1322,19 +1323,7 @@ variable bindings appear relative to the frame '*printInFrame*'.")
           (print-variable-bindings frame))
         (let ((truthValue (truth-value frame)))
           (when (defined? truthValue)
-            (print "truth=")
-            (cond ((true-truth-value? truthValue)
-                   (if (default-truth-value? truthValue)
-                       (print "t")
-                     (print "T")))
-                  ((false-truth-value? truthValue)
-                   (if (default-truth-value? truthValue)
-                       (print "f")
-                     (print "F")))
-                  ((unknown-truth-value? truthValue)
-                   (print "U"))
-                  (otherwise
-                   (print "?"))))))))
+            (print "truth=" (truth-value-to-string truthValue TRUE)))))))
     (:UP-FAIL
      (print "| FAIL")
      (case (state frame)
@@ -1351,19 +1340,7 @@ variable bindings appear relative to the frame '*printInFrame*'.")
                  (defined? (partial-match-frame frame)))
          (print ":"))
        (when (defined? truthValue)
-         (print " truth=")
-         (cond ((true-truth-value? truthValue)
-                (if (default-truth-value? truthValue)
-                    (print "t")
-                  (print "T")))
-               ((false-truth-value? truthValue)
-                (if (default-truth-value? truthValue)
-                    (print "f")
-                  (print "F")))
-               ((unknown-truth-value? truthValue)
-                (print "U"))
-               (otherwise
-                (print "?"))))))
+         (print " truth=" (truth-value-to-string truthValue TRUE)))))
     (otherwise (print "????: ")))
   (when (trace-keyword? :STATE-MACHINE)
     (print " state= " (state frame) "  lastMove= " lastMove
@@ -3579,7 +3556,8 @@ result will be in ascending order."
          " TICKS: " (allotted-clock-ticks self)))
       (print-native-stream
        stream
-       " " (proposition self) "]"))))
+       (choose (reverse-polarity? self) " ~" " ")
+       (proposition self) "]"))))
 
 (defun print-goal-stack ((frame CONTROL-FRAME) (verbose? BOOLEAN))
   :documentation "Print stack of goals.  Assumes that query has been interrupted
@@ -3600,9 +3578,11 @@ with a full stack of control frames."
 (defun print-query-iterator
     ((self QUERY-ITERATOR) (stream NATIVE-OUTPUT-STREAM))
   ;; Print all solutions collected in 'self' so far to 'stream'.
+  (when *DEBUG-MODE?*
+    (print-stream stream "[" (debug-id self) "] "))
   (if *printReadably?*
       (print-query-iterator-readably self stream)
-    (print-query-iterator-ornately self stream)))
+      (print-query-iterator-ornately self stream)))
 
 (defun print-query-iterator-ornately
     ((self QUERY-ITERATOR) (stream NATIVE-OUTPUT-STREAM))
@@ -3671,7 +3651,7 @@ with a full stack of control frames."
   (when (trace-keyword? :TRACE-SOLUTIONS)
     (print-stream STANDARD-OUTPUT "SOLUTION ")
     (print-query-iterator-solution-ornately
-     *queryIterator* solution solutionNumber STANDARD-OUTPUT)
+     self solution solutionNumber STANDARD-OUTPUT)
     (print-stream STANDARD-OUTPUT EOL)))
 
 (defun print-query-iterator-readably
@@ -3754,25 +3734,29 @@ with a full stack of control frames."
     (return externalVariables) ))
 
 (defun (create-query-iterator QUERY-ITERATOR) ((description DESCRIPTION)
-                                               (outsideBindings VECTOR))
+                                               (outsideBindings VECTOR)
+                                               (debugId STRING))
   ;; Create a query iterator, a query environment, and a top-level query frame
   ;;    for the query defined by `description'.
   ;; If 'outsideBindings' is non-nil, bind io-variables in 'description'
   ;;    to those arguments.
+  ;; 'debugId' is used to set an ID for indicating which iterator this is.
   (return
     (initialize-query-iterator
-     (allocate-query-iterator) description outsideBindings)))
+     (allocate-query-iterator) description outsideBindings debugId)))
 
 (defun (initialize-query-iterator QUERY-ITERATOR)
     ((queryIterator QUERY-ITERATOR)
      (description DESCRIPTION)
-     (outsideBindings VECTOR))
+     (outsideBindings VECTOR)
+     (debugId STRING))
   ;; Initialize `queryIterator' with a query environment and a top-level query
   ;;    frame for the query defined by `description'.
   ;; Any slots already initialized by `process-query-options' will
   ;;    be left alone and used as appropriate.
   ;; If 'outsideBindings' is non-nil, bind io-variables in 'description'
   ;;    to those arguments.
+  ;; 'debugId' is used to set an ID for indicating which iterator this is.
   (let ((baseControlFrame (new CONTROL-FRAME))
         (externalVariables VARIABLES-VECTOR NULL))
     (special ((*queryIterator* queryIterator)
@@ -3788,6 +3772,7 @@ with a full stack of control frames."
      (setf (base-control-frame queryIterator) baseControlFrame)
      (setf (current-control-frame queryIterator) baseControlFrame)
      (setq *control-frame-id-counter* 0)
+     (setf (debug-id queryIterator) debugId)
      ;; initialize 'baseControlFrame' slots:
      (setf (proposition baseControlFrame) (proposition description))
      (setf (up baseControlFrame) NULL)
@@ -3890,6 +3875,10 @@ with a full stack of control frames."
                              :array-size (length (external-variables self)))
               :truth-value UNKNOWN-TRUTH-VALUE))
         (duplicate QUERY-SOLUTION NULL))
+    ;; We set this here because it may be needed by TRY-TO-DEFEAT-LAST-ANSWER?,
+    ;;   and then we set it again before returning TRUE because the calls to
+    ;;   TRY-TO-DEFEAT-LAST-ANSWER? can alter some of the slots of this iterator
+    ;;   for true/false queries.   (TRY-TO-DEFEAT-LAST-ANSWER? efficiency hack).
     (setf (slot-value self value) solution)
     (when (first-iteration? self)
       (setf (first-iteration? self) FALSE)
@@ -3938,10 +3927,34 @@ with a full stack of control frames."
                     ;;    last result; check for overrides and clashes:
                     (try-to-defeat-last-answer? self))
            (continue))
-         ;; no defeat, restore the original truth value:
-         (setf (truth-value baseFrame) (truth-value solution))
+         (when (test-query-option? *queryIterator* :FOUR-VALUED?)
+           (mv-bind (answer negative-justification)
+                    (try-to-defeat-last-answer? self) ;; Strict defeat
+              (when answer
+                (if (query-is-true-false? self)
+                  (progn
+                    (setf (truth-value solution) INCONSISTENT-TRUTH-VALUE)
+                    (when (record-justifications?)
+                      (setf (justification solution)
+                            (create-clash-justification (proposition baseFrame)
+                                                        (cons-list (justification solution)
+                                                                   negative-justification)
+                                                        :BACKWARD)))
+                    (setf (truth-value baseFrame) INCONSISTENT-TRUTH-VALUE)
+                    (setf (justification baseFrame) (justification solution))
+                    (insert-at (solutions self) (bindings solution) solution)
+                    (setf (exhausted? self) FALSE)
+                    (setf (slot-value self value) solution)
+  ;(cl:break "FOUR-VALUED Conflict")
+                    (return TRUE))
+                  ;; For retrieval, skip inconsistent results
+                  (continue)))
+              ))
          (setf (justification baseFrame) (justification solution))
          (insert-at (solutions self) (bindings solution) solution)
+         (setf (slot-value self value) solution)
+         (setf (exhausted? self) FALSE)
+  ; (cl:break "Regular Return")
          (return TRUE)))
       (cond
        ((timeout? self)
@@ -3970,10 +3983,26 @@ with a full stack of control frames."
         (setf (exhausted? self) TRUE)
         (return FALSE)))) ))
 
-(defun (try-to-defeat-last-answer? BOOLEAN) ((self QUERY-ITERATOR))
+(defun (try-to-defeat-last-answer? BOOLEAN JUSTIFICATION) ((self QUERY-ITERATOR))
   ;; Try to derive the negation of the most recent answer generated by `self'.
   ;; Return TRUE if a negative answer of equal or higher strength could
   ;;    be derived; return FALSE otherwise.
+  ;; If TRUE, then if justifications are being recorded a justification
+  ;;    for the refutation will also be returned.  Otherwise the second
+  ;;    return value will be NULL.
+  ;; BUG:  If this is used in partial match mode for a true/false query,
+  ;;       then something gets messed up in the query iterator that we are
+  ;;       trying to defeat.  There are a couple of options for dealing 
+  ;;       with that:
+  ;;       1. Do not use :four-valued? or default reasoning with partial match
+  ;;       2. Always create a new negatedQuery instead of using the optimization
+  ;;          of reseting self
+  ;;       3. Create a new negatedQuery for partial match mode.
+  ;;       4. Track down exactly what is getting messed up and fix it in the
+  ;;          queryiterator.next? method so it doesn't break.
+  ;;      Current resolution: Use #1.       - tar 11/29/2010
+  ;; BUG: There seems to be some interaction with :inference-level :refutation
+  ;;      as well, also solved with item #2 or #3.  This bug is still present. - tar 11/30/2010
   (let ((negatedQuery
          (choose (query-is-true-false? self)
                  ;; For T/F queries we don't need a separate query:
@@ -3982,7 +4011,8 @@ with a full stack of control frames."
         (queryContext (query-context self))
         (strictPositiveAnswer? FALSE)
         (strictNegativeAnswer? FALSE)
-        (defeated? FALSE))
+        (defeated? FALSE)
+        (negativeJustification JUSTIFICATION NULL))
     (cond 
      ((null? negatedQuery)
       ;; for non T/F queries, allocate second query iterator with variable
@@ -3990,12 +4020,13 @@ with a full stack of control frames."
       (setq negatedQuery
             (create-query-iterator
              (query-description self)
-             (bindings (value self))))
+             (bindings (value self))
+             "negatedQuery"))
       (setf (query-context negatedQuery) queryContext))
      (otherwise
       (when (eql? self (negated-query negatedQuery))
         ;; We have a try-to-defeat loop:
-        (return FALSE))
+        (return FALSE NULL))
       ;; Reset the initial variable bindings to the new solution:
       (setf (initial-bindings negatedQuery) (bindings (value self)))))
     (setf (negated-query self) negatedQuery)
@@ -4014,7 +4045,8 @@ with a full stack of control frames."
       (reset negatedQuery)
       (special ((*dontUseDefaultKnowledge?* TRUE))
         (trace-if :GOAL-TREE "Looking for conflicting strict conclusion:" EOL)
-        (setq strictNegativeAnswer? (next? negatedQuery)))
+        (setq strictNegativeAnswer? (next? negatedQuery))
+        (setq negativeJustification (justification (base-control-frame negatedQuery))))
       ;; Check whether the positive answer was strict:
       (setf (reverse-polarity? (base-control-frame negatedQuery)) FALSE)
       (reset negatedQuery)
@@ -4022,21 +4054,29 @@ with a full stack of control frames."
         (trace-if :GOAL-TREE "Looking for strict conclusion:" EOL)
         (setq strictPositiveAnswer? (next? negatedQuery)))
       (if strictPositiveAnswer?
-        (cond
-         (strictNegativeAnswer?
+        (if strictNegativeAnswer?
           ;; We have a hard contradiction, now what:
           (special ((*queryIterator* negatedQuery))
-           (inform
-            EOL "CONTRADICTION: Discovered strict arguments for" EOL
-            "    " (proposition (base-control-frame negatedQuery))
-            EOL "and its negation." EOL))
-          (setq defeated? TRUE))
-         (otherwise
-          (setq defeated? FALSE)))
+ ;;             (inform EOL "CONTRADICTION: Discovered strict arguments for" EOL
+ ;;                     "    " (proposition (base-control-frame negatedQuery))
+ ;;                     EOL "and its negation." EOL)
+         #|
+             (let ((prop (proposition (base-control-frame negatedQuery)))
+                   (message (message-to-string "Derived both TRUE and FALSE for the proposition "
+                                               prop "." EOL
+                                               "   Clash occurred in the context " *context* 
+                                               " in module " *module* "."))
+                   (exception (new TRUTH-VALUE-CLASH :message message)))
+               (setf (proposition exception) prop)
+               (setf (context exception) *context*)
+               (signal-exception exception))
+                   |#
+             (setq defeated? TRUE))
+          (setq defeated? FALSE))
         (setq defeated? TRUE)))
     ;; Undo the loop-preventing back-link:
     (setf (negated-query negatedQuery) NULL)
-    (return defeated?)))
+    (return defeated? negativeJustification)))
 
 (defmethod reset ((self QUERY-ITERATOR))
   ;; Reset query frames within 'self' so that the query can
@@ -4098,7 +4138,8 @@ with a full stack of control frames."
     (return standardizedTree) ))
 
 (defun (make-query QUERY-ITERATOR) ((ioVariables OBJECT) (queryTree OBJECT) 
-                                    (externalBindings CONS) (options OBJECT))
+                                    (externalBindings CONS) (options OBJECT)
+                                    (debugId STRING))
   ;; Convert 'queryTree' into a query iterator.
   (finalize-objects)
   ;; recheck propositions that failed a type check:
@@ -4131,7 +4172,7 @@ with a full stack of control frames."
     (process-check-types-agenda)
     (when (defined? options)
       (process-query-options query options))
-    (return (initialize-query-iterator query description externalVector))))
+    (return (initialize-query-iterator query description externalVector debugId))))
 
 (defun (parse-query-and-options OBJECT OBJECT PROPERTY-LIST)
     ((query&Options CONS))
@@ -4269,6 +4310,9 @@ with a full stack of control frames."
                  (signal-parsing-error
                   "Illegal :INFERENCE-LEVEL value: " value))))
              (:THREE-VALUED?
+              (setq value (coerce-to-boolean value))
+              (insert-at theOptions key value))
+             (:FOUR-VALUED?
               (setq value (coerce-to-boolean value))
               (insert-at theOptions key value))
              (:ITERATIVE-DEEPENING?
@@ -4449,7 +4493,7 @@ with a full stack of control frames."
          (parse-query-and-options query)
        (if (and (null? ioVariables)
                 (defined? proposition))
-           (return (make-query NIL proposition NIL options))
+           (return (make-query NIL proposition NIL options "Ask"))
          (signal-parsing-error "Illegal ASK query: " query))))
     (otherwise
      (signal-parsing-error "Illegal ASK query: " query))))
@@ -4465,24 +4509,29 @@ queries and logical expressions."
             (*reversePolarity?* FALSE)
             (*inferenceLevel* (current-inference-level))
             (*generate-all-proofs?* FALSE))
-    (let ((truthValue TRUTH-VALUE NULL)
+    (let ((truth-value TRUTH-VALUE NULL)
           (threeValuedAsk?
-           (test-query-option? *queryIterator* :THREE-VALUED?)))
+           (test-query-option? *queryIterator* :THREE-VALUED?))
+          (fourValuedAsk?
+           (test-query-option? *queryIterator* :FOUR-VALUED?)))
       (when (null? *most-recent-query*)
         ;; only the top-level query commands handle nullification and use:
         (setq *most-recent-query* *queryIterator*))
       (next? *queryIterator*)
-      (setq truthValue
+      (setq truth-value
         (first-defined (truth-value (base-control-frame *queryIterator*))
                        UNKNOWN-TRUTH-VALUE))
-      (when (and threeValuedAsk? (unknown-truth-value? truthValue))
+      ;; Four-valued ask is handled for conflicts inside the query-iterator.next?
+      ;; method.  We only need to check here if the main query returns unknown.
+      (when (and (unknown-truth-value? truth-value) 
+                 (or threeValuedAsk? fourValuedAsk?))
         (setf (reverse-polarity? (base-control-frame *queryIterator*)) TRUE)
         (reset *queryIterator*)
         (next? *queryIterator*)
-        (setq truthValue
+        (setq truth-value
           (first-defined (truth-value (base-control-frame *queryIterator*))
                          UNKNOWN-TRUTH-VALUE)))
-      (return truthValue))))
+      (return truth-value))))
 
 (defun (ask TRUTH-VALUE) (&rest (proposition&options PARSE-TREE))
   :public? TRUE :command? TRUE :evaluate-arguments? FALSE
@@ -4539,10 +4588,11 @@ whether it is actually false."
              (make-query (consify (io-variables query))
                          (proposition-to-cons query)
                          NIL
-                         (bquote (:how-many & nofbindings)))))
+                         (bquote (:how-many & nofbindings))
+                         "Obsolete")))
       (CONS
        (setq theQuery
-         (make-query (first query) (second query) NIL (rest (rest query))))))
+         (make-query (first query) (second query) NIL (rest (rest query)) "Obsolete"))))
     (insert-at (options theQuery) :HOW-MANY nofBindings)
     (return (call-retrieve theQuery))))
 
@@ -4572,7 +4622,7 @@ whether it is actually false."
           "Missing IO-variable specification in retrieval query: " query))
         (otherwise
          (return
-           (make-query ioVariables queryProposition NIL options))))))
+           (make-query ioVariables queryProposition NIL options "Retrieve"))))))
     (otherwise
      (signal-parsing-error "Illegal retrieval query: " query))))
 
@@ -4817,7 +4867,8 @@ be reparsed and reoptimized each time they are invoked."
               (make-query (copy-cons-list variables)
                           (copy-cons-tree queryBody)
                           inputBindings
-                          options))
+                          options
+                          "Cached"))
          (LOGIC-EXCEPTION (e)
 	   (print-stream STANDARD-ERROR (exception-message e))
            (return NULL))))
@@ -4952,7 +5003,7 @@ be reparsed and reoptimized each time they are invoked."
         (within-meta-cache
          (setq result
            (call-ask
-            (create-query-iterator super (vector (get-prototype sub))))))
+            (create-query-iterator super (vector (get-prototype sub)) "u-specializes"))))
       (LOGIC-EXCEPTION (e)
         (print-stream STANDARD-ERROR (exception-message e))))
     (trace-if :GOAL-TREE EOL)
@@ -4991,7 +5042,7 @@ be reparsed and reoptimized each time they are invoked."
           ;; Note: current `*queryIterator*' is visible here:
           (inherit-description skolemsVector sub FALSE)
           (setq result
-            (call-ask (create-query-iterator super skolemsVector))))
+            (call-ask (create-query-iterator super skolemsVector "d-specialize"))))
       (LOGIC-EXCEPTION (e)
         (print-stream STANDARD-ERROR (exception-message e))))
     (pop-world)
@@ -5012,7 +5063,7 @@ be reparsed and reoptimized each time they are invoked."
   (exception-case
       (when (forall value in vector
                     always (defined? value))
-        (return (call-ask (create-query-iterator description vector))))
+        (return (call-ask (create-query-iterator description vector "v-specialize"))))
     (LOGIC-EXCEPTION (e)
       (print-stream STANDARD-ERROR (exception-message e))))
   (return UNKNOWN-TRUTH-VALUE))

@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: explanations.ste,v 1.13 2010/09/09 23:04:39 hans Exp
+;;; Version: explanations.ste,v 1.14 2010/12/07 01:20:25 tar Exp
 
 ;;; Support for generating explanations
 
@@ -286,6 +286,17 @@ proposition will be printed on the same line.")
   (define-explanation-phrase :failed :lay
     "could not be proven")
 
+  ;; introductory phrases for "X <is-inconsistent> <because>..."
+  (define-explanation-phrase :inconsistent :technical
+    "is inconsistent")
+  (define-explanation-phrase :inconsistent :lay
+    "has a contradiction")
+
+  (define-explanation-phrase :clash :technical
+    "because it and its negation were inferred")
+  (define-explanation-phrase :clash :lay
+    "because opposite conclusions were reached")
+
   ;; global phrases to annotate missing assertions or rules:
   (define-explanation-phrase :not-asserted :technical
     "is not asserted")
@@ -304,7 +315,7 @@ proposition will be printed on the same line.")
 ;;; inside them.
 
 (defclass EXPLANATION-INFO (STANDARD-OBJECT)
-  :slots ((label :type STRING)
+ :slots ((label :type STRING)
           (depth :type INTEGER)
           (explained? :type BOOLEAN)))
 
@@ -551,10 +562,14 @@ proposition will be printed on the same line.")
     (when (partially-follows? self)
       (pushq modifiers :partial)
       (pushq modifiers+ :partial))
-    (if (failed-goal-justification? self)
-        ;; we have a cutoff (modifiers will be ignored):
-        (setq introduction (lookup-explanation-phrase :failed modifiers NULL))
-      (setq introduction (lookup-explanation-phrase :follows modifiers NULL)))
+    (cond ((failed-goal-justification? self)
+           ;; we have a cutoff (modifiers will be ignored):
+           (setq introduction (lookup-explanation-phrase :failed modifiers NULL)))
+          ((isa? self @CLASH-JUSTIFICATION)
+           ;; A clash was encountered.
+           (setq introduction (lookup-explanation-phrase :inconsistent modifiers NULL)))
+          (otherwise
+           (setq introduction (lookup-explanation-phrase :follows modifiers NULL))))
     (case (inference-rule self)
       (:PRIMITIVE-STRATEGY
        ;; TO DO:  Is there a way to handle the case of assertions from
@@ -1001,6 +1016,26 @@ of 3 in brief explanation mode."
     (EXPLAIN-EXCEPTION (ee)
       (print-stream STANDARD-OUTPUT (exception-message ee)))))
   
+(defun explain-proposition ((prop PROPOSITION) (style KEYWORD) (maxDepth INTEGER) (stream OUTPUT-STREAM))
+  :public? true
+  :documentation "Print an explanation for `prop' if there is one.  This will only happen
+for forward-chained propositions."
+    (exception-case
+      (let ((justifications (forward-justifications prop)))
+        (when (defined? justifications)
+          (special ((*explanation-style* (choose (defined? style) style :BRIEF))
+                    (*most-recent-explanation-mapping* NULL))
+             (foreach justification in justifications
+                      do (setq *most-recent-explanation-mapping* NULL)
+                         (print-explanation justification
+                                            stream
+                                            *most-recent-explanation-mapping*
+                                            maxDepth
+                                            *explanation-audience*)))))
+    (EXPLAIN-EXCEPTION (ee)
+      (print-stream STANDARD-OUTPUT (exception-message ee)))))
+
+
 (defun (get-why-justification JUSTIFICATION) ((label STRING))  
   :public? true
   :documentation "Returns the current WHY justification.  May also throw one of the

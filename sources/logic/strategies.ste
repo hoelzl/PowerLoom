@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: strategies.ste,v 1.82 2010/09/10 22:45:56 hans Exp
+;;; Version: strategies.ste,v 1.83 2010/12/07 01:27:37 tar Exp
 
 ;;; Routines that implement alternate proof strategies for query processing
 
@@ -84,11 +84,7 @@
              (let ((truthValue (truth-value frame))
                    (default? (default-truth-value? truthValue)))
                (print-vertical-bars (1+ (compute-frame-depth frame)))
-               (print "CLSH: truth=")
-               (if (true-truth-value? truthValue)
-                   (if default? (print "t") (print "T"))
-                   (if default? (print "f") (print "F")))
-               (print EOL)))
+               (print "CLSH: truth=" (truth-value-to-string truthValue TRUE) EOL)))
            ;; undo any obsolete state we acquired:
            (unwind-to-choice-point frame)
            (cond
@@ -793,6 +789,7 @@ control stack before executing.")
         (truthValue (truth-value frame))
         (hasDisproof? FALSE))
     (setf (iterator frame) NULL)
+; (print "SHALLOW-DISPROOF: " proposition " TV=" (truth-value proposition) EOL)
     (special ((*reversePolarity?* (not (reverse-polarity? frame))))
       ;; CAREFUL: This might destructively change the iterator and the truth
       ;;   value of the proposition - which is why we reset the iterator below:
@@ -1346,6 +1343,7 @@ control stack before executing.")
         (scanIsaPropositions?
          (or *generate-all-proofs?*
              *reversePolarity?*)))
+; (print "ISA-PROOF:" proposition " TV=" (truth-value proposition) EOL)
     (when-cyc-kludges-enabled
      ;; when we run WhyNot use the faster test, otherwise we could page in
      ;;    tons of stuff:
@@ -1893,12 +1891,12 @@ control stack before executing.")
              where (not (eql? disj subgoalDisjunct))
              do (setq assumption
                   (recursively-fasten-down-propositions
-                   (choose (not negatedTruthValue?)
-                           (inherit-proposition
-                            disj (new ENTITY-MAPPING))
+                   (choose negatedTruthValue?
                            (conjoin-propositions
                             (inherit-as-top-level-proposition
-                             disj (new ENTITY-MAPPING))))
+                             disj (new ENTITY-MAPPING)))
+                           (inherit-proposition
+                            disj (new ENTITY-MAPPING)))
                    FALSE))
                 ;; PROBLEM: THIS PRINTS OUT ONE LINE TOO EARLY:
                 ;; TO DO: ADD INDENTING:
@@ -2137,8 +2135,6 @@ control stack before executing.")
 ;;    UNBOUND IO-VARIABLES???  ANYHOW, THIS SAFETY TEST IS TOO STRONG: -rmm
 ;  (safety 3 (all-arguments-bound? (proposition frame))
 ;          "Bug: 'fail' applied to proposition with unbound arguments.")
-  (when (reverse-polarity? frame)
-    (error ":FAIL not implemented for negative polarity."))
   (case lastMove
     (:DOWN
      ;; prepare to unbind all choices made during eval of :FAIL:
@@ -2146,15 +2142,23 @@ control stack before executing.")
      (setf (inference-cutoff-reason frame) NULL)
      (return :MOVE-DOWN))
     (:UP-TRUE
-     (set-frame-truth-value frame FALSE-TRUTH-VALUE)
-     (unbind-variables-beginning-at 
-      (current-pattern-record *queryIterator*)
-      (choice-point-unbinding-offset frame))
-     (when (defined? (down frame))
-       (pop-frames-up-to (down frame)))
-     (return :FAILURE))
+     ;; Why not :TERMINAL-FAILURE?
+     (let ((result (choose (reverse-polarity? frame) :FINAL-SUCCESS :FAILURE)))
+       (cond ((reverse-polarity? frame)
+              (set-frame-truth-value frame TRUE-TRUTH-VALUE)
+              (when (record-justifications?)
+                (record-negated-FAIL-justification frame lastMove)))
+             (otherwise
+              (set-frame-truth-value frame FALSE-TRUTH-VALUE)))
+       (unbind-variables-beginning-at 
+        (current-pattern-record *queryIterator*)
+        (choice-point-unbinding-offset frame))
+       (when (defined? (down frame))
+         (pop-frames-up-to (down frame)))
+       (return result)))
     (:UP-FAIL
-     (let ((result :FINAL-SUCCESS))
+     ;; Why not :TERMINAL-FAILURE?
+     (let ((result (choose (reverse-polarity? frame) :FAILURE :FINAL-SUCCESS)))
        (cond ((defined? (inference-cutoff-reason frame))
               ;; Somewhere in the proof we experienced a cutoff (timeout or
               ;;    depth violation), therefore, we return UNKNOWN, otherwise,
@@ -2165,6 +2169,11 @@ control stack before executing.")
               ;;       (fail (provable (foo bar) :timeout 2.0))
               (set-frame-truth-value frame UNKNOWN-TRUTH-VALUE)
               (setq result :FAILURE))
+             ((inconsistent-truth-value? (truth-value (result frame)))
+              (set-frame-truth-value frame INCONSISTENT-TRUTH-VALUE)
+              (setq result :TERMINAL-FAILURE))
+             ((reverse-polarity? frame)
+              (set-frame-truth-value frame FALSE-TRUTH-VALUE))
              (otherwise
               (set-frame-truth-value frame TRUE-TRUTH-VALUE)
               (when (record-justifications?)

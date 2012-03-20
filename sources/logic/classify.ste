@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2006      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2011      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: classify.ste,v 1.28 2008/10/24 01:07:46 hans Exp
+;;; Version: classify.ste,v 1.30 2011/04/16 00:29:00 hans Exp
 
 ;;; Routines that classify descriptions and instances
 
@@ -332,7 +332,7 @@ recorded in 'self'."
 ;                      do (mark-unmarked-superrelations markerTable super)))
 ;    (special ((*specialMarkerTable* markerTable))
 ;     (remove-if descriptions
-;                (code :function test-special-marker-table?))))
+;                (the-code :function test-special-marker-table?))))
 ;  (return descriptions) )
 
 (defun (most-specific-collections (CONS OF LOGIC-OBJECT))
@@ -1183,12 +1183,14 @@ by 'module'.  If 'local?', don't classify inherited descriptions.  If
             ;; record that everything is classified:
             (setf (everything-classified? session) TRUE))))))))
 
-(defun classify-relations ((module NAME) (local? BOOLEAN))
-  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
-  :documentation "Classify named relations visible in `module'.
-If `local?', only classify descriptions defined within `module', i.e.,
-don't classify descriptions inherited from ancestor modules.
-If `module' is NULL, classify relations in all modules.
+(defun classify-relations  (&rest (options OBJECT))
+  :documentation
+  "Classify relations visible in the module defined by the :module option (which
+defaults to the current module).  If :module was explicitly specified as NULL,
+classify relations in all modules.  If `:local?' is specified as TRUE only classify
+relations that belong to the specified module but not any modules it inherits.  For
+backwards compatibility, this command also supports the old <module> <local?>
+arguments specified without keywords.
 
 Conceptually, the classifier operates by comparing each concept or relation
 with all other concepts/relations, searching for a proof that a
@@ -1200,36 +1202,63 @@ relatively efficient -- it works hard at limiting the number of concepts
 or relations that need to be checked for possible subsumption
 relationships.
 "
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
   (finalize-objects)
-  (let ((theModule (coerce-to-module module TRUE)))
-    (when (defined? theModule)
-      (when (null? module)
-        (setq theModule NULL))
-      (upclassify-named-descriptions theModule local?))))
+  (let ((optionsList (coerce-&rest-to-cons options))
+        (theOptions
+         (parse-options
+          (choose (keyword? (first optionsList))
+                  optionsList
+                  ;; we have an old-style invocation, construct an argument list:
+                  (cons-list :module (first optionsList) :local? (second optionsList)))
+          (bquote (:module @MODULE
+                   :local? @BOOLEAN))
+          TRUE FALSE))
+        (theModule MODULE (lookup-with-default theOptions :module NULL))
+        (local? BOOLEAN (lookup-with-default theOptions :local? FALSE)))
+    ;; a null module means the current module unless it was explicitly specified:
+    (when (and (null? theModule)
+               (not (member? optionsList :module)))
+      (setq theModule *module*))
+    (upclassify-named-descriptions theModule local?)))
 
-(defun (list-unclassified-relations (CONS OF NAMED-DESCRIPTION))
-    ((module NAME) (local? BOOLEAN))
+(defun (list-unclassified-relations (CONS OF NAMED-DESCRIPTION)) (&rest (options OBJECT))
   :documentation
-  "Collect all named description in `module' (or in any module if `module'
-is NULL) that were not (or will not be) classified due to their lack of
-non-inferable/primitive ancestor relations."
+  "Collect all named description in the module defined by the :module option (which defaults
+to the current module) that were not (or will not be) classified due to their lack of
+non-inferable/primitive ancestor relations.  If :module was explicitly specified as NULL,
+look in all currently defined modules.  If `:local?' is specified as TRUE only look
+in the specified module but not any modules it inherits.  For backwards compatibility,
+this command also supports the old <module> <local?> arguments specified without keywords."
   :public? TRUE :command? TRUE :evaluate-arguments? FALSE
   (when (not *classify-from-non-inferable-parents-only?*)
     (return NIL))
   (finalize-objects)
-  (let ((theModule (coerce-to-module module TRUE))
+  (let ((optionsList (coerce-&rest-to-cons options))
+        (theOptions
+         (parse-options
+          (choose (keyword? (first optionsList))
+                  optionsList
+                  ;; we have an old-style invocation, construct an argument list:
+                  (cons-list :module (first optionsList) :local? (second optionsList)))
+          (bquote (:module @MODULE
+                   :local? @BOOLEAN))
+          TRUE FALSE))
+        (theModule MODULE (lookup-with-default theOptions :module NULL))
+        (local? BOOLEAN (lookup-with-default theOptions :local? FALSE))
         (unclassified NIL))
-    (when (defined? theModule)
-      (when (null? module)
-        (setq theModule NULL))
-      (within-classification-session :DESCRIPTION
-        (within-module (choose (null? theModule) *module* theModule)
-          (foreach d in (all-named-descriptions theModule local?)
-              where (and (inferable? d)
-                         (not (exists super in (all-ancestor-collections
-                                                d :DESCRIPTION)
-                                  where (non-inferable? super))))
-              collect d into unclassified))))
+    ;; a null module means the current module unless it was explicitly specified:
+    (when (and (null? theModule)
+               (not (member? optionsList :module)))
+      (setq theModule *module*))
+    (within-classification-session :DESCRIPTION
+      (within-module (choose (null? theModule) *module* theModule)
+        (foreach d in (all-named-descriptions theModule local?)
+            where (and (inferable? d)
+                       (not (exists super in (all-ancestor-collections
+                                              d :DESCRIPTION)
+                                where (non-inferable? super))))
+            collect d into unclassified)))
     (return unclassified)))
 
 (defun upclassify-instances ((module MODULE) (local? BOOLEAN))
@@ -1250,53 +1279,81 @@ by 'module'.  If 'local?', don't classify inherited descriptions.  If
             do (foreach i in (all-instances m TRUE)
                    do (upclassify-one-instance i))))))))
 
-(defun classify-instances ((module NAME) (local? BOOLEAN))
-  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
-  :documentation "Classify instances visible in `module'.
-If `local?', only classify instances that belong to `module',
-i.e., don't classify instances inherited from ancestor modules.
-If `module' is NULL, classify instances in all modules.
-
-Conceptually, the classifier operates by comparing each instance
-with all concepts in the hierarchy, searching for a
-proof for each pairing indicating that the instance belongs to the concept.
-Whenever a new `is-a' relation is discovered, the classifier
-adds an `is-a' link between the instance and the concept, thereby
-recording an additional fact about the instance.  The implemented
-classification algorithm is relatively efficient -- it works hard
-at limiting the number of concepts or relations that need to
-be checked for possible is-a relationships.
-"
-  (finalize-objects)
-  (let ((theModule (coerce-to-module module TRUE)))
-    (when (defined? theModule)
-      (when (null? module)
-        (setq theModule NULL))
-      (upclassify-instances theModule local?))))
-
-(defun (list-unclassified-instances (CONS OF LOGIC-OBJECT))
-    ((module NAME) (local? BOOLEAN))
+(defun classify-instances (&rest (options OBJECT))
   :documentation
-  "Collect all instances in `module' (or in any module if `module'
-is NULL) that were not (or will not be) classified due to their lack of
-non-inferable/primitive type assertions."
+  "Classify instances visible in the module defined by the :module option (which
+defaults to the current module).  If :module was explicitly specified as NULL,
+classify instances in all modules.  If `:local?' is specified as TRUE only classify
+instances that belong to the specified module but not any modules it inherits.  For
+backwards compatibility, this command also supports the old <module> <local?>
+arguments specified without keywords.
+
+Conceptually, the classifier operates by comparing each instance with all
+concepts in the hierarchy, searching for a proof for each pairing indicating
+that the instance belongs to the concept.  Whenever a new `is-a' relation is
+discovered, the classifier adds an `is-a' link between the instance and the
+concept, thereby recording an additional fact about the instance.  The
+implemented classification algorithm is relatively efficient -- it works hard at
+limiting the number of concepts or relations that need to be checked for
+possible is-a relationships.
+"
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (finalize-objects)
+  (let ((optionsList (coerce-&rest-to-cons options))
+        (theOptions
+         (parse-options
+          (choose (keyword? (first optionsList))
+                  optionsList
+                  ;; we have an old-style invocation, construct an argument list:
+                  (cons-list :module (first optionsList) :local? (second optionsList)))
+          (bquote (:module @MODULE
+                   :local? @BOOLEAN))
+          TRUE FALSE))
+        (theModule MODULE (lookup-with-default theOptions :module NULL))
+        (local? BOOLEAN (lookup-with-default theOptions :local? FALSE)))
+    ;; a null module means the current module unless it was explicitly specified:
+    (when (and (null? theModule)
+               (not (member? optionsList :module)))
+      (setq theModule *module*))
+    (upclassify-instances theModule local?)))
+
+(defun (list-unclassified-instances (CONS OF LOGIC-OBJECT)) (&rest (options OBJECT))
+  :documentation
+  "Collect all instances in the module defined by the :module option (which defaults
+to the current module) that were not (or will not be) classified due to their lack of
+non-inferable/primitive type assertions.  If :module was explicitly specified as NULL,
+look in all currently defined modules.  If `:local?' is specified as TRUE only look
+in the specified module but not any modules it inherits.  For backwards compatibility,
+this command also supports the old <module> <local?> arguments specified without keywords."
   :public? TRUE :command? TRUE :evaluate-arguments? FALSE
   (when (not *classify-from-non-inferable-parents-only?*)
     (return NIL))
   (finalize-objects)
-  (let ((theModule (coerce-to-module module TRUE))
+  (let ((optionsList (coerce-&rest-to-cons options))
+        (theOptions
+         (parse-options
+          (choose (keyword? (first optionsList))
+                  optionsList
+                  ;; we have an old-style invocation, construct an argument list:
+                  (cons-list :module (first optionsList) :local? (second optionsList)))
+          (bquote (:module @MODULE
+                   :local? @BOOLEAN))
+          TRUE FALSE))
+        (theModule MODULE (lookup-with-default theOptions :module NULL))
+        (local? BOOLEAN (lookup-with-default theOptions :local? FALSE))
         (unclassified NIL))
-    (when (defined? theModule)
-      (when (null? module)
-        (setq theModule NULL))
-      (within-classification-session :INSTANCE
-        (within-module (choose (null? theModule) *module* theModule)
-          (foreach i in (all-instances theModule local?)
-              where (and (not (function-output-skolem? i) )
-                         (not (exists type in (all-ancestor-collections
-                                               i :INSTANCE)
-                                  where (non-inferable? type))))
-              collect i into unclassified))))
+    ;; a null module means the current module unless it was explicitly specified:
+    (when (and (null? theModule)
+               (not (member? optionsList :module)))
+      (setq theModule *module*))
+    (within-classification-session :INSTANCE
+      (within-module (choose (null? theModule) *module* theModule)
+        (foreach i in (all-instances theModule local?)
+            where (and (not (function-output-skolem? i) )
+                       (not (exists type in (all-ancestor-collections
+                                             i :INSTANCE)
+                                where (non-inferable? type))))
+            collect i into unclassified)))
     (return unclassified)))
 
 ;; OOPS: THIS MAY NOT BE COMPATIBLE WITH THE NEW CACHING SCHEME:

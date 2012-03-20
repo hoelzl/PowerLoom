@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: arithmetic.ste,v 1.45 2010/09/09 22:53:29 hans Exp
+;;; Version: arithmetic.ste,v 1.47 2011/04/15 20:58:31 hans Exp
 
 ;;; Evaluators perform computations (e.g., '+', '>') during constraint
 ;;;    propagation, and may side-effect, causing additional propagations.
@@ -292,7 +292,7 @@
              (setq proposition
                (some p in (unfiltered-dependent-propositions self @INTERVAL-CACHE-OF)
                    where (eql? (relationRef p) @INTERVAL-CACHE-OF)))
-             (equate-values (value-of (last-argument proposition)) copyCache)
+             (equate-values proposition (value-of (last-argument proposition)) copyCache)
              (return copyCache)))
           (otherwise
            (return (create-interval-cache self))))))
@@ -302,7 +302,15 @@
   ;; Print an indication of the type of clash.
   ;; TO DO: FIGURE OUT HOW TO SUPPRESS PRINTING.
   (mark-as-incoherent (interval-member interval))
-  (signal CLASH  "Clash in interval values " interval EOL) )
+  (let ((message (message-to-string "Clash in interval values " interval EOL))
+	(clash (new INTERVAL-CLASH :message message)))
+    (setf (context clash) *context*)
+    (setf (/logic/interval-member clash) (interval-member interval))
+    (setf (/logic/lower-bound clash) (lower-bound interval))
+    (setf (/logic/upper-bound clash) (upper-bound interval))
+    (setf (/logic/strict-lower-bound? clash) (strict-lower-bound? interval))
+    (setf (/logic/strict-upper-bound? clash) (strict-upper-bound? interval))
+    (signal-exception clash)))
 
 (defun evaluate-adjacent-inequalities ((self LOGIC-OBJECT))
   ;; The interval bounds on 'self' have become tigher.
@@ -368,7 +376,7 @@
     (when (and (defined? lb) 
                (defined? ub)
                (eql? lb ub))
-      (equate-values (interval-member interval) lb))))
+      (equate-values NULL (interval-member interval) lb))))
 
 
 (defmethod evaluate-tighter-interval ((interval INTERVAL-CACHE))
@@ -384,7 +392,7 @@
       (if (or (strict-lower-bound? interval)
               (strict-upper-bound? interval))
         (signal-interval-clash interval)
-        (equate-values (interval-member interval) (lower-bound interval)))
+        (equate-values NULL (interval-member interval) (lower-bound interval)))
       (exception-case 
         (progn
           (when (compare-interval-bounds? @> (lower-bound interval)
@@ -393,6 +401,7 @@
           (when (integer-valued-member? interval)
             (evaluate-tighter-integer-interval interval)))
        (INCOMPATIBLE-QUANTITY-EXCEPTION ()
+          ;; Should this signal something else instead?  Like a plain clash?
           (signal-interval-clash interval)))))
   (evaluate-adjacent-inequalities (interval-member interval)))
    
@@ -826,7 +835,14 @@
          (get-interval-cache value2) value1
          (inverse-inequality-operator operator))
         ;; both arguments are bound:
-        (evaluate-PREDICATE-proposition self))) ))
+        (cond ((compare-interval-bounds? operator value1 value2)
+               (assign-truth-value self TRUE))
+              ((true? self)
+               (signal-truth-value-clash self))
+              (otherwise
+               ;; TO DO: in light of the `true?' test at the beginning of this function,
+               ;; we'll never get here, but we should probably generalize this appropriately:
+               (assign-truth-value self FALSE)))))))
 
 
 #|

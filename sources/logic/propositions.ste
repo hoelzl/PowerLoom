@@ -1,4 +1,4 @@
-;;; -*- Mode: Lisp; Package: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
+;;; -*- Mode: Lisp; Parekage: STELLA; Syntax: COMMON-LISP; Base: 10 -*-
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;; BEGIN LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;                                                                            ;
@@ -20,7 +20,7 @@
 ; UNIVERSITY OF SOUTHERN CALIFORNIA, INFORMATION SCIENCES INSTITUTE          ;
 ; 4676 Admiralty Way, Marina Del Rey, California 90292, U.S.A.               ;
 ;                                                                            ;
-; Portions created by the Initial Developer are Copyright (C) 1997-2010      ;
+; Portions created by the Initial Developer are Copyright (C) 1997-2011      ;
 ; the Initial Developer. All Rights Reserved.                                ;
 ;                                                                            ;
 ; Contributor(s):                                                            ;
@@ -40,7 +40,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END LICENSE BLOCK ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;;; Version: propositions.ste,v 1.206 2010/09/11 02:23:21 hans Exp
+;;; Version: propositions.ste,v 1.208 2011/04/16 00:23:25 hans Exp
 
 ;;; Parsing and constructing propositions.
 
@@ -812,7 +812,8 @@ the overhead of the context mechanism." )
                          (world-state? *context*))
                     (deassign-truth-value p :RETRACT-TRUE))
                    (otherwise
-                    (equate-values (value-of (last-argument p))
+                    (equate-values proposition
+                                   (value-of (last-argument p))
                                    (value-of (last arguments)))))))))
 
 (defun run-update-equivalence-proposition-demon 
@@ -1150,6 +1151,25 @@ the overhead of the context mechanism." )
     (update-property instance PL-KERNEL/@HIDDEN-RELATION :RETRACT-TRUE)
     (return *context*) ))
 
+(defun (list-inconsistent-propositions (CONS OF PROPOSITION)) (&rest (options OBJECT))
+  :documentation
+  "Return a list of all currently known inconsistent proposition in the module defined
+by the :module option (which defaults to the current module).  If `:local?' is specified
+as TRUE only look in the specified module but not any modules it inherits.  Note, that
+this simply reports propositions that have been assigned an inconsistent truth value so
+far (e.g., in clash exceptions), it will not try to detect any new or all inconsistencies
+in a module."
+  :public? TRUE :command? TRUE :evaluate-arguments? FALSE
+  (let ((theOptions
+         (parse-options
+          (coerce-&rest-to-cons options)
+          (bquote (:module @MODULE
+                   :local? @BOOLEAN))
+          TRUE FALSE))
+        (theModule MODULE (lookup-with-default theOptions :module *module*))
+        (local? BOOLEAN (lookup-with-default theOptions :local? FALSE)))
+    (return (consify (all-inconsistent-propositions theModule local?)))))
+
 
   ;;
 ;;;;;; Slot demons
@@ -1170,7 +1190,7 @@ the overhead of the context mechanism." )
       (let ((slot (native-relation (get-description (relationRef proposition))))
             (nativeFirstArgValue (value-of (first (arguments proposition)))))
         (if (defined? newValue)
-          (assign-native-slot-value nativeFirstArgValue slot newValue)
+          (assign-native-slot-value proposition nativeFirstArgValue slot newValue)
           (drop-native-slot-value nativeFirstArgValue slot oldValue))))
     (when (not (eql? oldValue newValue))
       ;; Bump memoization time stamps similar to `react-to-kb-update':
@@ -1220,7 +1240,7 @@ the overhead of the context mechanism." )
       (:ASSERT-TRUE
        (when *clippingEnabled?*
          (clear-native-slot-value object slot))
-       (assign-native-slot-value object slot value))
+       (assign-native-slot-value proposition object slot value))
       (:RETRACT-TRUE
        (drop-native-slot-value object slot value))
       (otherwise
@@ -1228,7 +1248,7 @@ the overhead of the context mechanism." )
               "   Proposition:  " proposition EOL)))
     (return NIL) ))
 
-(defun assign-native-slot-value ((self THING) (slot STORAGE-SLOT) (value OBJECT))
+(defun assign-native-slot-value ((prop PROPOSITION) (self THING) (slot STORAGE-SLOT) (value OBJECT))
   ;; Assign the value 'value' for the slot 'slot' on 'self'.
   (when (skolem? value)
     (return))
@@ -1237,7 +1257,7 @@ the overhead of the context mechanism." )
       (return))
     ;; 'oldValue' /= 'value':
     (when (defined? oldValue)           ; check for pre-existing value
-      (signal-unification-clash oldValue value))
+      (signal-unification-clash prop oldValue value))
     ;; assign 'value' to non-logical slot representation:
     (put-slot-value self slot value)))
 
@@ -1753,6 +1773,7 @@ considering default assertions)."
   :public? TRUE
   (cond
    ;; Note: we treat `INCONSISTENT-TRUTH-VALUE' just like FALSE:
+    ;; Perhaps this should return INCONSISTENT if both are inconsistent.
    ((or (eql? tv1 TRUE-TRUTH-VALUE)
         (eql? tv2 TRUE-TRUTH-VALUE))
     (return TRUE-TRUTH-VALUE))
@@ -1788,6 +1809,89 @@ considering default assertions)."
     ;;; Allow UNKNOWN, similar to other truth-value combinators:
     ;(warn "Don't know how to invert truth value: " self EOL)
     (return UNKNOWN-TRUTH-VALUE))) )
+
+(defun (stronger-truth-value? BOOLEAN) ((tv1 TRUTH-VALUE) (tv2 TRUTH-VALUE))
+  :documentation "Compare the two truth values and return `true' if `tv1' is strictly
+stronger than `tv2'.  Stronger uses the following partial order:
+  INCONSISTENT > STRICT > DEFAULT > UNKNOWN.
+Truth values at the same level are equal in strength."
+  :public? TRUE
+  (cond ((eql? tv1 tv2)
+         (return FALSE))
+        ;; Now we know the truth values are different, so we pick which
+        ;; one will win.
+        ;; First any inconsistent is stronger than not inconsistent.
+        ((inconsistent-truth-value? tv1)
+         (return (not (inconsistent-truth-value? tv2))))
+        ((inconsistent-truth-value? tv2)
+         (return FALSE))
+        ;; Second have strict override default.
+        ((strict-truth-value? tv1)
+         (return (not (strict-truth-value? tv2))))
+        ((strict-truth-value? tv2)
+         (return FALSE))
+        ;; Third have default override unknown.
+        ((default-truth-value? tv1)
+         (return (not (default-truth-value? tv2))))
+        ((default-truth-value? tv2)
+         (return FALSE))
+        ;; Fourth if we get here both are unknown.
+        ((and (unknown-truth-value? tv1) (unknown-truth-value? tv2))
+         (return FALSE))
+        ;; If we get here, then we have a conflict, either among default
+        ;; or among strict values.  If both are default, then we go with
+        ;; unknown, otherwise if strict, we have an inconsistency.
+        (otherwise
+         (signal LOGIC-EXCEPTION "Internal Error: STRONGER-TRUTH-VALUE?: Shouldn't get here. tv1=" tv1 
+                 " tv2=" tv2))))
+
+
+(defun (merge-truth-values TRUTH-VALUE) ((tv1 TRUTH-VALUE) (tv2 TRUTH-VALUE))
+  :documentation "Merge two truth values that are describing the \"same\" logical
+proposition.  This handles subordination of default to strict values, 
+known over unknown and potential inconsistent values.
+
+In particular, this can be used to check for negated values by asking for
+the truth of a proposition and its negation, inverting the negation and then
+using merge to come up with an answer."
+  :public? TRUE
+  (cond ((eql? tv1 tv2)
+         (return tv1))
+        ;; Now we know the truth values are different, so we pick which
+        ;; one will win.
+        ;; First any inconsistent result wins.
+        ((or (inconsistent-truth-value? tv1) (inconsistent-truth-value? tv2))
+         (return INCONSISTENT-TRUTH-VALUE))
+        ;; Second have strict override default.
+        ((and (strict-truth-value? tv1) (default-truth-value? tv2))
+         (return tv1))
+        ((and (default-truth-value? tv1) (strict-truth-value? tv2))
+         (return tv2))
+        ;; Third have known override unknown.
+        ((and (known-truth-value? tv1) (unknown-truth-value? tv2))
+         (return tv1))
+        ((and (unknown-truth-value? tv1) (known-truth-value? tv2))
+         (return tv2))
+        ;; If we get here, then we have a conflict, either among default
+        ;; or among strict values.  If both are default, then we go with
+        ;; unknown, otherwise if strict, we have an inconsistency.
+        ((and (default-truth-value? tv1) (default-truth-value? tv2))
+         (return UNKNOWN-TRUTH-VALUE))
+        ((and (strict-truth-value? tv1) (strict-truth-value? tv2))
+         (return INCONSISTENT-TRUTH-VALUE))
+        (otherwise
+         (signal LOGIC-EXCEPTION "Internal Error: MERGE-TRUTH-VALUES: Shouldn't get here. tv1=" tv1 
+                 " tv2=" tv2))))
+
+#|
+;; Test merge truth-values:
+(let ((tvs (LIST OF TRUTH-VALUE) (list TRUE-TRUTH-VALUE FALSE-TRUTH-VALUE DEFAULT-TRUE-TRUTH-VALUE
+                                       DEFAULT-FALSE-TRUTH-VALUE UNKNOWN-TRUTH-VALUE INCONSISTENT-TRUTH-VALUE)))
+  (foreach i in tvs
+      do (foreach j in tvs
+             do (print i "  &  " j "  =>  " (merge-truth-values i j) EOL))))
+
+|#
 
 (defun (weaken-truth-value TRUTH-VALUE) ((tv1 TRUTH-VALUE) (tv2 TRUTH-VALUE))
   :documentation
@@ -1857,78 +1961,145 @@ either TRUE or FALSE, but not UNKNOWN, INCONSISTENT, etc."
   :public? TRUE :globally-inline? TRUE
   (return (eql? self INCONSISTENT-TRUTH-VALUE)))
 
-(defun print-truth-value ((self TRUTH-VALUE) (stream OUTPUT-STREAM))
-  ;; Print `self' onto `stream'.
+(defun (truth-value-to-string STRING) ((self TRUTH-VALUE) (abbreviate? BOOLEAN))
+  ;; Return a string value for `truth-value', using a single character
+  ;; abbreviation if `abbreviate?' is `true'.  Return `null' if this is
+  ;; not a recognized truth-value.  (That shouldn't happen, though).
   (cond
    ((eql? self TRUE-TRUTH-VALUE)
-    (print-stream stream "TRUE"))
+    (return (choose abbreviate? "T" "TRUE")))
    ((eql? self FALSE-TRUTH-VALUE)
-    (print-stream stream "FALSE"))
+    (return (choose abbreviate?  "F" "FALSE")))
    ((eql? self DEFAULT-TRUE-TRUTH-VALUE)
-    (print-stream stream "DEFAULT-TRUE"))
+    (return (choose abbreviate?  "t" "DEFAULT-TRUE")))
    ((eql? self DEFAULT-FALSE-TRUTH-VALUE)
-    (print-stream stream "DEFAULT-FALSE"))
+    (return (choose abbreviate?  "f" "DEFAULT-FALSE")))
    ((eql? self UNKNOWN-TRUTH-VALUE)
-    (print-stream stream "UNKNOWN"))
+    (return (choose abbreviate?  "U" "UNKNOWN"))) ; Or maybe "?"
    ((eql? self INCONSISTENT-TRUTH-VALUE)
-    (print-stream stream "INCONSISTENT"))
+    (return (choose abbreviate?  "#" "INCONSISTENT")))
    (otherwise
-    (print-stream stream "|i|" (primary-type self)))))
+    (return NULL))))
+
+(defun print-truth-value ((self TRUTH-VALUE) (stream OUTPUT-STREAM))
+  ;; Print `self' onto `stream'.
+  (let ((tv-string (truth-value-to-string self FALSE)))
+    (if (null? tv-string)
+      (print-stream stream "|i|" (primary-type self))
+      (print-stream stream tv-string))))
 
 
   ;;
 ;;;;;; Skolem unification
   ;;
 
-(defun signal-unification-clash ((term1 OBJECT) (term2 OBJECT))
+(defun signal-unification-clash ((prop PROPOSITION) (term1 OBJECT) (term2 OBJECT))
   ;; Signal a clash, and jump out of the current context.
   ;; TO DO: UPGRADE SIMILAR TO `signal-truth-value-clash' TO MARK
   ;;    (ONE OF) THE CULPRITS AS INCONSISTENT.  REQUIRES THAT THE
   ;;    RESPONSIBLE PROPOSITION IS SUPPLIED AS AN ARGUMENT.
-  (if (and (defined? term1)
-	   (defined? term2))
-    (signal CLASH term1 " clashes with " term2)
-    (signal CLASH "Unification clash.")) )
+  (let ((message "Unification clash.")
+        (clash-object UNIFICATION-CLASH NULL))
+    (if (defined? prop) 
+      (assign-truth-value prop INCONSISTENT-TRUTH-VALUE)
+      (warn "Internal: SIGNAL-UNIFICATION-CLASH doesn't have responsible proposition available."))
+    (when (record-justifications?)
+      
+      (warn "SIGNAL-UNIFICATION-CLASH doesn't yet have justification support")
+      )
+    (when (and (defined? term1) (defined? term2))
+      (setq message (message-to-string term1 " clashes with " term2)))
+    (setq clash-object (new UNIFICATION-CLASH :message message))
+    (setf (proposition clash-object) prop)
+    (setf (context clash-object) *context*)
+    (setf (value1 clash-object) term1)
+    (setf (value2 clash-object) term2)
+    (signal-exception clash-object)))
 
 ;; Not called anywhere:
 (defun signal-variable-value-clash 
-       ((skolem SKOLEM) (value1 OBJECT) (value2 OBJECT))
+       ((prop PROPOSITION) (skolem SKOLEM) (value1 OBJECT) (value2 OBJECT))
   ;; Signal a clash between values equated with 'skolem' and jump
   ;;    out of the current context.
-  ;; TO DO: FIGURE OUT HOW TO ASSERT THE CLASHING PROPOSITION.
-  (if (and (defined? value1)
-             (defined? value2))
-    (signal CLASH
-	    "Skolem " skolem " is equated with multiple values:" EOL
-	    "   " value1 " and " value2 ".")
-    (signal CLASH "Variable value clash.")) )
+  (assign-truth-value prop INCONSISTENT-TRUTH-VALUE)
+  (let ((message "Variable value clash.")
+	(exception VARIABLE-VALUE-CLASH NULL))
+    (when (and (defined? value1) (defined? value2))
+	(setq message
+	      (message-to-string "Skolem " skolem " is equated with multiple values:" EOL
+				 "   " value1 " and " value2 ".")))
+
+    (setq exception (new VARIABLE-VALUE-CLASH :message message))
+    (setf (proposition exception) prop)
+    (setf (context exception) *context*)
+    (setf (skolem exception) skolem)
+    (setf (value1 exception) value1)
+    (setf (value2 exception) value2)
+    (signal-exception exception)))
 
 (defun signal-truth-value-clash ((proposition PROPOSITION))
   ;; Mark `proposition' as inconsistent and signal a clash.
   (unless (or (eql? proposition TRUE-PROPOSITION)
               (eql? proposition FALSE-PROPOSITION))
     ;; avoid modifying global proposition constants:
-    (assign-truth-value proposition INCONSISTENT-TRUTH-VALUE))
-  (cond
-   ((eql? *context* (meta-inference-cache *module*))
-    (signal CLASH
-	    "Derived both TRUE and FALSE for the proposition " proposition "." EOL
-	    "   Clash occurred in the meta inference cache for module "
-            *module* "."))
-   ((eql? *context* (truth-maintained-inference-cache *module*))
-    (signal CLASH
-	    "Derived both TRUE and FALSE for the proposition " proposition "." EOL
-	    "   Clash occurred in the default inference cache for module "
-            *module* "."))
-   ((eql? *context* *module*)
-    (signal CLASH
-	    "Derived both TRUE and FALSE for the proposition " proposition "." EOL
-	    "   Clash occurred in module " *module* "."))
-   (otherwise
-    (signal CLASH
-	    "Derived both TRUE and FALSE for the proposition " proposition "." EOL
-	    "   Clash occurred in the world " *context* 
-            " in module " *module* "."))) )
+    (assign-truth-value proposition INCONSISTENT-TRUTH-VALUE)
+    (when (record-justifications?)
+      (let ((negated-proposition (fasten-down-one-proposition
+				  (safely-invert-proposition proposition)
+				  TRUE))
+	    (antecedents (CONS OF JUSTIFICATION) NIL))
+	(if (and (defined? (forward-justifications negated-proposition))
+		 (not (empty? (forward-justifications negated-proposition))))
+	    (setq antecedents (the-cons-list (forward-justifications negated-proposition)))
+	    ;; Assume asserted.
+	    (pushq antecedents (new PRIMITIVE-STRATEGY 
+				    :proposition negated-proposition
+				    :strategy :LOOKUP-ASSERTIONS)))
+	(if (and (defined? (forward-justifications proposition))
+		 (not (empty? (forward-justifications proposition))))
+	    (setq antecedents (append (the-cons-list (forward-justifications proposition)) antecedents))
+	    (pushq antecedents (new PRIMITIVE-STRATEGY 
+				    :proposition proposition
+				    :strategy :LOOKUP-ASSERTIONS)))
+	(add-forward-justifications 
+	 proposition
+	 (create-clash-justification proposition antecedents :forward))
+        ;; TODO: Figure out if we really want to put the explanation on both
+        ;;       propositions, or if instead we want to drop the negated form
+        ;;       from what will be returned. ?? -tar
+        (add-forward-justifications
+         negated-proposition
+         (create-clash-justification negated-proposition (reverse (copy-cons-list antecedents)) :forward)))))
+  (let ((message STRING NULL)
+	(exception-context CONTEXT *context*)
+	(exception TRUTH-VALUE-CLASH NULL))
+    (cond
+      ((eql? *context* (meta-inference-cache *module*))
+       (setq message
+	     (message-to-string "Derived both TRUE and FALSE for the proposition "
+				proposition "." EOL
+				"   Clash occurred in the meta inference cache for module "
+				*module* ".")))
+      ((eql? *context* (truth-maintained-inference-cache *module*))
+       (setq message
+	     (message-to-string "Derived both TRUE and FALSE for the proposition "
+				proposition "." EOL
+				"   Clash occurred in the default inference cache for module "
+				*module* ".")))
+      ((eql? *context* *module*)
+       (setq message
+	     (message-to-string "Derived both TRUE and FALSE for the proposition "
+				proposition "." EOL "   Clash occurred in module " *module* ".")))
+      (otherwise
+       (setq message
+	     (message-to-string "Derived both TRUE and FALSE for the proposition "
+				proposition "." EOL
+				"   Clash occurred in the world " *context* 
+				" in module " *module* "."))))
+    (setq exception (new TRUTH-VALUE-CLASH :message message))
+    (setf (proposition exception) proposition)
+    (setf (context exception) exception-context)
+    (signal-exception exception)))
 
 (defun (logical-type TYPE) ((self OBJECT))
   ;; Return the base type for 'self'.
@@ -1993,7 +2164,8 @@ without signalling an error if none exists.")
           "INTERNAL ERROR: Must have forgotten to unwrap a wrapper type")
   (return (class-type self)) )
 
-(defun unify-types ((term1 SKOLEM) (term2 OBJECT))
+;; Not called anywhere
+(defun unify-types ((prop PROPOSITION) (term1 SKOLEM) (term2 OBJECT))
   ;; Unification of the types of 'term1' and 'term2'.
   ;; Check for clash, and infer type of typeless skolem.
   ;; Also signal a clash if '(not-bottom? term1)' and '(bottom term2)'.
@@ -2015,7 +2187,7 @@ without signalling an error if none exists.")
       ;; not a clash if 'term2' is BOTTOM and 'term1' allows the binding:
       (when (bottom? term2)
         (return))
-      (signal-unification-clash term1 term2))) ))
+      (signal-unification-clash prop term1 term2))) ))
 
 ;(defun unify-attribute-propositions
 ;       ((attributes1 (LIST OF PROPOSITION))
@@ -2039,7 +2211,7 @@ without signalling an error if none exists.")
 ;          (when (eql? slotRef1 slotRef2)
 ;            (let ((p1 PROPOSITION (value cursor1))
 ;                  (p2 PROPOSITION (value cursor2)))                  
-;              (equate-values (function-value p1) (function-value p2))))
+;              (equate-values p1 (function-value p1) (function-value p2))))
 ;          (setq cursor1 (rest cursor1))
 ;          (when (null? cursor1)
 ;            (return))
@@ -2171,9 +2343,11 @@ without signalling an error if none exists.")
       (react-to-skolem-value-update
        skolem oldValue NULL topLevelUpdate?))))
 
-(defun constrain-as-subset ((set1 COLLECTION)
+(defun constrain-as-subset ((prop PROPOSITION)
+                            (set1 COLLECTION)
                             (set2 COLLECTION))
   ;; Signal clash if 'set1' cannot logically represent a subset of 'set2'.
+  ;; 'prop' is the proposition triggering this equation.
   ;; Assumes that 'set1' and 'set2' have no duplicates.
   ;; Assumes that skolem members are necessarily distinct from sibling set members.
   ;; TO DO: THE UNIFICATION IS NOT COMPLETE FOR SOME CASES WHEN SKOLEMS
@@ -2182,7 +2356,9 @@ without signalling an error if none exists.")
   ;;   (subset-of {1,sk1} {2,sk2}) IMPLIES THAT sk1 = 2 and sk2 = 1.
   ;;   WE DON'T MAKE THAT INFERENCE (YET).
   (when (> (length set1) (length set2))
-    (signal-unification-clash set1 set2))
+    ;; BUG?  Is this test correct when there are multiple skolems in the set?
+    ;; Couldn't that then be resolved by having multiple skolems unify with values?
+    (signal-unification-clash prop set1 set2))
   (let ((copy1 NIL)
         (copy2 NIL))
     ;; make copy of set2:
@@ -2200,7 +2376,7 @@ without signalling an error if none exists.")
       ;; both sets have a single member remaining. Equate them:
       (let ((item1 (first copy1))
             (item2 (first copy2)))
-        (equate-values item1 item2)
+        (equate-values prop item1 item2)
         (return)))
     ;; 'copy2' has two or more members; 'copy1' has at least one:
     (let ((skolemCount1 0)
@@ -2210,29 +2386,31 @@ without signalling an error if none exists.")
       (foreach i2 in copy2 where (skolem? i2)
                do (++ skolemCount2))
       (when (eql? (+ skolemCount1 skolemCount2) 0)
-        (signal-unification-clash set1 set2))) ))
+        (signal-unification-clash prop set1 set2))) ))
 
-(defun equate-collections ((col1 COLLECTION) (col2 COLLECTION))
+(defun equate-collections ((prop PROPOSITION) (col1 COLLECTION) (col2 COLLECTION))
   ;; If 'col1' and 'col2' are logically incompatible signal
   ;;    a clash.
+  ;; 'prop' is the proposition triggering the equation of collections
   ;; If a correspondence can be established between members of 'col1' and
   ;;    members of 'col2', then unify the corresponding members.
   (when (and (ordered? col1) (ordered? col2))
     (foreach i1 in col1
              as i2 in col2
-             do (equate-values i1 i2))
+             do (equate-values prop i1 i2))
     (return))
   (when (and (no-duplicates? col1) (no-duplicates? col2))
-    (constrain-as-subset col1 col2)
-    (constrain-as-subset col2 col1)))
+    (constrain-as-subset prop col1 col2)
+    (constrain-as-subset prop col2 col1)))
 
 (defun (logic-collection? BOOLEAN) ((term OBJECT))
   ;; Returns TRUE if `term' is a subtype of logic collection.
   (return (test-type-on-instance? term LOGIC/@COLLECTION)))
 
 ;; TO DO: INVENT A DEFAULT VERSION OF 'equate-values':
-(defun equate-values ((term1 OBJECT) (term2 OBJECT))
+(defun equate-values ((prop PROPOSITION) (term1 OBJECT) (term2 OBJECT))
   ;; Equate the terms 'term1' and 'term2'.
+  ;; 'prop' is the proposition responsible for forcing the equation
   ;; If one or the other is a skolem, point its value at the other.
   ;; Otherwise, if they are unequal, signal a clash.
   ;; CAUTION: Assumes that 'term1' and 'term2' represent the end-point of
@@ -2247,14 +2425,14 @@ without signalling an error if none exists.")
    ;; TO DO: GENERALIZE THIS TO INCLUDE INTERVALS:
    ((and (stella-collection? term1)
          (stella-collection? term2))
-    (equate-collections term1 term2))
+    (equate-collections prop term1 term2))
    ((and (isa? term1 PL-KERNEL/@INTERVAL-CACHE)
          (isa? term2 PL-KERNEL/@INTERVAL-CACHE))
     ;; should we have an `equate-intervals' function?
     (pl-kernel/unify-interval-caches term1 term2 PL-KERNEL/@>=)
     (pl-kernel/unify-interval-caches term2 term1 PL-KERNEL/@>=))
    (otherwise ;; 'term1' and 'term2' are non-`eql?' constants:
-    (signal-unification-clash term1 term2))))
+    (signal-unification-clash prop term1 term2))))
 
 ;;; EXPERIMENT:
 ;;; IF WE KEEP THIS, IT HAS TO GO INTO THE DEFINITION OF `SKOLEM' TO MAKE IT
@@ -3119,7 +3297,7 @@ with size less than `sizeCutoff' (default is 10)."
             (cond
              ((clip-value? skolemOutput value) NULL)
              (otherwise
-              (equate-values (value-of skolemOutput) (value-of value)))))
+              (equate-values proposition (value-of skolemOutput) (value-of value)))))
            (:RETRACT-TRUE
             (unequate-values? skolemOutput value)))
          (return proposition)))
@@ -5446,7 +5624,7 @@ the processing and validation."
         ((clip-value? term1 term2) NULL)
         ((clip-value? term2 term1) NULL)
         (otherwise
-         (equate-values (value-of term1) (value-of term2)))))
+         (equate-values proposition (value-of term1) (value-of term2)))))
       (:RETRACT-TRUE
        (cond
         ((unequate-values? term1 term2) NULL)
